@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
 from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QKeyEvent, QMouseEvent, QPixmap
+from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from eidory.core.metadata_store import MetadataStore
@@ -131,6 +131,26 @@ class ImagePreviewDialogTest(unittest.TestCase):
 
         self.assertEqual(scaled.width(), 640)
         self.assertEqual(scaled.height(), 480)
+
+    def test_preview_transforms_grayscale_and_horizontal_mirror(self) -> None:
+        image = QImage(2, 1, QImage.Format.Format_RGB32)
+        image.setPixelColor(0, 0, QColor(255, 0, 0))
+        image.setPixelColor(1, 0, QColor(0, 0, 255))
+        pixmap = QPixmap.fromImage(image)
+
+        transformed = ImagePreviewDialog._apply_preview_transforms(
+            pixmap,
+            grayscale=True,
+            mirror_horizontal=True,
+        ).toImage()
+
+        left = transformed.pixelColor(0, 0)
+        right = transformed.pixelColor(1, 0)
+        self.assertEqual(left.red(), left.green())
+        self.assertEqual(left.green(), left.blue())
+        self.assertEqual(right.red(), right.green())
+        self.assertEqual(right.green(), right.blue())
+        self.assertLess(left.red(), right.red())
 
     def test_preview_double_click_closes_image_surface(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -294,6 +314,8 @@ class ImagePreviewDialogTest(unittest.TestCase):
 
             self.assertIs(dialog.preview_stack.currentWidget(), dialog.video_widget)
             self.assertFalse(dialog.fit_button.isEnabled())
+            self.assertFalse(dialog.grayscale_button.isEnabled())
+            self.assertFalse(dialog.mirror_button.isEnabled())
             self.assertFalse(dialog.video_controls_widget.isHidden())
             self.assertEqual(dialog.video_player.source().toLocalFile(), str(video_path))
             dialog.close()

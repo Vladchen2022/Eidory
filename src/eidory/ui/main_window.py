@@ -8,7 +8,7 @@ import threading
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QStringListModel, Qt, QTimer, QUrl
+from PySide6.QtCore import QSize, QStringListModel, Qt, QTimer, QUrl
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QPixmap, QTextOption
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QCompleter,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStatusBar,
+    QTabBar,
     QTabWidget,
     QTextEdit,
     QTreeWidget,
@@ -49,6 +51,12 @@ from PySide6.QtWidgets import (
 from eidory.config import AppPaths
 from eidory.core.embedding_provider import JinaClipV2Provider
 from eidory.core.embedding_worker import EmbeddingProgress, EmbeddingWorker
+from eidory.core.inspiration import (
+    InspirationMatch,
+    InspirationTerm,
+    mix_inspiration_search_results,
+)
+from eidory.core.llm_provider import LMStudioProvider, LLMProviderError
 from eidory.core.media_types import (
     SUPPORTED_IMAGE_EXTENSIONS,
     SUPPORTED_VIDEO_EXTENSIONS,
@@ -76,6 +84,38 @@ from eidory.models import ImageItem
 from eidory.ui.collection_tree import CollectionTreeWidget
 from eidory.ui.image_preview_dialog import ImagePreviewDialog
 from eidory.ui.justified_image_grid import JustifiedImageGridView
+
+
+LLM_SERVICE_OPTIONS = [
+    ("lm_studio", "LM Studio"),
+    ("openai", "OpenAI API"),
+    ("deepseek", "DeepSeek API"),
+    ("ollama", "Ollama"),
+    ("openai_compatible", "OpenAI-compatible"),
+]
+
+DEFAULT_LLM_ENDPOINTS = {
+    "lm_studio": "http://localhost:1234/v1",
+    "openai": "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "ollama": "http://localhost:11434/v1",
+    "openai_compatible": "http://localhost:1234/v1",
+}
+
+
+class EqualWidthTabBar(QTabBar):
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.updateGeometry()
+
+    def tabSizeHint(self, index: int) -> QSize:
+        size = super().tabSizeHint(index)
+        count = max(1, self.count())
+        parent_width = self.parentWidget().width() if self.parentWidget() is not None else 0
+        available_width = max(self.width(), parent_width)
+        if available_width > 0:
+            size.setWidth(max(34, available_width // count - 1))
+        return size
 
 
 class MainWindow(QMainWindow):
@@ -154,6 +194,17 @@ class MainWindow(QMainWindow):
         self.current_color_indexed_count = 0
         self.current_color_candidate_limit = 0
         self.current_search_scope_count: int | None = None
+        self.current_inspiration_project_id: int | None = None
+        self.current_inspiration_terms: list[InspirationTerm] = []
+        self.current_inspiration_images: list[ImageItem] = []
+        self.current_inspiration_filtered_images: list[ImageItem] = []
+        self.current_inspiration_matches: dict[int, list[InspirationMatch]] = {}
+        self.inspiration_proposal_terms: list[InspirationTerm] = []
+        self.inspiration_questions: list[str] = []
+        self.inspiration_model_name = ""
+        self.current_temp_project_id: int | None = None
+        self.current_temp_project_images: list[ImageItem] = []
+        self.current_temp_project_badges: dict[int, list[str]] = {}
         self.search_filters: list[SearchFilter] = []
         self.current_chain_images: list[ImageItem] = []
         self.current_chain_filtered_images: list[ImageItem] = []
@@ -162,13 +213,16 @@ class MainWindow(QMainWindow):
         self.selected_image: ImageItem | None = None
         self.embedding_refresh_counter = 0
         self._applying_view_payload = False
+        self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
 
         self.setWindowTitle("Eidory")
         self.setStatusBar(QStatusBar())
         self._build_ui()
+        self._apply_runtime_language_settings()
         self._connect_signals()
         self._refresh_folders()
         self._refresh_collections()
+        self._refresh_temporary_projects()
         self._refresh_tags()
         self._refresh_saved_views()
         self._reload_images()
@@ -227,6 +281,11 @@ class MainWindow(QMainWindow):
         self.collection_tree.setColumnWidth(0, 170)
         self.collection_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
+        self.temp_project_list = QListWidget()
+        self.temp_project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.temp_project_list.setMinimumHeight(130)
+        self.temp_project_list.setToolTip("保存的临时图片组；删除项目不会影响源文件。")
+
         self.status_list = QListWidget()
         for label, value in [
             ("全部", "all"),
@@ -274,7 +333,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("文件夹"))
         layout.addWidget(self.add_collection_button)
         layout.addWidget(self.add_folder_button)
-        layout.addWidget(self.collection_tree, 1)
+        layout.addWidget(self.collection_tree, 3)
+        layout.addWidget(QLabel("灵感暂存"))
+        layout.addWidget(self.temp_project_list, 1)
         return panel
 
     def _build_library_panel(self) -> QWidget:
@@ -541,6 +602,26 @@ class MainWindow(QMainWindow):
         ]:
             hidden_action_button.hide()
 
+        self.inspiration_brief_input = QTextEdit()
+        self.inspiration_brief_input.setPlaceholderText("用一句话描述画面的创作主题")
+        self.inspiration_brief_input.setAcceptRichText(False)
+        self.inspiration_brief_input.setFixedHeight(34)
+        self.inspiration_answers_input = QTextEdit()
+        self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
+        self.inspiration_answers_input.setAcceptRichText(False)
+        self.inspiration_answers_input.setFixedHeight(60)
+        self.inspiration_questions_label = QLabel("AI 追问：-")
+        self.inspiration_questions_label.setWordWrap(True)
+        self.inspiration_term_list = QListWidget()
+        self.inspiration_term_list.setMinimumHeight(360)
+        self.inspiration_status_label = QLabel("生成后最多选择 7 个语义探针。")
+        self.inspiration_status_label.setWordWrap(True)
+        self.generate_inspiration_button = QPushButton("生成语义探针")
+        self.search_inspiration_button = QPushButton("保存并搜索")
+        self.search_inspiration_button.setEnabled(False)
+        self.save_temp_project_button = QPushButton("暂存选中图片")
+        self.save_temp_project_button.setEnabled(False)
+
         form = QFormLayout()
         self.detail_form = form
         form.setContentsMargins(0, 0, 0, 0)
@@ -572,6 +653,25 @@ class MainWindow(QMainWindow):
         detail_layout.addWidget(self.note_input)
         detail_layout.addWidget(self.save_detail_button)
         detail_layout.addStretch(1)
+
+        inspiration_tab = QWidget()
+        inspiration_layout = QVBoxLayout(inspiration_tab)
+        inspiration_layout.setContentsMargins(8, 8, 8, 8)
+        inspiration_layout.setSpacing(8)
+        inspiration_layout.addWidget(QLabel("创作主题"))
+        inspiration_layout.addWidget(self.inspiration_brief_input)
+        inspiration_layout.addWidget(QLabel("补充信息"))
+        inspiration_layout.addWidget(self.inspiration_answers_input)
+        inspiration_layout.addWidget(self.inspiration_questions_label)
+        inspiration_layout.addWidget(QLabel("语义探针"))
+        inspiration_layout.addWidget(self.inspiration_term_list, 1)
+        inspiration_layout.addWidget(self.inspiration_status_label)
+        inspiration_button_row = QHBoxLayout()
+        inspiration_button_row.setContentsMargins(0, 0, 0, 0)
+        inspiration_button_row.addWidget(self.generate_inspiration_button)
+        inspiration_button_row.addWidget(self.search_inspiration_button)
+        inspiration_layout.addLayout(inspiration_button_row)
+        inspiration_layout.addWidget(self.save_temp_project_button)
 
         filter_tab = QWidget()
         filter_layout = QVBoxLayout(filter_tab)
@@ -615,10 +715,58 @@ class MainWindow(QMainWindow):
         index_layout.addWidget(self.retry_failed_button)
         index_layout.addStretch(1)
 
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.setContentsMargins(8, 8, 8, 8)
+        settings_layout.setSpacing(8)
+        settings_layout.addWidget(QLabel("文本模型设置"))
+        settings_form = QFormLayout()
+        settings_form.setContentsMargins(0, 0, 0, 0)
+        settings_form.setHorizontalSpacing(8)
+        settings_form.setVerticalSpacing(8)
+        self.llm_service_combo = QComboBox()
+        for service_key, service_label in LLM_SERVICE_OPTIONS:
+            self.llm_service_combo.addItem(service_label, service_key)
+        self.llm_endpoint_input = QLineEdit()
+        self.llm_model_input = QLineEdit()
+        self.llm_api_key_input = QLineEdit()
+        self.llm_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.llm_temperature_spin = QDoubleSpinBox()
+        self.llm_temperature_spin.setRange(0.0, 2.0)
+        self.llm_temperature_spin.setSingleStep(0.1)
+        self.llm_temperature_spin.setDecimals(2)
+        self.language_combo = QComboBox()
+        self.language_combo.addItem("中文", "zh")
+        self.language_combo.addItem("English", "en")
+        settings_form.addRow("模型服务", self.llm_service_combo)
+        settings_form.addRow("Endpoint", self.llm_endpoint_input)
+        settings_form.addRow("Model", self.llm_model_input)
+        settings_form.addRow("API Key", self.llm_api_key_input)
+        settings_form.addRow("温度", self.llm_temperature_spin)
+        settings_form.addRow("界面语言", self.language_combo)
+        settings_layout.addLayout(settings_form)
+        self.save_settings_button = QPushButton("保存设置")
+        self.settings_status_label = QLabel(
+            "LM Studio 默认使用 http://localhost:1234/v1；Ollama 默认使用 http://localhost:11434/v1；API Key 不会写入日志。"
+        )
+        self.settings_status_label.setWordWrap(True)
+        settings_layout.addWidget(self.save_settings_button)
+        settings_layout.addWidget(self.settings_status_label)
+        settings_layout.addStretch(1)
+        self._load_settings_controls()
+
         self.right_tab_widget = QTabWidget()
+        self.right_tab_widget.setTabBar(EqualWidthTabBar())
         self.right_tab_widget.addTab(detail_tab, "详情")
+        self.right_tab_widget.addTab(inspiration_tab, "AI")
         self.right_tab_widget.addTab(filter_tab, "筛选")
         self.right_tab_widget.addTab(index_tab, "索引")
+        self.right_tab_widget.addTab(settings_tab, "设置")
+        self.right_tab_widget.setElideMode(Qt.TextElideMode.ElideRight)
+        tab_bar = self.right_tab_widget.tabBar()
+        tab_bar.setExpanding(True)
+        tab_bar.setUsesScrollButtons(False)
+        tab_bar.setTabToolTip(1, "AI 语义探针")
         self.right_tab_widget.setCurrentIndex(
             self._setting_int("ui.right_tab_index", 0, 0, self.right_tab_widget.count() - 1)
         )
@@ -660,6 +808,11 @@ class MainWindow(QMainWindow):
         self.batch_add_tags_button.clicked.connect(self._batch_add_tags_from_panel)
         self.batch_remove_tag_button.clicked.connect(self._batch_remove_selected_tag)
         self.batch_clear_tags_button.clicked.connect(self._batch_clear_tags)
+        self.generate_inspiration_button.clicked.connect(self._generate_inspiration_terms_from_panel)
+        self.search_inspiration_button.clicked.connect(self._save_and_search_inspiration)
+        self.inspiration_term_list.itemClicked.connect(self._search_clicked_inspiration_term)
+        self.inspiration_term_list.itemChanged.connect(self._enforce_inspiration_selection_limit)
+        self.save_temp_project_button.clicked.connect(self._save_selected_images_as_temporary_project)
         self.feedback_relevant_button.clicked.connect(lambda: self._save_search_feedback("relevant"))
         self.feedback_irrelevant_button.clicked.connect(lambda: self._save_search_feedback("irrelevant"))
         self.feedback_ignored_button.clicked.connect(lambda: self._save_search_feedback("ignored"))
@@ -684,13 +837,127 @@ class MainWindow(QMainWindow):
         self.merge_tag_button.clicked.connect(self._merge_selected_tag)
         self.folder_tree.customContextMenuRequested.connect(self._show_folder_context_menu)
         self.collection_tree.customContextMenuRequested.connect(self._show_collection_context_menu)
+        self.temp_project_list.itemSelectionChanged.connect(self._load_selected_temporary_project)
+        self.temp_project_list.customContextMenuRequested.connect(self._show_temporary_project_context_menu)
         self.tag_list.customContextMenuRequested.connect(self._show_tag_context_menu)
         self.right_tab_widget.currentChanged.connect(self._save_right_tab_index)
+        self.llm_service_combo.currentIndexChanged.connect(self._on_llm_service_changed)
+        self.save_settings_button.clicked.connect(self._save_settings)
         self.saved_view_combo.currentIndexChanged.connect(self._refresh_saved_view_buttons)
         self.save_view_button.clicked.connect(self._save_current_view)
         self.apply_view_button.clicked.connect(self._apply_selected_saved_view)
         self.rename_view_button.clicked.connect(self._rename_selected_saved_view)
         self.delete_view_button.clicked.connect(self._delete_selected_saved_view)
+
+    def _load_settings_controls(self) -> None:
+        service = self._llm_service_key()
+        self._set_combo_to_data(self.llm_service_combo, service)
+        self._load_llm_service_controls(service)
+        self.llm_temperature_spin.setValue(self._llm_temperature())
+        self._set_combo_to_data(self.language_combo, self.current_language)
+
+    def _llm_service_key(self) -> str:
+        raw = self.store.get_setting("llm.provider", "lm_studio")
+        allowed = {key for key, _label in LLM_SERVICE_OPTIONS}
+        return raw if raw in allowed else "lm_studio"
+
+    def _llm_service_label(self, service: str) -> str:
+        return dict(LLM_SERVICE_OPTIONS).get(service, "LM Studio")
+
+    def _llm_endpoint(self, service: str) -> str:
+        return (
+            self.store.get_setting(f"llm.{service}.base_url")
+            or self.store.get_setting("llm.lmstudio.base_url")
+            or DEFAULT_LLM_ENDPOINTS.get(service)
+            or DEFAULT_LLM_ENDPOINTS["lm_studio"]
+        )
+
+    def _llm_model(self, service: str) -> str:
+        return self.store.get_setting(f"llm.{service}.model") or (
+            self.store.get_setting("llm.lmstudio.model") if service == "lm_studio" else ""
+        ) or ""
+
+    def _llm_api_key(self, service: str) -> str:
+        return self.store.get_setting(f"llm.{service}.api_key") or ""
+
+    def _llm_temperature(self) -> float:
+        raw = self.store.get_setting("llm.temperature", "0.7")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 0.7
+        return max(0.0, min(2.0, value))
+
+    def _load_llm_service_controls(self, service: str) -> None:
+        self.llm_endpoint_input.setText(self._llm_endpoint(service))
+        self.llm_model_input.setText(self._llm_model(service))
+        self.llm_api_key_input.setText(self._llm_api_key(service))
+
+    def _on_llm_service_changed(self) -> None:
+        service = str(self.llm_service_combo.currentData() or "lm_studio")
+        self._load_llm_service_controls(service)
+
+    def _save_settings(self) -> None:
+        service = str(self.llm_service_combo.currentData() or "lm_studio")
+        language = str(self.language_combo.currentData() or "zh")
+        self.store.set_setting("llm.provider", service)
+        self.store.set_setting(f"llm.{service}.base_url", self.llm_endpoint_input.text().strip())
+        self.store.set_setting(f"llm.{service}.model", self.llm_model_input.text().strip())
+        self.store.set_setting(f"llm.{service}.api_key", self.llm_api_key_input.text().strip())
+        self.store.set_setting("llm.temperature", f"{self.llm_temperature_spin.value():.2f}")
+        self.store.set_setting("ui.language", language)
+        self.current_language = language
+        self._apply_runtime_language_settings()
+        self.settings_status_label.setText("设置已保存。API Key 不会写入日志。")
+        self.statusBar().showMessage("设置已保存")
+
+    def _apply_runtime_language_settings(self) -> None:
+        if self.current_language == "en":
+            self.add_collection_button.setText("New Folder")
+            self.add_folder_button.setText("Import Here")
+            self.search_input.setPlaceholderText("File name, tags, notes, or semantic search text")
+            self.color_mode_button.setText("Color")
+            self.keyword_mode_button.setText("Keyword")
+            self.semantic_mode_button.setText("Semantic")
+            self.similar_image_button.setText("Similar")
+            self.search_button.setText("Search")
+            self.clear_search_button.setText("Clear")
+            self.save_detail_button.setText("Save Details")
+            self.inspiration_brief_input.setPlaceholderText("Describe the image concept in one sentence")
+            self.inspiration_answers_input.setPlaceholderText("Extra context: era, weather, lighting, mood, optional")
+            self.inspiration_questions_label.setText("AI questions: -")
+            self.inspiration_status_label.setText("Select up to 7 semantic probes.")
+            self.generate_inspiration_button.setText("Generate Probes")
+            self.search_inspiration_button.setText("Save and Search")
+            self.save_temp_project_button.setText("Save Selected")
+            self.right_tab_widget.setTabText(0, "Details")
+            self.right_tab_widget.setTabText(1, "AI")
+            self.right_tab_widget.setTabText(2, "Filters")
+            self.right_tab_widget.setTabText(3, "Index")
+            self.right_tab_widget.setTabText(4, "Settings")
+        else:
+            self.add_collection_button.setText("新建文件夹")
+            self.add_folder_button.setText("导入到当前文件夹")
+            self.search_input.setPlaceholderText("文件名、标签、备注，或语义搜索文本")
+            self.color_mode_button.setText("颜色")
+            self.keyword_mode_button.setText("关键词")
+            self.semantic_mode_button.setText("语义")
+            self.similar_image_button.setText("相似图")
+            self.search_button.setText("搜索")
+            self.clear_search_button.setText("清空")
+            self.save_detail_button.setText("保存详情")
+            self.inspiration_brief_input.setPlaceholderText("用一句话描述画面的创作主题")
+            self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
+            self.inspiration_questions_label.setText("AI 追问：-")
+            self.inspiration_status_label.setText("生成后最多选择 7 个语义探针。")
+            self.generate_inspiration_button.setText("生成语义探针")
+            self.search_inspiration_button.setText("保存并搜索")
+            self.save_temp_project_button.setText("暂存选中图片")
+            self.right_tab_widget.setTabText(0, "详情")
+            self.right_tab_widget.setTabText(1, "AI")
+            self.right_tab_widget.setTabText(2, "筛选")
+            self.right_tab_widget.setTabText(3, "索引")
+            self.right_tab_widget.setTabText(4, "设置")
 
     def _choose_folder(self) -> None:
         collection_id = self._selected_collection_id()
@@ -800,6 +1067,202 @@ class MainWindow(QMainWindow):
             return
         self._add_search_filter(search_filter)
         self._execute_search_chain()
+
+    def _generate_inspiration_terms_from_panel(self) -> None:
+        brief = self.inspiration_brief_input.toPlainText().strip()
+        if not brief:
+            self.inspiration_status_label.setText("先输入创作主题。")
+            return
+        self.generate_inspiration_button.setEnabled(False)
+        self.search_inspiration_button.setEnabled(False)
+        service = self._llm_service_key()
+        self.inspiration_status_label.setText(f"正在请求 {self._llm_service_label(service)} 生成语义探针...")
+        provider = LMStudioProvider(
+            base_url=self._llm_endpoint(service),
+            model_name=self._llm_model(service) or None,
+            api_key=self._llm_api_key(service),
+            service_name=self._llm_service_label(service),
+            temperature=self._llm_temperature(),
+        )
+        answers = self.inspiration_answers_input.toPlainText()
+
+        def run() -> None:
+            try:
+                proposal = provider.generate_inspiration_terms(
+                    brief=brief,
+                    answers=answers,
+                    language=self.current_language,
+                )
+                self.events.put(("inspiration_proposal", proposal))
+            except Exception as exc:
+                self.events.put(("inspiration_error", exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_inspiration_proposal(self, proposal) -> None:
+        self.inspiration_proposal_terms = list(proposal.terms)
+        self.inspiration_questions = list(proposal.questions)
+        self.inspiration_model_name = proposal.model_name
+        self.inspiration_term_list.blockSignals(True)
+        self.inspiration_term_list.clear()
+        for index, term in enumerate(self.inspiration_proposal_terms):
+            item = QListWidgetItem(f"{term.title}\n{term.query}\n{term.reason}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if index < 5 else Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, term)
+            item.setSizeHint(QSize(0, 58))
+            item.setToolTip(f"{term.query}\n{term.reason}")
+            self.inspiration_term_list.addItem(item)
+        self.inspiration_term_list.blockSignals(False)
+        question_prefix = "AI questions: " if self.current_language == "en" else "AI 追问："
+        self.inspiration_questions_label.setText(
+            question_prefix + " / ".join(self.inspiration_questions)
+            if self.inspiration_questions
+            else question_prefix + "-"
+        )
+        self._refresh_inspiration_status()
+        self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
+
+    def _show_inspiration_error(self, payload: object) -> None:
+        message = str(payload) if isinstance(payload, LLMProviderError) else f"生成失败：{payload}"
+        self.inspiration_status_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _enforce_inspiration_selection_limit(self, changed_item: QListWidgetItem) -> None:
+        selected = self._selected_inspiration_terms()
+        if len(selected) > 7:
+            self.inspiration_term_list.blockSignals(True)
+            changed_item.setCheckState(Qt.CheckState.Unchecked)
+            self.inspiration_term_list.blockSignals(False)
+            self.inspiration_status_label.setText("最多选择 7 个语义探针。")
+            return
+        self._refresh_inspiration_status()
+        self.search_inspiration_button.setEnabled(bool(selected))
+
+    def _refresh_inspiration_status(self) -> None:
+        count = len(self._selected_inspiration_terms())
+        total = self.inspiration_term_list.count()
+        if total == 0:
+            self.inspiration_status_label.setText("生成后最多选择 7 个语义探针；单击探针可单条搜索。")
+        else:
+            self.inspiration_status_label.setText(f"已选择 {count} / 7 个语义探针；单击探针可单条搜索。")
+
+    def _selected_inspiration_terms(self) -> list[InspirationTerm]:
+        terms: list[InspirationTerm] = []
+        for row in range(self.inspiration_term_list.count()):
+            item = self.inspiration_term_list.item(row)
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+            term = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(term, InspirationTerm):
+                terms.append(InspirationTerm(
+                    id=term.id,
+                    title=term.title,
+                    query=term.query,
+                    axis=term.axis,
+                    reason=term.reason,
+                    selected=True,
+                ))
+        return terms
+
+    def _search_clicked_inspiration_term(self, item: QListWidgetItem) -> None:
+        term = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(term, InspirationTerm):
+            return
+        self._run_single_inspiration_term_search(term)
+
+    def _run_single_inspiration_term_search(self, term: InspirationTerm) -> None:
+        self.inspiration_status_label.setText(f"正在单条搜索：{term.title}")
+        self._run_inspiration_search(
+            self.current_inspiration_project_id or 0,
+            [
+                InspirationTerm(
+                    id=term.id,
+                    title=term.title,
+                    query=term.query,
+                    axis=term.axis,
+                    reason=term.reason,
+                    selected=True,
+                )
+            ],
+        )
+
+    def _save_and_search_inspiration(self) -> None:
+        selected_terms = self._selected_inspiration_terms()
+        if not selected_terms:
+            self.inspiration_status_label.setText("至少选择 1 个语义探针。")
+            return
+        if len(selected_terms) > 7:
+            self.inspiration_status_label.setText("最多选择 7 个语义探针。")
+            return
+        brief = self.inspiration_brief_input.toPlainText().strip()
+        if not brief:
+            self.inspiration_status_label.setText("先输入创作主题。")
+            return
+        selected_titles = {term.title for term in selected_terms}
+        project_id = self.store.create_inspiration_project(
+            title=brief[:28] or "灵感项目",
+            brief=brief,
+            answers=self.inspiration_answers_input.toPlainText(),
+            questions=self.inspiration_questions,
+            provider_name="lm_studio",
+            model_name=self.inspiration_model_name or "local-model",
+            terms=self.inspiration_proposal_terms,
+            selected_titles=selected_titles,
+        )
+        self._run_inspiration_search(project_id, selected_terms)
+
+    def _run_inspiration_search(
+        self,
+        project_id: int,
+        selected_terms: list[InspirationTerm],
+    ) -> None:
+        if not selected_terms:
+            self.statusBar().showMessage("没有可搜索的语义探针")
+            return
+        self.semantic_search_revision += 1
+        revision = self.semantic_search_revision
+        folder_path_prefix = self._selected_folder_path_prefix()
+        collection_id = self._selected_collection_id()
+        tag_ids = self._selected_tag_ids()
+        tag_match_mode = self._selected_tag_match_mode()
+        status_filter = self._selected_status_filter()
+        self.current_result_mode = "inspiration"
+        self.current_inspiration_project_id = project_id
+        self.current_inspiration_terms = list(selected_terms)
+        self.current_inspiration_images = []
+        self.current_inspiration_filtered_images = []
+        self.current_inspiration_matches = {}
+        self.current_temp_project_id = None
+        self.current_temp_project_images = []
+        self.current_temp_project_badges = {}
+        self.search_filters.clear()
+        self.current_offset = 0
+        self.load_more_button.setEnabled(False)
+        self.generate_inspiration_button.setEnabled(False)
+        self.search_inspiration_button.setEnabled(False)
+        self._set_result_status(f"灵感项目搜索中：{len(selected_terms)} 个语义探针")
+        self.search_diagnostics_label.setText("搜索诊断：-")
+
+        def run() -> None:
+            try:
+                term_results = []
+                for term in selected_terms:
+                    result = self.search_service.semantic_search(
+                        term.query,
+                        folder_path_prefix=folder_path_prefix,
+                        collection_id=collection_id,
+                        tag_ids=tag_ids,
+                        tag_match_mode=tag_match_mode,
+                        status_filter=status_filter,
+                    )
+                    term_results.append((term, result.images[:100]))
+                mixed = mix_inspiration_search_results(term_results, limit=500)
+                self.events.put(("inspiration_done", (revision, project_id, selected_terms, mixed)))
+            except Exception as exc:
+                self.events.put(("error", f"灵感项目搜索失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _find_similar_to_selected_image(self) -> None:
         self._find_similar_to_image(self._selected_grid_image())
@@ -1226,6 +1689,166 @@ class MainWindow(QMainWindow):
         self._update_search_chain_diagnostics(filters, images)
         self._refresh_feedback_buttons(self.selected_image)
 
+    def _handle_inspiration_done(
+        self,
+        *,
+        project_id: int,
+        selected_terms: list[InspirationTerm],
+        result,
+    ) -> None:
+        self.current_result_mode = "inspiration"
+        self.current_inspiration_project_id = project_id
+        self.current_inspiration_terms = list(selected_terms)
+        self.current_inspiration_images = list(result.images)
+        self.current_inspiration_matches = dict(result.matches_by_image_id)
+        self._apply_inspiration_result_filters()
+        images = self.current_inspiration_filtered_images
+        badges = self._inspiration_badges_by_image_id()
+        self.grid_view.set_images(images, badges_by_image_id=badges)
+        self._set_inspiration_result_status(images)
+        self._update_inspiration_diagnostics(images)
+        self._refresh_feedback_buttons(self.selected_image)
+
+    def _inspiration_badges_by_image_id(self) -> dict[int, list[str]]:
+        return {
+            image_id: [self._format_inspiration_badge(matches)]
+            for image_id, matches in self.current_inspiration_matches.items()
+            if matches
+        }
+
+    def _update_inspiration_diagnostics(self, images: list[ImageItem]) -> None:
+        if not images:
+            self.search_diagnostics_label.setText("搜索诊断：-")
+            return
+        visible_term_titles = {
+            match.term_title
+            for image in images
+            for match in self.current_inspiration_matches.get(image.id, [])
+        }
+        covered_count = sum(
+            1
+            for term in self.current_inspiration_terms
+            if term.title in visible_term_titles
+        )
+        multi_hit_count = sum(
+            1
+            for image in images
+            if len(self.current_inspiration_matches.get(image.id, [])) > 1
+        )
+        scores = [image.score for image in images if image.score is not None]
+        threshold = self._score_threshold()
+        threshold_text = "不限" if threshold is None else f"{threshold:.2f}"
+        protected_count = (
+            0
+            if threshold is None
+            else sum(
+                1
+                for image in images
+                if image.score is not None and image.score < threshold
+            )
+        )
+        parts = [
+            f"显示 {len(images)}",
+            f"探针覆盖 {covered_count}/{len(self.current_inspiration_terms)}",
+            f"多重命中 {multi_hit_count}",
+            f"阈值 {threshold_text}",
+        ]
+        if protected_count:
+            parts.append(f"覆盖保留 {protected_count}")
+        if scores:
+            parts.extend([
+                f"最高 {max(scores):.3f}",
+                f"最低 {min(scores):.3f}",
+                f"平均 {sum(scores) / len(scores):.3f}",
+            ])
+        self.search_diagnostics_label.setText("搜索诊断：" + "，".join(parts))
+
+    def _set_inspiration_result_status(self, images: list[ImageItem]) -> None:
+        source_count = len(self.current_inspiration_images)
+        term_titles = "、".join(term.title for term in self.current_inspiration_terms)
+        if len(images) == source_count:
+            self._set_result_status(f"灵感项目结果：{len(images)} 张 ｜ {term_titles}")
+        else:
+            self._set_result_status(
+                f"灵感项目结果：{len(images)} / 原始 {source_count} ｜ {term_titles}"
+            )
+
+    def _apply_inspiration_result_filters(self) -> None:
+        threshold = self._score_threshold()
+        images = self.current_inspiration_images
+        if threshold is None:
+            filtered = list(images)
+        else:
+            passing = [
+                image
+                for image in images
+                if image.score is not None and image.score >= threshold
+            ]
+            filtered = self._unique_images([
+                *self._inspiration_coverage_images(images),
+                *passing,
+            ])
+        self.current_inspiration_filtered_images = self._sort_images(
+            self._apply_sidebar_filters(filtered)
+        )
+
+    def _inspiration_coverage_images(self, images: list[ImageItem]) -> list[ImageItem]:
+        coverage: list[ImageItem] = []
+        used_ids: set[int] = set()
+        for term in self.current_inspiration_terms:
+            best_unused = self._best_inspiration_image_for_term(
+                term.title,
+                images,
+                excluded_ids=used_ids,
+            )
+            best = best_unused or self._best_inspiration_image_for_term(
+                term.title,
+                images,
+                excluded_ids=set(),
+            )
+            if best is None:
+                continue
+            coverage.append(best)
+            used_ids.add(best.id)
+        return coverage
+
+    def _best_inspiration_image_for_term(
+        self,
+        term_title: str,
+        images: list[ImageItem],
+        *,
+        excluded_ids: set[int],
+    ) -> ImageItem | None:
+        best_image: ImageItem | None = None
+        best_score = float("-inf")
+        for image in images:
+            if image.id in excluded_ids:
+                continue
+            matches = self.current_inspiration_matches.get(image.id, [])
+            term_scores = [
+                match.score
+                for match in matches
+                if match.term_title == term_title and match.score is not None
+            ]
+            if not term_scores:
+                continue
+            score = max(float(term_score) for term_score in term_scores)
+            if best_image is None or score > best_score:
+                best_image = image
+                best_score = score
+        return best_image
+
+    @staticmethod
+    def _unique_images(images: list[ImageItem]) -> list[ImageItem]:
+        unique: list[ImageItem] = []
+        seen: set[int] = set()
+        for image in images:
+            if image.id in seen:
+                continue
+            seen.add(image.id)
+            unique.append(image)
+        return unique
+
     def _apply_search_chain_filters(self) -> None:
         images = self.current_chain_images
         threshold = self._active_score_threshold(images)
@@ -1420,6 +2043,7 @@ class MainWindow(QMainWindow):
 
     def _reload_images(self) -> None:
         self.current_offset = 0
+        self._clear_temporary_project_selection()
         self.search_filters.clear()
         self.current_keyword_query = None
         self.current_semantic_query = None
@@ -1431,6 +2055,14 @@ class MainWindow(QMainWindow):
         self.current_color_images = []
         self.current_color_filtered_images = []
         self.current_search_scope_count = None
+        self.current_inspiration_project_id = None
+        self.current_inspiration_terms = []
+        self.current_inspiration_images = []
+        self.current_inspiration_filtered_images = []
+        self.current_inspiration_matches = {}
+        self.current_temp_project_id = None
+        self.current_temp_project_images = []
+        self.current_temp_project_badges = {}
         self.current_chain_images = []
         self.current_chain_filtered_images = []
         self.current_chain_result = SearchChainResult(images=[])
@@ -1452,8 +2084,22 @@ class MainWindow(QMainWindow):
         self._refresh_feedback_buttons(self.selected_image)
         self._refresh_filter_chain_ui()
 
+    def _clear_temporary_project_selection(self) -> None:
+        if not hasattr(self, "temp_project_list"):
+            return
+        self.temp_project_list.blockSignals(True)
+        self.temp_project_list.clearSelection()
+        self.temp_project_list.setCurrentItem(None)
+        self.temp_project_list.blockSignals(False)
+
     def _load_more(self) -> None:
-        if self.search_filters or self.current_result_mode in {"semantic", "color", "search_chain"}:
+        if self.search_filters or self.current_result_mode in {
+            "semantic",
+            "color",
+            "search_chain",
+            "inspiration",
+            "temp_project",
+        }:
             return
         self.current_offset += self.page_size
         images = self.store.list_images(
@@ -1486,6 +2132,11 @@ class MainWindow(QMainWindow):
         self.current_color_indexed_count = 0
         self.current_color_candidate_limit = 0
         self.current_search_scope_count = None
+        self.current_inspiration_project_id = None
+        self.current_inspiration_terms = []
+        self.current_inspiration_images = []
+        self.current_inspiration_filtered_images = []
+        self.current_inspiration_matches = {}
         self.current_chain_images = []
         self.current_chain_filtered_images = []
         self.current_chain_result = SearchChainResult(images=[])
@@ -1541,6 +2192,25 @@ class MainWindow(QMainWindow):
             self._set_result_status(f"关键词结果：{len(images)}")
             return
 
+        if self.current_result_mode == "inspiration" and self.current_inspiration_terms:
+            self._run_inspiration_search(
+                self.current_inspiration_project_id or 0,
+                self.current_inspiration_terms,
+            )
+            return
+
+        if self.current_result_mode == "temp_project":
+            images = self._sort_images(self._apply_sidebar_filters(self.current_temp_project_images))
+            self.grid_view.set_images(images, badges_by_image_id=self.current_temp_project_badges)
+            project = (
+                self.store.get_temporary_project(self.current_temp_project_id)
+                if self.current_temp_project_id is not None
+                else None
+            )
+            name = project.name if project is not None else "灵感暂存"
+            self._set_result_status(f"灵感暂存：{name} ｜ {len(images)} 张")
+            return
+
         self._reload_images()
 
     def _set_result_status(self, message: str) -> None:
@@ -1591,6 +2261,137 @@ class MainWindow(QMainWindow):
             return selected
         image = self._selected_grid_image()
         return [image] if image is not None else []
+
+    def _refresh_temp_project_save_button(self) -> None:
+        if not hasattr(self, "save_temp_project_button"):
+            return
+        count = len(self._selected_grid_images())
+        self.save_temp_project_button.setEnabled(count > 0)
+        if self.current_language == "en":
+            self.save_temp_project_button.setText(
+                f"Save {count} Selected" if count else "Save Selected"
+            )
+        else:
+            self.save_temp_project_button.setText(
+                f"暂存选中 {count} 张" if count else "暂存选中图片"
+            )
+
+    def _save_selected_images_as_temporary_project(self) -> None:
+        images = self._selected_grid_images()
+        if not images:
+            self.statusBar().showMessage("没有选中图片")
+            return
+        default_name = self._suggest_temporary_project_name(images)
+        name, ok = QInputDialog.getText(
+            self,
+            "保存为灵感暂存",
+            "项目名称：",
+            QLineEdit.EchoMode.Normal,
+            default_name,
+        )
+        if not ok:
+            return
+        clean_name = name.strip()
+        if not clean_name:
+            self.statusBar().showMessage("项目名称不能为空")
+            return
+        project_id = self.store.create_temporary_project(
+            clean_name,
+            [image.id for image in images],
+        )
+        intent_labels, intent_queries = self._temporary_project_intents_for_images(images)
+        if intent_labels or intent_queries:
+            self.store.add_images_to_temporary_project(
+                project_id,
+                [image.id for image in images],
+                intent_labels=intent_labels,
+                intent_queries=intent_queries,
+            )
+        self._refresh_temporary_projects(select_project_id=project_id)
+        project = self.store.get_temporary_project(project_id)
+        project_name = project.name if project is not None else clean_name
+        self.statusBar().showMessage(f"已暂存 {len(images)} 张到“{project_name}”")
+
+    def _add_selection_to_temporary_project(self, project_id: int) -> None:
+        images = self._selected_grid_images()
+        if not images:
+            self.statusBar().showMessage("没有选中图片")
+            return
+        project = self.store.get_temporary_project(project_id)
+        if project is None:
+            self._refresh_temporary_projects()
+            self.statusBar().showMessage("该灵感暂存已不存在")
+            return
+        intent_labels, intent_queries = self._temporary_project_intents_for_images(images)
+        self.store.add_images_to_temporary_project(
+            project_id,
+            [image.id for image in images],
+            intent_labels=intent_labels,
+            intent_queries=intent_queries,
+        )
+        self._refresh_temporary_projects()
+        if self.current_result_mode == "temp_project" and self.current_temp_project_id == project_id:
+            self._load_temporary_project(project_id)
+        self.statusBar().showMessage(f"已加入 {len(images)} 张到“{project.name}”")
+
+    def _remove_selection_from_current_temporary_project(self) -> None:
+        if self.current_result_mode != "temp_project" or self.current_temp_project_id is None:
+            self.statusBar().showMessage("当前不在灵感暂存结果中")
+            return
+        images = self._selected_grid_images()
+        if not images:
+            self.statusBar().showMessage("没有选中图片")
+            return
+        project_id = self.current_temp_project_id
+        project = self.store.get_temporary_project(project_id)
+        project_name = project.name if project is not None else "灵感暂存"
+        removed = self.store.remove_images_from_temporary_project(
+            project_id,
+            [image.id for image in images],
+        )
+        self._refresh_temporary_projects(select_project_id=project_id)
+        if self.store.get_temporary_project(project_id) is not None:
+            self._load_temporary_project(project_id)
+        else:
+            self._reload_images()
+        self.statusBar().showMessage(f"已从“{project_name}”移除 {removed} 张")
+
+    def _temporary_project_intents_for_images(
+        self,
+        images: list[ImageItem],
+    ) -> tuple[dict[int, str], dict[int, str]]:
+        if self.current_result_mode != "inspiration":
+            return {}, {}
+        labels: dict[int, str] = {}
+        queries: dict[int, str] = {}
+        for image in images:
+            matches = self.current_inspiration_matches.get(image.id, [])
+            if not matches:
+                continue
+            labels[image.id] = self._format_inspiration_badge(matches)
+            queries[image.id] = matches[0].query
+        return labels, queries
+
+    @staticmethod
+    def _format_inspiration_badge(matches: list[InspirationMatch]) -> str:
+        if not matches:
+            return ""
+        text = matches[0].term_title
+        if len(matches) > 1:
+            text = f"{text} +{len(matches) - 1}"
+        return text
+
+    def _suggest_temporary_project_name(self, images: list[ImageItem]) -> str:
+        if self.current_result_mode == "inspiration":
+            brief = self.inspiration_brief_input.toPlainText().strip()
+            if brief:
+                return brief[:18]
+            if self.current_inspiration_terms:
+                return " / ".join(term.title for term in self.current_inspiration_terms[:2])
+        current = self._selected_grid_image()
+        if current is not None:
+            return Path(current.file_name).stem[:24]
+        return f"暂存 {len(images)} 张"
 
     def _open_image_preview(self, image: ImageItem | None = None) -> None:
         start_image = image or self._selected_grid_image()
@@ -1735,6 +2536,16 @@ class MainWindow(QMainWindow):
         unfavorite_action = menu.addAction("取消收藏")
         add_tags_action = menu.addAction("批量添加标签")
         clear_tags_action = menu.addAction("清除选中图片标签")
+        save_temp_action = menu.addAction("暂存选中图片")
+        temp_project_menu = menu.addMenu("加入已有灵感暂存")
+        temp_project_actions: dict[object, int] = {}
+        for project in self.store.list_temporary_projects():
+            project_action = temp_project_menu.addAction(f"{project.name} ({project.image_count})")
+            temp_project_actions[project_action] = project.id
+        if not temp_project_actions:
+            empty_action = temp_project_menu.addAction("没有可用暂存项目")
+            empty_action.setEnabled(False)
+        remove_from_temp_action = menu.addAction("从当前灵感暂存移除")
         add_to_collection_action = menu.addAction("添加到文件夹")
         move_to_collection_action = menu.addAction("移动到文件夹")
         remove_from_collection_action = menu.addAction("从当前文件夹移出")
@@ -1746,6 +2557,8 @@ class MainWindow(QMainWindow):
             unfavorite_action,
             add_tags_action,
             clear_tags_action,
+            save_temp_action,
+            remove_from_temp_action,
             add_to_collection_action,
             move_to_collection_action,
             remove_from_collection_action,
@@ -1753,6 +2566,8 @@ class MainWindow(QMainWindow):
             remove_index_action,
         ]:
             batch_action.setEnabled(has_selection)
+        temp_project_menu.setEnabled(has_selection and bool(temp_project_actions))
+        remove_from_temp_action.setEnabled(has_selection and self.current_result_mode == "temp_project")
         has_current_collection = self._selected_collection_id() is not None
         move_to_collection_action.setEnabled(has_selection and has_current_collection)
         remove_from_collection_action.setEnabled(has_selection and has_current_collection)
@@ -1776,6 +2591,12 @@ class MainWindow(QMainWindow):
             self._batch_add_tags()
         elif action == clear_tags_action:
             self._batch_clear_tags()
+        elif action == save_temp_action:
+            self._save_selected_images_as_temporary_project()
+        elif action in temp_project_actions:
+            self._add_selection_to_temporary_project(temp_project_actions[action])
+        elif action == remove_from_temp_action:
+            self._remove_selection_from_current_temporary_project()
         elif action == add_to_collection_action:
             self._add_selection_to_collection_dialog()
         elif action == move_to_collection_action:
@@ -1924,11 +2745,13 @@ class MainWindow(QMainWindow):
     def _on_grid_image_selected(self, image: ImageItem | None) -> None:
         self.selected_image = image
         self._show_image_details(image)
+        self._refresh_temp_project_save_button()
 
     def _on_grid_selection_changed(self, images: list[ImageItem]) -> None:
         if len(images) > 1:
             self.selected_image = images[-1]
             self._show_multi_selection_details(images)
+        self._refresh_temp_project_save_button()
 
     def _set_detail_controls_enabled(self, enabled: bool) -> None:
         for widget in [
@@ -1996,7 +2819,13 @@ class MainWindow(QMainWindow):
         self.size_label.setText(self._format_media_dimensions(image))
         self.modified_label.setText(image.modified_at or "-")
         self.embedding_label.setText(image.embedding_status)
-        self.score_label.setText("-" if image.score is None else f"{image.score:.4f}")
+        if self.current_result_mode == "inspiration" and image.id in self.current_inspiration_matches:
+            matches = self.current_inspiration_matches[image.id]
+            titles = "、".join(match.term_title for match in matches[:3])
+            score_text = "-" if image.score is None else f"{image.score:.4f}"
+            self.score_label.setText(f"{score_text} | {titles}")
+        else:
+            self.score_label.setText("-" if image.score is None else f"{image.score:.4f}")
         self.favorite_checkbox.setChecked(image.is_favorite)
         self.tags_input.setText(", ".join(self.store.get_image_tags(image.id)))
         self.note_input.setPlainText(image.note or "")
@@ -2867,10 +3696,30 @@ class MainWindow(QMainWindow):
                 if revision != self.semantic_search_revision:
                     continue
                 self._handle_search_chain_done(filters=filters, result=result)
+            elif kind == "inspiration_proposal":
+                self.generate_inspiration_button.setEnabled(True)
+                self._show_inspiration_proposal(payload)
+            elif kind == "inspiration_error":
+                self.generate_inspiration_button.setEnabled(True)
+                self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
+                self._show_inspiration_error(payload)
+            elif kind == "inspiration_done":
+                self.generate_inspiration_button.setEnabled(True)
+                self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
+                revision, project_id, selected_terms, result = payload
+                if revision != self.semantic_search_revision:
+                    continue
+                self._handle_inspiration_done(
+                    project_id=project_id,
+                    selected_terms=selected_terms,
+                    result=result,
+                )
             elif kind == "embedding":
                 self._handle_embedding_progress(payload)
             elif kind == "error":
                 self.search_button.setEnabled(True)
+                self.generate_inspiration_button.setEnabled(True)
+                self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
                 self.add_folder_button.setEnabled(True)
                 self.rescan_button.setEnabled(True)
                 QMessageBox.critical(self, "Eidory", str(payload))
@@ -2932,11 +3781,11 @@ class MainWindow(QMainWindow):
         self._refresh_embedding_stats()
         if progress.image_id is None:
             self.statusBar().showMessage(progress.message)
-            if progress.status in {"idle", "stopped"} and self.current_result_mode not in {"semantic", "color", "search_chain"}:
+            if progress.status in {"idle", "stopped"} and self.current_result_mode not in {"semantic", "color", "search_chain", "inspiration"}:
                 self._reload_images()
         else:
             self.statusBar().showMessage(f"{progress.file_name}: {progress.status}")
-        if progress.status in {"ready", "failed"} and self.current_result_mode not in {"semantic", "color", "search_chain"}:
+        if progress.status in {"ready", "failed"} and self.current_result_mode not in {"semantic", "color", "search_chain", "inspiration"}:
             self.embedding_refresh_counter += 1
             if self.embedding_refresh_counter >= 20:
                 self.embedding_refresh_counter = 0
@@ -3043,6 +3892,105 @@ class MainWindow(QMainWindow):
         if select_collection_id is not None:
             self._expand_folder_tree_parents(self.collection_tree.currentItem())
         self.collection_tree.blockSignals(False)
+
+    def _refresh_temporary_projects(self, select_project_id: int | None = None) -> None:
+        self.temp_project_list.blockSignals(True)
+        self.temp_project_list.clear()
+        selected_item: QListWidgetItem | None = None
+        for project in self.store.list_temporary_projects():
+            item = QListWidgetItem(f"{project.name}    {project.image_count}")
+            item.setData(Qt.ItemDataRole.UserRole, project.id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, project.name)
+            item.setToolTip(f"{project.name}\n{project.image_count} 张")
+            self.temp_project_list.addItem(item)
+            if select_project_id == project.id:
+                selected_item = item
+        if selected_item is not None:
+            self.temp_project_list.setCurrentItem(selected_item)
+        self.temp_project_list.blockSignals(False)
+
+    def _load_selected_temporary_project(self) -> None:
+        item = self.temp_project_list.currentItem()
+        if item is None:
+            return
+        project_id = item.data(Qt.ItemDataRole.UserRole)
+        if project_id is None:
+            return
+        self._load_temporary_project(int(project_id))
+
+    def _load_temporary_project(self, project_id: int) -> None:
+        project = self.store.get_temporary_project(project_id)
+        if project is None:
+            self._refresh_temporary_projects()
+            self.statusBar().showMessage("该灵感暂存已不存在")
+            return
+        image_ids = self.store.temporary_project_image_ids(project_id)
+        images = self.store.images_by_ids(image_ids)
+        badges = self.store.temporary_project_image_badges(project_id)
+        self.semantic_search_revision += 1
+        self.search_filters.clear()
+        self.current_keyword_query = None
+        self.current_semantic_query = None
+        self.current_result_mode = "temp_project"
+        self.current_temp_project_id = project_id
+        self.current_temp_project_images = list(images)
+        self.current_temp_project_badges = dict(badges)
+        self.current_inspiration_project_id = None
+        self.current_inspiration_terms = []
+        self.current_inspiration_images = []
+        self.current_inspiration_filtered_images = []
+        self.current_inspiration_matches = {}
+        self.current_chain_images = []
+        self.current_chain_filtered_images = []
+        self.current_chain_result = SearchChainResult(images=[])
+        self.current_offset = 0
+        self.load_more_button.setEnabled(False)
+        self._refresh_filter_chain_ui()
+        self.grid_view.set_images(
+            self._sort_images(images),
+            selected_image_ids=[],
+            badges_by_image_id=badges,
+        )
+        self._set_result_status(f"灵感暂存：{project.name} ｜ {len(images)} 张")
+        self.search_diagnostics_label.setText("搜索诊断：-")
+
+    def _show_temporary_project_context_menu(self, position) -> None:
+        item = self.temp_project_list.itemAt(position)
+        if item is None:
+            return
+        self.temp_project_list.setCurrentItem(item)
+        project_id = item.data(Qt.ItemDataRole.UserRole)
+        project_name = item.data(Qt.ItemDataRole.UserRole + 1)
+        if project_id is None:
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("打开暂存项目")
+        delete_action = menu.addAction("删除暂存项目")
+        action = menu.exec(self.temp_project_list.viewport().mapToGlobal(position))
+        if action == open_action:
+            self._load_temporary_project(int(project_id))
+        elif action == delete_action:
+            self._delete_temporary_project(int(project_id), str(project_name or "暂存项目"))
+
+    def _delete_temporary_project(self, project_id: int, project_name: str) -> None:
+        answer = QMessageBox.question(
+            self,
+            "删除灵感暂存",
+            f"删除“{project_name}”？这只删除暂存项目，不会删除图片源文件。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        deleted = self.store.delete_temporary_project(project_id)
+        if self.current_temp_project_id == project_id:
+            self.current_temp_project_id = None
+            self.current_temp_project_images = []
+            self.current_temp_project_badges = {}
+            self._reload_images()
+        self._refresh_temporary_projects()
+        if deleted:
+            self.statusBar().showMessage(f"已删除灵感暂存：{project_name}")
 
     def _make_collection_tree_item(
         self,
@@ -3547,6 +4495,17 @@ class MainWindow(QMainWindow):
             self._set_search_chain_result_status(tuple(self.search_filters), images)
             self._update_search_chain_diagnostics(tuple(self.search_filters), images)
             return
+        if self.current_result_mode == "temp_project":
+            images = self._sort_images(self.current_temp_project_images)
+            self.grid_view.set_images(images, badges_by_image_id=self.current_temp_project_badges)
+            project = (
+                self.store.get_temporary_project(self.current_temp_project_id)
+                if self.current_temp_project_id is not None
+                else None
+            )
+            name = project.name if project is not None else "灵感暂存"
+            self._set_result_status(f"灵感暂存：{name} ｜ {len(images)} 张")
+            return
         self._refresh_current_results_for_filters()
 
     def _database_sort_key(self) -> str:
@@ -3674,6 +4633,12 @@ class MainWindow(QMainWindow):
             self.grid_view.set_images(images)
             self._set_color_result_status(images)
             self._update_color_search_diagnostics(images)
+        elif self.current_result_mode == "inspiration":
+            self._apply_inspiration_result_filters()
+            images = self.current_inspiration_filtered_images
+            self.grid_view.set_images(images, badges_by_image_id=self._inspiration_badges_by_image_id())
+            self._set_inspiration_result_status(images)
+            self._update_inspiration_diagnostics(images)
 
     def _score_threshold(self) -> float | None:
         value = self.score_threshold_slider.value()

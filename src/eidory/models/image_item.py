@@ -63,3 +63,12 @@ class SavedViewItem:
     payload_json: str
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class TemporaryProjectItem:
+    id: int
+    name: str
+    image_count: int
+    created_at: str
+    updated_at: str

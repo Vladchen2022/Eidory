@@ -28,6 +28,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._spacing = spacing
         self._selected_index = -1
         self._selected_indexes: set[int] = set()
+        self._badges_by_image_id: dict[int, list[str]] = {}
         self._selection_anchor = -1
         self._drag_start_position: QPoint | None = None
         self._drag_start_index = -1
@@ -93,6 +94,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         *,
         selected_image_ids: list[int] | None = None,
         current_image_id: int | None = None,
+        badges_by_image_id: dict[int, list[str]] | None = None,
     ) -> None:
         if selected_image_ids is None:
             selected_image_ids = self.selected_image_ids()
@@ -101,6 +103,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
             current_image_id = current.id if current is not None else None
 
         self._images = list(images)
+        self._badges_by_image_id = dict(badges_by_image_id or {})
         indexes_by_id = {image.id: index for index, image in enumerate(self._images)}
         self._selected_indexes = {
             indexes_by_id[image_id]
@@ -165,6 +168,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
                 self._draw_placeholder(painter, draw_rect, image)
             else:
                 painter.drawPixmap(draw_rect, pixmap)
+            self._draw_badges(painter, draw_rect, image)
             if index in self._selected_indexes:
                 painter.fillRect(draw_rect, QColor(79, 124, 255, 55))
                 pen = painter.pen()
@@ -211,7 +215,12 @@ class JustifiedImageGridView(QAbstractScrollArea):
             return
         index = self._index_at(event.position().toPoint())
         if index >= 0:
-            self.setToolTip(self._images[index].file_path)
+            image = self._images[index]
+            badges = self._badges_by_image_id.get(image.id, [])
+            tooltip = image.file_path
+            if badges:
+                tooltip = f"{tooltip}\n命中探针：" + "、".join(badges)
+            self.setToolTip(tooltip)
         else:
             self.setToolTip("")
         super().mouseMoveEvent(event)
@@ -503,3 +512,30 @@ class JustifiedImageGridView(QAbstractScrollArea):
         else:
             text = "无缩略图"
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _draw_badges(self, painter: QPainter, rect: QRect, image: ImageItem) -> None:
+        badges = self._badges_by_image_id.get(image.id, [])
+        if not badges:
+            return
+        text = badges[0]
+        if len(badges) > 1:
+            text = f"{text} +{len(badges) - 1}"
+        metrics = painter.fontMetrics()
+        text = metrics.elidedText(text, Qt.TextElideMode.ElideRight, max(24, rect.width() - 14))
+        padding_x = 5
+        padding_y = 3
+        badge_width = min(rect.width() - 8, metrics.horizontalAdvance(text) + padding_x * 2)
+        badge_height = metrics.height() + padding_y * 2
+        badge_rect = QRect(
+            rect.left() + 4,
+            rect.bottom() - badge_height - 4,
+            max(1, badge_width),
+            badge_height,
+        )
+        painter.fillRect(badge_rect, QColor(17, 19, 24, 190))
+        painter.setPen(QColor("#f4f6fb"))
+        painter.drawText(
+            badge_rect.adjusted(padding_x, 0, -padding_x, 0),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            text,
+        )

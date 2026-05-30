@@ -60,6 +60,8 @@ class ImagePreviewDialog(QDialog):
         self.embedding_dim = embedding_dim
         self.fit_to_window = True
         self.zoom_factor = 1.0
+        self.grayscale_preview = False
+        self.mirrored_preview = False
         self._panning = False
         self._pan_start_pos = QPoint()
         self._pan_start_horizontal = 0
@@ -109,6 +111,10 @@ class ImagePreviewDialog(QDialog):
         self.previous_button = QPushButton("上一张")
         self.next_button = QPushButton("下一张")
         self.fit_button = QPushButton("适应窗口")
+        self.grayscale_button = QPushButton("黑白")
+        self.grayscale_button.setCheckable(True)
+        self.mirror_button = QPushButton("左右翻转")
+        self.mirror_button.setCheckable(True)
         self.video_play_pause_button = QPushButton("播放")
         self.video_position_slider = QSlider(Qt.Orientation.Horizontal)
         self.video_position_slider.setRange(0, 0)
@@ -134,6 +140,8 @@ class ImagePreviewDialog(QDialog):
             self.previous_button,
             self.next_button,
             self.fit_button,
+            self.grayscale_button,
+            self.mirror_button,
         ]
         for button in [*nav_buttons, *self.feedback_buttons.values()]:
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -153,6 +161,8 @@ class ImagePreviewDialog(QDialog):
         controls.addWidget(self.previous_button)
         controls.addWidget(self.next_button)
         controls.addWidget(self.fit_button)
+        controls.addWidget(self.grayscale_button)
+        controls.addWidget(self.mirror_button)
         controls.addSpacing(12)
         controls.addWidget(self.favorite_checkbox)
         controls.addSpacing(12)
@@ -170,6 +180,8 @@ class ImagePreviewDialog(QDialog):
         self.previous_button.clicked.connect(lambda: self._move(-1))
         self.next_button.clicked.connect(lambda: self._move(1))
         self.fit_button.clicked.connect(self._fit_image_to_window)
+        self.grayscale_button.toggled.connect(self._set_grayscale_preview)
+        self.mirror_button.toggled.connect(self._set_mirrored_preview)
         self.favorite_checkbox.toggled.connect(self._save_favorite)
         self.feedback_relevant_button.clicked.connect(lambda: self._save_feedback("relevant"))
         self.feedback_irrelevant_button.clicked.connect(lambda: self._save_feedback("irrelevant"))
@@ -304,6 +316,9 @@ class ImagePreviewDialog(QDialog):
             self.image_label.setText("未选择图片")
             self.image_label.resize(self.scroll_area.viewport().size())
             self.video_controls_widget.hide()
+            self.fit_button.setEnabled(False)
+            self.grayscale_button.setEnabled(False)
+            self.mirror_button.setEnabled(False)
             self._stop_video()
             return
 
@@ -379,6 +394,8 @@ class ImagePreviewDialog(QDialog):
         self.video_controls_widget.hide()
         self.preview_stack.setCurrentWidget(self.scroll_area)
         self.fit_button.setEnabled(True)
+        self.grayscale_button.setEnabled(True)
+        self.mirror_button.setEnabled(True)
         max_width, max_height = self._render_bounds()
         pixmap = self._load_preview_pixmap(
             image.file_path,
@@ -394,6 +411,11 @@ class ImagePreviewDialog(QDialog):
             self.image_label.resize(self.scroll_area.viewport().size())
             return
         self.image_label.setText("")
+        pixmap = self._apply_preview_transforms(
+            pixmap,
+            grayscale=self.grayscale_preview,
+            mirror_horizontal=self.mirrored_preview,
+        )
         pixmap = self._scale_pixmap_to_bounds(pixmap, max_width, max_height)
         self.image_label.setPixmap(pixmap)
         self.image_label.resize(pixmap.size())
@@ -402,6 +424,8 @@ class ImagePreviewDialog(QDialog):
 
     def _render_current_video(self, image: ImageItem) -> None:
         self.fit_button.setEnabled(False)
+        self.grayscale_button.setEnabled(False)
+        self.mirror_button.setEnabled(False)
         self._stop_pan()
         self.preview_stack.setCurrentWidget(self.video_widget)
         self.video_controls_widget.show()
@@ -440,6 +464,34 @@ class ImagePreviewDialog(QDialog):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+
+    @staticmethod
+    def _apply_preview_transforms(
+        pixmap: QPixmap,
+        *,
+        grayscale: bool,
+        mirror_horizontal: bool,
+    ) -> QPixmap:
+        if pixmap.isNull() or (not grayscale and not mirror_horizontal):
+            return pixmap
+        image = pixmap.toImage()
+        if grayscale:
+            image = image.convertToFormat(QImage.Format.Format_Grayscale8)
+        if mirror_horizontal:
+            image = image.flipped(Qt.Orientation.Horizontal)
+        return QPixmap.fromImage(image)
+
+    def _set_grayscale_preview(self, checked: bool) -> None:
+        self.grayscale_preview = checked
+        image = self.current_image()
+        if image is not None and not is_supported_video(image.file_path):
+            self._render_current_image()
+
+    def _set_mirrored_preview(self, checked: bool) -> None:
+        self.mirrored_preview = checked
+        image = self.current_image()
+        if image is not None and not is_supported_video(image.file_path):
+            self._render_current_image()
 
     def _zoom_by(self, wheel_delta: int) -> None:
         if wheel_delta == 0:

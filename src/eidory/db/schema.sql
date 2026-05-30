@@ -158,6 +158,62 @@ CREATE TABLE IF NOT EXISTS saved_views (
 CREATE INDEX IF NOT EXISTS idx_saved_views_updated_at
 ON saved_views(updated_at);
 
+CREATE TABLE IF NOT EXISTS temporary_projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_temporary_projects_updated_at
+ON temporary_projects(updated_at);
+
+CREATE TABLE IF NOT EXISTS temporary_project_images (
+    project_id INTEGER NOT NULL,
+    image_id INTEGER NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    intent_label TEXT,
+    intent_query TEXT,
+    PRIMARY KEY(project_id, image_id),
+    FOREIGN KEY(project_id) REFERENCES temporary_projects(id) ON DELETE CASCADE,
+    FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_temporary_project_images_project_order
+ON temporary_project_images(project_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS inspiration_projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    brief TEXT NOT NULL,
+    answers TEXT,
+    questions_json TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_inspiration_projects_updated_at
+ON inspiration_projects(updated_at);
+
+CREATE TABLE IF NOT EXISTS inspiration_terms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    query TEXT NOT NULL,
+    axis TEXT NOT NULL,
+    reason TEXT,
+    selected INTEGER NOT NULL DEFAULT 0,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES inspiration_projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_inspiration_terms_project_order
+ON inspiration_terms(project_id, sort_order);
+
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,

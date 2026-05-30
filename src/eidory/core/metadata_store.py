@@ -1,17 +1,33 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 
 from eidory.core.color_features import COLOR_VECTOR_DIM, COLOR_VECTOR_VERSION
+from eidory.core.inspiration import InspirationTerm
 from eidory.core.media_types import SUPPORTED_IMAGE_EXTENSIONS
 from eidory.core.time_utils import timestamp_ns_to_iso, utc_now_iso
-from eidory.models import CollectionItem, FolderItem, ImageItem, SavedViewItem, TagItem
+from eidory.models import (
+    CollectionItem,
+    FolderItem,
+    ImageItem,
+    SavedViewItem,
+    TagItem,
+    TemporaryProjectItem,
+)
+
+
+def _clean_optional_text(value: object, *, max_length: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    clean = " ".join(value.strip().split())[:max_length]
+    return clean or None
 
 
 class MetadataStore:
@@ -48,6 +64,94 @@ class MetadataStore:
             """
             CREATE INDEX IF NOT EXISTS idx_saved_views_updated_at
             ON saved_views(updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS temporary_projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_temporary_projects_updated_at
+            ON temporary_projects(updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS temporary_project_images (
+                project_id INTEGER NOT NULL,
+                image_id INTEGER NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                intent_label TEXT,
+                intent_query TEXT,
+                PRIMARY KEY(project_id, image_id),
+                FOREIGN KEY(project_id) REFERENCES temporary_projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+            )
+            """
+        )
+        temporary_image_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(temporary_project_images)").fetchall()
+        }
+        if "intent_label" not in temporary_image_columns:
+            conn.execute("ALTER TABLE temporary_project_images ADD COLUMN intent_label TEXT")
+        if "intent_query" not in temporary_image_columns:
+            conn.execute("ALTER TABLE temporary_project_images ADD COLUMN intent_query TEXT")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_temporary_project_images_project_order
+            ON temporary_project_images(project_id, sort_order)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inspiration_projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                brief TEXT NOT NULL,
+                answers TEXT,
+                questions_json TEXT NOT NULL,
+                provider_name TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_inspiration_projects_updated_at
+            ON inspiration_projects(updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inspiration_terms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                query TEXT NOT NULL,
+                axis TEXT NOT NULL,
+                reason TEXT,
+                selected INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES inspiration_projects(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_inspiration_terms_project_order
+            ON inspiration_terms(project_id, sort_order)
             """
         )
 
@@ -1608,6 +1712,304 @@ class MetadataStore:
         with self.connect() as conn:
             cur = conn.execute("DELETE FROM saved_views WHERE id = ?", (saved_view_id,))
             return int(cur.rowcount) > 0
+
+    def create_temporary_project(self, name: str, image_ids: Sequence[int]) -> int:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("temporary project name must not be empty")
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            raise ValueError("temporary project must contain at least one image")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM temporary_projects WHERE name = ?",
+                (clean_name,),
+            ).fetchone()
+            if existing is not None:
+                suffix = 2
+                base_name = clean_name
+                while True:
+                    candidate = f"{base_name} {suffix}"
+                    row = conn.execute(
+                        "SELECT id FROM temporary_projects WHERE name = ?",
+                        (candidate,),
+                    ).fetchone()
+                    if row is None:
+                        clean_name = candidate
+                        break
+                    suffix += 1
+
+            cur = conn.execute(
+                """
+                INSERT INTO temporary_projects(name, created_at, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (clean_name, now, now),
+            )
+            project_id = int(cur.lastrowid)
+            for index, image_id in enumerate(clean_ids):
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO temporary_project_images(
+                        project_id, image_id, sort_order, created_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (project_id, image_id, index, now),
+                )
+            return project_id
+
+    def list_temporary_projects(self) -> list[TemporaryProjectItem]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT p.*, COUNT(tpi.image_id) AS image_count
+                FROM temporary_projects p
+                LEFT JOIN temporary_project_images tpi ON tpi.project_id = p.id
+                GROUP BY p.id
+                ORDER BY p.updated_at DESC, p.id DESC
+                """
+            ).fetchall()
+        return [
+            TemporaryProjectItem(
+                id=int(row["id"]),
+                name=str(row["name"]),
+                image_count=int(row["image_count"]),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
+    def temporary_project_image_ids(self, project_id: int) -> list[int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT image_id
+                FROM temporary_project_images
+                WHERE project_id = ?
+                ORDER BY sort_order, image_id
+                """,
+                (project_id,),
+            ).fetchall()
+        return [int(row["image_id"]) for row in rows]
+
+    def temporary_project_image_badges(self, project_id: int) -> dict[int, list[str]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT image_id, intent_label
+                FROM temporary_project_images
+                WHERE project_id = ?
+                  AND intent_label IS NOT NULL
+                  AND TRIM(intent_label) != ''
+                ORDER BY sort_order, image_id
+                """,
+                (project_id,),
+            ).fetchall()
+        return {
+            int(row["image_id"]): [str(row["intent_label"])]
+            for row in rows
+        }
+
+    def get_temporary_project(self, project_id: int) -> TemporaryProjectItem | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT p.*, COUNT(tpi.image_id) AS image_count
+                FROM temporary_projects p
+                LEFT JOIN temporary_project_images tpi ON tpi.project_id = p.id
+                WHERE p.id = ?
+                GROUP BY p.id
+                """,
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return TemporaryProjectItem(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            image_count=int(row["image_count"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def delete_temporary_project(self, project_id: int) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute("DELETE FROM temporary_projects WHERE id = ?", (project_id,))
+            return int(cur.rowcount) > 0
+
+    def add_images_to_temporary_project(
+        self,
+        project_id: int,
+        image_ids: Sequence[int],
+        *,
+        intent_labels: Mapping[int, str] | None = None,
+        intent_queries: Mapping[int, str] | None = None,
+    ) -> int:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return 0
+        intent_labels = intent_labels or {}
+        intent_queries = intent_queries or {}
+        now = utc_now_iso()
+        changed = 0
+        with self.connect() as conn:
+            project = conn.execute(
+                "SELECT id FROM temporary_projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                raise ValueError("temporary project does not exist")
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(sort_order), -1) AS max_sort_order
+                FROM temporary_project_images
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+            next_order = int(row["max_sort_order"]) + 1 if row is not None else 0
+            for offset, image_id in enumerate(clean_ids):
+                label = _clean_optional_text(intent_labels.get(image_id), max_length=80)
+                query = _clean_optional_text(intent_queries.get(image_id), max_length=160)
+                cur = conn.execute(
+                    """
+                    INSERT INTO temporary_project_images(
+                        project_id, image_id, sort_order, created_at, intent_label, intent_query
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, image_id) DO UPDATE SET
+                        intent_label = COALESCE(excluded.intent_label, temporary_project_images.intent_label),
+                        intent_query = COALESCE(excluded.intent_query, temporary_project_images.intent_query)
+                    """,
+                    (project_id, image_id, next_order + offset, now, label, query),
+                )
+                changed += int(cur.rowcount)
+            conn.execute(
+                "UPDATE temporary_projects SET updated_at = ? WHERE id = ?",
+                (now, project_id),
+            )
+        return changed
+
+    def remove_images_from_temporary_project(
+        self,
+        project_id: int,
+        image_ids: Sequence[int],
+    ) -> int:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return 0
+        placeholders = ",".join("?" for _ in clean_ids)
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                f"""
+                DELETE FROM temporary_project_images
+                WHERE project_id = ?
+                  AND image_id IN ({placeholders})
+                """,
+                [project_id, *clean_ids],
+            )
+            removed = int(cur.rowcount)
+            if removed:
+                conn.execute(
+                    "UPDATE temporary_projects SET updated_at = ? WHERE id = ?",
+                    (now, project_id),
+                )
+            return removed
+
+    def create_inspiration_project(
+        self,
+        *,
+        title: str,
+        brief: str,
+        answers: str,
+        questions: Sequence[str],
+        provider_name: str,
+        model_name: str,
+        terms: Sequence[InspirationTerm],
+        selected_titles: set[str],
+    ) -> int:
+        clean_title = title.strip() or "未命名灵感项目"
+        clean_brief = brief.strip()
+        if not clean_brief:
+            raise ValueError("inspiration project brief must not be empty")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO inspiration_projects(
+                    title, brief, answers, questions_json, provider_name, model_name,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_title,
+                    clean_brief,
+                    answers.strip(),
+                    json.dumps(list(questions), ensure_ascii=False),
+                    provider_name,
+                    model_name,
+                    now,
+                    now,
+                ),
+            )
+            project_id = int(cur.lastrowid)
+            for index, term in enumerate(terms):
+                conn.execute(
+                    """
+                    INSERT INTO inspiration_terms(
+                        project_id, title, query, axis, reason, selected, sort_order, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project_id,
+                        term.title,
+                        term.query,
+                        term.axis,
+                        term.reason,
+                        1 if term.title in selected_titles else 0,
+                        index,
+                        now,
+                    ),
+                )
+            return project_id
+
+    def inspiration_terms_for_project(
+        self,
+        project_id: int,
+        *,
+        selected_only: bool = False,
+    ) -> list[InspirationTerm]:
+        clauses = ["project_id = ?"]
+        params: list[object] = [project_id]
+        if selected_only:
+            clauses.append("selected = 1")
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM inspiration_terms
+                WHERE {' AND '.join(clauses)}
+                ORDER BY sort_order, id
+                """,
+                params,
+            ).fetchall()
+        return [
+            InspirationTerm(
+                id=int(row["id"]),
+                title=str(row["title"]),
+                query=str(row["query"]),
+                axis=str(row["axis"]),
+                reason=str(row["reason"] or ""),
+                selected=bool(row["selected"]),
+            )
+            for row in rows
+        ]
 
     def next_embedding_jobs(
         self,

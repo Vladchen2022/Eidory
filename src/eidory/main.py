@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import sys
+import multiprocessing
 
 from eidory.config import AppPaths
 from eidory.core.metadata_store import MetadataStore
 
 
 def main() -> int:
+    multiprocessing.freeze_support()
+
     from PySide6.QtWidgets import QApplication
 
     from eidory.ui.main_window import MainWindow
@@ -45,4 +48,5 @@ def _setting_int(
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     raise SystemExit(main())

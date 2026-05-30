@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QListWidgetItem, QTreeWidget, QTreeWidgetItem
 
 from eidory.config import AppPaths
+from eidory.core.inspiration import InspirationMatch
 from eidory.core.metadata_store import MetadataStore
 from eidory.core.search_filters import (
     SearchFilter,
@@ -418,6 +419,85 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             window.close()
             self.assertEqual(window.search_filters, [SearchFilter("color", (0, 0, 255))])
+
+    def test_temporary_project_load_preserves_intent_badges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            first_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=200,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            second_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "second.jpg"),
+                file_size=456,
+                width=200,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=2,
+            )
+            project_id = store.create_temporary_project("机械参考", [first_id, second_id])
+            store.add_images_to_temporary_project(
+                project_id,
+                [first_id],
+                intent_labels={first_id: "引擎细节 +1"},
+                intent_queries={first_id: "老旧引擎，机械结构"},
+            )
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._load_temporary_project(project_id)
+            self.app.processEvents()
+
+            self.assertEqual(window.current_result_mode, "temp_project")
+            self.assertEqual(window.current_temp_project_badges, {first_id: ["引擎细节 +1"]})
+            self.assertEqual(window.grid_view._badges_by_image_id, {first_id: ["引擎细节 +1"]})
+            window._set_combo_to_data(window.sort_combo, "name")
+            window._on_sort_changed()
+            self.assertEqual(window.grid_view._badges_by_image_id, {first_id: ["引擎细节 +1"]})
+            window.close()
+
+    def test_inspiration_matches_become_temporary_project_intents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.current_result_mode = "inspiration"
+            window.current_inspiration_matches = {
+                8: [
+                    InspirationMatch("破旧工坊", "破旧工坊，昏暗灯光", "环境参考", 0.7),
+                    InspirationMatch("引擎细节", "老旧引擎，机械结构", "机械参考", 0.6),
+                ]
+            }
+
+            labels, queries = window._temporary_project_intents_for_images([self._image(8)])
+
+            self.assertEqual(labels, {8: "破旧工坊 +1"})
+            self.assertEqual(queries, {8: "破旧工坊，昏暗灯光"})
+            window.close()
 
     def test_saved_view_payload_restores_ui_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

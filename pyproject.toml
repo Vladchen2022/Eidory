@@ -21,6 +21,9 @@ dependencies = [
 test = [
     "pytest>=8.0",
 ]
+app = [
+    "pyinstaller>=6.0",
+]
 
 [project.scripts]
 eidory = "eidory.main:main"

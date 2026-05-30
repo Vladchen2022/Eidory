@@ -130,6 +130,93 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertTrue(reopened.delete_saved_view(view_id))
             self.assertEqual(reopened.list_saved_views(), [])
 
+    def test_temporary_projects_persist_image_order_and_delete_without_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            first_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1_700_000_000_000_000_001,
+            )
+            second_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "second.jpg"),
+                file_size=456,
+                width=30,
+                height=40,
+                created_time_ns=None,
+                modified_time_ns=1_700_000_000_000_000_002,
+            )
+
+            project_id = store.create_temporary_project("飞行器参考", [second_id, first_id])
+            changed = store.add_images_to_temporary_project(
+                project_id,
+                [second_id],
+                intent_labels={second_id: "引擎细节 +1"},
+                intent_queries={second_id: "老旧引擎，机械结构"},
+            )
+            self.assertGreaterEqual(changed, 1)
+            projects = store.list_temporary_projects()
+            self.assertEqual(len(projects), 1)
+            self.assertEqual(projects[0].name, "飞行器参考")
+            self.assertEqual(projects[0].image_count, 2)
+            self.assertEqual(store.temporary_project_image_ids(project_id), [second_id, first_id])
+            self.assertEqual(
+                store.temporary_project_image_badges(project_id),
+                {second_id: ["引擎细节 +1"]},
+            )
+
+            self.assertTrue(store.delete_temporary_project(project_id))
+            self.assertEqual(store.list_temporary_projects(), [])
+            self.assertIsNotNone(store.get_image(first_id))
+            self.assertIsNotNone(store.get_image(second_id))
+
+    def test_temporary_project_add_and_remove_only_changes_project_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids: list[int] = []
+            for index in range(3):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{index}.jpg"),
+                    file_size=100 + index,
+                    width=10,
+                    height=20,
+                    created_time_ns=None,
+                    modified_time_ns=1_700_000_000_000_000_010 + index,
+                )
+                image_ids.append(image_id)
+
+            project_id = store.create_temporary_project("机械参考", [image_ids[0]])
+            store.add_images_to_temporary_project(
+                project_id,
+                [image_ids[1], image_ids[2]],
+                intent_labels={image_ids[1]: "破旧工坊"},
+                intent_queries={image_ids[1]: "破旧工坊，昏暗灯光"},
+            )
+
+            self.assertEqual(store.temporary_project_image_ids(project_id), image_ids)
+            self.assertEqual(
+                store.temporary_project_image_badges(project_id),
+                {image_ids[1]: ["破旧工坊"]},
+            )
+
+            removed = store.remove_images_from_temporary_project(project_id, [image_ids[1]])
+            self.assertEqual(removed, 1)
+            self.assertEqual(store.temporary_project_image_ids(project_id), [image_ids[0], image_ids[2]])
+            self.assertEqual(store.temporary_project_image_badges(project_id), {})
+            self.assertIsNotNone(store.get_image(image_ids[1]))
+
     def test_duration_persists_and_images_can_sort_by_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"

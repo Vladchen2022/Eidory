@@ -73,3 +73,4 @@ class TemporaryProjectItem:
     created_at: str
     updated_at: str
     summary: str = ""
+    color_hex: str = ""

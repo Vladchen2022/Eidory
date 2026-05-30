@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from eidory.core.metadata_store import MetadataStore
+from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
 
 
 class MetadataStoreTest(unittest.TestCase):
@@ -172,6 +172,7 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(projects[0].name, "飞行器参考")
             self.assertEqual(projects[0].image_count, 2)
             self.assertEqual(projects[0].summary, "飞行器和引擎结构参考")
+            self.assertEqual(projects[0].color_hex, TEMPORARY_PROJECT_COLORS[0])
             self.assertEqual(store.temporary_project_image_ids(project_id), [second_id, first_id])
             self.assertEqual(
                 store.temporary_project_image_badges(project_id),
@@ -212,6 +213,35 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(updated.name, "机械参考 2")
             self.assertEqual(updated.summary, "用于寻找机械细节。")
             self.assertEqual(store.get_temporary_project(existing_id).name, "机械参考")
+
+    def test_temporary_project_color_can_be_set_and_next_color_cycles_from_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+
+            first_id = store.create_temporary_project(
+                "第一批",
+                [image_id],
+                color_hex="#756742",
+            )
+            second_id = store.create_temporary_project("第二批", [image_id])
+
+            self.assertEqual(store.get_temporary_project(first_id).color_hex, "#756742")
+            self.assertEqual(
+                store.get_temporary_project(second_id).color_hex,
+                TEMPORARY_PROJECT_COLORS[2],
+            )
 
     def test_temporary_project_add_and_remove_only_changes_project_links(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -162,6 +162,7 @@ CREATE TABLE IF NOT EXISTS temporary_projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
     summary TEXT NOT NULL DEFAULT '',
+    color_hex TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

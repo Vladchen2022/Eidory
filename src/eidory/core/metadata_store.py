@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -28,6 +29,27 @@ def _clean_optional_text(value: object, *, max_length: int) -> str | None:
         return None
     clean = " ".join(value.strip().split())[:max_length]
     return clean or None
+
+
+TEMPORARY_PROJECT_COLORS = (
+    "#7A4E56",
+    "#756742",
+    "#4F6E5B",
+    "#4C6078",
+    "#67577D",
+    "#735846",
+    "#586E78",
+    "#6F5970",
+)
+
+
+def _clean_color_hex(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    clean = value.strip()
+    if re.fullmatch(r"#[0-9A-Fa-f]{6}", clean):
+        return clean.upper()
+    return ""
 
 
 class MetadataStore:
@@ -72,6 +94,7 @@ class MetadataStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 summary TEXT NOT NULL DEFAULT '',
+                color_hex TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -83,6 +106,9 @@ class MetadataStore:
         }
         if "summary" not in temporary_project_columns:
             conn.execute("ALTER TABLE temporary_projects ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+        if "color_hex" not in temporary_project_columns:
+            conn.execute("ALTER TABLE temporary_projects ADD COLUMN color_hex TEXT NOT NULL DEFAULT ''")
+        MetadataStore._backfill_temporary_project_colors(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_temporary_projects_updated_at
@@ -1726,6 +1752,7 @@ class MetadataStore:
         image_ids: Sequence[int],
         *,
         summary: str = "",
+        color_hex: str = "",
     ) -> int:
         clean_name = name.strip()
         if not clean_name:
@@ -1736,6 +1763,7 @@ class MetadataStore:
         clean_summary = _clean_optional_text(summary, max_length=600) or ""
         now = utc_now_iso()
         with self.connect() as conn:
+            clean_color = _clean_color_hex(color_hex) or self._next_temporary_project_color(conn)
             existing = conn.execute(
                 "SELECT id FROM temporary_projects WHERE name = ?",
                 (clean_name,),
@@ -1756,10 +1784,10 @@ class MetadataStore:
 
             cur = conn.execute(
                 """
-                INSERT INTO temporary_projects(name, summary, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO temporary_projects(name, summary, color_hex, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (clean_name, clean_summary, now, now),
+                (clean_name, clean_summary, clean_color, now, now),
             )
             project_id = int(cur.lastrowid)
             for index, image_id in enumerate(clean_ids):
@@ -1793,6 +1821,7 @@ class MetadataStore:
                 created_at=str(row["created_at"]),
                 updated_at=str(row["updated_at"]),
                 summary=str(row["summary"] or ""),
+                color_hex=str(row["color_hex"] or ""),
             )
             for row in rows
         ]
@@ -1849,7 +1878,12 @@ class MetadataStore:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             summary=str(row["summary"] or ""),
+            color_hex=str(row["color_hex"] or ""),
         )
+
+    def next_temporary_project_color(self) -> str:
+        with self.connect() as conn:
+            return self._next_temporary_project_color(conn)
 
     def delete_temporary_project(self, project_id: int) -> bool:
         with self.connect() as conn:
@@ -1917,6 +1951,43 @@ class MetadataStore:
                 return candidate
             candidate = f"{base_name} {suffix}"
             suffix += 1
+
+    @staticmethod
+    def _backfill_temporary_project_colors(conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM temporary_projects
+            WHERE color_hex IS NULL OR TRIM(color_hex) = ''
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+        for index, row in enumerate(rows):
+            conn.execute(
+                "UPDATE temporary_projects SET color_hex = ? WHERE id = ?",
+                (TEMPORARY_PROJECT_COLORS[index % len(TEMPORARY_PROJECT_COLORS)], int(row["id"])),
+            )
+
+    @staticmethod
+    def _next_temporary_project_color(conn: sqlite3.Connection) -> str:
+        row = conn.execute(
+            """
+            SELECT color_hex
+            FROM temporary_projects
+            WHERE color_hex IS NOT NULL AND TRIM(color_hex) != ''
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return TEMPORARY_PROJECT_COLORS[0]
+        current = _clean_color_hex(row["color_hex"])
+        if current in TEMPORARY_PROJECT_COLORS:
+            index = TEMPORARY_PROJECT_COLORS.index(current)
+            return TEMPORARY_PROJECT_COLORS[(index + 1) % len(TEMPORARY_PROJECT_COLORS)]
+        count_row = conn.execute("SELECT COUNT(*) AS count FROM temporary_projects").fetchone()
+        count = int(count_row["count"]) if count_row is not None else 0
+        return TEMPORARY_PROJECT_COLORS[count % len(TEMPORARY_PROJECT_COLORS)]
 
     def add_images_to_temporary_project(
         self,

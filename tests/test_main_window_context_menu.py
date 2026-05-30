@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QApplication, QListWidgetItem, QTreeWidget, QTreeW
 from eidory.config import AppPaths
 from eidory.core.inspiration import InspirationMatch
 from eidory.core.llm_provider import GroupNameSuggestion
-from eidory.core.metadata_store import MetadataStore
+from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
 from eidory.core.reference_grouping import ReferenceGroup
 from eidory.core.search_filters import (
     SearchFilter,
@@ -546,6 +546,9 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(len(projects), 2)
             names = {project.name for project in projects}
             self.assertEqual(names, {"破旧工坊", "机械细节"})
+            colors = {project.color_hex for project in projects}
+            self.assertEqual(colors, {TEMPORARY_PROJECT_COLORS[0]})
+            self.assertEqual(window.temp_project_list.item(0).background().color().name().upper(), TEMPORARY_PROJECT_COLORS[0])
             first_project = next(project for project in projects if project.name == "破旧工坊")
             self.assertEqual(store.temporary_project_image_badges(first_project.id), {
                 image_ids[0]: ["破旧工坊"],

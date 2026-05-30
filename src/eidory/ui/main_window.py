@@ -2462,6 +2462,7 @@ class MainWindow(QMainWindow):
     def _create_reference_group_projects(self, payload: object) -> None:
         groups, suggestions, error_message = payload
         created = 0
+        batch_color = self.store.next_temporary_project_color()
         for group, suggestion in zip(groups, suggestions, strict=False):
             if not group.image_ids:
                 continue
@@ -2469,6 +2470,7 @@ class MainWindow(QMainWindow):
                 suggestion.name,
                 group.image_ids,
                 summary=suggestion.summary,
+                color_hex=batch_color,
             )
             self.store.add_images_to_temporary_project(
                 project_id,
@@ -4085,6 +4087,8 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"{project.name}    {project.image_count}")
             item.setData(Qt.ItemDataRole.UserRole, project.id)
             item.setData(Qt.ItemDataRole.UserRole + 1, project.name)
+            item.setData(Qt.ItemDataRole.UserRole + 2, project.color_hex)
+            self._apply_temporary_project_item_color(item, project.color_hex)
             tooltip_parts = [project.name, f"{project.image_count} 张"]
             if project.summary:
                 tooltip_parts.append(project.summary)
@@ -4095,6 +4099,14 @@ class MainWindow(QMainWindow):
         if selected_item is not None:
             self.temp_project_list.setCurrentItem(selected_item)
         self.temp_project_list.blockSignals(False)
+
+    @staticmethod
+    def _apply_temporary_project_item_color(item: QListWidgetItem, color_hex: str) -> None:
+        color = QColor(color_hex)
+        if not color.isValid():
+            return
+        item.setBackground(QBrush(color))
+        item.setForeground(QBrush(QColor("#f4f6fb")))
 
     def _load_selected_temporary_project(self) -> None:
         item = self.temp_project_list.currentItem()

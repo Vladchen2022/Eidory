@@ -1890,6 +1890,13 @@ class MetadataStore:
             cur = conn.execute("DELETE FROM temporary_projects WHERE id = ?", (project_id,))
             return int(cur.rowcount) > 0
 
+    def clear_temporary_projects(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM temporary_projects").fetchone()
+            count = int(row["count"]) if row is not None else 0
+            conn.execute("DELETE FROM temporary_projects")
+            return count
+
     def update_temporary_project_details(
         self,
         project_id: int,

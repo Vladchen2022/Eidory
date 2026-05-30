@@ -184,6 +184,47 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertIsNotNone(store.get_image(first_id))
             self.assertIsNotNone(store.get_image(second_id))
 
+    def test_temporary_projects_persist_after_reopening_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            project_id = store.create_temporary_project(
+                "长期项目",
+                [image_id],
+                summary="关闭软件后仍应保留。",
+                color_hex="#756742",
+            )
+            store.add_images_to_temporary_project(
+                project_id,
+                [image_id],
+                intent_labels={image_id: "机械住处"},
+            )
+
+            reopened = MetadataStore(db_path)
+            reopened.initialize()
+
+            projects = reopened.list_temporary_projects()
+            self.assertEqual(len(projects), 1)
+            self.assertEqual(projects[0].name, "长期项目")
+            self.assertEqual(projects[0].summary, "关闭软件后仍应保留。")
+            self.assertEqual(projects[0].color_hex, "#756742")
+            self.assertEqual(reopened.temporary_project_image_ids(project_id), [image_id])
+            self.assertEqual(
+                reopened.temporary_project_image_badges(project_id),
+                {image_id: ["机械住处"]},
+            )
+
     def test_temporary_project_details_can_be_updated_with_unique_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"
@@ -281,6 +322,36 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(store.temporary_project_image_ids(project_id), [image_ids[0], image_ids[2]])
             self.assertEqual(store.temporary_project_image_badges(project_id), {})
             self.assertIsNotNone(store.get_image(image_ids[1]))
+
+    def test_clear_temporary_projects_removes_only_project_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            first_project = store.create_temporary_project("第一组", [image_id])
+            store.create_temporary_project("第二组", [image_id])
+            store.add_images_to_temporary_project(
+                first_project,
+                [image_id],
+                intent_labels={image_id: "破旧工坊"},
+            )
+
+            cleared = store.clear_temporary_projects()
+
+            self.assertEqual(cleared, 2)
+            self.assertEqual(store.list_temporary_projects(), [])
+            self.assertEqual(store.temporary_project_image_ids(first_project), [])
+            self.assertIsNotNone(store.get_image(image_id))
 
     def test_duration_persists_and_images_can_sort_by_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -476,6 +476,44 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.grid_view._badges_by_image_id, {first_id: ["引擎细节 +1"]})
             window.close()
 
+    def test_clear_all_temporary_projects_resets_temporary_project_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=200,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            project_id = store.create_temporary_project("机械参考", [image_id])
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._load_temporary_project(project_id)
+            self.assertEqual(window.current_result_mode, "temp_project")
+            window._clear_all_temporary_projects(confirm=False)
+            self.app.processEvents()
+
+            self.assertEqual(store.list_temporary_projects(), [])
+            self.assertEqual(window.temp_project_list.count(), 0)
+            self.assertEqual(window.current_result_mode, "library")
+            self.assertIsNotNone(store.get_image(image_id))
+            window.close()
+
     def test_inspiration_matches_become_temporary_project_intents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(

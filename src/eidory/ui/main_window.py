@@ -4173,6 +4173,12 @@ class MainWindow(QMainWindow):
     def _show_temporary_project_context_menu(self, position) -> None:
         item = self.temp_project_list.itemAt(position)
         if item is None:
+            menu = QMenu(self)
+            clear_action = menu.addAction("清空暂存")
+            clear_action.setEnabled(bool(self.store.list_temporary_projects()))
+            action = menu.exec(self.temp_project_list.viewport().mapToGlobal(position))
+            if action == clear_action:
+                self._clear_all_temporary_projects()
             return
         self.temp_project_list.setCurrentItem(item)
         project_id = item.data(Qt.ItemDataRole.UserRole)
@@ -4207,6 +4213,31 @@ class MainWindow(QMainWindow):
         self._refresh_temporary_projects()
         if deleted:
             self.statusBar().showMessage(f"已删除灵感暂存：{project_name}")
+
+    def _clear_all_temporary_projects(self, *, confirm: bool = True) -> None:
+        projects = self.store.list_temporary_projects()
+        if not projects:
+            self.statusBar().showMessage("没有可清空的灵感暂存")
+            return
+        if confirm:
+            answer = QMessageBox.question(
+                self,
+                "清空灵感暂存",
+                f"清空全部 {len(projects)} 个灵感暂存项目？这不会删除图片源文件。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        cleared = self.store.clear_temporary_projects()
+        was_viewing_temporary_project = self.current_result_mode == "temp_project"
+        self.current_temp_project_id = None
+        self.current_temp_project_images = []
+        self.current_temp_project_badges = {}
+        if was_viewing_temporary_project:
+            self._reload_images()
+        self._refresh_temporary_projects()
+        self.statusBar().showMessage(f"已清空 {cleared} 个灵感暂存项目")
 
     def _make_collection_tree_item(
         self,

@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
     QDoubleSpinBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -2549,17 +2551,22 @@ class MainWindow(QMainWindow):
         self,
         images: list[ImageItem],
     ) -> tuple[dict[int, str], dict[int, str]]:
-        if self.current_result_mode != "inspiration":
-            return {}, {}
+        if self.current_result_mode == "inspiration":
+            labels: dict[int, str] = {}
+            queries: dict[int, str] = {}
+            for image in images:
+                matches = self.current_inspiration_matches.get(image.id, [])
+                if not matches:
+                    continue
+                labels[image.id] = self._format_inspiration_badge(matches)
+                queries[image.id] = matches[0].query
+            return labels, queries
         labels: dict[int, str] = {}
-        queries: dict[int, str] = {}
         for image in images:
-            matches = self.current_inspiration_matches.get(image.id, [])
-            if not matches:
-                continue
-            labels[image.id] = self._format_inspiration_badge(matches)
-            queries[image.id] = matches[0].query
-        return labels, queries
+            badges = self._badges_for_image_id(image.id)
+            if badges:
+                labels[image.id] = badges[0]
+        return labels, {}
 
     @staticmethod
     def _format_inspiration_badge(matches: list[InspirationMatch]) -> str:
@@ -4241,15 +4248,79 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         open_action = menu.addAction("打开暂存项目")
+        edit_action = menu.addAction("编辑名称和摘要")
         ai_details_action = menu.addAction("AI 重新命名和摘要")
         delete_action = menu.addAction("删除暂存项目")
         action = menu.exec(self.temp_project_list.viewport().mapToGlobal(position))
         if action == open_action:
             self._load_temporary_project(int(project_id))
+        elif action == edit_action:
+            self._edit_temporary_project_details(int(project_id))
         elif action == ai_details_action:
             self._request_temporary_project_ai_details(int(project_id))
         elif action == delete_action:
             self._delete_temporary_project(int(project_id), str(project_name or "暂存项目"))
+
+    def _edit_temporary_project_details(self, project_id: int) -> None:
+        project = self.store.get_temporary_project(project_id)
+        if project is None:
+            self._refresh_temporary_projects()
+            self.statusBar().showMessage("该灵感暂存已不存在")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("编辑灵感暂存")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        name_input = QLineEdit(project.name)
+        summary_input = QTextEdit()
+        summary_input.setAcceptRichText(False)
+        summary_input.setPlainText(project.summary)
+        summary_input.setFixedHeight(86)
+        form.addRow("名称", name_input)
+        form.addRow("摘要", summary_input)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._update_temporary_project_details_from_values(
+            project_id,
+            name=name_input.text(),
+            summary=summary_input.toPlainText(),
+        )
+
+    def _update_temporary_project_details_from_values(
+        self,
+        project_id: int,
+        *,
+        name: str,
+        summary: str,
+    ) -> None:
+        clean_name = name.strip()
+        if not clean_name:
+            self.statusBar().showMessage("灵感暂存名称不能为空")
+            return
+        try:
+            updated = self.store.update_temporary_project_details(
+                project_id,
+                name=clean_name,
+                summary=summary,
+            )
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc))
+            return
+        if updated is None:
+            self._refresh_temporary_projects()
+            self.statusBar().showMessage("该灵感暂存已不存在")
+            return
+        self._refresh_temporary_projects(select_project_id=project_id)
+        if self.current_temp_project_id == project_id:
+            self._load_temporary_project(project_id)
+        self.statusBar().showMessage(f"已更新灵感暂存：{updated.name}")
 
     def _request_temporary_project_ai_details(self, project_id: int) -> None:
         project = self.store.get_temporary_project(project_id)

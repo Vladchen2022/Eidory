@@ -1904,9 +1904,17 @@ class MetadataStore:
         name: str | None = None,
         summary: str | None = None,
     ) -> TemporaryProjectItem | None:
-        clean_name = _clean_optional_text(name, max_length=80) if name is not None else None
-        clean_summary = _clean_optional_text(summary, max_length=600) if summary is not None else None
-        if clean_name is None and clean_summary is None:
+        clean_name: str | None = None
+        if name is not None:
+            clean_name = " ".join(name.strip().split())[:80]
+            if not clean_name:
+                raise ValueError("temporary project name must not be empty")
+        clean_summary = (
+            " ".join(summary.strip().split())[:600]
+            if summary is not None
+            else None
+        )
+        if name is None and summary is None:
             return self.get_temporary_project(project_id)
         now = utc_now_iso()
         with self.connect() as conn:

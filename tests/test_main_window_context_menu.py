@@ -541,6 +541,27 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(queries, {8: "破旧工坊，昏暗灯光"})
             window.close()
 
+    def test_temporary_project_badges_are_preserved_when_re_saving_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.current_result_mode = "temp_project"
+            window.current_temp_project_badges = {8: ["破旧工坊 +1"]}
+
+            labels, queries = window._temporary_project_intents_for_images([self._image(8)])
+
+            self.assertEqual(labels, {8: "破旧工坊 +1"})
+            self.assertEqual(queries, {})
+            window.close()
+
     def test_clicking_inspiration_term_does_not_run_single_probe_search(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -734,6 +755,53 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(updated.summary, "用于机械住处与旧设备参考。")
             self.assertIn("AI 命名项目", window.result_state_label.text())
             self.assertIn("用于机械住处与旧设备参考。", window.result_state_label.text())
+            window.close()
+
+    def test_manual_project_detail_update_can_clear_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=200,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            project_id = store.create_temporary_project(
+                "临时项目",
+                [image_id],
+                summary="旧摘要",
+            )
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._load_temporary_project(project_id)
+            window._update_temporary_project_details_from_values(
+                project_id,
+                name="手动命名",
+                summary="",
+            )
+            self.app.processEvents()
+
+            updated = store.get_temporary_project(project_id)
+            self.assertIsNotNone(updated)
+            self.assertEqual(updated.name, "手动命名")
+            self.assertEqual(updated.summary, "")
+            self.assertIn("手动命名", window.result_state_label.text())
+            self.assertNotIn("旧摘要", window.result_state_label.text())
             window.close()
 
     def test_saved_view_payload_restores_ui_filters(self) -> None:

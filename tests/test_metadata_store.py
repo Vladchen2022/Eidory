@@ -255,6 +255,15 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(updated.summary, "用于寻找机械细节。")
             self.assertEqual(store.get_temporary_project(existing_id).name, "机械参考")
 
+            cleared = store.update_temporary_project_details(
+                project_id,
+                summary="",
+            )
+            self.assertIsNotNone(cleared)
+            self.assertEqual(cleared.summary, "")
+            with self.assertRaises(ValueError):
+                store.update_temporary_project_details(project_id, name="   ")
+
     def test_temporary_project_color_can_be_set_and_next_color_cycles_from_latest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"

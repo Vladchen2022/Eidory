@@ -155,7 +155,11 @@ class MetadataStoreTest(unittest.TestCase):
                 modified_time_ns=1_700_000_000_000_000_002,
             )
 
-            project_id = store.create_temporary_project("飞行器参考", [second_id, first_id])
+            project_id = store.create_temporary_project(
+                "飞行器参考",
+                [second_id, first_id],
+                summary="飞行器和引擎结构参考",
+            )
             changed = store.add_images_to_temporary_project(
                 project_id,
                 [second_id],
@@ -167,6 +171,7 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(len(projects), 1)
             self.assertEqual(projects[0].name, "飞行器参考")
             self.assertEqual(projects[0].image_count, 2)
+            self.assertEqual(projects[0].summary, "飞行器和引擎结构参考")
             self.assertEqual(store.temporary_project_image_ids(project_id), [second_id, first_id])
             self.assertEqual(
                 store.temporary_project_image_badges(project_id),
@@ -177,6 +182,36 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(store.list_temporary_projects(), [])
             self.assertIsNotNone(store.get_image(first_id))
             self.assertIsNotNone(store.get_image(second_id))
+
+    def test_temporary_project_details_can_be_updated_with_unique_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+
+            existing_id = store.create_temporary_project("机械参考", [image_id])
+            project_id = store.create_temporary_project("未命名", [image_id])
+
+            updated = store.update_temporary_project_details(
+                project_id,
+                name="机械参考",
+                summary="用于寻找机械细节。",
+            )
+
+            self.assertIsNotNone(updated)
+            self.assertEqual(updated.name, "机械参考 2")
+            self.assertEqual(updated.summary, "用于寻找机械细节。")
+            self.assertEqual(store.get_temporary_project(existing_id).name, "机械参考")
 
     def test_temporary_project_add_and_remove_only_changes_project_links(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

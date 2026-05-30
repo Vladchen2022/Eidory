@@ -63,6 +63,7 @@ from eidory.core.media_types import (
     is_supported_video,
 )
 from eidory.core.metadata_store import MetadataStore
+from eidory.core.reference_grouping import ReferenceGroup, cluster_reference_vectors
 from eidory.core.scanner import ImageScanner, ScanResult
 from eidory.core.search_filters import (
     SearchChainResult,
@@ -888,6 +889,16 @@ class MainWindow(QMainWindow):
             value = 0.7
         return max(0.0, min(2.0, value))
 
+    def _make_llm_provider(self) -> LMStudioProvider:
+        service = self._llm_service_key()
+        return LMStudioProvider(
+            base_url=self._llm_endpoint(service),
+            model_name=self._llm_model(service) or None,
+            api_key=self._llm_api_key(service),
+            service_name=self._llm_service_label(service),
+            temperature=self._llm_temperature(),
+        )
+
     def _load_llm_service_controls(self, service: str) -> None:
         self.llm_endpoint_input.setText(self._llm_endpoint(service))
         self.llm_model_input.setText(self._llm_model(service))
@@ -1077,13 +1088,7 @@ class MainWindow(QMainWindow):
         self.search_inspiration_button.setEnabled(False)
         service = self._llm_service_key()
         self.inspiration_status_label.setText(f"正在请求 {self._llm_service_label(service)} 生成语义探针...")
-        provider = LMStudioProvider(
-            base_url=self._llm_endpoint(service),
-            model_name=self._llm_model(service) or None,
-            api_key=self._llm_api_key(service),
-            service_name=self._llm_service_label(service),
-            temperature=self._llm_temperature(),
-        )
+        provider = self._make_llm_provider()
         answers = self.inspiration_answers_input.toPlainText()
 
         def run() -> None:
@@ -2208,7 +2213,8 @@ class MainWindow(QMainWindow):
                 else None
             )
             name = project.name if project is not None else "灵感暂存"
-            self._set_result_status(f"灵感暂存：{name} ｜ {len(images)} 张")
+            suffix = f" ｜ {project.summary}" if project is not None and project.summary else ""
+            self._set_result_status(f"灵感暂存：{name} ｜ {len(images)} 张{suffix}")
             return
 
         self._reload_images()
@@ -2311,6 +2317,11 @@ class MainWindow(QMainWindow):
         project = self.store.get_temporary_project(project_id)
         project_name = project.name if project is not None else clean_name
         self.statusBar().showMessage(f"已暂存 {len(images)} 张到“{project_name}”")
+        self._suggest_temporary_project_details(
+            project_id=project_id,
+            images=images,
+            can_rename=clean_name == default_name,
+        )
 
     def _add_selection_to_temporary_project(self, project_id: int) -> None:
         images = self._selected_grid_images()
@@ -2356,6 +2367,121 @@ class MainWindow(QMainWindow):
             self._reload_images()
         self.statusBar().showMessage(f"已从“{project_name}”移除 {removed} 张")
 
+    def _group_selected_images_with_ai(self) -> None:
+        images = self._selected_grid_images()
+        if len(images) < 4:
+            self.statusBar().showMessage("至少选中 4 张图片才能分组")
+            return
+        vectors_by_image_id = self._selected_ready_embedding_vectors(images)
+        if len(vectors_by_image_id) < 4:
+            QMessageBox.warning(
+                self,
+                "AI 分组",
+                "至少需要 4 张已完成语义索引的图片。请先完成索引，或减少未索引/视频文件。",
+            )
+            return
+        groups = cluster_reference_vectors(vectors_by_image_id, max_groups=6)
+        if len(groups) <= 1:
+            self.statusBar().showMessage("选中图片的视觉差异不足，未拆分成多个组")
+            return
+        group_contexts = self._reference_group_contexts(groups, images)
+        provider = self._make_llm_provider()
+        self.statusBar().showMessage(f"已分成 {len(groups)} 组，正在让 AI 命名...")
+
+        def run() -> None:
+            error_message = ""
+            try:
+                suggestions = provider.suggest_reference_group_names(
+                    groups=group_contexts,
+                    language=self.current_language,
+                )
+            except Exception as exc:
+                error_message = str(exc)
+                suggestions = self._fallback_reference_group_suggestions(groups)
+            self.events.put(("reference_groups_done", (groups, suggestions, error_message)))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _selected_ready_embedding_vectors(self, images: list[ImageItem]) -> dict[int, object]:
+        vectors: dict[int, object] = {}
+        for image in images:
+            if image.embedding_status != "ready" or is_supported_video(image.file_path):
+                continue
+            vector = self.store.embedding_vector_for_image(
+                image.id,
+                model_name=self.embedding_provider.model_name,
+                model_revision=self.embedding_provider.model_revision,
+                embedding_dim=self.embedding_provider.dim,
+            )
+            if vector is not None:
+                vectors[image.id] = vector
+        return vectors
+
+    def _reference_group_contexts(
+        self,
+        groups: list[ReferenceGroup],
+        images: list[ImageItem],
+    ) -> list[dict[str, object]]:
+        image_by_id = {image.id: image for image in images}
+        contexts: list[dict[str, object]] = []
+        for group in groups:
+            file_names = [
+                image_by_id[image_id].file_name
+                for image_id in group.image_ids
+                if image_id in image_by_id
+            ]
+            badges = [
+                badge
+                for image_id in group.image_ids
+                for badge in self._badges_for_image_id(image_id)
+            ]
+            contexts.append({
+                "file_names": file_names,
+                "badges": list(dict.fromkeys(badges)),
+            })
+        return contexts
+
+    def _badges_for_image_id(self, image_id: int) -> list[str]:
+        if self.current_result_mode == "inspiration":
+            matches = self.current_inspiration_matches.get(image_id, [])
+            label = self._format_inspiration_badge(matches)
+            return [label] if label else []
+        if self.current_result_mode == "temp_project":
+            return self.current_temp_project_badges.get(image_id, [])
+        return self.grid_view._badges_by_image_id.get(image_id, [])
+
+    @staticmethod
+    def _fallback_reference_group_suggestions(groups: list[ReferenceGroup]) -> list[object]:
+        from eidory.core.llm_provider import GroupNameSuggestion
+
+        return [
+            GroupNameSuggestion(name=f"AI 分组 {index}", summary=f"{len(group.image_ids)} 张参考图")
+            for index, group in enumerate(groups, start=1)
+        ]
+
+    def _create_reference_group_projects(self, payload: object) -> None:
+        groups, suggestions, error_message = payload
+        created = 0
+        for group, suggestion in zip(groups, suggestions, strict=False):
+            if not group.image_ids:
+                continue
+            project_id = self.store.create_temporary_project(
+                suggestion.name,
+                group.image_ids,
+                summary=suggestion.summary,
+            )
+            self.store.add_images_to_temporary_project(
+                project_id,
+                group.image_ids,
+                intent_labels={image_id: suggestion.name for image_id in group.image_ids},
+            )
+            created += 1
+        self._refresh_temporary_projects()
+        if error_message:
+            self.statusBar().showMessage(f"已创建 {created} 个 AI 分组；命名失败，使用备用名称：{error_message}")
+        else:
+            self.statusBar().showMessage(f"已创建 {created} 个 AI 分组暂存项目")
+
     def _temporary_project_intents_for_images(
         self,
         images: list[ImageItem],
@@ -2380,6 +2506,53 @@ class MainWindow(QMainWindow):
         if len(matches) > 1:
             text = f"{text} +{len(matches) - 1}"
         return text
+
+    def _suggest_temporary_project_details(
+        self,
+        *,
+        project_id: int,
+        images: list[ImageItem],
+        can_rename: bool,
+    ) -> None:
+        provider = self._make_llm_provider()
+        brief = self.inspiration_brief_input.toPlainText().strip()
+        labels, _queries = self._temporary_project_intents_for_images(images)
+        selected_terms = sorted(set(labels.values()))
+        file_names = [image.file_name for image in images[:24]]
+
+        def run() -> None:
+            try:
+                suggestion = provider.suggest_project_details(
+                    brief=brief,
+                    selected_terms=selected_terms,
+                    file_names=file_names,
+                    language=self.current_language,
+                )
+                self.events.put(("temp_project_suggestion", (project_id, can_rename, suggestion)))
+            except Exception as exc:
+                self.events.put(("temp_project_suggestion_error", (project_id, exc)))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _apply_temporary_project_suggestion(self, payload: object) -> None:
+        project_id, can_rename, suggestion = payload
+        project = self.store.get_temporary_project(int(project_id))
+        if project is None:
+            return
+        updated = self.store.update_temporary_project_details(
+            int(project_id),
+            name=suggestion.name if can_rename else None,
+            summary=suggestion.summary,
+        )
+        self._refresh_temporary_projects(
+            select_project_id=int(project_id) if self.current_temp_project_id == int(project_id) else None
+        )
+        if updated is not None:
+            self.statusBar().showMessage(f"AI 已更新灵感暂存：{updated.name}")
+
+    def _show_temporary_project_suggestion_error(self, payload: object) -> None:
+        _project_id, exc = payload
+        self.statusBar().showMessage(f"AI 项目命名失败：{exc}")
 
     def _suggest_temporary_project_name(self, images: list[ImageItem]) -> str:
         if self.current_result_mode == "inspiration":
@@ -2537,6 +2710,7 @@ class MainWindow(QMainWindow):
         add_tags_action = menu.addAction("批量添加标签")
         clear_tags_action = menu.addAction("清除选中图片标签")
         save_temp_action = menu.addAction("暂存选中图片")
+        group_selection_action = menu.addAction("AI 分组选中图片")
         temp_project_menu = menu.addMenu("加入已有灵感暂存")
         temp_project_actions: dict[object, int] = {}
         for project in self.store.list_temporary_projects():
@@ -2558,6 +2732,7 @@ class MainWindow(QMainWindow):
             add_tags_action,
             clear_tags_action,
             save_temp_action,
+            group_selection_action,
             remove_from_temp_action,
             add_to_collection_action,
             move_to_collection_action,
@@ -2566,6 +2741,7 @@ class MainWindow(QMainWindow):
             remove_index_action,
         ]:
             batch_action.setEnabled(has_selection)
+        group_selection_action.setEnabled(len(selected_images) >= 4)
         temp_project_menu.setEnabled(has_selection and bool(temp_project_actions))
         remove_from_temp_action.setEnabled(has_selection and self.current_result_mode == "temp_project")
         has_current_collection = self._selected_collection_id() is not None
@@ -2593,6 +2769,8 @@ class MainWindow(QMainWindow):
             self._batch_clear_tags()
         elif action == save_temp_action:
             self._save_selected_images_as_temporary_project()
+        elif action == group_selection_action:
+            self._group_selected_images_with_ai()
         elif action in temp_project_actions:
             self._add_selection_to_temporary_project(temp_project_actions[action])
         elif action == remove_from_temp_action:
@@ -3714,6 +3892,12 @@ class MainWindow(QMainWindow):
                     selected_terms=selected_terms,
                     result=result,
                 )
+            elif kind == "temp_project_suggestion":
+                self._apply_temporary_project_suggestion(payload)
+            elif kind == "temp_project_suggestion_error":
+                self._show_temporary_project_suggestion_error(payload)
+            elif kind == "reference_groups_done":
+                self._create_reference_group_projects(payload)
             elif kind == "embedding":
                 self._handle_embedding_progress(payload)
             elif kind == "error":
@@ -3901,7 +4085,10 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"{project.name}    {project.image_count}")
             item.setData(Qt.ItemDataRole.UserRole, project.id)
             item.setData(Qt.ItemDataRole.UserRole + 1, project.name)
-            item.setToolTip(f"{project.name}\n{project.image_count} 张")
+            tooltip_parts = [project.name, f"{project.image_count} 张"]
+            if project.summary:
+                tooltip_parts.append(project.summary)
+            item.setToolTip("\n".join(tooltip_parts))
             self.temp_project_list.addItem(item)
             if select_project_id == project.id:
                 selected_item = item
@@ -3951,7 +4138,8 @@ class MainWindow(QMainWindow):
             selected_image_ids=[],
             badges_by_image_id=badges,
         )
-        self._set_result_status(f"灵感暂存：{project.name} ｜ {len(images)} 张")
+        suffix = f" ｜ {project.summary}" if project.summary else ""
+        self._set_result_status(f"灵感暂存：{project.name} ｜ {len(images)} 张{suffix}")
         self.search_diagnostics_label.setText("搜索诊断：-")
 
     def _show_temporary_project_context_menu(self, position) -> None:
@@ -4504,7 +4692,8 @@ class MainWindow(QMainWindow):
                 else None
             )
             name = project.name if project is not None else "灵感暂存"
-            self._set_result_status(f"灵感暂存：{name} ｜ {len(images)} 张")
+            suffix = f" ｜ {project.summary}" if project is not None and project.summary else ""
+            self._set_result_status(f"灵感暂存：{name} ｜ {len(images)} 张{suffix}")
             return
         self._refresh_current_results_for_filters()
 

@@ -72,3 +72,4 @@ class TemporaryProjectItem:
     image_count: int
     created_at: str
     updated_at: str
+    summary: str = ""

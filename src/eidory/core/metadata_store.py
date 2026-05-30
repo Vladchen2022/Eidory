@@ -71,11 +71,18 @@ class MetadataStore:
             CREATE TABLE IF NOT EXISTS temporary_projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
+                summary TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        temporary_project_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(temporary_projects)").fetchall()
+        }
+        if "summary" not in temporary_project_columns:
+            conn.execute("ALTER TABLE temporary_projects ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_temporary_projects_updated_at
@@ -1713,13 +1720,20 @@ class MetadataStore:
             cur = conn.execute("DELETE FROM saved_views WHERE id = ?", (saved_view_id,))
             return int(cur.rowcount) > 0
 
-    def create_temporary_project(self, name: str, image_ids: Sequence[int]) -> int:
+    def create_temporary_project(
+        self,
+        name: str,
+        image_ids: Sequence[int],
+        *,
+        summary: str = "",
+    ) -> int:
         clean_name = name.strip()
         if not clean_name:
             raise ValueError("temporary project name must not be empty")
         clean_ids = self._clean_ids(image_ids)
         if not clean_ids:
             raise ValueError("temporary project must contain at least one image")
+        clean_summary = _clean_optional_text(summary, max_length=600) or ""
         now = utc_now_iso()
         with self.connect() as conn:
             existing = conn.execute(
@@ -1742,10 +1756,10 @@ class MetadataStore:
 
             cur = conn.execute(
                 """
-                INSERT INTO temporary_projects(name, created_at, updated_at)
-                VALUES (?, ?, ?)
+                INSERT INTO temporary_projects(name, summary, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
                 """,
-                (clean_name, now, now),
+                (clean_name, clean_summary, now, now),
             )
             project_id = int(cur.lastrowid)
             for index, image_id in enumerate(clean_ids):
@@ -1778,6 +1792,7 @@ class MetadataStore:
                 image_count=int(row["image_count"]),
                 created_at=str(row["created_at"]),
                 updated_at=str(row["updated_at"]),
+                summary=str(row["summary"] or ""),
             )
             for row in rows
         ]
@@ -1833,12 +1848,75 @@ class MetadataStore:
             image_count=int(row["image_count"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            summary=str(row["summary"] or ""),
         )
 
     def delete_temporary_project(self, project_id: int) -> bool:
         with self.connect() as conn:
             cur = conn.execute("DELETE FROM temporary_projects WHERE id = ?", (project_id,))
             return int(cur.rowcount) > 0
+
+    def update_temporary_project_details(
+        self,
+        project_id: int,
+        *,
+        name: str | None = None,
+        summary: str | None = None,
+    ) -> TemporaryProjectItem | None:
+        clean_name = _clean_optional_text(name, max_length=80) if name is not None else None
+        clean_summary = _clean_optional_text(summary, max_length=600) if summary is not None else None
+        if clean_name is None and clean_summary is None:
+            return self.get_temporary_project(project_id)
+        now = utc_now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id, name FROM temporary_projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if clean_name is not None:
+                clean_name = self._unique_temporary_project_name(
+                    conn,
+                    clean_name,
+                    exclude_project_id=project_id,
+                )
+            assignments: list[str] = ["updated_at = ?"]
+            params: list[object] = [now]
+            if clean_name is not None:
+                assignments.append("name = ?")
+                params.append(clean_name)
+            if clean_summary is not None:
+                assignments.append("summary = ?")
+                params.append(clean_summary)
+            params.append(project_id)
+            conn.execute(
+                f"UPDATE temporary_projects SET {', '.join(assignments)} WHERE id = ?",
+                params,
+            )
+        return self.get_temporary_project(project_id)
+
+    @staticmethod
+    def _unique_temporary_project_name(
+        conn: sqlite3.Connection,
+        name: str,
+        *,
+        exclude_project_id: int | None = None,
+    ) -> str:
+        base_name = name
+        suffix = 2
+        candidate = base_name
+        while True:
+            row = conn.execute(
+                "SELECT id FROM temporary_projects WHERE name = ?",
+                (candidate,),
+            ).fetchone()
+            if row is None or (
+                exclude_project_id is not None and int(row["id"]) == exclude_project_id
+            ):
+                return candidate
+            candidate = f"{base_name} {suffix}"
+            suffix += 1
 
     def add_images_to_temporary_project(
         self,

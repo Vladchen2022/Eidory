@@ -5,7 +5,12 @@ import unittest
 from pathlib import Path
 
 from eidory.core.inspiration import InspirationTerm, mix_inspiration_search_results
-from eidory.core.llm_provider import _terms_from_plain_text, parse_inspiration_proposal
+from eidory.core.llm_provider import (
+    _terms_from_plain_text,
+    parse_group_name_suggestions,
+    parse_inspiration_proposal,
+    parse_project_suggestion,
+)
 from eidory.core.metadata_store import MetadataStore
 from eidory.models import ImageItem
 
@@ -84,6 +89,23 @@ class InspirationTest(unittest.TestCase):
         self.assertEqual(len(terms), 5)
         self.assertEqual(terms[0].title, "环境氛围")
         self.assertEqual(terms[0].axis, "environment")
+
+    def test_parse_project_suggestion(self) -> None:
+        name, summary = parse_project_suggestion(
+            '{"name":"潮湿机械住处","summary":"用于寻找落魄工程师住处和机械细节的参考。"}'
+        )
+
+        self.assertEqual(name, "潮湿机械住处")
+        self.assertEqual(summary, "用于寻找落魄工程师住处和机械细节的参考。")
+
+    def test_parse_group_name_suggestions_fills_missing_groups(self) -> None:
+        suggestions = parse_group_name_suggestions(
+            '{"groups":[{"name":"破旧工坊","summary":"昏暗室内和工作台参考。"}]}',
+            expected_count=2,
+        )
+
+        self.assertEqual(suggestions[0].name, "破旧工坊")
+        self.assertEqual(suggestions[1].name, "参考组 2")
 
     def test_mix_inspiration_results_round_robins_and_records_matches(self) -> None:
         engine = InspirationTerm(title="引擎细节", query="engine")

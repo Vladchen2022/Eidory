@@ -16,6 +16,19 @@ class InspirationProposal:
     model_name: str
 
 
+@dataclass(frozen=True)
+class ProjectSuggestion:
+    name: str
+    summary: str
+    model_name: str
+
+
+@dataclass(frozen=True)
+class GroupNameSuggestion:
+    name: str
+    summary: str
+
+
 class LLMProviderError(RuntimeError):
     pass
 
@@ -81,12 +94,83 @@ class LMStudioProvider:
                     f"{first_error}；自动修复也失败：{second_error}"
                 ) from second_error
 
+    def suggest_project_details(
+        self,
+        *,
+        brief: str,
+        selected_terms: list[str],
+        file_names: list[str],
+        language: str = "zh",
+    ) -> ProjectSuggestion:
+        model_name = self.model_name or self._first_available_model()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You name temporary visual reference projects. Return strict JSON only."
+                    if language == "en"
+                    else "你负责给视觉参考临时项目命名并写摘要。只输出严格 JSON。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _build_project_suggestion_prompt(
+                    brief=brief,
+                    selected_terms=selected_terms,
+                    file_names=file_names,
+                    language=language,
+                ),
+            },
+        ]
+        content = self._chat_completion(
+            model_name=model_name,
+            messages=messages,
+            prefer_json=True,
+            response_format=_project_response_format(),
+            temperature=0.35,
+            max_tokens=700,
+        )
+        name, summary = parse_project_suggestion(content, language=language)
+        return ProjectSuggestion(name=name, summary=summary, model_name=model_name)
+
+    def suggest_reference_group_names(
+        self,
+        *,
+        groups: list[dict[str, object]],
+        language: str = "zh",
+    ) -> list[GroupNameSuggestion]:
+        model_name = self.model_name or self._first_available_model()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You name clustered visual reference groups. Return strict JSON only."
+                    if language == "en"
+                    else "你负责给已经聚类的视觉参考图组命名。只输出严格 JSON。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _build_group_naming_prompt(groups=groups, language=language),
+            },
+        ]
+        content = self._chat_completion(
+            model_name=model_name,
+            messages=messages,
+            prefer_json=True,
+            response_format=_group_names_response_format(),
+            temperature=0.4,
+            max_tokens=1400,
+        )
+        return parse_group_name_suggestions(content, expected_count=len(groups), language=language)
+
     def _chat_completion(
         self,
         *,
         model_name: str,
         messages: list[dict[str, str]],
         prefer_json: bool,
+        response_format: dict[str, object] | None = None,
         temperature: float = 0.75,
         max_tokens: int = 2200,
     ) -> str:
@@ -97,7 +181,7 @@ class LMStudioProvider:
             "max_tokens": max_tokens,
         }
         if prefer_json:
-            payload["response_format"] = _inspiration_response_format()
+            payload["response_format"] = response_format or _inspiration_response_format()
         headers = self._headers()
         try:
             response = requests.post(
@@ -192,6 +276,40 @@ def parse_inspiration_proposal(content: str, *, model_name: str) -> InspirationP
     )
 
 
+def parse_project_suggestion(content: str, *, language: str = "zh") -> tuple[str, str]:
+    payload = _load_json_object(content)
+    fallback_name = "Reference Set" if language == "en" else "灵感参考组"
+    name = _clean_project_text(payload.get("name"), max_length=60) or fallback_name
+    summary = _clean_project_text(payload.get("summary"), max_length=300)
+    return name, summary
+
+
+def parse_group_name_suggestions(
+    content: str,
+    *,
+    expected_count: int,
+    language: str = "zh",
+) -> list[GroupNameSuggestion]:
+    payload = _load_json_object(content)
+    raw_groups = payload.get("groups", [])
+    if not isinstance(raw_groups, list):
+        raw_groups = []
+    fallback_prefix = "Reference Group" if language == "en" else "参考组"
+    suggestions: list[GroupNameSuggestion] = []
+    for index in range(expected_count):
+        raw = raw_groups[index] if index < len(raw_groups) and isinstance(raw_groups[index], dict) else {}
+        name = _clean_project_text(raw.get("name"), max_length=60) or f"{fallback_prefix} {index + 1}"
+        summary = _clean_project_text(raw.get("summary"), max_length=240)
+        suggestions.append(GroupNameSuggestion(name=name, summary=summary))
+    return suggestions
+
+
+def _clean_project_text(value: object, *, max_length: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.strip().split())[:max_length]
+
+
 def _load_json_object(content: str) -> dict[str, object]:
     try:
         data = json.loads(content)
@@ -229,6 +347,49 @@ def _inspiration_response_format() -> dict[str, object]:
                     },
                 },
                 "required": ["questions", "terms"],
+            },
+        },
+    }
+
+
+def _project_response_format() -> dict[str, object]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "eidory_project_suggestion",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["name", "summary"],
+            },
+        },
+    }
+
+
+def _group_names_response_format() -> dict[str, object]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "eidory_reference_group_names",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "groups": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "summary": {"type": "string"},
+                            },
+                            "required": ["name", "summary"],
+                        },
+                    },
+                },
+                "required": ["groups"],
             },
         },
     }
@@ -394,4 +555,91 @@ Requirements:
 4. 避免单独输出“孤独”“落魄”“命运”这类不可直接搜图的词。
 5. 每条 query 应适合直接交给中文图文 embedding 搜图。
 6. 不要输出 Markdown，不要解释 JSON 之外的内容。
+""".strip()
+
+
+def _build_project_suggestion_prompt(
+    *,
+    brief: str,
+    selected_terms: list[str],
+    file_names: list[str],
+    language: str,
+) -> str:
+    terms_text = "\n".join(f"- {term}" for term in selected_terms[:12]) or "-"
+    files_text = "\n".join(f"- {name}" for name in file_names[:24]) or "-"
+    if language == "en":
+        return f"""
+Creative brief:
+{brief or "-"}
+
+Selected semantic probes:
+{terms_text}
+
+Representative file names:
+{files_text}
+
+Return JSON:
+{{"name":"short project name, 2-6 words","summary":"one concise sentence about the visual intent"}}
+
+Keep the name concrete and usable as a sidebar project title.
+Do not output Markdown.
+""".strip()
+    return f"""
+创作主题：
+{brief or "-"}
+
+已选择的语义探针：
+{terms_text}
+
+代表性文件名：
+{files_text}
+
+请输出 JSON：
+{{"name":"简短项目名，6-18 个字","summary":"一句话说明这组参考图的视觉意图"}}
+
+项目名要具体，适合显示在左侧栏。
+不要输出 Markdown。
+""".strip()
+
+
+def _build_group_naming_prompt(*, groups: list[dict[str, object]], language: str) -> str:
+    lines: list[str] = []
+    for index, group in enumerate(groups, start=1):
+        file_names = group.get("file_names", [])
+        if not isinstance(file_names, list):
+            file_names = []
+        badges = group.get("badges", [])
+        if not isinstance(badges, list):
+            badges = []
+        lines.append(f"Group {index}:")
+        lines.append("files:")
+        lines.extend(f"- {name}" for name in file_names[:14] if isinstance(name, str))
+        if badges:
+            lines.append("intent labels:")
+            lines.extend(f"- {badge}" for badge in badges[:8] if isinstance(badge, str))
+    groups_text = "\n".join(lines) or "-"
+    if language == "en":
+        return f"""
+The images below have already been clustered by visual embeddings.
+Name each group based only on the file names and intent labels.
+
+{groups_text}
+
+Return JSON:
+{{"groups":[{{"name":"short visual group name","summary":"one concise sentence"}}]}}
+
+Return exactly one group object per input group, in the same order.
+Do not output Markdown.
+""".strip()
+    return f"""
+下面这些图片已经按图像 embedding 聚类完成。
+请只根据文件名和意图标注，为每组命名。
+
+{groups_text}
+
+请输出 JSON：
+{{"groups":[{{"name":"简短视觉组名","summary":"一句话说明这一组的共同参考价值"}}]}}
+
+必须按输入顺序返回，每个输入组对应一个 group。
+不要输出 Markdown。
 """.strip()

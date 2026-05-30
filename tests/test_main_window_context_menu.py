@@ -12,7 +12,9 @@ from PySide6.QtWidgets import QApplication, QListWidgetItem, QTreeWidget, QTreeW
 
 from eidory.config import AppPaths
 from eidory.core.inspiration import InspirationMatch
+from eidory.core.llm_provider import GroupNameSuggestion
 from eidory.core.metadata_store import MetadataStore
+from eidory.core.reference_grouping import ReferenceGroup
 from eidory.core.search_filters import (
     SearchFilter,
     last_score_filter_kind,
@@ -497,6 +499,58 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             self.assertEqual(labels, {8: "破旧工坊 +1"})
             self.assertEqual(queries, {8: "破旧工坊，昏暗灯光"})
+            window.close()
+
+    def test_reference_group_payload_creates_temporary_projects_with_badges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids: list[int] = []
+            for index in range(4):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{index}.jpg"),
+                    file_size=123 + index,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=index + 1,
+                )
+                image_ids.append(image_id)
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._create_reference_group_projects((
+                [
+                    ReferenceGroup(image_ids=image_ids[:2], representative_id=image_ids[0]),
+                    ReferenceGroup(image_ids=image_ids[2:], representative_id=image_ids[2]),
+                ],
+                [
+                    GroupNameSuggestion("破旧工坊", "工作台和昏暗室内参考。"),
+                    GroupNameSuggestion("机械细节", "引擎和金属结构参考。"),
+                ],
+                "",
+            ))
+
+            projects = store.list_temporary_projects()
+            self.assertEqual(len(projects), 2)
+            names = {project.name for project in projects}
+            self.assertEqual(names, {"破旧工坊", "机械细节"})
+            first_project = next(project for project in projects if project.name == "破旧工坊")
+            self.assertEqual(store.temporary_project_image_badges(first_project.id), {
+                image_ids[0]: ["破旧工坊"],
+                image_ids[1]: ["破旧工坊"],
+            })
             window.close()
 
     def test_saved_view_payload_restores_ui_filters(self) -> None:

@@ -130,5 +130,34 @@ def apply_dark_theme(app: QApplication) -> None:
             border-color: #7b8796;
             border-bottom-color: #5a6370;
         }
+        QTabWidget#rightSidebarTabs::pane {
+            border: 1px solid #56606d;
+            border-radius: 5px;
+            top: 4px;
+        }
+        QTabWidget#rightSidebarTabs QTabBar {
+            background: transparent;
+        }
+        QTabWidget#rightSidebarTabs QTabBar::tab {
+            background-color: #444951;
+            color: #f0f2f5;
+            border: 1px solid #626976;
+            border-radius: 4px;
+            min-height: 26px;
+            min-width: 0;
+            padding: 4px 8px;
+            margin-right: 3px;
+            margin-bottom: 3px;
+        }
+        QTabWidget#rightSidebarTabs QTabBar::tab:hover {
+            background-color: #4d535d;
+            border-color: #707887;
+            color: #ffffff;
+        }
+        QTabWidget#rightSidebarTabs QTabBar::tab:selected {
+            background-color: #4f7cff;
+            border-color: #6d95ff;
+            color: #ffffff;
+        }
         """
     )

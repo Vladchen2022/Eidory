@@ -1036,6 +1036,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             detail_tab = window.right_tab_widget.widget(0)
 
+            self.assertEqual(window.right_tab_widget.objectName(), "rightSidebarTabs")
             self.assertIs(window.preview_stack.parentWidget(), detail_tab)
             self.assertEqual(window.right_tab_widget.tabText(0), "详情")
             window.close()

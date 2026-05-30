@@ -767,6 +767,7 @@ class MainWindow(QMainWindow):
         self._refresh_inspiration_history()
 
         self.right_tab_widget = QTabWidget()
+        self.right_tab_widget.setObjectName("rightSidebarTabs")
         self.right_tab_widget.setTabBar(EqualWidthTabBar())
         self.right_tab_widget.addTab(detail_tab, "详情")
         self.right_tab_widget.addTab(inspiration_tab, "AI")

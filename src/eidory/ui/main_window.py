@@ -2475,13 +2475,22 @@ class MainWindow(QMainWindow):
             for index, group in enumerate(groups, start=1)
         ]
 
-    def _create_reference_group_projects(self, payload: object) -> None:
+    def _create_reference_group_projects(self, payload: object, *, confirm: bool = False) -> None:
         groups, suggestions, error_message = payload
+        group_pairs = [
+            (group, suggestion)
+            for group, suggestion in zip(groups, suggestions, strict=False)
+            if group.image_ids
+        ]
+        if not group_pairs:
+            self.statusBar().showMessage("AI 分组没有可保存的图片")
+            return
+        if confirm and not self._confirm_reference_group_projects(group_pairs, str(error_message or "")):
+            self.statusBar().showMessage("已取消 AI 分组保存")
+            return
         created = 0
         batch_color = self.store.next_temporary_project_color()
-        for group, suggestion in zip(groups, suggestions, strict=False):
-            if not group.image_ids:
-                continue
+        for group, suggestion in group_pairs:
             project_id = self.store.create_temporary_project(
                 suggestion.name,
                 group.image_ids,
@@ -2499,6 +2508,42 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"已创建 {created} 个 AI 分组；命名失败，使用备用名称：{error_message}")
         else:
             self.statusBar().showMessage(f"已创建 {created} 个 AI 分组暂存项目")
+
+    def _confirm_reference_group_projects(self, group_pairs: list[tuple[ReferenceGroup, object]], error_message: str) -> bool:
+        preview = "\n".join(self._reference_group_preview_lines(group_pairs))
+        message = f"将创建 {len(group_pairs)} 个灵感暂存项目：\n\n{preview}\n\n继续？"
+        if error_message:
+            message += f"\n\nAI 命名失败时会使用备用名称：{error_message}"
+        answer = QMessageBox.question(
+            self,
+            "确认 AI 分组",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _reference_group_preview_lines(self, group_pairs: list[tuple[ReferenceGroup, object]]) -> list[str]:
+        image_ids = [
+            image_id
+            for group, _suggestion in group_pairs
+            for image_id in group.image_ids[:3]
+        ]
+        image_by_id = {image.id: image for image in self.store.images_by_ids(image_ids)}
+        lines: list[str] = []
+        for index, (group, suggestion) in enumerate(group_pairs, start=1):
+            name = str(getattr(suggestion, "name", f"AI 分组 {index}")).strip() or f"AI 分组 {index}"
+            summary = str(getattr(suggestion, "summary", "")).strip()
+            file_names = [
+                image_by_id[image_id].file_name
+                for image_id in group.image_ids[:3]
+                if image_id in image_by_id
+            ]
+            suffix = "..." if len(group.image_ids) > 3 else ""
+            samples = f"：{', '.join(file_names)}{suffix}" if file_names else ""
+            summary_text = f" - {summary}" if summary else ""
+            lines.append(f"{index}. {name}（{len(group.image_ids)} 张）{summary_text}{samples}")
+        return lines[:8]
 
     def _temporary_project_intents_for_images(
         self,
@@ -2535,6 +2580,13 @@ class MainWindow(QMainWindow):
         provider = self._make_llm_provider()
         brief = self.inspiration_brief_input.toPlainText().strip()
         labels, _queries = self._temporary_project_intents_for_images(images)
+        if not labels:
+            project_badges = self.store.temporary_project_image_badges(project_id)
+            labels = {
+                image_id: badges[0]
+                for image_id, badges in project_badges.items()
+                if badges
+            }
         selected_terms = sorted(set(labels.values()))
         file_names = [image.file_name for image in images[:24]]
 
@@ -2565,6 +2617,8 @@ class MainWindow(QMainWindow):
         self._refresh_temporary_projects(
             select_project_id=int(project_id) if self.current_temp_project_id == int(project_id) else None
         )
+        if self.current_temp_project_id == int(project_id):
+            self._load_temporary_project(int(project_id))
         if updated is not None:
             self.statusBar().showMessage(f"AI 已更新灵感暂存：{updated.name}")
 
@@ -3915,7 +3969,7 @@ class MainWindow(QMainWindow):
             elif kind == "temp_project_suggestion_error":
                 self._show_temporary_project_suggestion_error(payload)
             elif kind == "reference_groups_done":
-                self._create_reference_group_projects(payload)
+                self._create_reference_group_projects(payload, confirm=True)
             elif kind == "embedding":
                 self._handle_embedding_progress(payload)
             elif kind == "error":
@@ -4187,12 +4241,33 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         open_action = menu.addAction("打开暂存项目")
+        ai_details_action = menu.addAction("AI 重新命名和摘要")
         delete_action = menu.addAction("删除暂存项目")
         action = menu.exec(self.temp_project_list.viewport().mapToGlobal(position))
         if action == open_action:
             self._load_temporary_project(int(project_id))
+        elif action == ai_details_action:
+            self._request_temporary_project_ai_details(int(project_id))
         elif action == delete_action:
             self._delete_temporary_project(int(project_id), str(project_name or "暂存项目"))
+
+    def _request_temporary_project_ai_details(self, project_id: int) -> None:
+        project = self.store.get_temporary_project(project_id)
+        if project is None:
+            self._refresh_temporary_projects()
+            self.statusBar().showMessage("该灵感暂存已不存在")
+            return
+        image_ids = self.store.temporary_project_image_ids(project_id)
+        images = self.store.images_by_ids(image_ids)
+        if not images:
+            self.statusBar().showMessage("该灵感暂存没有图片，无法生成名称和摘要")
+            return
+        self.statusBar().showMessage(f"正在用 AI 更新“{project.name}”的名称和摘要...")
+        self._suggest_temporary_project_details(
+            project_id=project_id,
+            images=images,
+            can_rename=True,
+        )
 
     def _delete_temporary_project(self, project_id: int, project_name: str) -> None:
         answer = QMessageBox.question(

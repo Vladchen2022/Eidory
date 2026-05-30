@@ -5,15 +5,16 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QListWidgetItem, QTreeWidget, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QListWidgetItem, QMessageBox, QTreeWidget, QTreeWidgetItem
 
 from eidory.config import AppPaths
 from eidory.core.inspiration import InspirationMatch, InspirationTerm
-from eidory.core.llm_provider import GroupNameSuggestion
+from eidory.core.llm_provider import GroupNameSuggestion, ProjectSuggestion
 from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
 from eidory.core.reference_grouping import ReferenceGroup
 from eidory.core.search_filters import (
@@ -632,6 +633,107 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 image_ids[0]: ["破旧工坊"],
                 image_ids[1]: ["破旧工坊"],
             })
+            window.close()
+
+    def test_reference_group_creation_can_be_cancelled_before_saving(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids: list[int] = []
+            for index in range(4):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{index}.jpg"),
+                    file_size=123 + index,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=index + 1,
+                )
+                image_ids.append(image_id)
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            with patch(
+                "eidory.ui.main_window.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.No,
+            ):
+                window._create_reference_group_projects(
+                    (
+                        [
+                            ReferenceGroup(image_ids=image_ids[:2], representative_id=image_ids[0]),
+                            ReferenceGroup(image_ids=image_ids[2:], representative_id=image_ids[2]),
+                        ],
+                        [
+                            GroupNameSuggestion("破旧工坊", "工作台和昏暗室内参考。"),
+                            GroupNameSuggestion("机械细节", "引擎和金属结构参考。"),
+                        ],
+                        "",
+                    ),
+                    confirm=True,
+                )
+
+            self.assertEqual(store.list_temporary_projects(), [])
+            self.assertEqual(window.statusBar().currentMessage(), "已取消 AI 分组保存")
+            window.close()
+
+    def test_ai_project_detail_update_refreshes_loaded_temporary_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=200,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            project_id = store.create_temporary_project("临时项目", [image_id])
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._load_temporary_project(project_id)
+            window._apply_temporary_project_suggestion(
+                (
+                    project_id,
+                    True,
+                    ProjectSuggestion(
+                        name="AI 命名项目",
+                        summary="用于机械住处与旧设备参考。",
+                        model_name="fake",
+                    ),
+                )
+            )
+            self.app.processEvents()
+
+            updated = store.get_temporary_project(project_id)
+            self.assertIsNotNone(updated)
+            self.assertEqual(updated.name, "AI 命名项目")
+            self.assertEqual(updated.summary, "用于机械住处与旧设备参考。")
+            self.assertIn("AI 命名项目", window.result_state_label.text())
+            self.assertIn("用于机械住处与旧设备参考。", window.result_state_label.text())
             window.close()
 
     def test_saved_view_payload_restores_ui_filters(self) -> None:

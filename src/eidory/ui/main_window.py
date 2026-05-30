@@ -614,6 +614,7 @@ class MainWindow(QMainWindow):
         self.inspiration_questions_label = QLabel("AI 追问：-")
         self.inspiration_questions_label.setWordWrap(True)
         self.inspiration_term_list = QListWidget()
+        self.inspiration_term_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.inspiration_term_list.setMinimumHeight(360)
         self.inspiration_status_label = QLabel("生成后最多选择 7 个语义探针。")
         self.inspiration_status_label.setWordWrap(True)
@@ -811,8 +812,8 @@ class MainWindow(QMainWindow):
         self.batch_clear_tags_button.clicked.connect(self._batch_clear_tags)
         self.generate_inspiration_button.clicked.connect(self._generate_inspiration_terms_from_panel)
         self.search_inspiration_button.clicked.connect(self._save_and_search_inspiration)
-        self.inspiration_term_list.itemClicked.connect(self._search_clicked_inspiration_term)
         self.inspiration_term_list.itemChanged.connect(self._enforce_inspiration_selection_limit)
+        self.inspiration_term_list.customContextMenuRequested.connect(self._show_inspiration_term_context_menu)
         self.save_temp_project_button.clicked.connect(self._save_selected_images_as_temporary_project)
         self.feedback_relevant_button.clicked.connect(lambda: self._save_search_feedback("relevant"))
         self.feedback_irrelevant_button.clicked.connect(lambda: self._save_search_feedback("irrelevant"))
@@ -1148,9 +1149,11 @@ class MainWindow(QMainWindow):
         count = len(self._selected_inspiration_terms())
         total = self.inspiration_term_list.count()
         if total == 0:
-            self.inspiration_status_label.setText("生成后最多选择 7 个语义探针；单击探针可单条搜索。")
+            self.inspiration_status_label.setText("生成后最多选择 7 个语义探针；右键探针可单条搜索。")
         else:
-            self.inspiration_status_label.setText(f"已选择 {count} / 7 个语义探针；单击探针可单条搜索。")
+            self.inspiration_status_label.setText(
+                f"已选择 {count} / 7 个语义探针；保存并搜索会混排所有已选探针，右键可单条搜索。"
+            )
 
     def _selected_inspiration_terms(self) -> list[InspirationTerm]:
         terms: list[InspirationTerm] = []
@@ -1169,6 +1172,19 @@ class MainWindow(QMainWindow):
                     selected=True,
                 ))
         return terms
+
+    def _show_inspiration_term_context_menu(self, position) -> None:
+        item = self.inspiration_term_list.itemAt(position)
+        if item is None:
+            return
+        term = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(term, InspirationTerm):
+            return
+        menu = QMenu(self)
+        search_action = menu.addAction("单独搜索此探针")
+        action = menu.exec(self.inspiration_term_list.viewport().mapToGlobal(position))
+        if action == search_action:
+            self._search_clicked_inspiration_term(item)
 
     def _search_clicked_inspiration_term(self, item: QListWidgetItem) -> None:
         term = item.data(Qt.ItemDataRole.UserRole)

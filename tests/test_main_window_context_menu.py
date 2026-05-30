@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -11,7 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QListWidgetItem, QTreeWidget, QTreeWidgetItem
 
 from eidory.config import AppPaths
-from eidory.core.inspiration import InspirationMatch
+from eidory.core.inspiration import InspirationMatch, InspirationTerm
 from eidory.core.llm_provider import GroupNameSuggestion
 from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
 from eidory.core.reference_grouping import ReferenceGroup
@@ -499,6 +500,45 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             self.assertEqual(labels, {8: "破旧工坊 +1"})
             self.assertEqual(queries, {8: "破旧工坊，昏暗灯光"})
+            window.close()
+
+    def test_clicking_inspiration_term_does_not_run_single_probe_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._show_inspiration_proposal(SimpleNamespace(
+                terms=[
+                    InspirationTerm(title=f"探针{i}", query=f"query {i}", reason="reason")
+                    for i in range(6)
+                ],
+                questions=[],
+                model_name="fake",
+            ))
+            calls: list[str] = []
+            window._run_single_inspiration_term_search = lambda term: calls.append(term.title)
+
+            sixth_item = window.inspiration_term_list.item(5)
+            sixth_item.setCheckState(Qt.CheckState.Checked)
+            window.inspiration_term_list.itemClicked.emit(sixth_item)
+            self.app.processEvents()
+
+            self.assertEqual(calls, [])
+            self.assertEqual(
+                [term.title for term in window._selected_inspiration_terms()],
+                [f"探针{i}" for i in range(6)],
+            )
+            self.assertIn("保存并搜索会混排所有已选探针", window.inspiration_status_label.text())
             window.close()
 
     def test_reference_group_payload_creates_temporary_projects_with_badges(self) -> None:

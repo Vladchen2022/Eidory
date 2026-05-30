@@ -1019,6 +1019,27 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.video_player.source().toLocalFile(), str(video_path))
             window.close()
 
+    def test_embedded_preview_belongs_to_detail_tab(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            detail_tab = window.right_tab_widget.widget(0)
+
+            self.assertIs(window.preview_stack.parentWidget(), detail_tab)
+            self.assertEqual(window.right_tab_widget.tabText(0), "详情")
+            window.close()
+
     def test_metadata_filter_matchers(self) -> None:
         landscape = self._image(1, file_ext=".jpg", width=1600, height=900)
         portrait = self._image(2, file_ext=".png", width=900, height=1600)

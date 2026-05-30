@@ -655,6 +655,7 @@ class MainWindow(QMainWindow):
         detail_tab.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.note_input.setMaximumHeight(96)
         self.note_input.setMinimumHeight(76)
+        detail_layout.addWidget(self.preview_stack)
         detail_layout.addLayout(form)
         detail_layout.addWidget(QLabel("备注"))
         detail_layout.addWidget(self.note_input)
@@ -781,8 +782,6 @@ class MainWindow(QMainWindow):
             self._setting_int("ui.right_tab_index", 0, 0, self.right_tab_widget.count() - 1)
         )
 
-        layout.addWidget(self.preview_stack)
-        layout.addSpacing(8)
         layout.addWidget(self.right_tab_widget, 1)
         return panel
 

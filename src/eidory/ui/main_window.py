@@ -615,6 +615,9 @@ class MainWindow(QMainWindow):
         self.inspiration_answers_input.setFixedHeight(60)
         self.inspiration_questions_label = QLabel("AI 追问：-")
         self.inspiration_questions_label.setWordWrap(True)
+        self.inspiration_history_list = QListWidget()
+        self.inspiration_history_list.setMaximumHeight(116)
+        self.inspiration_history_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.inspiration_term_list = QListWidget()
         self.inspiration_term_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.inspiration_term_list.setMinimumHeight(360)
@@ -667,6 +670,8 @@ class MainWindow(QMainWindow):
         inspiration_layout.addWidget(QLabel("补充信息"))
         inspiration_layout.addWidget(self.inspiration_answers_input)
         inspiration_layout.addWidget(self.inspiration_questions_label)
+        inspiration_layout.addWidget(QLabel("历史探针"))
+        inspiration_layout.addWidget(self.inspiration_history_list)
         inspiration_layout.addWidget(QLabel("语义探针"))
         inspiration_layout.addWidget(self.inspiration_term_list, 1)
         inspiration_layout.addWidget(self.inspiration_status_label)
@@ -758,6 +763,7 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.settings_status_label)
         settings_layout.addStretch(1)
         self._load_settings_controls()
+        self._refresh_inspiration_history()
 
         self.right_tab_widget = QTabWidget()
         self.right_tab_widget.setTabBar(EqualWidthTabBar())
@@ -814,6 +820,8 @@ class MainWindow(QMainWindow):
         self.batch_clear_tags_button.clicked.connect(self._batch_clear_tags)
         self.generate_inspiration_button.clicked.connect(self._generate_inspiration_terms_from_panel)
         self.search_inspiration_button.clicked.connect(self._save_and_search_inspiration)
+        self.inspiration_history_list.itemClicked.connect(self._load_selected_inspiration_history)
+        self.inspiration_history_list.customContextMenuRequested.connect(self._show_inspiration_history_context_menu)
         self.inspiration_term_list.itemChanged.connect(self._enforce_inspiration_selection_limit)
         self.inspiration_term_list.customContextMenuRequested.connect(self._show_inspiration_term_context_menu)
         self.save_temp_project_button.clicked.connect(self._save_selected_images_as_temporary_project)
@@ -1108,33 +1116,144 @@ class MainWindow(QMainWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def _show_inspiration_proposal(self, proposal) -> None:
+        self.current_inspiration_project_id = None
         self.inspiration_proposal_terms = list(proposal.terms)
         self.inspiration_questions = list(proposal.questions)
         self.inspiration_model_name = proposal.model_name
+        self._populate_inspiration_term_list(
+            self.inspiration_proposal_terms,
+            default_selected_count=5,
+        )
+        self._sync_inspiration_questions_label()
+        self._refresh_inspiration_status()
+        self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
+
+    def _populate_inspiration_term_list(
+        self,
+        terms: list[InspirationTerm],
+        *,
+        default_selected_count: int | None = None,
+    ) -> None:
         self.inspiration_term_list.blockSignals(True)
         self.inspiration_term_list.clear()
-        for index, term in enumerate(self.inspiration_proposal_terms):
+        for index, term in enumerate(terms):
             item = QListWidgetItem(f"{term.title}\n{term.query}\n{term.reason}")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if index < 5 else Qt.CheckState.Unchecked)
+            checked = term.selected or (
+                default_selected_count is not None and index < default_selected_count
+            )
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, term)
             item.setSizeHint(QSize(0, 58))
             item.setToolTip(f"{term.query}\n{term.reason}")
             self.inspiration_term_list.addItem(item)
         self.inspiration_term_list.blockSignals(False)
+
+    def _sync_inspiration_questions_label(self) -> None:
         question_prefix = "AI questions: " if self.current_language == "en" else "AI 追问："
         self.inspiration_questions_label.setText(
             question_prefix + " / ".join(self.inspiration_questions)
             if self.inspiration_questions
             else question_prefix + "-"
         )
-        self._refresh_inspiration_status()
-        self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
 
     def _show_inspiration_error(self, payload: object) -> None:
         message = str(payload) if isinstance(payload, LLMProviderError) else f"生成失败：{payload}"
         self.inspiration_status_label.setText(message)
         self.statusBar().showMessage(message)
+
+    def _refresh_inspiration_history(self, select_project_id: int | None = None) -> None:
+        if not hasattr(self, "inspiration_history_list"):
+            return
+        self.inspiration_history_list.blockSignals(True)
+        self.inspiration_history_list.clear()
+        selected_item: QListWidgetItem | None = None
+        for project in self.store.list_inspiration_projects():
+            item = QListWidgetItem(
+                f"{project.title}    {project.selected_count}/{project.term_count}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, project.id)
+            item.setToolTip(
+                "\n".join([
+                    project.brief,
+                    project.answers,
+                    f"{project.provider_name} / {project.model_name}",
+                ]).strip()
+            )
+            self.inspiration_history_list.addItem(item)
+            if project.id == select_project_id:
+                selected_item = item
+        if selected_item is not None:
+            self.inspiration_history_list.setCurrentItem(selected_item)
+        self.inspiration_history_list.blockSignals(False)
+
+    def _load_selected_inspiration_history(self, item: QListWidgetItem | None = None) -> None:
+        item = item or self.inspiration_history_list.currentItem()
+        if item is None:
+            return
+        project_id = item.data(Qt.ItemDataRole.UserRole)
+        if project_id is None:
+            return
+        self._load_inspiration_project(int(project_id))
+
+    def _load_inspiration_project(self, project_id: int) -> None:
+        project = self.store.get_inspiration_project(project_id)
+        if project is None:
+            self._refresh_inspiration_history()
+            self.statusBar().showMessage("该 AI 探针历史已不存在")
+            return
+        terms = self.store.inspiration_terms_for_project(project_id)
+        self.current_inspiration_project_id = project.id
+        self.inspiration_proposal_terms = list(terms)
+        self.inspiration_questions = list(project.questions)
+        self.inspiration_model_name = project.model_name
+        self.inspiration_brief_input.setPlainText(project.brief)
+        self.inspiration_answers_input.setPlainText(project.answers)
+        self._populate_inspiration_term_list(self.inspiration_proposal_terms)
+        self._sync_inspiration_questions_label()
+        self._refresh_inspiration_status()
+        self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
+        self._refresh_inspiration_history(select_project_id=project_id)
+        self.statusBar().showMessage(f"已恢复 AI 探针历史：{project.title}")
+
+    def _show_inspiration_history_context_menu(self, position) -> None:
+        item = self.inspiration_history_list.itemAt(position)
+        if item is None:
+            return
+        self.inspiration_history_list.setCurrentItem(item)
+        project_id = item.data(Qt.ItemDataRole.UserRole)
+        if project_id is None:
+            return
+        menu = QMenu(self)
+        restore_action = menu.addAction("恢复此探针")
+        delete_action = menu.addAction("删除历史")
+        action = menu.exec(self.inspiration_history_list.viewport().mapToGlobal(position))
+        if action == restore_action:
+            self._load_inspiration_project(int(project_id))
+        elif action == delete_action:
+            self._delete_inspiration_project(int(project_id))
+
+    def _delete_inspiration_project(self, project_id: int) -> None:
+        project = self.store.get_inspiration_project(project_id)
+        if project is None:
+            self._refresh_inspiration_history()
+            self.statusBar().showMessage("该 AI 探针历史已不存在")
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除 AI 探针历史",
+            f"删除“{project.title}”？这只删除探针历史，不会删除图片或灵感暂存项目。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        deleted = self.store.delete_inspiration_project(project_id)
+        if self.current_inspiration_project_id == project_id:
+            self.current_inspiration_project_id = None
+        self._refresh_inspiration_history()
+        if deleted:
+            self.statusBar().showMessage(f"已删除 AI 探针历史：{project.title}")
 
     def _enforce_inspiration_selection_limit(self, changed_item: QListWidgetItem) -> None:
         selected = self._selected_inspiration_terms()
@@ -1223,16 +1342,25 @@ class MainWindow(QMainWindow):
             self.inspiration_status_label.setText("先输入创作主题。")
             return
         selected_titles = {term.title for term in selected_terms}
-        project_id = self.store.create_inspiration_project(
-            title=brief[:28] or "灵感项目",
-            brief=brief,
-            answers=self.inspiration_answers_input.toPlainText(),
-            questions=self.inspiration_questions,
-            provider_name="lm_studio",
-            model_name=self.inspiration_model_name or "local-model",
-            terms=self.inspiration_proposal_terms,
-            selected_titles=selected_titles,
-        )
+        project_id = self.current_inspiration_project_id
+        if project_id is not None and self.store.get_inspiration_project(project_id) is not None:
+            self.store.update_inspiration_project_selection(
+                project_id,
+                selected_titles=selected_titles,
+            )
+        else:
+            service = self._llm_service_key()
+            project_id = self.store.create_inspiration_project(
+                title=brief[:28] or "灵感项目",
+                brief=brief,
+                answers=self.inspiration_answers_input.toPlainText(),
+                questions=self.inspiration_questions,
+                provider_name=self._llm_service_label(service),
+                model_name=self.inspiration_model_name or self._llm_model(service) or "local-model",
+                terms=self.inspiration_proposal_terms,
+                selected_titles=selected_titles,
+            )
+        self._refresh_inspiration_history(select_project_id=project_id)
         self._run_inspiration_search(project_id, selected_terms)
 
     def _run_inspiration_search(

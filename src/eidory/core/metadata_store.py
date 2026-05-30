@@ -18,6 +18,7 @@ from eidory.models import (
     CollectionItem,
     FolderItem,
     ImageItem,
+    InspirationProjectItem,
     SavedViewItem,
     TagItem,
     TemporaryProjectItem,
@@ -2174,6 +2175,109 @@ class MetadataStore:
             )
             for row in rows
         ]
+
+    def list_inspiration_projects(self, *, limit: int = 80) -> list[InspirationProjectItem]:
+        safe_limit = max(1, min(int(limit), 500))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    p.*,
+                    COUNT(t.id) AS term_count,
+                    COALESCE(SUM(CASE WHEN t.selected = 1 THEN 1 ELSE 0 END), 0) AS selected_count
+                FROM inspiration_projects p
+                LEFT JOIN inspiration_terms t ON t.project_id = p.id
+                GROUP BY p.id
+                ORDER BY p.updated_at DESC, p.id DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+        return [self._inspiration_project_from_row(row) for row in rows]
+
+    def get_inspiration_project(self, project_id: int) -> InspirationProjectItem | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    p.*,
+                    COUNT(t.id) AS term_count,
+                    COALESCE(SUM(CASE WHEN t.selected = 1 THEN 1 ELSE 0 END), 0) AS selected_count
+                FROM inspiration_projects p
+                LEFT JOIN inspiration_terms t ON t.project_id = p.id
+                WHERE p.id = ?
+                GROUP BY p.id
+                """,
+                (project_id,),
+            ).fetchone()
+        return self._inspiration_project_from_row(row) if row is not None else None
+
+    def update_inspiration_project_selection(
+        self,
+        project_id: int,
+        *,
+        selected_titles: set[str],
+    ) -> bool:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            project = conn.execute(
+                "SELECT id FROM inspiration_projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                return False
+            conn.execute(
+                "UPDATE inspiration_terms SET selected = 0 WHERE project_id = ?",
+                (project_id,),
+            )
+            if selected_titles:
+                placeholders = ",".join("?" for _ in selected_titles)
+                conn.execute(
+                    f"""
+                    UPDATE inspiration_terms
+                    SET selected = 1
+                    WHERE project_id = ?
+                      AND title IN ({placeholders})
+                    """,
+                    [project_id, *sorted(selected_titles)],
+                )
+            conn.execute(
+                "UPDATE inspiration_projects SET updated_at = ? WHERE id = ?",
+                (now, project_id),
+            )
+            return True
+
+    def delete_inspiration_project(self, project_id: int) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute("DELETE FROM inspiration_projects WHERE id = ?", (project_id,))
+            return int(cur.rowcount) > 0
+
+    @staticmethod
+    def _inspiration_project_from_row(row: sqlite3.Row) -> InspirationProjectItem:
+        try:
+            questions = json.loads(str(row["questions_json"] or "[]"))
+        except json.JSONDecodeError:
+            questions = []
+        if not isinstance(questions, list):
+            questions = []
+        clean_questions = [
+            str(question)
+            for question in questions
+            if str(question).strip()
+        ]
+        return InspirationProjectItem(
+            id=int(row["id"]),
+            title=str(row["title"]),
+            brief=str(row["brief"]),
+            answers=str(row["answers"] or ""),
+            questions=clean_questions,
+            provider_name=str(row["provider_name"]),
+            model_name=str(row["model_name"]),
+            term_count=int(row["term_count"]),
+            selected_count=int(row["selected_count"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
 
     def next_embedding_jobs(
         self,

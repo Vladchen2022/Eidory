@@ -601,6 +601,58 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertIn("保存并搜索会混排所有已选探针", window.inspiration_status_label.text())
             window.close()
 
+    def test_inspiration_history_restores_brief_answers_questions_and_selected_terms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_inspiration_project(
+                title="机械工程师",
+                brief="落魄机械工程师研究摩托车",
+                answers="雨夜，低饱和",
+                questions=["更偏未来还是复古？"],
+                provider_name="LM Studio",
+                model_name="fake",
+                terms=[
+                    InspirationTerm(title="破旧工坊", query="破旧工坊", reason="环境"),
+                    InspirationTerm(title="引擎细节", query="老旧引擎", reason="机械"),
+                ],
+                selected_titles={"引擎细节"},
+            )
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            self.assertEqual(window.inspiration_history_list.count(), 1)
+            window._load_inspiration_project(project_id)
+            self.app.processEvents()
+
+            self.assertEqual(window.current_inspiration_project_id, project_id)
+            self.assertEqual(
+                window.inspiration_brief_input.toPlainText(),
+                "落魄机械工程师研究摩托车",
+            )
+            self.assertEqual(window.inspiration_answers_input.toPlainText(), "雨夜，低饱和")
+            self.assertIn("更偏未来还是复古？", window.inspiration_questions_label.text())
+            self.assertEqual(window.inspiration_term_list.count(), 2)
+            self.assertEqual(
+                window.inspiration_term_list.item(0).checkState(),
+                Qt.CheckState.Unchecked,
+            )
+            self.assertEqual(
+                window.inspiration_term_list.item(1).checkState(),
+                Qt.CheckState.Checked,
+            )
+            self.assertTrue(window.search_inspiration_button.isEnabled())
+            window.close()
+
     def test_reference_group_payload_creates_temporary_projects_with_badges(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(

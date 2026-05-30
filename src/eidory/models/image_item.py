@@ -66,6 +66,21 @@ class SavedViewItem:
 
 
 @dataclass(frozen=True)
+class InspirationProjectItem:
+    id: int
+    title: str
+    brief: str
+    answers: str
+    questions: list[str]
+    provider_name: str
+    model_name: str
+    term_count: int
+    selected_count: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class TemporaryProjectItem:
     id: int
     name: str

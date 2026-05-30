@@ -153,6 +153,26 @@ class InspirationTest(unittest.TestCase):
             self.assertEqual(selected[0].title, "引擎细节")
             self.assertTrue(selected[0].selected)
 
+            projects = store.list_inspiration_projects()
+            self.assertEqual(len(projects), 1)
+            self.assertEqual(projects[0].brief, "落魄机械工程师")
+            self.assertEqual(projects[0].answers, "雨夜")
+            self.assertEqual(projects[0].questions, ["更偏未来还是复古？"])
+            self.assertEqual(projects[0].term_count, 2)
+            self.assertEqual(projects[0].selected_count, 1)
+
+            self.assertTrue(
+                store.update_inspiration_project_selection(
+                    project_id,
+                    selected_titles={"破旧工坊"},
+                )
+            )
+            selected = store.inspiration_terms_for_project(project_id, selected_only=True)
+            self.assertEqual([term.title for term in selected], ["破旧工坊"])
+            self.assertEqual(store.get_inspiration_project(project_id).selected_count, 1)
+            self.assertTrue(store.delete_inspiration_project(project_id))
+            self.assertEqual(store.list_inspiration_projects(), [])
+
     @staticmethod
     def _image(image_id: int, *, score: float | None = None) -> ImageItem:
         return ImageItem(

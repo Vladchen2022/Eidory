@@ -131,9 +131,11 @@ def apply_dark_theme(app: QApplication) -> None:
             border-bottom-color: #5a6370;
         }
         QTabWidget#rightSidebarTabs::pane {
-            border: 1px solid #56606d;
-            border-radius: 5px;
-            top: 4px;
+            border: 0;
+            top: 0;
+        }
+        QTabWidget#rightSidebarTabs::tab-bar {
+            top: 0;
         }
         QTabWidget#rightSidebarTabs QTabBar {
             background: transparent;
@@ -143,11 +145,11 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #f0f2f5;
             border: 1px solid #626976;
             border-radius: 4px;
-            min-height: 26px;
+            min-height: 0;
             min-width: 0;
-            padding: 4px 8px;
+            padding: 4px 10px;
             margin-right: 3px;
-            margin-bottom: 3px;
+            margin-bottom: 8px;
         }
         QTabWidget#rightSidebarTabs QTabBar::tab:hover {
             background-color: #4d535d;

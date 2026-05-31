@@ -1,70 +1,192 @@
 # Eidory
 
-Eidory v0.1 is a local-first semantic image library for personal use.
+Eidory is a local-first image and reference library built with Python and PySide6.
+It is designed for personal creative reference workflows: importing local image
+folders, browsing them quickly, searching by text/image/color, and using an LLM
+to generate semantic probes for inspiration.
 
-It indexes image folders in place, generates local thumbnails, stores metadata in SQLite, and searches image embeddings with an in-memory NumPy index. It does not move, copy, delete, or modify source images.
+Current status: early personal-use desktop app. It is usable, but the UI and data
+model are still changing.
 
-## Scope
+## What It Does
 
-Implemented:
+- Indexes local files in place. Source files are not moved, copied, modified, or deleted.
+- Supports image files: JPG, JPEG, PNG, and WebP.
+- Supports video files: MP4, MOV, M4V, AVI, MKV, and WebM.
+- Generates thumbnail cache under `~/Library/Application Support/Eidory/thumbnails`.
+- Stores metadata in SQLite under `~/Library/Application Support/Eidory/eidory.sqlite3`.
+- Supports nested library folders, manual tags, favorites, notes, and temporary inspiration projects.
+- Searches by keyword, semantic text query, similar image, color, and stacked filters.
+- Uses local embeddings for image semantic search.
+- Uses an LLM provider for AI semantic probes and reference grouping.
+- Exports selected files or the whole logical library folder tree.
 
-- In-place folder indexing for JPG, JPEG, PNG, WebP, MP4, MOV, M4V, AVI, MKV, and WebM
-- Thumbnail cache under `~/Library/Application Support/Eidory/thumbnails`
-- SQLite metadata store under `~/Library/Application Support/Eidory/eidory.sqlite3`
-- Manual tags, favorite flag, and notes
-- Jina CLIP v2 embedding provider for local semantic search
-- Similar-image search using stored image embeddings
-- Color search and stacked search filters
-- AI inspiration projects through local LM Studio: generate visual semantic probes, select up to 7, and search mixed reference results
-- LLM settings for LM Studio, OpenAI API, DeepSeek API, Ollama, and generic OpenAI-compatible endpoints
-- Background embedding worker with pause/resume/stop
-- Video thumbnail generation and preview playback
-- Nested collection folders with manual image assignment
-- PySide6 desktop UI using Qt Model/View for the image grid
+## What It Does Not Do Yet
 
-Intentionally not included:
-
-- AI chat recommendations
-- AI tag generation
 - Cloud sync
 - Real-time file watching
-- GIF, HEIC, PSD, PDF, and other asset formats
-- Signed distribution and auto-update
+- AI auto-tagging
+- Full chat-based recommendation workflow
+- Signed macOS distribution
+- Auto-update
+- HEIC, GIF, PSD, PDF, or design-source-file management
 
-## Run From Source
+## Install And Run From Source
+
+Requirements:
+
+- macOS
+- Python 3.11 or newer
+- Optional: `ffmpeg` for video thumbnails
+- Optional: LM Studio, Ollama, OpenAI API, DeepSeek API, or another OpenAI-compatible endpoint for AI features
 
 ```bash
+git clone https://github.com/Vladchen2022/Eidory.git
+cd Eidory
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e ".[test,app]"
 eidory
 ```
 
-The first semantic indexing run downloads `jinaai/jina-clip-v2` from Hugging Face. That model requires `trust_remote_code=True` and is licensed `cc-by-nc-4.0`; this project treats it as a personal-use default.
+If the `eidory` command is not found, run:
 
-The AI inspiration panel defaults to a local LM Studio OpenAI-compatible server at `http://localhost:1234/v1`. It does not require an OpenAI API key. Advanced users can override `llm.lmstudio.base_url` and `llm.lmstudio.model` in `app_settings`.
+```bash
+python -m eidory
+```
 
-## Build macOS App
+## Build A Local macOS App
 
 ```bash
 ./scripts/build_macos_app.sh
 open dist/Eidory.app
 ```
 
-This creates a local unsigned `.app` for personal use. macOS may require right-clicking the app and choosing Open the first time.
+The generated app is unsigned. On macOS, the first launch may require
+right-clicking `dist/Eidory.app` and choosing `Open`.
+
+## First Use
+
+1. Open Eidory.
+2. Create or select a library folder in the left sidebar.
+3. Click `导入到当前文件夹` to import images from a disk folder into the selected logical folder.
+4. Click `扫描全部` or `扫描新增` from the settings panel when files changed on disk.
+5. Click `开始索引` if semantic search has not indexed the imported images yet.
+6. Use the search bar with `语义`, `关键词`, `相似图`, or `颜色`.
+
+Eidory indexes files in place. Importing means “record these files in Eidory and
+assign them to the selected logical folder”; it does not copy the source files.
+
+## Search
+
+Search modes:
+
+- `关键词`: searches filename, tag, note, and stored text fields.
+- `语义`: encodes the text query and searches image embeddings.
+- `相似图`: searches by the selected image embedding.
+- `颜色`: searches by dominant color similarity.
+
+Search logic:
+
+- `重新搜索`: search the whole current scope again.
+- `在结果中搜`: narrow inside current results.
+- `合并结果`: search again and union the new results with current results.
+
+The minimum-similarity slider controls how many semantic/color/probe results are
+kept. Lower values are broader; higher values are stricter.
+
+## AI Semantic Probes
+
+Open the right sidebar `AI` tab:
+
+1. Write one sentence describing the creative topic.
+2. Add optional context such as time, weather, lighting, mood, era, or art direction.
+3. Click `生成语义探针`.
+4. Select up to 7 probes.
+5. Click `保存并搜索` to search mixed reference results.
+6. Save chosen results into inspiration projects for later review.
+
+Default local AI provider:
+
+- LM Studio
+- Endpoint: `http://localhost:1234/v1`
+
+You can change the provider in the right sidebar `设置` tab. Supported provider
+types are LM Studio, OpenAI API, DeepSeek API, Ollama, and generic
+OpenAI-compatible endpoints.
+
+API keys are stored in the local SQLite settings table. They should not be
+committed to this repository and are not written into logs by design.
+
+## Semantic Model
+
+The default embedding model is `jinaai/jina-clip-v2`.
+
+Important constraints:
+
+- The first semantic indexing run downloads the model from Hugging Face.
+- It uses `trust_remote_code=True`.
+- The model license is `cc-by-nc-4.0`, so the current default is intended for
+  non-commercial personal use.
+- Before commercial use, review the model license and consider replacing the
+  default provider.
+
+## Export
+
+Eidory has two export paths:
+
+- `导出选中`: copies the currently selected files to a user-selected folder.
+- `导出图库`: copies all non-missing library files into a user-selected folder,
+  preserving Eidory's current logical folder tree.
+
+Export never modifies source files. If multiple files have the same name in the
+same export target, Eidory automatically creates unique filenames.
+
+Whole-library export is useful before moving machines or rebuilding the app:
+
+1. Click `导出图库`.
+2. Choose an empty destination folder.
+3. After reinstalling Eidory, import that destination folder by disk directory.
+
+## Data Location
+
+Default data directory:
+
+```text
+~/Library/Application Support/Eidory/
+```
+
+Main files:
+
+```text
+~/Library/Application Support/Eidory/eidory.sqlite3
+~/Library/Application Support/Eidory/thumbnails/
+```
+
+The settings page includes buttons to open the data directory, back up the
+database, restore the database, and run startup checks.
 
 ## Run Tests
 
 ```bash
-python -m py_compile $(find src tests -name '*.py')
+source .venv/bin/activate
 python -m pytest -q
 ```
 
-The tests use fake embeddings and do not download the real model.
+The test suite uses fake embedding providers where possible. It should not need
+to download the real semantic model.
 
-## Maintenance Boundary
+## Development Notes
 
-The UI is already broad enough for this stage. Avoid adding more Eagle/Billfish-style
-management features before splitting `src/eidory/ui/main_window.py` into smaller
-controllers or panels. New AI work should first reuse the existing embedding index
-or add a clearly isolated service with fake-provider tests.
+The UI is already broad for this stage. Before adding more large features,
+`src/eidory/ui/main_window.py` should be split into smaller controllers or panels.
+New AI features should reuse the existing embedding/search services or introduce
+isolated services with fake-provider tests.
+
+## License
+
+No open-source license has been selected yet.
+
+This means the repository can be public, but it is not legally open-source in the
+OSI sense until a `LICENSE` file is added. Choose a license such as MIT, Apache-2.0,
+GPL-3.0, or a custom license before inviting external reuse.

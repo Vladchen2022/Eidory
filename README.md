@@ -185,8 +185,10 @@ isolated services with fake-provider tests.
 
 ## License
 
-No open-source license has been selected yet.
+Eidory's source code is licensed under the Apache License, Version 2.0.
+See [LICENSE](LICENSE).
 
-This means the repository can be public, but it is not legally open-source in the
-OSI sense until a `LICENSE` file is added. Choose a license such as MIT, Apache-2.0,
-GPL-3.0, or a custom license before inviting external reuse.
+The default embedding model is still governed by its own license. In particular,
+`jinaai/jina-clip-v2` is licensed separately and is currently treated by this
+project as a non-commercial personal-use default. The Apache-2.0 license applies
+to this repository's code, not to third-party model weights or services.

@@ -4,6 +4,15 @@ version = "0.1.0"
 description = "Local-first semantic image library for personal use."
 readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics",
+]
 dependencies = [
     "einops>=0.8",
     "numpy>=1.26",

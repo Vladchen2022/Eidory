@@ -5,13 +5,14 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
 from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QPixmap
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from eidory.core.metadata_store import MetadataStore
 from eidory.ui.image_preview_dialog import ImagePreviewDialog
@@ -113,6 +114,9 @@ class ImagePreviewDialogTest(unittest.TestCase):
             self.assertGreater(dialog.zoom_factor, 1.0)
             dialog._fit_image_to_window()
             self.assertTrue(dialog.fit_to_window)
+            self.assertEqual(dialog.zoom_factor, 1.0)
+            dialog._actual_size_image()
+            self.assertFalse(dialog.fit_to_window)
             self.assertEqual(dialog.zoom_factor, 1.0)
             self.assertGreaterEqual(len(dialog._shortcuts), 8)
             dialog._panning = True
@@ -318,6 +322,47 @@ class ImagePreviewDialogTest(unittest.TestCase):
             self.assertFalse(dialog.mirror_button.isEnabled())
             self.assertFalse(dialog.video_controls_widget.isHidden())
             self.assertEqual(dialog.video_player.source().toLocalFile(), str(video_path))
+            dialog.close()
+
+    def test_preview_remove_index_keeps_source_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            thumbnail_dir = root / "thumbs"
+            thumbnail_dir.mkdir()
+            thumbnail_path = thumbnail_dir / "thumb_000000001.webp"
+            Image.new("RGB", (32, 24), color="red").save(thumbnail_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            store.update_thumbnail(image_id, str(thumbnail_path), "ready")
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+                thumbnail_dir=thumbnail_dir,
+            )
+
+            with patch("eidory.ui.image_preview_dialog.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+                dialog._remove_current_index()
+
+            self.assertIsNone(store.get_image(image_id))
+            self.assertTrue(image_path.exists())
+            self.assertFalse(thumbnail_path.exists())
             dialog.close()
 
 

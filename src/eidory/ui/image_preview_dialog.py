@@ -37,6 +37,7 @@ class ImagePreviewDialog(QDialog):
     imageChanged = Signal(object)
     favoriteChanged = Signal(object)
     feedbackSaved = Signal(object, str)
+    indexRemoved = Signal(object)
 
     def __init__(
         self,
@@ -48,6 +49,7 @@ class ImagePreviewDialog(QDialog):
         model_name: str,
         model_revision: str,
         embedding_dim: int,
+        thumbnail_dir: Path | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -58,6 +60,7 @@ class ImagePreviewDialog(QDialog):
         self.model_name = model_name
         self.model_revision = model_revision
         self.embedding_dim = embedding_dim
+        self.thumbnail_dir = Path(thumbnail_dir) if thumbnail_dir is not None else None
         self.fit_to_window = True
         self.zoom_factor = 1.0
         self.grayscale_preview = False
@@ -111,6 +114,7 @@ class ImagePreviewDialog(QDialog):
         self.previous_button = QPushButton("上一张")
         self.next_button = QPushButton("下一张")
         self.fit_button = QPushButton("适应窗口")
+        self.actual_size_button = QPushButton("100%")
         self.grayscale_button = QPushButton("黑白")
         self.grayscale_button.setCheckable(True)
         self.mirror_button = QPushButton("左右翻转")
@@ -140,6 +144,7 @@ class ImagePreviewDialog(QDialog):
             self.previous_button,
             self.next_button,
             self.fit_button,
+            self.actual_size_button,
             self.grayscale_button,
             self.mirror_button,
         ]
@@ -148,7 +153,9 @@ class ImagePreviewDialog(QDialog):
 
         self.open_original_button = QPushButton("打开源文件")
         self.reveal_button = QPushButton("Finder 中显示")
+        self.copy_image_button = QPushButton("复制图片")
         self.copy_path_button = QPushButton("复制路径")
+        self.remove_index_button = QPushButton("移除索引")
 
         self.video_controls_widget = QWidget()
         video_controls = QHBoxLayout(self.video_controls_widget)
@@ -161,6 +168,7 @@ class ImagePreviewDialog(QDialog):
         controls.addWidget(self.previous_button)
         controls.addWidget(self.next_button)
         controls.addWidget(self.fit_button)
+        controls.addWidget(self.actual_size_button)
         controls.addWidget(self.grayscale_button)
         controls.addWidget(self.mirror_button)
         controls.addSpacing(12)
@@ -169,7 +177,9 @@ class ImagePreviewDialog(QDialog):
         controls.addStretch(1)
         controls.addWidget(self.open_original_button)
         controls.addWidget(self.reveal_button)
+        controls.addWidget(self.copy_image_button)
         controls.addWidget(self.copy_path_button)
+        controls.addWidget(self.remove_index_button)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.preview_stack, 1)
@@ -180,6 +190,7 @@ class ImagePreviewDialog(QDialog):
         self.previous_button.clicked.connect(lambda: self._move(-1))
         self.next_button.clicked.connect(lambda: self._move(1))
         self.fit_button.clicked.connect(self._fit_image_to_window)
+        self.actual_size_button.clicked.connect(self._actual_size_image)
         self.grayscale_button.toggled.connect(self._set_grayscale_preview)
         self.mirror_button.toggled.connect(self._set_mirrored_preview)
         self.favorite_checkbox.toggled.connect(self._save_favorite)
@@ -188,7 +199,9 @@ class ImagePreviewDialog(QDialog):
         self.feedback_ignored_button.clicked.connect(lambda: self._save_feedback("ignored"))
         self.open_original_button.clicked.connect(self._open_original)
         self.reveal_button.clicked.connect(self._reveal_in_finder)
+        self.copy_image_button.clicked.connect(self._copy_current_image)
         self.copy_path_button.clicked.connect(self._copy_path)
+        self.remove_index_button.clicked.connect(self._remove_current_index)
         self.video_play_pause_button.clicked.connect(self._toggle_video_playback)
         self.video_position_slider.sliderMoved.connect(self._seek_video)
         self.video_player.positionChanged.connect(self._update_video_position)
@@ -317,8 +330,11 @@ class ImagePreviewDialog(QDialog):
             self.image_label.resize(self.scroll_area.viewport().size())
             self.video_controls_widget.hide()
             self.fit_button.setEnabled(False)
+            self.actual_size_button.setEnabled(False)
             self.grayscale_button.setEnabled(False)
             self.mirror_button.setEnabled(False)
+            self.copy_image_button.setEnabled(False)
+            self.remove_index_button.setEnabled(False)
             self._stop_video()
             return
 
@@ -327,6 +343,7 @@ class ImagePreviewDialog(QDialog):
         self.favorite_checkbox.blockSignals(True)
         self.favorite_checkbox.setChecked(image.is_favorite)
         self.favorite_checkbox.blockSignals(False)
+        self.remove_index_button.setEnabled(True)
         self._refresh_feedback_buttons(image)
         self._update_info(image)
         if is_supported_video(image.file_path):
@@ -394,8 +411,10 @@ class ImagePreviewDialog(QDialog):
         self.video_controls_widget.hide()
         self.preview_stack.setCurrentWidget(self.scroll_area)
         self.fit_button.setEnabled(True)
+        self.actual_size_button.setEnabled(True)
         self.grayscale_button.setEnabled(True)
         self.mirror_button.setEnabled(True)
+        self.copy_image_button.setEnabled(True)
         max_width, max_height = self._render_bounds()
         pixmap = self._load_preview_pixmap(
             image.file_path,
@@ -424,8 +443,10 @@ class ImagePreviewDialog(QDialog):
 
     def _render_current_video(self, image: ImageItem) -> None:
         self.fit_button.setEnabled(False)
+        self.actual_size_button.setEnabled(False)
         self.grayscale_button.setEnabled(False)
         self.mirror_button.setEnabled(False)
+        self.copy_image_button.setEnabled(False)
         self._stop_pan()
         self.preview_stack.setCurrentWidget(self.video_widget)
         self.video_controls_widget.show()
@@ -452,6 +473,9 @@ class ImagePreviewDialog(QDialog):
         height = max(1, viewport.height() - 2)
         if self.fit_to_window:
             return width, height
+        image = self.current_image()
+        if image is not None and image.width and image.height:
+            return max(1, int(image.width * self.zoom_factor)), max(1, int(image.height * self.zoom_factor))
         return max(1, int(width * self.zoom_factor)), max(1, int(height * self.zoom_factor))
 
     @staticmethod
@@ -505,6 +529,12 @@ class ImagePreviewDialog(QDialog):
 
     def _fit_image_to_window(self) -> None:
         self.fit_to_window = True
+        self.zoom_factor = 1.0
+        self._stop_pan()
+        self._render_current_image()
+
+    def _actual_size_image(self) -> None:
+        self.fit_to_window = False
         self.zoom_factor = 1.0
         self._stop_pan()
         self._render_current_image()
@@ -615,8 +645,11 @@ class ImagePreviewDialog(QDialog):
     def _show_image_context_menu(self, position) -> None:
         menu = QMenu(self)
         fit_action = menu.addAction("适应窗口显示")
+        actual_size_action = menu.addAction("实际大小 100%")
+        copy_image_action = menu.addAction("复制图片")
         open_action = menu.addAction("打开原图")
         reveal_action = menu.addAction("Finder 中显示")
+        remove_index_action = menu.addAction("移除当前索引")
         sender = self.sender()
         if hasattr(sender, "mapToGlobal"):
             global_position = sender.mapToGlobal(position)
@@ -625,10 +658,16 @@ class ImagePreviewDialog(QDialog):
         action = menu.exec(global_position)
         if action == fit_action:
             self._fit_image_to_window()
+        elif action == actual_size_action:
+            self._actual_size_image()
+        elif action == copy_image_action:
+            self._copy_current_image()
         elif action == open_action:
             self._open_original()
         elif action == reveal_action:
             self._reveal_in_finder()
+        elif action == remove_index_action:
+            self._remove_current_index()
 
     def _install_shortcuts(self) -> None:
         shortcuts = [
@@ -717,11 +756,68 @@ class ImagePreviewDialog(QDialog):
             return
         subprocess.run(["open", "-R", str(path)], check=False)
 
+    def _copy_current_image(self) -> None:
+        image = self.current_image()
+        if image is None or is_supported_video(image.file_path):
+            return
+        width = image.width or self.scroll_area.viewport().width()
+        height = image.height or self.scroll_area.viewport().height()
+        pixmap = self._load_preview_pixmap(image.file_path, width, height)
+        if pixmap.isNull():
+            fallback = image.thumbnail_path if image.thumbnail_path and Path(image.thumbnail_path).exists() else None
+            pixmap = QPixmap(fallback) if fallback else QPixmap()
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Eidory", "无法复制当前图片。")
+            return
+        pixmap = self._apply_preview_transforms(
+            pixmap,
+            grayscale=self.grayscale_preview,
+            mirror_horizontal=self.mirrored_preview,
+        )
+        QApplication.clipboard().setPixmap(pixmap)
+
     def _copy_path(self) -> None:
         image = self.current_image()
         if image is None:
             return
         QApplication.clipboard().setText(image.file_path)
+
+    def _remove_current_index(self) -> None:
+        image = self.current_image()
+        if image is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "移除索引",
+            f"只从 Eidory 移除“{image.file_name}”的索引记录，不删除源文件。继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        thumbnail_paths = self.store.remove_images_from_library([image.id])
+        self._delete_thumbnail_files(thumbnail_paths)
+        removed_image = image
+        del self.images[self.index]
+        if self.images:
+            self.index = min(self.index, len(self.images) - 1)
+            self._refresh()
+        else:
+            self._refresh()
+            self.close()
+        self.indexRemoved.emit(removed_image)
+
+    def _delete_thumbnail_files(self, thumbnail_paths: list[str]) -> None:
+        if self.thumbnail_dir is None:
+            return
+        thumbnail_root = self.thumbnail_dir.resolve()
+        for thumbnail_path in thumbnail_paths:
+            try:
+                resolved = Path(thumbnail_path).resolve()
+                if resolved.is_relative_to(thumbnail_root):
+                    resolved.unlink(missing_ok=True)
+            except Exception:
+                continue
 
     @staticmethod
     def _load_preview_pixmap(image_path: str, max_width: int, max_height: int) -> QPixmap:

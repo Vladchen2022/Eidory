@@ -96,6 +96,7 @@ class MetadataStore:
                 name TEXT NOT NULL UNIQUE,
                 summary TEXT NOT NULL DEFAULT '',
                 color_hex TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -109,11 +110,20 @@ class MetadataStore:
             conn.execute("ALTER TABLE temporary_projects ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
         if "color_hex" not in temporary_project_columns:
             conn.execute("ALTER TABLE temporary_projects ADD COLUMN color_hex TEXT NOT NULL DEFAULT ''")
+        if "sort_order" not in temporary_project_columns:
+            conn.execute("ALTER TABLE temporary_projects ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+            MetadataStore._backfill_temporary_project_sort_order(conn)
         MetadataStore._backfill_temporary_project_colors(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_temporary_projects_updated_at
             ON temporary_projects(updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_temporary_projects_sort_order
+            ON temporary_projects(sort_order)
             """
         )
         conn.execute(
@@ -1785,10 +1795,10 @@ class MetadataStore:
 
             cur = conn.execute(
                 """
-                INSERT INTO temporary_projects(name, summary, color_hex, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO temporary_projects(name, summary, color_hex, sort_order, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (clean_name, clean_summary, clean_color, now, now),
+                (clean_name, clean_summary, clean_color, self._next_temporary_project_sort_order(conn), now, now),
             )
             project_id = int(cur.lastrowid)
             for index, image_id in enumerate(clean_ids):
@@ -1811,7 +1821,7 @@ class MetadataStore:
                 FROM temporary_projects p
                 LEFT JOIN temporary_project_images tpi ON tpi.project_id = p.id
                 GROUP BY p.id
-                ORDER BY p.updated_at DESC, p.id DESC
+                ORDER BY p.sort_order DESC, p.updated_at DESC, p.id DESC
                 """
             ).fetchall()
         return [
@@ -1897,6 +1907,38 @@ class MetadataStore:
             count = int(row["count"]) if row is not None else 0
             conn.execute("DELETE FROM temporary_projects")
             return count
+
+    def move_temporary_project(self, project_id: int, direction: int) -> bool:
+        if direction == 0:
+            return False
+        with self.connect() as conn:
+            self._normalize_temporary_project_sort_order(conn)
+            rows = conn.execute(
+                """
+                SELECT id, sort_order
+                FROM temporary_projects
+                ORDER BY sort_order DESC, updated_at DESC, id DESC
+                """
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            try:
+                index = ids.index(int(project_id))
+            except ValueError:
+                return False
+            target_index = index + (-1 if direction < 0 else 1)
+            if target_index < 0 or target_index >= len(rows):
+                return False
+            current = rows[index]
+            target = rows[target_index]
+            conn.execute(
+                "UPDATE temporary_projects SET sort_order = ? WHERE id = ?",
+                (int(target["sort_order"]), int(current["id"])),
+            )
+            conn.execute(
+                "UPDATE temporary_projects SET sort_order = ? WHERE id = ?",
+                (int(current["sort_order"]), int(target["id"])),
+            )
+            return True
 
     def update_temporary_project_details(
         self,
@@ -2004,6 +2046,43 @@ class MetadataStore:
         count_row = conn.execute("SELECT COUNT(*) AS count FROM temporary_projects").fetchone()
         count = int(count_row["count"]) if count_row is not None else 0
         return TEMPORARY_PROJECT_COLORS[count % len(TEMPORARY_PROJECT_COLORS)]
+
+    @staticmethod
+    def _backfill_temporary_project_sort_order(conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM temporary_projects
+            ORDER BY updated_at ASC, id ASC
+            """
+        ).fetchall()
+        for index, row in enumerate(rows):
+            conn.execute(
+                "UPDATE temporary_projects SET sort_order = ? WHERE id = ?",
+                (index, int(row["id"])),
+            )
+
+    @staticmethod
+    def _normalize_temporary_project_sort_order(conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM temporary_projects
+            ORDER BY sort_order ASC, updated_at ASC, id ASC
+            """
+        ).fetchall()
+        for index, row in enumerate(rows):
+            conn.execute(
+                "UPDATE temporary_projects SET sort_order = ? WHERE id = ?",
+                (index, int(row["id"])),
+            )
+
+    @staticmethod
+    def _next_temporary_project_sort_order(conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM temporary_projects"
+        ).fetchone()
+        return int(row["next_order"]) if row is not None else 0
 
     def add_images_to_temporary_project(
         self,
@@ -2702,6 +2781,18 @@ class MetadataStore:
         with self.connect() as conn:
             row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
             return str(row["value"]) if row else default
+
+    def thumbnail_paths_in_use(self) -> set[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT thumbnail_path
+                FROM images
+                WHERE thumbnail_path IS NOT NULL
+                  AND TRIM(thumbnail_path) != ''
+                """
+            ).fetchall()
+        return {str(row["thumbnail_path"]) for row in rows}
 
     @staticmethod
     def _folder_from_row(row: sqlite3.Row) -> FolderItem:

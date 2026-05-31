@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
@@ -292,6 +293,39 @@ class MetadataStoreTest(unittest.TestCase):
                 store.get_temporary_project(second_id).color_hex,
                 TEMPORARY_PROJECT_COLORS[2],
             )
+
+    def test_temporary_project_sort_order_migrates_existing_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE temporary_projects (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL UNIQUE,
+                        summary TEXT NOT NULL DEFAULT '',
+                        color_hex TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO temporary_projects(name, summary, color_hex, created_at, updated_at)
+                    VALUES ('旧项目', '', '', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+                    """
+                )
+
+            store = MetadataStore(db_path)
+            store.initialize()
+
+            with sqlite3.connect(db_path) as conn:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(temporary_projects)")}
+                indexes = {row[1] for row in conn.execute("PRAGMA index_list(temporary_projects)")}
+            self.assertIn("sort_order", columns)
+            self.assertIn("idx_temporary_projects_sort_order", indexes)
+            self.assertEqual([project.name for project in store.list_temporary_projects()], ["旧项目"])
 
     def test_temporary_project_add_and_remove_only_changes_project_links(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -515,6 +515,103 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertIsNotNone(store.get_image(image_id))
             window.close()
 
+    def test_temporary_projects_can_be_manually_sorted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids = []
+            for index in range(3):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{index}.jpg"),
+                    file_size=123,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=index + 1,
+                )
+                image_ids.append(image_id)
+            first = store.create_temporary_project("一", [image_ids[0]])
+            second = store.create_temporary_project("二", [image_ids[1]])
+            third = store.create_temporary_project("三", [image_ids[2]])
+
+            self.assertEqual([project.name for project in store.list_temporary_projects()], ["三", "二", "一"])
+            self.assertTrue(store.move_temporary_project(third, 1))
+            self.assertEqual([project.name for project in store.list_temporary_projects()], ["二", "三", "一"])
+            self.assertTrue(store.move_temporary_project(first, -1))
+            self.assertEqual([project.name for project in store.list_temporary_projects()], ["二", "一", "三"])
+            self.assertFalse(store.move_temporary_project(second, -1))
+
+    def test_search_chain_can_continue_within_loaded_temporary_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            keep_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "keep-machine.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            other_project_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "other.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=2,
+            )
+            outside_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "keep-outside.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=3,
+            )
+            project_id = store.create_temporary_project("机械暂存", [keep_id, other_project_id])
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._load_temporary_project(project_id)
+            base_ids, base_label = window._search_chain_base_context()
+            result = window._compute_search_chain(
+                filters=(SearchFilter("keyword", "keep"),),
+                folder_path_prefix=None,
+                collection_id=None,
+                tag_ids=[],
+                tag_match_mode="any",
+                status_filter=None,
+                base_image_ids=base_ids,
+            )
+
+            self.assertEqual(base_ids, {keep_id, other_project_id})
+            self.assertEqual(base_label, "基于灵感暂存：机械暂存")
+            self.assertEqual([image.id for image in result.images], [keep_id])
+            self.assertNotIn(outside_id, [image.id for image in result.images])
+            window.close()
+
     def test_inspiration_matches_become_temporary_project_intents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(

@@ -109,6 +109,11 @@ DEFAULT_LLM_ENDPOINTS = {
 class EqualWidthTabBar(QTabBar):
     BUTTON_MATCH_HEIGHT = 26
     BOTTOM_GAP = 8
+    MIN_TAB_WIDTH = 72
+
+    @classmethod
+    def minimum_width_for_tab_count(cls, count: int) -> int:
+        return max(1, count) * cls.MIN_TAB_WIDTH
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -120,9 +125,14 @@ class EqualWidthTabBar(QTabBar):
         parent_width = self.parentWidget().width() if self.parentWidget() is not None else 0
         available_width = max(self.width(), parent_width)
         if available_width > 0:
-            size.setWidth(max(34, available_width // count - 1))
+            size.setWidth(max(self.MIN_TAB_WIDTH, available_width // count))
+        else:
+            size.setWidth(max(self.MIN_TAB_WIDTH, size.width()))
         size.setHeight(self.BUTTON_MATCH_HEIGHT + self.BOTTOM_GAP)
         return size
+
+
+TOOL_BUTTON_MIN_WIDTH = EqualWidthTabBar.MIN_TAB_WIDTH
 
 
 class MainWindow(QMainWindow):
@@ -350,6 +360,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
 
         search_row = QHBoxLayout()
+        self.search_row = search_row
+        search_row.setSpacing(0)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("文件名、标签、备注，或语义搜索文本")
         self.search_mode_group = QButtonGroup(self)
@@ -357,7 +369,6 @@ class MainWindow(QMainWindow):
         self.color_mode_button = QPushButton("颜色")
         self.color_mode_button.setCheckable(True)
         self.color_swatch_button = QPushButton()
-        self.color_swatch_button.setMaximumWidth(92)
         self.color_swatch_button.setToolTip("选择颜色")
         self._update_color_swatch()
         self.keyword_mode_button = QPushButton("关键词")
@@ -372,7 +383,18 @@ class MainWindow(QMainWindow):
         self.search_mode_group.addButton(self.semantic_mode_button)
         self.search_button = QPushButton("搜索")
         self.clear_search_button = QPushButton("清空")
+        for search_action_button in [
+            self.color_mode_button,
+            self.color_swatch_button,
+            self.keyword_mode_button,
+            self.semantic_mode_button,
+            self.similar_image_button,
+            self.search_button,
+            self.clear_search_button,
+        ]:
+            search_action_button.setMinimumWidth(TOOL_BUTTON_MIN_WIDTH)
         search_row.addWidget(self.search_input, 1)
+        search_row.addSpacing(8)
         search_row.addWidget(self.color_mode_button)
         search_row.addWidget(self.color_swatch_button)
         search_row.addWidget(self.keyword_mode_button)
@@ -783,6 +805,11 @@ class MainWindow(QMainWindow):
         tab_bar.setExpanding(True)
         tab_bar.setUsesScrollButtons(False)
         tab_bar.setTabToolTip(1, "AI 语义探针")
+        tab_bar.setMinimumWidth(
+            EqualWidthTabBar.minimum_width_for_tab_count(self.right_tab_widget.count())
+        )
+        left_margin, _top_margin, right_margin, _bottom_margin = layout.getContentsMargins()
+        panel.setMinimumWidth(tab_bar.minimumWidth() + left_margin + right_margin)
         self.right_tab_widget.setCurrentIndex(
             self._setting_int("ui.right_tab_index", 0, 0, self.right_tab_widget.count() - 1)
         )

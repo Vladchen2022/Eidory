@@ -24,7 +24,7 @@ from eidory.core.search_filters import (
     search_filter_to_payload,
 )
 from eidory.models import ImageItem
-from eidory.ui.main_window import EqualWidthTabBar, MainWindow
+from eidory.ui.main_window import EqualWidthTabBar, MainWindow, TOOL_BUTTON_MIN_WIDTH
 
 
 class MainWindowContextMenuTest(unittest.TestCase):
@@ -1041,6 +1041,25 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 window.right_tab_widget.tabBar().tabSizeHint(0).height(),
                 EqualWidthTabBar.BUTTON_MATCH_HEIGHT + EqualWidthTabBar.BOTTOM_GAP,
             )
+            self.assertGreaterEqual(
+                window.right_tab_widget.tabBar().tabSizeHint(0).width(),
+                EqualWidthTabBar.MIN_TAB_WIDTH,
+            )
+            self.assertEqual(window.search_row.spacing(), 0)
+            self.assertGreaterEqual(
+                window.right_tab_widget.parentWidget().minimumWidth(),
+                EqualWidthTabBar.minimum_width_for_tab_count(window.right_tab_widget.count()),
+            )
+            for button in [
+                window.color_mode_button,
+                window.color_swatch_button,
+                window.keyword_mode_button,
+                window.semantic_mode_button,
+                window.similar_image_button,
+                window.search_button,
+                window.clear_search_button,
+            ]:
+                self.assertEqual(button.minimumWidth(), TOOL_BUTTON_MIN_WIDTH)
             self.assertIs(window.preview_stack.parentWidget(), detail_tab)
             self.assertEqual(window.right_tab_widget.tabText(0), "详情")
             window.close()

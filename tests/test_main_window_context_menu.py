@@ -24,7 +24,7 @@ from eidory.core.search_filters import (
     search_filter_to_payload,
 )
 from eidory.models import ImageItem
-from eidory.ui.main_window import MainWindow
+from eidory.ui.main_window import EqualWidthTabBar, MainWindow
 
 
 class MainWindowContextMenuTest(unittest.TestCase):
@@ -1037,6 +1037,10 @@ class MainWindowContextMenuTest(unittest.TestCase):
             detail_tab = window.right_tab_widget.widget(0)
 
             self.assertEqual(window.right_tab_widget.objectName(), "rightSidebarTabs")
+            self.assertEqual(
+                window.right_tab_widget.tabBar().tabSizeHint(0).height(),
+                EqualWidthTabBar.BUTTON_MATCH_HEIGHT + EqualWidthTabBar.BOTTOM_GAP,
+            )
             self.assertIs(window.preview_stack.parentWidget(), detail_tab)
             self.assertEqual(window.right_tab_widget.tabText(0), "详情")
             window.close()

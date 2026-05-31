@@ -107,6 +107,9 @@ DEFAULT_LLM_ENDPOINTS = {
 
 
 class EqualWidthTabBar(QTabBar):
+    BUTTON_MATCH_HEIGHT = 26
+    BOTTOM_GAP = 8
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.updateGeometry()
@@ -118,6 +121,7 @@ class EqualWidthTabBar(QTabBar):
         available_width = max(self.width(), parent_width)
         if available_width > 0:
             size.setWidth(max(34, available_width // count - 1))
+        size.setHeight(self.BUTTON_MATCH_HEIGHT + self.BOTTOM_GAP)
         return size
 
 

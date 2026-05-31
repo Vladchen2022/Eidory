@@ -787,6 +787,7 @@ class MainWindow(QMainWindow):
             self._setting_int("ui.right_tab_index", 0, 0, self.right_tab_widget.count() - 1)
         )
 
+        layout.addSpacing(10)
         layout.addWidget(self.right_tab_widget, 1)
         return panel
 

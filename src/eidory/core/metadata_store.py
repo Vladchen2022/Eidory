@@ -287,6 +287,206 @@ class MetadataStore:
             row = conn.execute("SELECT * FROM folders WHERE id = ?", (folder_id,)).fetchone()
             return self._folder_from_row(row) if row else None
 
+    def path_remap_candidates(self) -> list[str]:
+        candidates: set[str] = set()
+        with self.connect() as conn:
+            folder_rows = conn.execute(
+                "SELECT folder_path FROM folders WHERE is_active = 1"
+            ).fetchall()
+            missing_rows = conn.execute(
+                "SELECT file_path FROM images WHERE is_missing = 1"
+            ).fetchall()
+
+        for row in folder_rows:
+            candidates.add(self._normalize_folder_prefix(str(row["folder_path"])))
+        for row in missing_rows:
+            candidates.add(
+                self._normalize_folder_prefix(os.path.dirname(str(row["file_path"])))
+            )
+        return sorted(candidates, key=str.casefold)
+
+    def path_prefix_match_counts(self, old_prefix: str) -> dict[str, int]:
+        normalized = self._normalize_folder_prefix(old_prefix)
+        like = self._folder_path_like(normalized)
+        with self.connect() as conn:
+            folder_row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM folders
+                WHERE folder_path = ?
+                   OR folder_path LIKE ? ESCAPE '\\'
+                """,
+                (normalized, like),
+            ).fetchone()
+            image_row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM images
+                WHERE file_path LIKE ? ESCAPE '\\'
+                """,
+                (like,),
+            ).fetchone()
+            missing_row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM images
+                WHERE file_path LIKE ? ESCAPE '\\'
+                  AND is_missing = 1
+                """,
+                (like,),
+            ).fetchone()
+        return {
+            "folders": int(folder_row["count"]),
+            "images": int(image_row["count"]),
+            "missing": int(missing_row["count"]),
+        }
+
+    def remap_path_prefix(self, old_prefix: str, new_prefix: str) -> dict[str, int]:
+        old_normalized = self._normalize_folder_prefix(old_prefix)
+        new_normalized = self._normalize_folder_prefix(new_prefix)
+        if old_normalized == new_normalized:
+            raise ValueError("old and new paths are the same")
+        if not os.path.isdir(new_normalized):
+            raise FileNotFoundError(f"new path does not exist: {new_normalized}")
+
+        now = utc_now_iso()
+        folder_like = self._folder_path_like(old_normalized)
+        image_like = self._folder_path_like(old_normalized)
+        counts = {
+            "folders_updated": 0,
+            "folders_merged": 0,
+            "images_updated": 0,
+            "relinked": 0,
+            "still_missing": 0,
+            "conflicts": 0,
+        }
+
+        with self.connect() as conn:
+            folder_rows = conn.execute(
+                """
+                SELECT id, folder_path
+                FROM folders
+                WHERE folder_path = ?
+                   OR folder_path LIKE ? ESCAPE '\\'
+                ORDER BY LENGTH(folder_path), folder_path
+                """,
+                (old_normalized, folder_like),
+            ).fetchall()
+            for row in folder_rows:
+                folder_id = int(row["id"])
+                old_folder_path = str(row["folder_path"])
+                new_folder_path = self._replace_path_prefix(
+                    old_folder_path,
+                    old_normalized,
+                    new_normalized,
+                )
+                if new_folder_path is None or new_folder_path == old_folder_path:
+                    continue
+                existing = conn.execute(
+                    "SELECT id FROM folders WHERE folder_path = ? AND id != ?",
+                    (new_folder_path, folder_id),
+                ).fetchone()
+                if existing is not None:
+                    target_id = int(existing["id"])
+                    conn.execute(
+                        "UPDATE images SET folder_id = ? WHERE folder_id = ?",
+                        (target_id, folder_id),
+                    )
+                    conn.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
+                    counts["folders_merged"] += 1
+                    continue
+                conn.execute(
+                    """
+                    UPDATE folders
+                    SET folder_path = ?, is_active = 1
+                    WHERE id = ?
+                    """,
+                    (new_folder_path, folder_id),
+                )
+                counts["folders_updated"] += 1
+
+            image_rows = conn.execute(
+                """
+                SELECT id, file_path, file_size, modified_time_ns, is_missing
+                FROM images
+                WHERE file_path LIKE ? ESCAPE '\\'
+                ORDER BY file_path
+                """,
+                (image_like,),
+            ).fetchall()
+            for row in image_rows:
+                image_id = int(row["id"])
+                old_file_path = str(row["file_path"])
+                new_file_path = self._replace_path_prefix(
+                    old_file_path,
+                    old_normalized,
+                    new_normalized,
+                )
+                if new_file_path is None or new_file_path == old_file_path:
+                    continue
+                existing = conn.execute(
+                    "SELECT id FROM images WHERE file_path = ? AND id != ?",
+                    (new_file_path, image_id),
+                ).fetchone()
+                if existing is not None:
+                    counts["conflicts"] += 1
+                    continue
+
+                file_name = os.path.basename(new_file_path)
+                file_ext = Path(file_name).suffix.lower()
+                try:
+                    stat = os.stat(new_file_path, follow_symlinks=False)
+                    exists = os.path.isfile(new_file_path)
+                except OSError:
+                    stat = None
+                    exists = False
+
+                if exists and stat is not None:
+                    file_size = int(stat.st_size)
+                    modified_time_ns = int(stat.st_mtime_ns)
+                    modified_at = timestamp_ns_to_iso(modified_time_ns)
+                    changed = (
+                        int(row["file_size"]) != file_size
+                        or int(row["modified_time_ns"]) != modified_time_ns
+                        or bool(row["is_missing"])
+                    )
+                    conn.execute(
+                        """
+                        UPDATE images
+                        SET file_path = ?, file_name = ?, file_ext = ?, file_size = ?,
+                            modified_at = ?, modified_time_ns = ?, last_seen_at = ?,
+                            is_missing = 0
+                        WHERE id = ?
+                        """,
+                        (
+                            new_file_path,
+                            file_name,
+                            file_ext,
+                            file_size,
+                            modified_at,
+                            modified_time_ns,
+                            now,
+                            image_id,
+                        ),
+                    )
+                    counts["relinked"] += 1
+                    if changed:
+                        self._mark_image_media_stale(conn, image_id, now)
+                else:
+                    conn.execute(
+                        """
+                        UPDATE images
+                        SET file_path = ?, file_name = ?, file_ext = ?,
+                            last_seen_at = ?, is_missing = 1
+                        WHERE id = ?
+                        """,
+                        (new_file_path, file_name, file_ext, now, image_id),
+                    )
+                    counts["still_missing"] += 1
+                counts["images_updated"] += 1
+
+        return counts
+
     def list_collections(self) -> list[CollectionItem]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -297,6 +497,57 @@ class MetadataStore:
                 """
             ).fetchall()
         return [self._collection_from_row(row) for row in rows]
+
+    def collection_export_paths(self) -> list[tuple[CollectionItem, tuple[str, ...]]]:
+        collections = self.list_collections()
+        by_id = {collection.id: collection for collection in collections}
+        path_cache: dict[int, tuple[str, ...]] = {}
+
+        def path_for(collection_id: int) -> tuple[str, ...]:
+            cached = path_cache.get(collection_id)
+            if cached is not None:
+                return cached
+            collection = by_id[collection_id]
+            if collection.parent_id is None or collection.parent_id not in by_id:
+                path = (collection.name,)
+            else:
+                path = (*path_for(collection.parent_id), collection.name)
+            path_cache[collection_id] = path
+            return path
+
+        return [(collection, path_for(collection.id)) for collection in collections]
+
+    def list_images_for_collection_direct(self, collection_id: int) -> list[ImageItem]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT i.*
+                FROM images i
+                JOIN image_collections ic ON ic.image_id = i.id
+                WHERE ic.collection_id = ?
+                  AND i.is_missing = 0
+                ORDER BY i.file_name COLLATE NOCASE, i.id
+                """,
+                (collection_id,),
+            ).fetchall()
+        return [self._image_from_row(row) for row in rows]
+
+    def list_images_without_collections(self) -> list[ImageItem]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT i.*
+                FROM images i
+                WHERE i.is_missing = 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM image_collections ic
+                      WHERE ic.image_id = i.id
+                  )
+                ORDER BY i.file_name COLLATE NOCASE, i.id
+                """
+            ).fetchall()
+        return [self._image_from_row(row) for row in rows]
 
     def list_collections_with_counts(self) -> list[tuple[CollectionItem, int]]:
         collections = self.list_collections()
@@ -1055,6 +1306,13 @@ class MetadataStore:
             row = conn.execute("SELECT COUNT(*) AS c FROM images").fetchone()
             return int(row["c"])
 
+    def count_missing_images(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM images WHERE is_missing = 1"
+            ).fetchone()
+            return int(row["c"])
+
     def get_image(self, image_id: int) -> ImageItem | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
@@ -1552,6 +1810,38 @@ class MetadataStore:
             conn.execute(f"DELETE FROM images WHERE id IN ({placeholders})", tuple(clean_ids))
             self._delete_unused_tags(conn)
             return thumbnail_paths
+
+    def remove_missing_images_from_library(self) -> tuple[list[str], int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT thumbnail_path
+                FROM images
+                WHERE is_missing = 1
+                  AND thumbnail_path IS NOT NULL
+                """
+            ).fetchall()
+            count_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM images WHERE is_missing = 1"
+            ).fetchone()
+            thumbnail_paths = [str(row["thumbnail_path"]) for row in rows]
+            conn.execute("DELETE FROM images WHERE is_missing = 1")
+            self._delete_unused_tags(conn)
+            return thumbnail_paths, int(count_row["count"])
+
+    def folders_with_missing_images(self) -> list[FolderItem]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT f.*
+                FROM folders f
+                JOIN images i ON i.folder_id = f.id
+                WHERE f.is_active = 1
+                  AND i.is_missing = 1
+                ORDER BY f.folder_path COLLATE NOCASE
+                """
+            ).fetchall()
+        return [self._folder_from_row(row) for row in rows]
 
     def remove_folder_from_library(self, folder_id: int) -> tuple[list[str], int]:
         with self.connect() as conn:
@@ -2873,6 +3163,39 @@ class MetadataStore:
                 seen.add(key)
         return clean_names
 
+    @staticmethod
+    def _mark_image_media_stale(
+        conn: sqlite3.Connection,
+        image_id: int,
+        updated_at: str,
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE images
+            SET thumbnail_status = 'pending',
+                thumbnail_path = NULL,
+                embedding_status = 'pending'
+            WHERE id = ?
+            """,
+            (image_id,),
+        )
+        conn.execute(
+            """
+            UPDATE embeddings
+            SET status = 'stale', vector_blob = NULL, updated_at = ?
+            WHERE image_id = ?
+            """,
+            (updated_at, image_id),
+        )
+        conn.execute(
+            """
+            UPDATE color_features
+            SET status = 'stale', hist_blob = NULL, updated_at = ?
+            WHERE image_id = ?
+            """,
+            (updated_at, image_id),
+        )
+
     @classmethod
     def _folder_path_like(cls, folder_path_prefix: str) -> str:
         normalized = cls._normalize_folder_prefix(folder_path_prefix)
@@ -2897,6 +3220,23 @@ class MetadataStore:
         if normalized_prefix == os.sep:
             return normalized_path.startswith(os.sep)
         return normalized_path.startswith(f"{normalized_prefix}{os.sep}")
+
+    @classmethod
+    def _replace_path_prefix(
+        cls,
+        path: str,
+        old_prefix: str,
+        new_prefix: str,
+    ) -> str | None:
+        normalized_path = os.path.abspath(os.path.expanduser(path)).rstrip(os.sep) or os.sep
+        normalized_old = cls._normalize_folder_prefix(old_prefix)
+        normalized_new = cls._normalize_folder_prefix(new_prefix)
+        if normalized_path == normalized_old:
+            return normalized_new
+        if not cls._path_is_under_prefix(normalized_path, normalized_old, include_self=False):
+            return None
+        relative_path = os.path.relpath(normalized_path, normalized_old)
+        return os.path.normpath(os.path.join(normalized_new, relative_path))
 
     @staticmethod
     def _image_extension_clause(column: str) -> str:

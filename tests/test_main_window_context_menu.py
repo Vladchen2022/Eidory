@@ -612,6 +612,123 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertNotIn(outside_id, [image.id for image in result.images])
             window.close()
 
+    def test_search_operation_context_uses_visible_results_only_after_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window.grid_view.set_images([self._image(1), self._image(2)])
+            window.search_filters = [SearchFilter("semantic", "晴天")]
+            base_ids, base_label, merge_base = window._search_operation_context("refine")
+            self.assertIsNone(base_ids)
+            self.assertIsNone(base_label)
+            self.assertIsNone(merge_base)
+
+            window.current_result_mode = "search_chain"
+            base_ids, base_label, merge_base = window._search_operation_context("refine")
+            self.assertEqual(base_ids, {1, 2})
+            self.assertEqual(base_label, "在当前结果中")
+            self.assertIsNone(merge_base)
+
+            base_ids, base_label, merge_base = window._search_operation_context("merge")
+            self.assertIsNone(base_ids)
+            self.assertEqual(base_label, "合并当前结果")
+            self.assertEqual([image.id for image in merge_base or []], [1, 2])
+            window.close()
+
+    def test_merge_search_operation_unions_current_and_new_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            sunny_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "sunny.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            house_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "house.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=2,
+            )
+            store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "tree.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=3,
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            result = window._compute_search_chain(
+                filters=(SearchFilter("keyword", "house"),),
+                folder_path_prefix=None,
+                collection_id=None,
+                tag_ids=[],
+                tag_match_mode="any",
+                status_filter=None,
+                merge_base_images=store.images_by_ids([sunny_id]),
+            )
+
+            self.assertEqual([image.id for image in result.images], [sunny_id, house_id])
+            window.close()
+
+    def test_refine_search_can_append_same_filter_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._add_search_filter(SearchFilter("semantic", "晴天"))
+            window._add_search_filter(SearchFilter("semantic", "房屋"), replace_same_kind=False)
+
+            self.assertEqual(
+                window.search_filters,
+                [
+                    SearchFilter("semantic", "晴天"),
+                    SearchFilter("semantic", "房屋"),
+                ],
+            )
+            window.close()
+
     def test_inspiration_matches_become_temporary_project_intents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -1227,6 +1344,117 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ),
             "共同标签：室内\n部分标签：夜晚 (2/3)、人物 (1/3)\n无标签：1",
         )
+
+    def test_result_management_excludes_selected_items_in_temporary_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids = []
+            for index in range(3):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{index}.jpg"),
+                    file_size=123,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=index + 1,
+                )
+                image_ids.append(image_id)
+            project_id = store.create_temporary_project("结果", image_ids)
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._load_temporary_project(project_id)
+            window.grid_view.set_images(window.grid_view.images(), selected_image_ids=[image_ids[1]])
+            window._exclude_selection_from_results()
+            self.app.processEvents()
+
+            self.assertEqual([image.id for image in window.grid_view.images()], [image_ids[0], image_ids[2]])
+            self.assertEqual(window.result_excluded_image_ids, {image_ids[1]})
+            self.assertIn("排除 1", window.result_state_label.text())
+            window._clear_result_exclusions()
+            self.assertEqual([image.id for image in window.grid_view.images()], image_ids)
+            window.close()
+
+    def test_visible_result_set_can_be_saved_as_temporary_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids = []
+            for index in range(2):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{index}.jpg"),
+                    file_size=123,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=index + 1,
+                )
+                image_ids.append(image_id)
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window.current_result_mode = "search_chain"
+            window.grid_view.set_images(store.images_by_ids(image_ids))
+
+            with patch(
+                "eidory.ui.main_window.QInputDialog.getText",
+                return_value=("当前结果", True),
+            ):
+                window._save_current_visible_results_as_temporary_project()
+
+            project = store.list_temporary_projects()[0]
+            self.assertEqual(project.name, "当前结果")
+            self.assertEqual(store.temporary_project_image_ids(project.id), image_ids)
+            window.close()
+
+    def test_shuffle_current_grid_images_preserves_badges_and_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            images = [self._image(1), self._image(2), self._image(3)]
+            window.grid_view.set_images(
+                images,
+                selected_image_ids=[2],
+                badges_by_image_id={2: ["机械"], 3: ["室内"]},
+            )
+
+            with patch("eidory.ui.main_window.random.shuffle", side_effect=lambda values: values.reverse()):
+                window._shuffle_current_grid_images()
+
+            self.assertEqual([image.id for image in window.grid_view.images()], [3, 2, 1])
+            self.assertEqual(window.grid_view.selected_image_ids(), [2])
+            self.assertEqual(window.grid_view._badges_by_image_id, {2: ["机械"], 3: ["室内"]})
+            window.close()
 
     @staticmethod
     def _image(

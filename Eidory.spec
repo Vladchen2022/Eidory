@@ -51,7 +51,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="Eidory.app",
-    icon=None,
+    icon="assets/app_icon.icns",
     bundle_identifier="local.eidory",
     info_plist={
         "CFBundleName": "Eidory",

@@ -38,6 +38,86 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(image.note, "warm light reference")
             self.assertEqual(reopened.get_image_tags(image_id), ["灯光", "赛博朋克"])
 
+    def test_path_prefix_remap_updates_folders_and_recovers_missing_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            old_root = Path(tmp) / "old-library"
+            new_root = Path(tmp) / "new-library"
+            new_root.mkdir()
+            new_file = new_root / "image.jpg"
+            new_file.write_bytes(b"new image bytes")
+
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(old_root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(old_root / "image.jpg"),
+                file_size=1,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            self.assertEqual(store.mark_missing_for_folder(folder_id, []), 1)
+
+            self.assertEqual(
+                store.path_prefix_match_counts(str(old_root)),
+                {"folders": 1, "images": 1, "missing": 1},
+            )
+            result = store.remap_path_prefix(str(old_root), str(new_root))
+
+            self.assertEqual(result["folders_updated"], 1)
+            self.assertEqual(result["images_updated"], 1)
+            self.assertEqual(result["relinked"], 1)
+            self.assertEqual(result["still_missing"], 0)
+            self.assertEqual(result["conflicts"], 0)
+            folder = store.get_folder(folder_id)
+            self.assertIsNotNone(folder)
+            self.assertEqual(folder.folder_path, str(new_root))
+            image = store.get_image(image_id)
+            self.assertIsNotNone(image)
+            self.assertEqual(image.file_path, str(new_file))
+            self.assertFalse(image.is_missing)
+            self.assertEqual(image.thumbnail_status, "pending")
+            self.assertEqual(image.embedding_status, "pending")
+
+    def test_remove_missing_images_from_library_keeps_existing_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            root = Path(tmp) / "library"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            missing_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(root / "missing.jpg"),
+                file_size=1,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            existing_path = str(root / "existing.jpg")
+            existing_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=existing_path,
+                file_size=2,
+                width=30,
+                height=40,
+                created_time_ns=None,
+                modified_time_ns=2,
+            )
+            self.assertEqual(store.mark_missing_for_folder(folder_id, [existing_path]), 1)
+
+            thumbnail_paths, removed = store.remove_missing_images_from_library()
+
+            self.assertEqual(thumbnail_paths, [])
+            self.assertEqual(removed, 1)
+            self.assertIsNone(store.get_image(missing_id))
+            self.assertIsNotNone(store.get_image(existing_id))
+            self.assertEqual(store.count_missing_images(), 0)
+
     def test_search_feedback_is_query_and_model_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"

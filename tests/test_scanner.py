@@ -78,6 +78,33 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(repaired.thumbnail_status, "ready")
             self.assertTrue(Path(repaired.thumbnail_path or "").exists())
 
+    def test_scan_folder_new_only_does_not_mark_missing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            first_path = root / "first.jpg"
+            second_path = root / "second.jpg"
+            self._make_image(first_path, "red")
+
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+            scanner = ImageScanner(store, Thumbnailer(Path(tmp) / "thumbs"))
+
+            scanner.scan_folder(str(root))
+            first_path.unlink()
+            self._make_image(second_path, "blue")
+
+            result = scanner.scan_folder_new_only(str(root))
+
+            self.assertEqual(result.scanned_files, 1)
+            self.assertEqual(result.new_files, 1)
+            self.assertEqual(result.missing_marked, 0)
+            self.assertEqual(store.count_missing_images(), 0)
+            self.assertEqual(
+                sorted(image.file_name for image in store.list_images(limit=10)),
+                ["first.jpg", "second.jpg"],
+            )
+
     def test_scan_allows_local_images_above_pillow_pixel_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "library"

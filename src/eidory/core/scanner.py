@@ -44,6 +44,31 @@ class ImageScanner:
         *,
         on_progress: ScanProgressCallback | None = None,
     ) -> ScanResult:
+        return self._scan_folder(
+            folder_path,
+            on_progress=on_progress,
+            mark_missing=True,
+        )
+
+    def scan_folder_new_only(
+        self,
+        folder_path: str,
+        *,
+        on_progress: ScanProgressCallback | None = None,
+    ) -> ScanResult:
+        return self._scan_folder(
+            folder_path,
+            on_progress=on_progress,
+            mark_missing=False,
+        )
+
+    def _scan_folder(
+        self,
+        folder_path: str,
+        *,
+        on_progress: ScanProgressCallback | None,
+        mark_missing: bool,
+    ) -> ScanResult:
         root = os.path.abspath(os.path.expanduser(folder_path))
         if not os.path.isdir(root):
             raise FileNotFoundError(f"folder does not exist: {root}")
@@ -96,7 +121,11 @@ class ImageScanner:
             if on_progress is not None:
                 on_progress(image_id, state, file_path)
 
-        missing_marked = self.store.mark_missing_for_folder(folder_id, seen_paths)
+        missing_marked = (
+            self.store.mark_missing_for_folder(folder_id, seen_paths)
+            if mark_missing
+            else 0
+        )
         self.store.finish_folder_scan(folder_id)
         return ScanResult(
             folder_id=folder_id,

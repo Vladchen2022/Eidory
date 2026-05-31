@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import os
 import queue
+import random
 import re
 import shutil
 import sqlite3
 import subprocess
 import threading
+import time
 import json
 import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import QSize, QStringListModel, Qt, QTimer, QUrl
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QPixmap, QTextOption
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -58,6 +61,11 @@ from PySide6.QtWidgets import (
 from eidory.config import AppPaths
 from eidory.core.embedding_provider import JinaClipV2Provider
 from eidory.core.embedding_worker import EmbeddingProgress, EmbeddingWorker
+from eidory.core.exporter import (
+    ExportResult,
+    export_images_to_directory,
+    export_library_to_directory,
+)
 from eidory.core.inspiration import (
     InspirationMatch,
     InspirationTerm,
@@ -69,6 +77,7 @@ from eidory.core.media_types import (
     SUPPORTED_VIDEO_EXTENSIONS,
     is_supported_video,
 )
+from eidory.core.media_tools import find_media_tool
 from eidory.core.metadata_store import MetadataStore
 from eidory.core.reference_grouping import ReferenceGroup, cluster_reference_vectors
 from eidory.core.scanner import ImageScanner, ScanResult
@@ -233,6 +242,8 @@ class MainWindow(QMainWindow):
         self.current_chain_result = SearchChainResult(images=[])
         self.current_chain_base_image_ids: set[int] | None = None
         self.current_chain_base_label: str | None = None
+        self.current_chain_operation_mode = "replace"
+        self.result_excluded_image_ids: set[int] = set()
         self.semantic_search_revision = 0
         self.selected_image: ImageItem | None = None
         self.embedding_refresh_counter = 0
@@ -414,6 +425,34 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.search_button)
         search_row.addWidget(self.clear_search_button)
 
+        search_operation_row = QHBoxLayout()
+        search_operation_row.setContentsMargins(0, 0, 0, 0)
+        search_operation_row.setSpacing(0)
+        self.search_operation_group = QButtonGroup(self)
+        self.search_operation_group.setExclusive(True)
+        self.search_within_results_button = QPushButton("在结果中搜")
+        self.search_merge_results_button = QPushButton("合并结果")
+        self.search_replace_results_button = QPushButton("重新搜索")
+        self.search_within_results_button.setCheckable(True)
+        self.search_merge_results_button.setCheckable(True)
+        self.search_replace_results_button.setCheckable(True)
+        self.search_within_results_button.setChecked(True)
+        self.search_within_results_button.setToolTip("第二轮搜索时，只在当前结果中继续筛选")
+        self.search_merge_results_button.setToolTip("第二轮搜索时，重新搜索当前图库/文件夹范围，并与当前结果合并")
+        self.search_replace_results_button.setToolTip("清空当前搜索条件，用这次搜索替换当前结果")
+        self.search_operation_label = QLabel("搜索逻辑")
+        search_operation_row.addWidget(self.search_operation_label)
+        search_operation_row.addSpacing(8)
+        for operation_button in [
+            self.search_within_results_button,
+            self.search_merge_results_button,
+            self.search_replace_results_button,
+        ]:
+            operation_button.setMinimumWidth(TOOL_BUTTON_MIN_WIDTH)
+            self.search_operation_group.addButton(operation_button)
+            search_operation_row.addWidget(operation_button)
+        search_operation_row.addStretch(1)
+
         metadata_filter_row = QHBoxLayout()
         self.file_type_filter_combo = QComboBox()
         self.file_type_filter_combo.addItem("文件类型", None)
@@ -477,6 +516,10 @@ class MainWindow(QMainWindow):
         metadata_filter_row.addWidget(QLabel("排序"))
         metadata_filter_row.addWidget(self.sort_combo)
         metadata_filter_row.addWidget(self.sort_order_combo)
+        self.shuffle_results_button = QPushButton("打乱排序")
+        self.shuffle_results_button.setToolTip("随机打乱当前显示的图片顺序，不改变筛选条件")
+        self.shuffle_results_button.setMinimumWidth(TOOL_BUTTON_MIN_WIDTH)
+        metadata_filter_row.addWidget(self.shuffle_results_button)
         metadata_filter_row.addStretch(1)
 
         self.filter_chain_widget = QWidget()
@@ -485,6 +528,18 @@ class MainWindow(QMainWindow):
         self.filter_chain_label = QLabel("筛选：无")
         self.filter_chain_layout.addWidget(self.filter_chain_label)
         self.filter_chain_layout.addStretch(1)
+
+        result_tools_row = QHBoxLayout()
+        result_tools_row.setContentsMargins(0, 0, 0, 0)
+        result_tools_row.setSpacing(0)
+        self.save_result_set_button = QPushButton("暂存结果")
+        self.save_result_set_button.setToolTip("把当前可见搜索结果整体保存到灵感暂存")
+        self.save_result_set_button.setMinimumWidth(TOOL_BUTTON_MIN_WIDTH)
+        self.save_result_set_button.setEnabled(False)
+        result_tools_row.addWidget(QLabel("结果管理"))
+        result_tools_row.addSpacing(8)
+        result_tools_row.addWidget(self.save_result_set_button)
+        result_tools_row.addStretch(1)
 
         threshold_row = QHBoxLayout()
         self.score_threshold_slider = QSlider(Qt.Orientation.Horizontal)
@@ -517,8 +572,10 @@ class MainWindow(QMainWindow):
         thumbnail_size_row.addWidget(self.thumbnail_size_slider)
 
         layout.addLayout(search_row)
+        layout.addLayout(search_operation_row)
         layout.addLayout(metadata_filter_row)
         layout.addWidget(self.filter_chain_widget)
+        layout.addLayout(result_tools_row)
         layout.addLayout(threshold_row)
         layout.addWidget(self.result_state_label)
         layout.addWidget(self.search_diagnostics_label)
@@ -760,9 +817,6 @@ class MainWindow(QMainWindow):
         index_layout.addWidget(self.start_embedding_button)
         index_layout.addWidget(self.pause_embedding_button)
         index_layout.addWidget(self.retry_failed_button)
-        index_layout.addSpacing(8)
-        index_layout.addWidget(self.rescan_all_button)
-        index_layout.addWidget(self.clean_orphan_thumbnails_button)
         index_layout.addStretch(1)
 
         settings_tab = QWidget()
@@ -804,17 +858,74 @@ class MainWindow(QMainWindow):
         self.save_settings_button = QPushButton("保存设置")
         self.open_data_dir_button = QPushButton("打开数据目录")
         self.backup_database_button = QPushButton("备份数据库")
+        self.restore_database_button = QPushButton("恢复数据库")
         self.run_self_check_button = QPushButton("运行启动自检")
         self.show_error_log_button = QPushButton("查看错误日志")
+        self.rescan_new_button = QPushButton("扫描新增/变化")
+        self.rescan_missing_button = QPushButton("扫描缺失所在目录")
+        self.clean_missing_index_button = QPushButton("清理丢失索引")
+        self.run_performance_check_button = QPushButton("性能压测")
+        self.export_library_button = QPushButton("导出图库")
+        self.export_selection_button = QPushButton("导出选中")
+        self.export_selection_button.setEnabled(False)
+        self.path_remap_old_combo = QComboBox()
+        self.path_remap_old_combo.setEditable(True)
+        self.path_remap_new_input = QLineEdit()
+        self.path_remap_new_input.setPlaceholderText("选择移动后的新根目录")
+        self.refresh_path_candidates_button = QPushButton("刷新旧位置")
+        self.choose_remap_new_path_button = QPushButton("选择新位置")
+        self.apply_path_remap_button = QPushButton("应用路径重映射")
         self.settings_status_label = QLabel(
             "LM Studio 默认使用 http://localhost:1234/v1；Ollama 默认使用 http://localhost:11434/v1；API Key 不会写入日志。"
         )
         self.settings_status_label.setWordWrap(True)
         settings_layout.addWidget(self.save_settings_button)
+        settings_layout.addSpacing(4)
+        settings_layout.addWidget(QLabel("路径修复"))
+        path_remap_form = QFormLayout()
+        path_remap_form.setContentsMargins(0, 0, 0, 0)
+        path_remap_form.setHorizontalSpacing(8)
+        path_remap_form.setVerticalSpacing(6)
+        path_remap_form.addRow("旧位置", self.path_remap_old_combo)
+        path_remap_form.addRow("新位置", self.path_remap_new_input)
+        settings_layout.addLayout(path_remap_form)
+        path_remap_actions_row = QHBoxLayout()
+        path_remap_actions_row.setContentsMargins(0, 0, 0, 0)
+        path_remap_actions_row.addWidget(self.refresh_path_candidates_button)
+        path_remap_actions_row.addWidget(self.choose_remap_new_path_button)
+        settings_layout.addLayout(path_remap_actions_row)
+        settings_layout.addWidget(self.apply_path_remap_button)
+        settings_layout.addSpacing(4)
+        settings_layout.addWidget(QLabel("图库维护"))
+        maintenance_scan_row = QHBoxLayout()
+        maintenance_scan_row.setContentsMargins(0, 0, 0, 0)
+        maintenance_scan_row.addWidget(self.rescan_all_button)
+        maintenance_scan_row.addWidget(self.rescan_new_button)
+        settings_layout.addLayout(maintenance_scan_row)
+        maintenance_clean_row = QHBoxLayout()
+        maintenance_clean_row.setContentsMargins(0, 0, 0, 0)
+        maintenance_clean_row.addWidget(self.rescan_missing_button)
+        maintenance_clean_row.addWidget(self.clean_missing_index_button)
+        settings_layout.addLayout(maintenance_clean_row)
+        maintenance_extra_row = QHBoxLayout()
+        maintenance_extra_row.setContentsMargins(0, 0, 0, 0)
+        maintenance_extra_row.addWidget(self.clean_orphan_thumbnails_button)
+        maintenance_extra_row.addWidget(self.run_performance_check_button)
+        settings_layout.addLayout(maintenance_extra_row)
+        settings_layout.addSpacing(4)
+        settings_layout.addWidget(QLabel("导出"))
+        export_row = QHBoxLayout()
+        export_row.setContentsMargins(0, 0, 0, 0)
+        export_row.addWidget(self.export_library_button)
+        export_row.addWidget(self.export_selection_button)
+        settings_layout.addLayout(export_row)
+        settings_layout.addSpacing(4)
+        settings_layout.addWidget(QLabel("数据库维护"))
         settings_actions_row = QHBoxLayout()
         settings_actions_row.setContentsMargins(0, 0, 0, 0)
         settings_actions_row.addWidget(self.open_data_dir_button)
         settings_actions_row.addWidget(self.backup_database_button)
+        settings_actions_row.addWidget(self.restore_database_button)
         settings_layout.addLayout(settings_actions_row)
         settings_health_row = QHBoxLayout()
         settings_health_row.setContentsMargins(0, 0, 0, 0)
@@ -856,8 +967,10 @@ class MainWindow(QMainWindow):
         self.add_folder_button.clicked.connect(self._choose_folder)
         self.rescan_button.clicked.connect(self._rescan_selected_folder)
         self.add_collection_button.clicked.connect(self._create_collection_from_button)
+        self.shuffle_results_button.clicked.connect(self._shuffle_current_grid_images)
         self.search_button.clicked.connect(self._run_search)
         self.clear_search_button.clicked.connect(self._clear_search)
+        self.save_result_set_button.clicked.connect(self._save_current_visible_results_as_temporary_project)
         self.search_input.returnPressed.connect(self._run_search)
         self.similar_image_button.clicked.connect(self._find_similar_to_selected_image)
         self.color_swatch_button.clicked.connect(self._choose_search_color)
@@ -898,7 +1011,12 @@ class MainWindow(QMainWindow):
         self.pause_embedding_button.clicked.connect(self._pause_embedding)
         self.retry_failed_button.clicked.connect(self._retry_failed_embeddings)
         self.rescan_all_button.clicked.connect(self._rescan_all_folders)
+        self.rescan_new_button.clicked.connect(self._rescan_new_or_changed_folders)
+        self.rescan_missing_button.clicked.connect(self._rescan_missing_folders)
+        self.clean_missing_index_button.clicked.connect(self._clean_missing_index)
         self.clean_orphan_thumbnails_button.clicked.connect(self._clean_orphan_thumbnails)
+        self.export_library_button.clicked.connect(self._export_library)
+        self.export_selection_button.clicked.connect(self._export_selected_images)
         self.folder_tree.itemSelectionChanged.connect(self._refresh_current_results_for_filters)
         self.collection_tree.itemSelectionChanged.connect(self._refresh_current_results_for_filters)
         self.collection_tree.treeReordered.connect(self._save_collection_tree_order)
@@ -925,8 +1043,13 @@ class MainWindow(QMainWindow):
         self.save_settings_button.clicked.connect(self._save_settings)
         self.open_data_dir_button.clicked.connect(self._open_data_directory)
         self.backup_database_button.clicked.connect(self._backup_database)
+        self.restore_database_button.clicked.connect(self._restore_database_from_file)
         self.run_self_check_button.clicked.connect(self._run_self_check_from_settings)
         self.show_error_log_button.clicked.connect(self._show_error_log_window)
+        self.refresh_path_candidates_button.clicked.connect(self._refresh_path_remap_candidates)
+        self.choose_remap_new_path_button.clicked.connect(self._choose_remap_new_path)
+        self.apply_path_remap_button.clicked.connect(self._apply_path_remap)
+        self.run_performance_check_button.clicked.connect(self._run_performance_check)
         self.saved_view_combo.currentIndexChanged.connect(self._refresh_saved_view_buttons)
         self.save_view_button.clicked.connect(self._save_current_view)
         self.apply_view_button.clicked.connect(self._apply_selected_saved_view)
@@ -939,6 +1062,8 @@ class MainWindow(QMainWindow):
         self._load_llm_service_controls(service)
         self.llm_temperature_spin.setValue(self._llm_temperature())
         self._set_combo_to_data(self.language_combo, self.current_language)
+        if hasattr(self, "path_remap_old_combo"):
+            self._refresh_path_remap_candidates()
 
     def _llm_service_key(self) -> str:
         raw = self.store.get_setting("llm.provider", "lm_studio")
@@ -1030,6 +1155,190 @@ class MainWindow(QMainWindow):
                 source.backup(target)
         return backup_path
 
+    def _restore_database_from_file(self) -> None:
+        database_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "选择要恢复的 Eidory 数据库",
+            str(self.paths.data_dir),
+            "SQLite Database (*.sqlite3 *.db);;All Files (*)",
+        )
+        if not database_path:
+            return
+        source_path = Path(database_path).expanduser()
+        ok, message = self._validate_database_file(source_path)
+        if not ok:
+            QMessageBox.warning(self, "Eidory", f"数据库文件无效：{message}")
+            return
+        try:
+            if source_path.resolve() == self.paths.database_path.resolve():
+                QMessageBox.information(self, "Eidory", "选择的是当前正在使用的数据库。")
+                return
+        except OSError:
+            pass
+        confirm = QMessageBox.question(
+            self,
+            "恢复数据库",
+            "恢复会先备份当前数据库，然后用所选数据库替换当前数据库。继续？",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        restore_temp_path: Path | None = None
+        try:
+            if self.embedding_worker is not None:
+                self.embedding_worker.stop()
+            backup_path = self._backup_database_to_default_location()
+            self.paths.database_path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            restore_temp_path = self.paths.database_path.with_name(
+                f".eidory-restore-{timestamp}.sqlite3"
+            )
+            source_uri = f"{source_path.resolve().as_uri()}?mode=ro"
+            with sqlite3.connect(source_uri, uri=True) as source:
+                with sqlite3.connect(restore_temp_path) as target:
+                    source.backup(target)
+            shutil.move(str(restore_temp_path), self.paths.database_path)
+            for suffix in ("-wal", "-shm"):
+                self.paths.database_path.with_name(
+                    f"{self.paths.database_path.name}{suffix}"
+                ).unlink(missing_ok=True)
+            self.store.initialize()
+            self._refresh_after_database_change()
+        except Exception as exc:
+            if restore_temp_path is not None:
+                restore_temp_path.unlink(missing_ok=True)
+            self._record_error(f"数据库恢复失败：{exc}")
+            QMessageBox.critical(self, "Eidory", f"数据库恢复失败：{exc}")
+            return
+        self.settings_status_label.setText(f"数据库已恢复。恢复前备份：{backup_path}")
+        self.statusBar().showMessage("数据库已恢复")
+
+    @staticmethod
+    def _validate_database_file(database_path: Path) -> tuple[bool, str]:
+        if not database_path.is_file():
+            return False, "文件不存在"
+        try:
+            uri = f"{database_path.resolve().as_uri()}?mode=ro"
+            with sqlite3.connect(uri, uri=True) as conn:
+                row = conn.execute("PRAGMA integrity_check").fetchone()
+                if row is None or str(row[0]) != "ok":
+                    return False, str(row[0]) if row is not None else "integrity_check 无结果"
+                table_rows = conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name IN ('folders', 'images', 'app_settings')
+                    """
+                ).fetchall()
+        except Exception as exc:
+            return False, str(exc)
+        found_tables = {str(row[0]) for row in table_rows}
+        missing = {"folders", "images", "app_settings"} - found_tables
+        if missing:
+            return False, f"缺少表：{', '.join(sorted(missing))}"
+        return True, "ok"
+
+    def _refresh_path_remap_candidates(self) -> None:
+        if not hasattr(self, "path_remap_old_combo"):
+            return
+        current_text = self.path_remap_old_combo.currentText().strip()
+        candidates = self.store.path_remap_candidates()
+        self.path_remap_old_combo.blockSignals(True)
+        self.path_remap_old_combo.clear()
+        self.path_remap_old_combo.addItems(candidates)
+        if current_text:
+            index = self.path_remap_old_combo.findText(current_text)
+            if index >= 0:
+                self.path_remap_old_combo.setCurrentIndex(index)
+            else:
+                self.path_remap_old_combo.setEditText(current_text)
+        self.path_remap_old_combo.blockSignals(False)
+
+    def _choose_remap_new_path(self) -> None:
+        folder_path = QFileDialog.getExistingDirectory(self, "选择移动后的新根目录")
+        if folder_path:
+            self.path_remap_new_input.setText(folder_path)
+
+    def _apply_path_remap(self) -> None:
+        old_prefix = self.path_remap_old_combo.currentText().strip()
+        new_prefix = self.path_remap_new_input.text().strip()
+        if not old_prefix or not new_prefix:
+            self.statusBar().showMessage("请先填写旧位置和新位置")
+            return
+        try:
+            counts = self.store.path_prefix_match_counts(old_prefix)
+        except Exception as exc:
+            QMessageBox.warning(self, "Eidory", f"检查旧位置失败：{exc}")
+            return
+        if counts["folders"] == 0 and counts["images"] == 0:
+            QMessageBox.information(self, "Eidory", "旧位置没有匹配到图库记录。")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "应用路径重映射",
+            (
+                f"旧位置匹配到 {counts['folders']} 个导入目录、"
+                f"{counts['images']} 个文件记录，其中 {counts['missing']} 个丢失。继续？"
+            ),
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._set_maintenance_controls_enabled(False)
+        self.settings_status_label.setText("正在应用路径重映射...")
+
+        def run() -> None:
+            try:
+                result = self.store.remap_path_prefix(old_prefix, new_prefix)
+                self.events.put(("path_remap_done", result))
+            except Exception as exc:
+                self.events.put(("error", f"路径重映射失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _handle_path_remap_done(self, result: dict[str, int]) -> None:
+        self._set_maintenance_controls_enabled(True)
+        self.vector_index.invalidate()
+        self._refresh_after_database_change()
+        message = (
+            "路径重映射完成："
+            f"目录更新 {result.get('folders_updated', 0)}，"
+            f"目录合并 {result.get('folders_merged', 0)}，"
+            f"文件更新 {result.get('images_updated', 0)}，"
+            f"已恢复 {result.get('relinked', 0)}，"
+            f"仍丢失 {result.get('still_missing', 0)}，"
+            f"冲突跳过 {result.get('conflicts', 0)}"
+        )
+        self.settings_status_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _refresh_after_database_change(self) -> None:
+        self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
+        self._load_settings_controls()
+        self._apply_runtime_language_settings()
+        self.vector_index.invalidate()
+        self._refresh_folders()
+        self._refresh_collections()
+        self._refresh_temporary_projects()
+        self._refresh_tags()
+        self._refresh_saved_views()
+        self._refresh_inspiration_history()
+        self._reload_images()
+        self._refresh_embedding_stats()
+
+    def _set_maintenance_controls_enabled(self, enabled: bool) -> None:
+        for attr in [
+            "rescan_all_button",
+            "rescan_new_button",
+            "rescan_missing_button",
+            "clean_missing_index_button",
+            "clean_orphan_thumbnails_button",
+            "run_performance_check_button",
+            "restore_database_button",
+            "apply_path_remap_button",
+        ]:
+            if hasattr(self, attr):
+                getattr(self, attr).setEnabled(enabled)
+
     def _run_startup_self_check(self) -> None:
         if not hasattr(self, "settings_status_label"):
             return
@@ -1055,7 +1364,7 @@ class MainWindow(QMainWindow):
         report.append(self._check_directory("数据目录", self.paths.data_dir))
         report.append(self._check_directory("缩略图目录", self.paths.thumbnail_dir))
         report.append(self._check_database())
-        ffmpeg_path = shutil.which("ffmpeg")
+        ffmpeg_path = find_media_tool("ffmpeg")
         report.append(("ffmpeg", ffmpeg_path is not None, ffmpeg_path or "未找到，视频缩略图会失败"))
         report.append(self._check_llm_endpoint())
         return report
@@ -1153,6 +1462,12 @@ class MainWindow(QMainWindow):
             self.similar_image_button.setText("Similar")
             self.search_button.setText("Search")
             self.clear_search_button.setText("Clear")
+            self.search_within_results_button.setText("Within Results")
+            self.search_merge_results_button.setText("Merge Results")
+            self.search_replace_results_button.setText("Replace")
+            self.search_operation_label.setText("Search Logic")
+            self.shuffle_results_button.setText("Shuffle")
+            self.save_result_set_button.setText("Save Results")
             self.save_detail_button.setText("Save Details")
             self.inspiration_brief_input.setPlaceholderText("Describe the image concept in one sentence")
             self.inspiration_answers_input.setPlaceholderText("Extra context: era, weather, lighting, mood, optional")
@@ -1161,12 +1476,23 @@ class MainWindow(QMainWindow):
             self.generate_inspiration_button.setText("Generate Probes")
             self.search_inspiration_button.setText("Save and Search")
             self.save_temp_project_button.setText("Save Selected")
-            self.rescan_all_button.setText("Rescan All Imports")
-            self.clean_orphan_thumbnails_button.setText("Clean Orphan Thumbnails")
-            self.open_data_dir_button.setText("Open Data Directory")
-            self.backup_database_button.setText("Back Up Database")
-            self.run_self_check_button.setText("Run Startup Check")
+            self.rescan_all_button.setText("Scan All")
+            self.rescan_new_button.setText("Scan New")
+            self.rescan_missing_button.setText("Scan Missing")
+            self.clean_missing_index_button.setText("Clean Missing")
+            self.clean_orphan_thumbnails_button.setText("Clean Thumbs")
+            self.run_performance_check_button.setText("Benchmark")
+            self.export_library_button.setText("Export Library")
+            self.export_selection_button.setText("Export Selected")
+            self.open_data_dir_button.setText("Open Data")
+            self.backup_database_button.setText("Backup DB")
+            self.restore_database_button.setText("Restore DB")
+            self.run_self_check_button.setText("Startup Check")
             self.show_error_log_button.setText("Error Log")
+            self.path_remap_new_input.setPlaceholderText("Choose the new root folder")
+            self.refresh_path_candidates_button.setText("Refresh")
+            self.choose_remap_new_path_button.setText("Choose")
+            self.apply_path_remap_button.setText("Apply Remap")
             self.right_tab_widget.setTabText(0, "Details")
             self.right_tab_widget.setTabText(1, "AI")
             self.right_tab_widget.setTabText(2, "Filters")
@@ -1182,6 +1508,12 @@ class MainWindow(QMainWindow):
             self.similar_image_button.setText("相似图")
             self.search_button.setText("搜索")
             self.clear_search_button.setText("清空")
+            self.search_within_results_button.setText("在结果中搜")
+            self.search_merge_results_button.setText("合并结果")
+            self.search_replace_results_button.setText("重新搜索")
+            self.search_operation_label.setText("搜索逻辑")
+            self.shuffle_results_button.setText("打乱排序")
+            self.save_result_set_button.setText("暂存结果")
             self.save_detail_button.setText("保存详情")
             self.inspiration_brief_input.setPlaceholderText("用一句话描述画面的创作主题")
             self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
@@ -1190,12 +1522,23 @@ class MainWindow(QMainWindow):
             self.generate_inspiration_button.setText("生成语义探针")
             self.search_inspiration_button.setText("保存并搜索")
             self.save_temp_project_button.setText("暂存选中图片")
-            self.rescan_all_button.setText("重新扫描全部导入目录")
-            self.clean_orphan_thumbnails_button.setText("清理孤立缩略图")
-            self.open_data_dir_button.setText("打开数据目录")
+            self.rescan_all_button.setText("扫描全部")
+            self.rescan_new_button.setText("扫描新增")
+            self.rescan_missing_button.setText("扫描缺失")
+            self.clean_missing_index_button.setText("清理丢失")
+            self.clean_orphan_thumbnails_button.setText("清理缩略图")
+            self.run_performance_check_button.setText("性能压测")
+            self.export_library_button.setText("导出图库")
+            self.export_selection_button.setText("导出选中")
+            self.open_data_dir_button.setText("打开数据")
             self.backup_database_button.setText("备份数据库")
-            self.run_self_check_button.setText("运行启动自检")
-            self.show_error_log_button.setText("查看错误日志")
+            self.restore_database_button.setText("恢复数据库")
+            self.run_self_check_button.setText("启动自检")
+            self.show_error_log_button.setText("错误日志")
+            self.path_remap_new_input.setPlaceholderText("选择移动后的新根目录")
+            self.refresh_path_candidates_button.setText("刷新")
+            self.choose_remap_new_path_button.setText("选择")
+            self.apply_path_remap_button.setText("应用重映射")
             self.right_tab_widget.setTabText(0, "详情")
             self.right_tab_widget.setTabText(1, "AI")
             self.right_tab_widget.setTabText(2, "筛选")
@@ -1241,7 +1584,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"重新扫描全部导入目录：{len(folders)} 个")
         self.add_folder_button.setEnabled(False)
         self.rescan_button.setEnabled(False)
-        self.rescan_all_button.setEnabled(False)
+        self._set_maintenance_controls_enabled(False)
+        self.settings_status_label.setText(f"正在重新扫描全部导入目录：{len(folders)} 个")
 
         def run() -> None:
             results: list[ScanResult] = []
@@ -1253,6 +1597,70 @@ class MainWindow(QMainWindow):
                 self.events.put(("error", f"重新扫描全部导入目录失败：{exc}"))
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _rescan_new_or_changed_folders(self) -> None:
+        folders = self.store.list_folders()
+        if not folders:
+            self.statusBar().showMessage("没有可扫描的导入目录")
+            return
+        self.statusBar().showMessage(f"扫描新增/变化：{len(folders)} 个目录")
+        self.add_folder_button.setEnabled(False)
+        self.rescan_button.setEnabled(False)
+        self._set_maintenance_controls_enabled(False)
+        self.settings_status_label.setText("正在扫描新增/变化；不会标记丢失文件。")
+
+        def run() -> None:
+            results: list[ScanResult] = []
+            try:
+                for folder in folders:
+                    results.append(self.scanner.scan_folder_new_only(folder.folder_path))
+                self.events.put(("scan_new_done", results))
+            except Exception as exc:
+                self.events.put(("error", f"扫描新增/变化失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _rescan_missing_folders(self) -> None:
+        folders = self.store.folders_with_missing_images()
+        if not folders:
+            self.statusBar().showMessage("没有包含丢失文件的导入目录")
+            return
+        self.statusBar().showMessage(f"扫描缺失所在目录：{len(folders)} 个")
+        self.add_folder_button.setEnabled(False)
+        self.rescan_button.setEnabled(False)
+        self._set_maintenance_controls_enabled(False)
+        self.settings_status_label.setText(f"正在重新扫描 {len(folders)} 个包含丢失文件的目录...")
+
+        def run() -> None:
+            results: list[ScanResult] = []
+            try:
+                for folder in folders:
+                    results.append(self.scanner.scan_folder(folder.folder_path))
+                self.events.put(("scan_missing_done", results))
+            except Exception as exc:
+                self.events.put(("error", f"扫描缺失所在目录失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _clean_missing_index(self) -> None:
+        missing_count = self.store.count_missing_images()
+        if missing_count == 0:
+            self.statusBar().showMessage("没有丢失索引可清理")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "清理丢失索引",
+            f"将从 Eidory 中移除 {missing_count} 个丢失文件记录，不删除硬盘源文件。继续？",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        thumbnail_paths, removed = self.store.remove_missing_images_from_library()
+        self._delete_thumbnail_files(thumbnail_paths)
+        self.vector_index.invalidate()
+        self._refresh_after_database_change()
+        message = f"已清理 {removed} 个丢失索引"
+        self.settings_status_label.setText(message)
+        self.statusBar().showMessage(message)
 
     def _clean_orphan_thumbnails(self) -> None:
         thumbnail_root = self.paths.thumbnail_dir
@@ -1271,7 +1679,132 @@ class MainWindow(QMainWindow):
                 removed += 1
             except Exception as exc:
                 self._record_error(f"清理孤立缩略图失败：{path}: {exc}")
-        self.statusBar().showMessage(f"已清理 {removed} 个孤立缩略图")
+        message = f"已清理 {removed} 个孤立缩略图"
+        self.settings_status_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _run_performance_check(self) -> None:
+        self.run_performance_check_button.setEnabled(False)
+        self.settings_status_label.setText("正在性能压测...")
+        self.statusBar().showMessage("正在性能压测")
+
+        def run() -> None:
+            try:
+                report = self._build_performance_report()
+                self.events.put(("performance_done", report))
+            except Exception as exc:
+                self.events.put(("error", f"性能压测失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _build_performance_report(self) -> str:
+        total_started = time.perf_counter()
+        image_count = self.store.count_images()
+
+        started = time.perf_counter()
+        first_page = self.store.list_images(
+            limit=500,
+            sort_key=self._database_sort_key(),
+            sort_desc=self.current_sort_desc,
+        )
+        first_page_ms = (time.perf_counter() - started) * 1000
+
+        started = time.perf_counter()
+        sample = self.store.list_images(limit=5_000)
+        sample_ms = (time.perf_counter() - started) * 1000
+
+        started = time.perf_counter()
+        image_ids, matrix = self.store.embeddings_for_model(
+            model_name=self.embedding_provider.model_name,
+            model_revision=self.embedding_provider.model_revision,
+            embedding_dim=self.embedding_provider.dim,
+        )
+        vector_load_ms = (time.perf_counter() - started) * 1000
+
+        vector_search_ms: float | None = None
+        if matrix.shape[0] > 0:
+            started = time.perf_counter()
+            normalized = matrix.astype(np.float32, copy=False)
+            norms = np.linalg.norm(normalized, axis=1, keepdims=True)
+            norms[norms == 0] = 1
+            normalized = normalized / norms
+            query = normalized[0]
+            scores = normalized @ query
+            top_k = min(500, scores.shape[0])
+            if top_k > 0:
+                np.argpartition(-scores, top_k - 1)[:top_k]
+            vector_search_ms = (time.perf_counter() - started) * 1000
+
+        total_ms = (time.perf_counter() - total_started) * 1000
+        search_line = (
+            f"NumPy 精确检索 top500：{vector_search_ms:.1f} ms"
+            if vector_search_ms is not None
+            else "NumPy 精确检索：无可用 embedding"
+        )
+        return (
+            "性能压测完成\n"
+            f"图片记录：{image_count}\n"
+            f"首屏列表 500 条：{first_page_ms:.1f} ms / 返回 {len(first_page)}\n"
+            f"样本列表 5000 条：{sample_ms:.1f} ms / 返回 {len(sample)}\n"
+            f"向量加载：{vector_load_ms:.1f} ms / {len(image_ids)} 条\n"
+            f"{search_line}\n"
+            f"总耗时：{total_ms:.1f} ms"
+        )
+
+    def _export_library(self) -> None:
+        target_dir = QFileDialog.getExistingDirectory(self, "选择图库导出位置")
+        if not target_dir:
+            return
+        self._set_export_controls_enabled(False)
+        self.settings_status_label.setText("正在导出图库...")
+        self.statusBar().showMessage("正在导出图库")
+
+        def run() -> None:
+            try:
+                result = export_library_to_directory(self.store, Path(target_dir))
+                self.events.put(("export_done", ("图库导出", result)))
+            except Exception as exc:
+                self.events.put(("error", f"导出图库失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _export_selected_images(self) -> None:
+        images = self._selected_grid_images()
+        if not images:
+            self.statusBar().showMessage("没有选中图片")
+            return
+        target_dir = QFileDialog.getExistingDirectory(self, "选择图片导出位置")
+        if not target_dir:
+            return
+        self._set_export_controls_enabled(False)
+        self.settings_status_label.setText(f"正在导出选中图片：{len(images)} 个...")
+        self.statusBar().showMessage("正在导出选中图片")
+
+        def run() -> None:
+            try:
+                result = export_images_to_directory(images, Path(target_dir))
+                self.events.put(("export_done", ("选中图片导出", result)))
+            except Exception as exc:
+                self.events.put(("error", f"导出选中图片失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _set_export_controls_enabled(self, enabled: bool) -> None:
+        self.export_library_button.setEnabled(enabled)
+        self.export_selection_button.setEnabled(enabled and bool(self._selected_grid_images()))
+
+    def _handle_export_done(self, payload: object) -> None:
+        label, result = payload
+        if not isinstance(result, ExportResult):
+            return
+        self._set_export_controls_enabled(True)
+        message = (
+            f"{label}完成：复制 {result.copied}，"
+            f"跳过缺失 {result.skipped_missing}，失败 {result.failed}，"
+            f"目录 {result.directories}。位置：{result.target_dir}"
+        )
+        self.settings_status_label.setText(message)
+        self.statusBar().showMessage(message)
 
     def _start_import(
         self,
@@ -1348,8 +1881,7 @@ class MainWindow(QMainWindow):
         search_filter = self._search_filter_from_controls()
         if search_filter is None:
             return
-        self._add_search_filter(search_filter)
-        self._execute_search_chain()
+        self._start_search_with_filter(search_filter)
 
     def _generate_inspiration_terms_from_panel(self) -> None:
         brief = self.inspiration_brief_input.toPlainText().strip()
@@ -1685,8 +2217,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(reason)
             return
         assert image is not None
-        self._add_search_filter(SearchFilter("similar", image.id))
-        self._execute_search_chain()
+        self._start_search_with_filter(SearchFilter("similar", image.id))
 
     def _similar_image_blocking_reason(
         self,
@@ -1716,8 +2247,7 @@ class MainWindow(QMainWindow):
         if not value:
             self.statusBar().showMessage("请选择文件类型")
             return
-        self._add_search_filter(SearchFilter("file_type", str(value)))
-        self._execute_search_chain()
+        self._start_search_with_filter(SearchFilter("file_type", str(value)))
 
     def _add_dimension_filter_from_controls(self) -> None:
         value = self.dimension_filter_combo.currentData()
@@ -1728,8 +2258,7 @@ class MainWindow(QMainWindow):
         if kind not in {"orientation", "size"} or not filter_value:
             self.statusBar().showMessage("未知的尺寸筛选条件")
             return
-        self._add_search_filter(SearchFilter(kind, filter_value))
-        self._execute_search_chain()
+        self._start_search_with_filter(SearchFilter(kind, filter_value))
 
     def _save_current_view(self) -> None:
         name, ok = QInputDialog.getText(
@@ -1824,15 +2353,37 @@ class MainWindow(QMainWindow):
             return SearchFilter("semantic", query)
         return SearchFilter("keyword", query)
 
-    def _add_search_filter(self, search_filter: SearchFilter) -> None:
-        if self.search_filters and self.search_filters[-1].kind == search_filter.kind:
+    def _selected_search_operation_mode(self) -> str:
+        if self.search_merge_results_button.isChecked():
+            return "merge"
+        if self.search_replace_results_button.isChecked():
+            return "replace"
+        return "refine"
+
+    def _start_search_with_filter(self, search_filter: SearchFilter) -> None:
+        operation_mode = self._selected_search_operation_mode()
+        if operation_mode in {"merge", "replace"}:
+            self.search_filters.clear()
+        self._add_search_filter(
+            search_filter,
+            replace_same_kind=operation_mode == "replace",
+        )
+        self._execute_search_chain(operation_mode=operation_mode)
+
+    def _add_search_filter(
+        self,
+        search_filter: SearchFilter,
+        *,
+        replace_same_kind: bool = True,
+    ) -> None:
+        if replace_same_kind and self.search_filters and self.search_filters[-1].kind == search_filter.kind:
             self.search_filters[-1] = search_filter
         else:
             self.search_filters.append(search_filter)
         self._sync_legacy_search_state_from_filters()
         self._refresh_filter_chain_ui()
 
-    def _execute_search_chain(self) -> None:
+    def _execute_search_chain(self, operation_mode: str = "refine") -> None:
         if not self.search_filters:
             self._reload_images()
             return
@@ -1845,7 +2396,7 @@ class MainWindow(QMainWindow):
         tag_ids = self._selected_tag_ids()
         tag_match_mode = self._selected_tag_match_mode()
         status_filter = self._selected_status_filter()
-        base_image_ids, base_label = self._search_chain_base_context()
+        base_image_ids, base_label, merge_base_images = self._search_operation_context(operation_mode)
 
         self.current_result_mode = "search_chain"
         self.current_offset = 0
@@ -1856,6 +2407,7 @@ class MainWindow(QMainWindow):
         self.current_chain_result = SearchChainResult(images=[])
         self.current_chain_base_image_ids = base_image_ids
         self.current_chain_base_label = base_label
+        self.current_chain_operation_mode = operation_mode
         base_prefix = f"{base_label} ｜ " if base_label else ""
         self._set_result_status(f"筛选中：{base_prefix}{self._format_filter_chain(filters)}")
         self.search_diagnostics_label.setText("搜索诊断：-")
@@ -1872,6 +2424,7 @@ class MainWindow(QMainWindow):
                     tag_match_mode=tag_match_mode,
                     status_filter=status_filter,
                     base_image_ids=base_image_ids,
+                    merge_base_images=merge_base_images,
                 )
                 self.events.put(("search_chain_done", (revision, filters, result)))
             except Exception as exc:
@@ -1890,6 +2443,30 @@ class MainWindow(QMainWindow):
             return set(self.current_chain_base_image_ids), self.current_chain_base_label
         return None, None
 
+    def _search_operation_context(
+        self,
+        operation_mode: str,
+    ) -> tuple[set[int] | None, str | None, list[ImageItem] | None]:
+        if operation_mode == "recompute":
+            base_image_ids, base_label = self._search_chain_base_context()
+            return base_image_ids, base_label, None
+
+        if operation_mode == "replace":
+            self._clear_result_management_state()
+            return None, None, None
+
+        visible_images = list(self.grid_view.images()) if self._has_visible_result_context() else []
+        if operation_mode == "merge":
+            if visible_images:
+                return None, "合并当前结果", visible_images
+            return None, None, None
+
+        if visible_images:
+            return {image.id for image in visible_images}, "在当前结果中", None
+
+        base_image_ids, base_label = self._search_chain_base_context()
+        return base_image_ids, base_label, None
+
     def _compute_search_chain(
         self,
         *,
@@ -1900,6 +2477,7 @@ class MainWindow(QMainWindow):
         tag_match_mode: str,
         status_filter: str | None,
         base_image_ids: set[int] | None = None,
+        merge_base_images: list[ImageItem] | None = None,
     ) -> SearchChainResult:
         images: list[ImageItem] = (
             self.store.images_by_ids(sorted(base_image_ids))
@@ -2020,6 +2598,9 @@ class MainWindow(QMainWindow):
             if not allowed_image_ids:
                 break
 
+        if merge_base_images:
+            images = self._merge_search_result_images(merge_base_images, images)
+
         return SearchChainResult(
             images=images,
             semantic_searchable_count=semantic_searchable_count,
@@ -2030,6 +2611,20 @@ class MainWindow(QMainWindow):
             color_indexed_count=color_indexed_count,
             color_candidate_limit=color_candidate_limit,
         )
+
+    @staticmethod
+    def _merge_search_result_images(
+        base_images: list[ImageItem],
+        new_images: list[ImageItem],
+    ) -> list[ImageItem]:
+        merged: list[ImageItem] = []
+        seen: set[int] = set()
+        for image in [*base_images, *new_images]:
+            if image.id in seen:
+                continue
+            seen.add(image.id)
+            merged.append(image)
+        return merged
 
     def _list_chain_base_images(
         self,
@@ -2199,11 +2794,12 @@ class MainWindow(QMainWindow):
     def _set_inspiration_result_status(self, images: list[ImageItem]) -> None:
         source_count = len(self.current_inspiration_images)
         term_titles = "、".join(term.title for term in self.current_inspiration_terms)
+        suffix = self._result_management_status_suffix()
         if len(images) == source_count:
-            self._set_result_status(f"灵感项目结果：{len(images)} 张 ｜ {term_titles}")
+            self._set_result_status(f"灵感项目结果：{len(images)} 张 ｜ {term_titles}{suffix}")
         else:
             self._set_result_status(
-                f"灵感项目结果：{len(images)} / 原始 {source_count} ｜ {term_titles}"
+                f"灵感项目结果：{len(images)} / 原始 {source_count} ｜ {term_titles}{suffix}"
             )
 
     def _apply_inspiration_result_filters(self) -> None:
@@ -2221,9 +2817,8 @@ class MainWindow(QMainWindow):
                 *self._inspiration_coverage_images(images),
                 *passing,
             ])
-        self.current_inspiration_filtered_images = self._sort_images(
-            self._apply_sidebar_filters(filtered)
-        )
+        filtered = self._apply_result_management_filters(self._apply_sidebar_filters(filtered))
+        self.current_inspiration_filtered_images = self._sort_images(filtered)
 
     def _inspiration_coverage_images(self, images: list[ImageItem]) -> list[ImageItem]:
         coverage: list[ImageItem] = []
@@ -2291,7 +2886,8 @@ class MainWindow(QMainWindow):
                 for image in images
                 if image.score is not None and image.score >= threshold
             ]
-        self.current_chain_filtered_images = self._sort_images(self._apply_sidebar_filters(images))
+        images = self._apply_result_management_filters(self._apply_sidebar_filters(images))
+        self.current_chain_filtered_images = self._sort_images(images)
 
     def _active_score_threshold(self, images: list[ImageItem]) -> float | None:
         score_kind = last_score_filter_kind(self.search_filters)
@@ -2309,10 +2905,11 @@ class MainWindow(QMainWindow):
         source_count = len(self.current_chain_images)
         chain = self._format_filter_chain(filters)
         base_prefix = f"{self.current_chain_base_label} ｜ " if self.current_chain_base_label else ""
+        suffix = self._result_management_status_suffix()
         if len(images) == source_count:
-            self._set_result_status(f"筛选结果：{base_prefix}{len(images)} ｜ {chain}")
+            self._set_result_status(f"筛选结果：{base_prefix}{len(images)} ｜ {chain}{suffix}")
         else:
-            self._set_result_status(f"筛选结果：{base_prefix}{len(images)} / 原始 {source_count} ｜ {chain}")
+            self._set_result_status(f"筛选结果：{base_prefix}{len(images)} / 原始 {source_count} ｜ {chain}{suffix}")
 
     def _update_search_chain_diagnostics(
         self,
@@ -2425,9 +3022,24 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda _checked=False, action=callback: action())
             self.filter_chain_layout.addWidget(button)
 
+        for label, callback in self._result_management_filter_actions():
+            has_filter = True
+            button = QPushButton(f"× {label}")
+            button.setToolTip("移除此结果管理条件")
+            button.clicked.connect(lambda _checked=False, action=callback: action())
+            self.filter_chain_layout.addWidget(button)
+
         if not has_filter:
             self.filter_chain_layout.addWidget(QLabel("无"))
         self.filter_chain_layout.addStretch(1)
+        self._refresh_result_management_buttons()
+
+    def _refresh_result_management_buttons(self) -> None:
+        if not hasattr(self, "save_result_set_button"):
+            return
+        has_result_context = self._has_result_context()
+        has_visible_results = bool(self.grid_view.images()) if hasattr(self, "grid_view") else False
+        self.save_result_set_button.setEnabled(has_result_context and has_visible_results)
 
     def _remove_search_filter(self, index: int) -> None:
         if index < 0 or index >= len(self.search_filters):
@@ -2436,7 +3048,7 @@ class MainWindow(QMainWindow):
         self._sync_legacy_search_state_from_filters()
         self._refresh_filter_chain_ui()
         if self.search_filters:
-            self._execute_search_chain()
+            self._execute_search_chain(operation_mode="recompute")
         else:
             self._reload_images()
 
@@ -2460,6 +3072,17 @@ class MainWindow(QMainWindow):
             actions.append((f"状态：{status_item.text()}", self._clear_status_filter))
         return actions
 
+    def _result_management_filter_actions(self) -> list[tuple[str, object]]:
+        actions: list[tuple[str, object]] = []
+        if self.result_excluded_image_ids:
+            actions.append((f"结果排除：{len(self.result_excluded_image_ids)} 张", self._clear_result_exclusions))
+        return actions
+
+    def _clear_result_exclusions(self) -> None:
+        self.result_excluded_image_ids.clear()
+        self._refresh_filter_chain_ui()
+        self._refresh_current_results_for_filters()
+
     def _clear_collection_filter(self) -> None:
         item = self.collection_tree.topLevelItem(0)
         if item is not None:
@@ -2479,6 +3102,7 @@ class MainWindow(QMainWindow):
 
     def _reload_images(self) -> None:
         self.current_offset = 0
+        self._clear_result_management_state()
         self._clear_temporary_project_selection()
         self.search_filters.clear()
         self.current_keyword_query = None
@@ -2504,6 +3128,7 @@ class MainWindow(QMainWindow):
         self.current_chain_result = SearchChainResult(images=[])
         self.current_chain_base_image_ids = None
         self.current_chain_base_label = None
+        self.current_chain_operation_mode = "replace"
         self.load_more_button.setEnabled(True)
         images = self.store.list_images(
             status_filter=self._selected_status_filter(),
@@ -2557,6 +3182,7 @@ class MainWindow(QMainWindow):
 
     def _clear_search(self) -> None:
         self.semantic_search_revision += 1
+        self._clear_result_management_state()
         self.search_filters.clear()
         self.current_semantic_filtered_images = []
         self.current_semantic_searchable_count = 0
@@ -2580,6 +3206,7 @@ class MainWindow(QMainWindow):
         self.current_chain_result = SearchChainResult(images=[])
         self.current_chain_base_image_ids = None
         self.current_chain_base_label = None
+        self.current_chain_operation_mode = "replace"
         self.search_input.clear()
         self.search_button.setEnabled(True)
         self._refresh_filter_chain_ui()
@@ -2628,8 +3255,9 @@ class MainWindow(QMainWindow):
                 sort_desc=self.current_sort_desc,
             )
             self.current_offset = 0
+            images = self._apply_result_management_filters(images)
             self.grid_view.set_images(images)
-            self._set_result_status(f"关键词结果：{len(images)}")
+            self._set_result_status(f"关键词结果：{len(images)}{self._result_management_status_suffix()}")
             return
 
         if self.current_result_mode == "inspiration" and self.current_inspiration_terms:
@@ -2640,7 +3268,10 @@ class MainWindow(QMainWindow):
             return
 
         if self.current_result_mode == "temp_project":
-            images = self._sort_images(self._apply_sidebar_filters(self.current_temp_project_images))
+            images = self._apply_result_management_filters(
+                self._apply_sidebar_filters(self.current_temp_project_images)
+            )
+            images = self._sort_images(images)
             self.grid_view.set_images(images, badges_by_image_id=self.current_temp_project_badges)
             project = (
                 self.store.get_temporary_project(self.current_temp_project_id)
@@ -2649,7 +3280,9 @@ class MainWindow(QMainWindow):
             )
             name = project.name if project is not None else "灵感暂存"
             suffix = f" ｜ {project.summary}" if project is not None and project.summary else ""
-            self._set_result_status(f"灵感暂存：{name} ｜ {len(images)} 张{suffix}")
+            self._set_result_status(
+                f"灵感暂存：{name} ｜ {len(images)} 张{suffix}{self._result_management_status_suffix()}"
+            )
             return
 
         self._reload_images()
@@ -2657,6 +3290,25 @@ class MainWindow(QMainWindow):
     def _set_result_status(self, message: str) -> None:
         self.result_state_label.setText(message)
         self.statusBar().showMessage(message)
+        self._refresh_result_management_buttons()
+
+    def _shuffle_current_grid_images(self) -> None:
+        images = self.grid_view.images()
+        if len(images) <= 1:
+            self.statusBar().showMessage("当前没有足够的图片可打乱")
+            return
+        random.shuffle(images)
+        self.grid_view.set_images(
+            images,
+            badges_by_image_id=self._current_grid_badges_by_image_id(),
+        )
+        self.statusBar().showMessage(f"已打乱当前显示的 {len(images)} 张图片")
+
+    def _current_grid_badges_by_image_id(self) -> dict[int, list[str]]:
+        return {
+            image_id: list(badges)
+            for image_id, badges in getattr(self.grid_view, "_badges_by_image_id", {}).items()
+        }
 
     def _selected_grid_image(self) -> ImageItem | None:
         return self.grid_view.current_image() or self.selected_image
@@ -2708,14 +3360,24 @@ class MainWindow(QMainWindow):
             return
         count = len(self._selected_grid_images())
         self.save_temp_project_button.setEnabled(count > 0)
+        if hasattr(self, "export_selection_button"):
+            self.export_selection_button.setEnabled(count > 0)
         if self.current_language == "en":
             self.save_temp_project_button.setText(
                 f"Save {count} Selected" if count else "Save Selected"
             )
+            if hasattr(self, "export_selection_button"):
+                self.export_selection_button.setText(
+                    f"Export {count}" if count else "Export Selected"
+                )
         else:
             self.save_temp_project_button.setText(
                 f"暂存选中 {count} 张" if count else "暂存选中图片"
             )
+            if hasattr(self, "export_selection_button"):
+                self.export_selection_button.setText(
+                    f"导出 {count} 张" if count else "导出选中"
+                )
 
     def _save_selected_images_as_temporary_project(self) -> None:
         images = self._selected_grid_images()
@@ -2757,6 +3419,66 @@ class MainWindow(QMainWindow):
             images=images,
             can_rename=clean_name == default_name,
         )
+
+    def _save_current_visible_results_as_temporary_project(self) -> None:
+        images = self.grid_view.images()
+        if not images:
+            self.statusBar().showMessage("当前没有可暂存的结果")
+            return
+        default_name = self._suggest_current_result_set_name(images)
+        name, ok = QInputDialog.getText(
+            self,
+            "暂存当前结果集",
+            f"项目名称（当前结果 {len(images)} 张）：",
+            QLineEdit.EchoMode.Normal,
+            default_name,
+        )
+        if not ok:
+            return
+        clean_name = name.strip()
+        if not clean_name:
+            self.statusBar().showMessage("项目名称不能为空")
+            return
+        project_id = self.store.create_temporary_project(
+            clean_name,
+            [image.id for image in images],
+        )
+        intent_labels, intent_queries = self._temporary_project_intents_for_images(images)
+        if intent_labels or intent_queries:
+            self.store.add_images_to_temporary_project(
+                project_id,
+                [image.id for image in images],
+                intent_labels=intent_labels,
+                intent_queries=intent_queries,
+            )
+        self._refresh_temporary_projects(select_project_id=project_id)
+        self.statusBar().showMessage(f"已暂存当前结果集 {len(images)} 张到“{clean_name}”")
+
+    def _suggest_current_result_set_name(self, images: list[ImageItem]) -> str:
+        if self.current_result_mode == "temp_project" and self.current_temp_project_id is not None:
+            project = self.store.get_temporary_project(self.current_temp_project_id)
+            if project is not None:
+                return f"{project.name} 结果"
+        if self.current_result_mode == "inspiration" and self.current_inspiration_terms:
+            return " / ".join(term.title for term in self.current_inspiration_terms[:2])[:28]
+        if self.search_filters:
+            return self._format_filter_chain(self.search_filters[:2])[:28]
+        return f"结果集 {len(images)} 张"
+
+    def _exclude_selection_from_results(self) -> None:
+        images = self._selected_grid_images()
+        if not images:
+            self.statusBar().showMessage("没有选中图片")
+            return
+        if not self._has_result_context():
+            self.statusBar().showMessage("当前不是搜索或暂存结果")
+            return
+        before = len(self.result_excluded_image_ids)
+        self.result_excluded_image_ids.update(image.id for image in images)
+        added = len(self.result_excluded_image_ids) - before
+        self._refresh_filter_chain_ui()
+        self._refresh_current_results_for_filters()
+        self.statusBar().showMessage(f"已从当前结果排除 {added} 张")
 
     def _add_selection_to_temporary_project(self, project_id: int) -> None:
         images = self._selected_grid_images()
@@ -3222,6 +3944,8 @@ class MainWindow(QMainWindow):
         add_tags_action = menu.addAction("批量添加标签")
         clear_tags_action = menu.addAction("清除选中图片标签")
         save_temp_action = menu.addAction("暂存选中图片")
+        export_selection_action = menu.addAction("导出选中图片")
+        save_result_set_action = menu.addAction("暂存当前结果集")
         group_selection_action = menu.addAction("AI 分组选中图片")
         temp_project_menu = menu.addMenu("加入已有灵感暂存")
         temp_project_actions: dict[object, int] = {}
@@ -3235,30 +3959,36 @@ class MainWindow(QMainWindow):
         add_to_collection_action = menu.addAction("添加到文件夹")
         move_to_collection_action = menu.addAction("移动到文件夹")
         remove_from_collection_action = menu.addAction("从当前文件夹移出")
+        exclude_from_results_action = menu.addAction("从当前结果排除选中")
         rebuild_thumbnails_action = menu.addAction("重建缩略图")
         remove_index_action = menu.addAction("从图库移除索引")
         has_selection = bool(selected_images)
+        has_visible_results = bool(self.grid_view.images())
+        has_result_context = self._has_result_context()
         for batch_action in [
             favorite_action,
             unfavorite_action,
             add_tags_action,
             clear_tags_action,
             save_temp_action,
-            group_selection_action,
+            export_selection_action,
             remove_from_temp_action,
             add_to_collection_action,
             move_to_collection_action,
             remove_from_collection_action,
+            exclude_from_results_action,
             rebuild_thumbnails_action,
             remove_index_action,
         ]:
             batch_action.setEnabled(has_selection)
+        save_result_set_action.setEnabled(has_visible_results and has_result_context)
         group_selection_action.setEnabled(len(selected_images) >= 4)
         temp_project_menu.setEnabled(has_selection and bool(temp_project_actions))
         remove_from_temp_action.setEnabled(has_selection and self.current_result_mode == "temp_project")
         has_current_collection = self._selected_collection_id() is not None
         move_to_collection_action.setEnabled(has_selection and has_current_collection)
         remove_from_collection_action.setEnabled(has_selection and has_current_collection)
+        exclude_from_results_action.setEnabled(has_selection and has_result_context)
 
         action = menu.exec(global_position)
         if action == preview_action:
@@ -3281,6 +4011,10 @@ class MainWindow(QMainWindow):
             self._batch_clear_tags()
         elif action == save_temp_action:
             self._save_selected_images_as_temporary_project()
+        elif action == export_selection_action:
+            self._export_selected_images()
+        elif action == save_result_set_action:
+            self._save_current_visible_results_as_temporary_project()
         elif action == group_selection_action:
             self._group_selected_images_with_ai()
         elif action in temp_project_actions:
@@ -3293,6 +4027,8 @@ class MainWindow(QMainWindow):
             self._move_selection_to_collection_dialog()
         elif action == remove_from_collection_action:
             self._remove_selection_from_current_collection()
+        elif action == exclude_from_results_action:
+            self._exclude_selection_from_results()
         elif action == rebuild_thumbnails_action:
             self._batch_rebuild_thumbnails()
         elif action == remove_index_action:
@@ -4336,6 +5072,10 @@ class MainWindow(QMainWindow):
                 self._handle_scan_done(payload)
             elif kind == "scan_all_done":
                 self._handle_scan_all_done(payload)
+            elif kind == "scan_new_done":
+                self._handle_scan_new_done(payload)
+            elif kind == "scan_missing_done":
+                self._handle_scan_missing_done(payload)
             elif kind == "import_done":
                 result, collection_id, collection_name, assigned, preserve_structure = payload
                 self._handle_import_done(
@@ -4414,6 +5154,12 @@ class MainWindow(QMainWindow):
                 self._create_reference_group_projects(payload, confirm=True)
             elif kind == "self_check_done":
                 self._handle_self_check_done(payload)
+            elif kind == "path_remap_done":
+                self._handle_path_remap_done(payload)
+            elif kind == "performance_done":
+                self._handle_performance_done(payload)
+            elif kind == "export_done":
+                self._handle_export_done(payload)
             elif kind == "embedding":
                 self._handle_embedding_progress(payload)
             elif kind == "error":
@@ -4423,17 +5169,20 @@ class MainWindow(QMainWindow):
                 self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
                 self.add_folder_button.setEnabled(True)
                 self.rescan_button.setEnabled(True)
-                self.rescan_all_button.setEnabled(True)
+                self._set_maintenance_controls_enabled(True)
+                if hasattr(self, "export_library_button"):
+                    self._set_export_controls_enabled(True)
                 QMessageBox.critical(self, "Eidory", str(payload))
 
     def _handle_scan_done(self, result: ScanResult) -> None:
         self.add_folder_button.setEnabled(True)
         self.rescan_button.setEnabled(True)
-        self.rescan_all_button.setEnabled(True)
+        self._set_maintenance_controls_enabled(True)
         self._refresh_folders()
         self._refresh_collections()
         self._reload_images()
         self._refresh_embedding_stats()
+        self._refresh_path_remap_candidates()
         self.statusBar().showMessage(
             f"扫描完成：新增 {result.new_files}，变化 {result.changed_files}，丢失 {result.missing_marked}"
         )
@@ -4441,18 +5190,65 @@ class MainWindow(QMainWindow):
     def _handle_scan_all_done(self, results: list[ScanResult]) -> None:
         self.add_folder_button.setEnabled(True)
         self.rescan_button.setEnabled(True)
-        self.rescan_all_button.setEnabled(True)
+        self._set_maintenance_controls_enabled(True)
         self._refresh_folders()
         self._refresh_collections()
         self._reload_images()
         self._refresh_embedding_stats()
+        self._refresh_path_remap_candidates()
         scanned = sum(result.scanned_files for result in results)
         new_files = sum(result.new_files for result in results)
         changed_files = sum(result.changed_files for result in results)
         missing = sum(result.missing_marked for result in results)
-        self.statusBar().showMessage(
-            f"全部重新扫描完成：目录 {len(results)}，扫描 {scanned}，新增 {new_files}，变化 {changed_files}，丢失 {missing}"
+        message = (
+            f"全部重新扫描完成：目录 {len(results)}，扫描 {scanned}，"
+            f"新增 {new_files}，变化 {changed_files}，丢失 {missing}"
         )
+        self.settings_status_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _handle_scan_new_done(self, results: list[ScanResult]) -> None:
+        self.add_folder_button.setEnabled(True)
+        self.rescan_button.setEnabled(True)
+        self._set_maintenance_controls_enabled(True)
+        self._refresh_folders()
+        self._refresh_collections()
+        self._reload_images()
+        self._refresh_embedding_stats()
+        self._refresh_path_remap_candidates()
+        scanned = sum(result.scanned_files for result in results)
+        new_files = sum(result.new_files for result in results)
+        changed_files = sum(result.changed_files for result in results)
+        message = (
+            f"扫描新增/变化完成：目录 {len(results)}，扫描 {scanned}，"
+            f"新增 {new_files}，变化 {changed_files}，未标记丢失"
+        )
+        self.settings_status_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _handle_scan_missing_done(self, results: list[ScanResult]) -> None:
+        self.add_folder_button.setEnabled(True)
+        self.rescan_button.setEnabled(True)
+        self._set_maintenance_controls_enabled(True)
+        self._refresh_folders()
+        self._refresh_collections()
+        self._reload_images()
+        self._refresh_embedding_stats()
+        self._refresh_path_remap_candidates()
+        scanned = sum(result.scanned_files for result in results)
+        recovered = sum(result.changed_files for result in results)
+        missing = sum(result.missing_marked for result in results)
+        message = (
+            f"扫描缺失所在目录完成：目录 {len(results)}，扫描 {scanned}，"
+            f"恢复/变化 {recovered}，新标记丢失 {missing}"
+        )
+        self.settings_status_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _handle_performance_done(self, report: str) -> None:
+        self.run_performance_check_button.setEnabled(True)
+        self.settings_status_label.setText(report)
+        self.statusBar().showMessage("性能压测完成")
 
     def _handle_import_done(
         self,
@@ -4660,6 +5456,7 @@ class MainWindow(QMainWindow):
         images = self.store.images_by_ids(image_ids)
         badges = self.store.temporary_project_image_badges(project_id)
         self.semantic_search_revision += 1
+        self._clear_result_management_state()
         self.search_filters.clear()
         self.current_keyword_query = None
         self.current_semantic_query = None
@@ -4677,6 +5474,7 @@ class MainWindow(QMainWindow):
         self.current_chain_result = SearchChainResult(images=[])
         self.current_chain_base_image_ids = None
         self.current_chain_base_label = None
+        self.current_chain_operation_mode = "replace"
         self.current_offset = 0
         self.load_more_button.setEnabled(False)
         self._refresh_filter_chain_ui()
@@ -5361,7 +6159,10 @@ class MainWindow(QMainWindow):
             self._update_search_chain_diagnostics(tuple(self.search_filters), images)
             return
         if self.current_result_mode == "temp_project":
-            images = self._sort_images(self.current_temp_project_images)
+            images = self._apply_result_management_filters(
+                self._apply_sidebar_filters(self.current_temp_project_images)
+            )
+            images = self._sort_images(images)
             self.grid_view.set_images(images, badges_by_image_id=self.current_temp_project_badges)
             project = (
                 self.store.get_temporary_project(self.current_temp_project_id)
@@ -5370,7 +6171,9 @@ class MainWindow(QMainWindow):
             )
             name = project.name if project is not None else "灵感暂存"
             suffix = f" ｜ {project.summary}" if project is not None and project.summary else ""
-            self._set_result_status(f"灵感暂存：{name} ｜ {len(images)} 张{suffix}")
+            self._set_result_status(
+                f"灵感暂存：{name} ｜ {len(images)} 张{suffix}{self._result_management_status_suffix()}"
+            )
             return
         self._refresh_current_results_for_filters()
 
@@ -5463,6 +6266,42 @@ class MainWindow(QMainWindow):
         self.color_mode_button.setChecked(True)
         self._run_search()
 
+    def _apply_result_management_filters(self, images: list[ImageItem]) -> list[ImageItem]:
+        return [
+            image
+            for image in images
+            if image.id not in self.result_excluded_image_ids
+        ]
+
+    def _result_management_status_suffix(self) -> str:
+        parts: list[str] = []
+        if self.result_excluded_image_ids:
+            parts.append(f"排除 {len(self.result_excluded_image_ids)}")
+        return "，" + "，".join(parts) if parts else ""
+
+    def _has_result_context(self) -> bool:
+        return self.current_result_mode in {
+            "semantic",
+            "color",
+            "search_chain",
+            "inspiration",
+            "temp_project",
+            "keyword",
+        } or bool(self.search_filters)
+
+    def _has_visible_result_context(self) -> bool:
+        return self.current_result_mode in {
+            "semantic",
+            "color",
+            "search_chain",
+            "inspiration",
+            "temp_project",
+            "keyword",
+        }
+
+    def _clear_result_management_state(self) -> None:
+        self.result_excluded_image_ids.clear()
+
     @staticmethod
     def _swatch_text_color(rgb: tuple[int, int, int]) -> str:
         red, green, blue = rgb
@@ -5521,7 +6360,8 @@ class MainWindow(QMainWindow):
                 for image in images
                 if image.score is not None and image.score >= threshold
             ]
-        self.current_semantic_filtered_images = self._sort_images(self._apply_sidebar_filters(images))
+        images = self._apply_result_management_filters(self._apply_sidebar_filters(images))
+        self.current_semantic_filtered_images = self._sort_images(images)
 
     def _apply_color_result_filters(self) -> None:
         threshold = self._color_score_threshold(self.current_color_images)
@@ -5532,7 +6372,8 @@ class MainWindow(QMainWindow):
                 for image in images
                 if image.score is not None and image.score >= threshold
             ]
-        self.current_color_filtered_images = self._sort_images(self._apply_sidebar_filters(images))
+        images = self._apply_result_management_filters(self._apply_sidebar_filters(images))
+        self.current_color_filtered_images = self._sort_images(images)
 
     def _set_semantic_result_status(self, images: list[ImageItem]) -> None:
         source_count = len(self.current_semantic_images)
@@ -5541,10 +6382,11 @@ class MainWindow(QMainWindow):
             if self.current_search_scope_count is None
             else f"，叠加范围 {self.current_search_scope_count}"
         )
+        suffix = self._result_management_status_suffix()
         if len(images) == source_count:
-            self._set_result_status(f"语义结果：{len(images)}{scope_text}")
+            self._set_result_status(f"语义结果：{len(images)}{scope_text}{suffix}")
         else:
-            self._set_result_status(f"语义结果：{len(images)} / 原始 {source_count}{scope_text}")
+            self._set_result_status(f"语义结果：{len(images)} / 原始 {source_count}{scope_text}{suffix}")
 
     def _set_color_result_status(self, images: list[ImageItem]) -> None:
         source_count = len(self.current_color_images)
@@ -5554,10 +6396,11 @@ class MainWindow(QMainWindow):
             if self.current_search_scope_count is None
             else f"，叠加范围 {self.current_search_scope_count}"
         )
+        suffix = self._result_management_status_suffix()
         if len(images) == source_count:
-            self._set_result_status(f"颜色结果 {color_hex}：{len(images)}{scope_text}")
+            self._set_result_status(f"颜色结果 {color_hex}：{len(images)}{scope_text}{suffix}")
         else:
-            self._set_result_status(f"颜色结果 {color_hex}：{len(images)} / 原始 {source_count}{scope_text}")
+            self._set_result_status(f"颜色结果 {color_hex}：{len(images)} / 原始 {source_count}{scope_text}{suffix}")
 
     def _update_search_diagnostics(self, images: list[ImageItem]) -> None:
         if self.current_result_mode != "semantic" or not images:

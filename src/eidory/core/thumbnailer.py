@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import shutil
 import subprocess
 from pathlib import Path
 
 from PIL import Image, ImageOps
 
 from eidory.core.image_loader import open_local_image
+from eidory.core.media_tools import find_media_tool
 
 
 class Thumbnailer:
@@ -31,7 +31,7 @@ class Thumbnailer:
         return output_path
 
     def generate_video(self, image_id: int, video_path: str) -> Path:
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = find_media_tool("ffmpeg")
         if ffmpeg is None:
             raise RuntimeError("ffmpeg not found; cannot generate video thumbnail")
 
@@ -68,7 +68,7 @@ class Thumbnailer:
 
     @staticmethod
     def _video_duration(video_path: str) -> float | None:
-        ffprobe = shutil.which("ffprobe")
+        ffprobe = find_media_tool("ffprobe")
         if ffprobe is None:
             return None
         command = [

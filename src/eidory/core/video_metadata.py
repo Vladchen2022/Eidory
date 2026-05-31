@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from dataclasses import dataclass
+
+from eidory.core.media_tools import find_media_tool
 
 
 @dataclass(frozen=True)
@@ -14,7 +15,7 @@ class VideoMetadata:
 
 
 def read_video_metadata(video_path: str) -> VideoMetadata:
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = find_media_tool("ffprobe")
     if ffprobe is None:
         return VideoMetadata()
     command = [

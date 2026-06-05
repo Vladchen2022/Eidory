@@ -9,15 +9,19 @@ import sqlite3
 import subprocess
 import threading
 import time
+import html as html_lib
 import json
+import mimetypes
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QSize, QStringListModel, Qt, QTimer, QUrl
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QPixmap, QTextOption
+from PySide6.QtCore import QFile, QBuffer, QIODevice, QSize, QStringListModel, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QImage, QKeySequence, QPixmap, QTextOption
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -73,8 +77,10 @@ from eidory.core.inspiration import (
 )
 from eidory.core.llm_provider import LMStudioProvider, LLMProviderError
 from eidory.core.media_types import (
+    SUPPORTED_MEDIA_EXTENSIONS,
     SUPPORTED_IMAGE_EXTENSIONS,
     SUPPORTED_VIDEO_EXTENSIONS,
+    is_supported_media,
     is_supported_video,
 )
 from eidory.core.media_tools import find_media_tool
@@ -250,6 +256,7 @@ class MainWindow(QMainWindow):
         self._applying_view_payload = False
         self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
         self.error_log_messages: list[str] = []
+        self._last_removal_undo: dict[str, object] | None = None
 
         self.setWindowTitle("Eidory")
         self.setStatusBar(QStatusBar())
@@ -270,6 +277,7 @@ class MainWindow(QMainWindow):
         self.poll_timer.start(250)
 
     def closeEvent(self, event) -> None:
+        self._clear_last_removal_undo(cleanup_backups=True)
         if self.embedding_worker is not None:
             self.embedding_worker.stop()
         if hasattr(self, "video_player"):
@@ -607,9 +615,8 @@ class MainWindow(QMainWindow):
         self.preview_stack.addWidget(self.preview_label)
         self.preview_stack.addWidget(self.video_widget)
 
-        self.file_name_label = QLabel("-")
-        self.file_name_label.setWordWrap(True)
-        self.file_name_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.file_name_input = QLineEdit()
+        self.file_name_input.setPlaceholderText("文件名")
         self.path_label = QTextEdit()
         self.path_label.setReadOnly(True)
         self.path_label.setAcceptRichText(False)
@@ -626,6 +633,9 @@ class MainWindow(QMainWindow):
         self.modified_label = QLabel("-")
         self.embedding_label = QLabel("-")
         self.score_label = QLabel("-")
+        self.image_collections_label = QLabel("-")
+        self.image_collections_label.setWordWrap(True)
+        self.image_collections_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.feedback_group = QButtonGroup(self)
         self.feedback_group.setExclusive(True)
         self.feedback_relevant_button = QPushButton("相关")
@@ -687,6 +697,8 @@ class MainWindow(QMainWindow):
         self.note_input.setPlaceholderText("备注")
         self.note_input.setAcceptRichText(False)
         self.save_detail_button = QPushButton("保存详情")
+        self.delete_source_button = QPushButton("删除/移除图片")
+        self.delete_source_button.setToolTip("选择删除源文件，或只从 Eidory 移除索引")
         self.play_pause_button = QPushButton("播放", panel)
         self.open_original_button = QPushButton("打开源文件", panel)
         self.reveal_in_finder_button = QPushButton("Finder 中显示", panel)
@@ -728,8 +740,9 @@ class MainWindow(QMainWindow):
         form.setContentsMargins(0, 0, 0, 0)
         form.setHorizontalSpacing(6)
         form.setVerticalSpacing(4)
-        form.addRow("文件名", self.file_name_label)
+        form.addRow("文件名", self.file_name_input)
         form.addRow("路径", self.path_label)
+        form.addRow("所在文件夹", self.image_collections_label)
         form.addRow("尺寸", self.size_label)
         form.addRow("修改时间", self.modified_label)
         form.addRow("索引状态", self.embedding_label)
@@ -749,12 +762,49 @@ class MainWindow(QMainWindow):
         detail_tab.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.note_input.setMaximumHeight(96)
         self.note_input.setMinimumHeight(76)
-        detail_layout.addWidget(self.preview_stack)
-        detail_layout.addLayout(form)
-        detail_layout.addWidget(QLabel("备注"))
-        detail_layout.addWidget(self.note_input)
-        detail_layout.addWidget(self.save_detail_button)
-        detail_layout.addStretch(1)
+
+        self.image_detail_widget = QWidget()
+        image_detail_layout = QVBoxLayout(self.image_detail_widget)
+        image_detail_layout.setContentsMargins(0, 0, 0, 0)
+        image_detail_layout.setSpacing(6)
+        image_detail_layout.addWidget(self.preview_stack)
+        image_detail_layout.addLayout(form)
+        image_detail_layout.addWidget(QLabel("备注"))
+        image_detail_layout.addWidget(self.note_input)
+        image_detail_layout.addWidget(self.save_detail_button)
+        image_detail_layout.addWidget(self.delete_source_button)
+        image_detail_layout.addStretch(1)
+
+        self.collection_detail_widget = QWidget()
+        collection_detail_layout = QVBoxLayout(self.collection_detail_widget)
+        collection_detail_layout.setContentsMargins(0, 0, 0, 0)
+        collection_detail_layout.setSpacing(8)
+        collection_form = QFormLayout()
+        collection_form.setContentsMargins(0, 0, 0, 0)
+        collection_form.setHorizontalSpacing(6)
+        collection_form.setVerticalSpacing(6)
+        self.collection_detail_name_label = QLabel("-")
+        self.collection_detail_name_label.setWordWrap(True)
+        self.collection_detail_path_label = QLabel("-")
+        self.collection_detail_path_label.setWordWrap(True)
+        self.collection_detail_count_label = QLabel("-")
+        self.collection_detail_import_dir_label = QLabel("-")
+        self.collection_detail_import_dir_label.setWordWrap(True)
+        self.collection_detail_import_dir_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        collection_form.addRow("文件夹", self.collection_detail_name_label)
+        collection_form.addRow("层级", self.collection_detail_path_label)
+        collection_form.addRow("图片/视频", self.collection_detail_count_label)
+        collection_form.addRow("保存位置", self.collection_detail_import_dir_label)
+        self.open_collection_import_dir_button = QPushButton("打开保存位置")
+        collection_detail_layout.addLayout(collection_form)
+        collection_detail_layout.addWidget(self.open_collection_import_dir_button)
+        collection_detail_layout.addStretch(1)
+        self.collection_detail_widget.hide()
+
+        detail_layout.addWidget(self.image_detail_widget, 1)
+        detail_layout.addWidget(self.collection_detail_widget, 1)
 
         inspiration_tab = QWidget()
         inspiration_layout = QVBoxLayout(inspiration_tab)
@@ -864,9 +914,13 @@ class MainWindow(QMainWindow):
         self.rescan_new_button = QPushButton("扫描新增/变化")
         self.rescan_missing_button = QPushButton("扫描缺失所在目录")
         self.clean_missing_index_button = QPushButton("清理丢失索引")
+        self.rebuild_selected_thumbnails_button = QPushButton("重建选中缩略图")
+        self.remove_selected_index_button = QPushButton("移除选中索引")
+        self.rebuild_selected_thumbnails_button.setEnabled(False)
+        self.remove_selected_index_button.setEnabled(False)
         self.run_performance_check_button = QPushButton("性能压测")
         self.export_library_button = QPushButton("导出图库")
-        self.export_selection_button = QPushButton("导出选中")
+        self.export_selection_button = QPushButton("导出图片")
         self.export_selection_button.setEnabled(False)
         self.path_remap_old_combo = QComboBox()
         self.path_remap_old_combo.setEditable(True)
@@ -912,6 +966,11 @@ class MainWindow(QMainWindow):
         maintenance_extra_row.addWidget(self.clean_orphan_thumbnails_button)
         maintenance_extra_row.addWidget(self.run_performance_check_button)
         settings_layout.addLayout(maintenance_extra_row)
+        maintenance_selected_row = QHBoxLayout()
+        maintenance_selected_row.setContentsMargins(0, 0, 0, 0)
+        maintenance_selected_row.addWidget(self.rebuild_selected_thumbnails_button)
+        maintenance_selected_row.addWidget(self.remove_selected_index_button)
+        settings_layout.addLayout(maintenance_selected_row)
         settings_layout.addSpacing(4)
         settings_layout.addWidget(QLabel("导出"))
         export_row = QHBoxLayout()
@@ -987,7 +1046,16 @@ class MainWindow(QMainWindow):
         self.grid_view.imagePreviewRequested.connect(self._open_image_preview)
         self.grid_view.imageContextMenuRequested.connect(self._show_grid_context_menu)
         self.grid_view.filesDropped.connect(self._import_dropped_files_to_selected_collection)
+        self.grid_view.dropPayloadDropped.connect(self._import_drop_payload_to_selected_collection)
         self.save_detail_button.clicked.connect(self._save_current_details)
+        self.delete_source_button.clicked.connect(self._delete_selected_source_files)
+        self.undo_removal_action = QAction("撤销删除/移除", self)
+        self.undo_removal_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self.undo_removal_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.undo_removal_action.setEnabled(False)
+        self.undo_removal_action.triggered.connect(self._undo_last_library_removal)
+        self.addAction(self.undo_removal_action)
+        self.open_collection_import_dir_button.clicked.connect(self._open_selected_collection_import_dir)
         self.open_original_button.clicked.connect(self._open_selected_original)
         self.reveal_in_finder_button.clicked.connect(self._reveal_selected_in_finder)
         self.copy_path_button.clicked.connect(self._copy_selected_path)
@@ -1015,10 +1083,12 @@ class MainWindow(QMainWindow):
         self.rescan_missing_button.clicked.connect(self._rescan_missing_folders)
         self.clean_missing_index_button.clicked.connect(self._clean_missing_index)
         self.clean_orphan_thumbnails_button.clicked.connect(self._clean_orphan_thumbnails)
+        self.rebuild_selected_thumbnails_button.clicked.connect(self._batch_rebuild_thumbnails)
+        self.remove_selected_index_button.clicked.connect(self._batch_remove_from_library)
         self.export_library_button.clicked.connect(self._export_library)
         self.export_selection_button.clicked.connect(self._export_selected_images)
         self.folder_tree.itemSelectionChanged.connect(self._refresh_current_results_for_filters)
-        self.collection_tree.itemSelectionChanged.connect(self._refresh_current_results_for_filters)
+        self.collection_tree.itemSelectionChanged.connect(self._on_collection_selection_changed)
         self.collection_tree.treeReordered.connect(self._save_collection_tree_order)
         self.collection_tree.imagesDropped.connect(self._assign_dropped_images_to_collection)
         self.collection_tree.filesDropped.connect(self._import_dropped_files_to_collection)
@@ -1469,6 +1539,8 @@ class MainWindow(QMainWindow):
             self.shuffle_results_button.setText("Shuffle")
             self.save_result_set_button.setText("Save Results")
             self.save_detail_button.setText("Save Details")
+            self.delete_source_button.setText("Delete / Remove")
+            self.delete_source_button.setToolTip("Delete source files, or only remove them from Eidory")
             self.inspiration_brief_input.setPlaceholderText("Describe the image concept in one sentence")
             self.inspiration_answers_input.setPlaceholderText("Extra context: era, weather, lighting, mood, optional")
             self.inspiration_questions_label.setText("AI questions: -")
@@ -1481,9 +1553,11 @@ class MainWindow(QMainWindow):
             self.rescan_missing_button.setText("Scan Missing")
             self.clean_missing_index_button.setText("Clean Missing")
             self.clean_orphan_thumbnails_button.setText("Clean Thumbs")
+            self.rebuild_selected_thumbnails_button.setText("Rebuild Selected")
+            self.remove_selected_index_button.setText("Remove Selected")
             self.run_performance_check_button.setText("Benchmark")
             self.export_library_button.setText("Export Library")
-            self.export_selection_button.setText("Export Selected")
+            self.export_selection_button.setText("Export Images")
             self.open_data_dir_button.setText("Open Data")
             self.backup_database_button.setText("Backup DB")
             self.restore_database_button.setText("Restore DB")
@@ -1515,6 +1589,8 @@ class MainWindow(QMainWindow):
             self.shuffle_results_button.setText("打乱排序")
             self.save_result_set_button.setText("暂存结果")
             self.save_detail_button.setText("保存详情")
+            self.delete_source_button.setText("删除/移除图片")
+            self.delete_source_button.setToolTip("选择删除源文件，或只从 Eidory 移除索引")
             self.inspiration_brief_input.setPlaceholderText("用一句话描述画面的创作主题")
             self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
             self.inspiration_questions_label.setText("AI 追问：-")
@@ -1527,9 +1603,11 @@ class MainWindow(QMainWindow):
             self.rescan_missing_button.setText("扫描缺失")
             self.clean_missing_index_button.setText("清理丢失")
             self.clean_orphan_thumbnails_button.setText("清理缩略图")
+            self.rebuild_selected_thumbnails_button.setText("重建选中")
+            self.remove_selected_index_button.setText("移除选中")
             self.run_performance_check_button.setText("性能压测")
             self.export_library_button.setText("导出图库")
-            self.export_selection_button.setText("导出选中")
+            self.export_selection_button.setText("导出图片")
             self.open_data_dir_button.setText("打开数据")
             self.backup_database_button.setText("备份数据库")
             self.restore_database_button.setText("恢复数据库")
@@ -3362,22 +3440,22 @@ class MainWindow(QMainWindow):
         self.save_temp_project_button.setEnabled(count > 0)
         if hasattr(self, "export_selection_button"):
             self.export_selection_button.setEnabled(count > 0)
+        if hasattr(self, "rebuild_selected_thumbnails_button"):
+            self.rebuild_selected_thumbnails_button.setEnabled(count > 0)
+        if hasattr(self, "remove_selected_index_button"):
+            self.remove_selected_index_button.setEnabled(count > 0)
         if self.current_language == "en":
             self.save_temp_project_button.setText(
                 f"Save {count} Selected" if count else "Save Selected"
             )
             if hasattr(self, "export_selection_button"):
-                self.export_selection_button.setText(
-                    f"Export {count}" if count else "Export Selected"
-                )
+                self.export_selection_button.setText("Export Images")
         else:
             self.save_temp_project_button.setText(
                 f"暂存选中 {count} 张" if count else "暂存选中图片"
             )
             if hasattr(self, "export_selection_button"):
-                self.export_selection_button.setText(
-                    f"导出 {count} 张" if count else "导出选中"
-                )
+                self.export_selection_button.setText("导出图片")
 
     def _save_selected_images_as_temporary_project(self) -> None:
         images = self._selected_grid_images()
@@ -3922,117 +4000,165 @@ class MainWindow(QMainWindow):
             self._show_image_details(image)
         context_image = image or (selected_images[0] if len(selected_images) == 1 else None)
 
+        menu = self._build_grid_context_menu(
+            selected_images=selected_images,
+            context_image=context_image,
+        )
+        action = menu.exec(global_position)
+        if action is None:
+            return
+        command = action.data()
+        if command == "preview":
+            self._open_image_preview(context_image)
+        elif command == "find_similar":
+            self._find_similar_to_image(context_image)
+        elif command == "open":
+            self._open_selected_original()
+        elif command == "reveal":
+            self._reveal_selected_in_finder()
+        elif command == "copy_path":
+            self._copy_selected_path()
+        elif command == "favorite":
+            self._batch_set_favorite(True)
+        elif command == "unfavorite":
+            self._batch_set_favorite(False)
+        elif command == "add_tags":
+            self._batch_add_tags()
+        elif command == "clear_tags":
+            self._batch_clear_tags()
+        elif command == "save_temp":
+            self._save_selected_images_as_temporary_project()
+        elif command == "export_selection":
+            self._export_selected_images()
+        elif command == "delete_source":
+            self._delete_selected_source_files()
+        elif command == "save_result_set":
+            self._save_current_visible_results_as_temporary_project()
+        elif command == "group_selection":
+            self._group_selected_images_with_ai()
+        elif isinstance(command, str) and command.startswith("temporary_project:"):
+            self._add_selection_to_temporary_project(int(command.split(":", 1)[1]))
+        elif command == "remove_from_temp":
+            self._remove_selection_from_current_temporary_project()
+        elif command == "add_to_collection":
+            self._add_selection_to_collection_dialog()
+        elif command == "move_to_collection":
+            self._move_selection_to_collection_dialog()
+        elif command == "remove_from_collection":
+            self._remove_selection_from_current_collection()
+        elif command == "exclude_from_results":
+            self._exclude_selection_from_results()
+
+    def _build_grid_context_menu(
+        self,
+        *,
+        selected_images: list[ImageItem],
+        context_image: ImageItem | None,
+    ) -> QMenu:
         menu = QMenu(self)
-        preview_action = menu.addAction("快速预览")
-        find_similar_action = menu.addAction("查找相似图片")
-        open_action = menu.addAction("打开源文件")
-        reveal_action = menu.addAction("在 Finder 中显示")
-        copy_action = menu.addAction("复制路径")
+        actions: dict[str, object] = {}
+
+        def add_action(target_menu: QMenu, key: str, text: str):
+            action = target_menu.addAction(text)
+            action.setData(key)
+            actions[key] = action
+            return action
+
+        add_action(menu, "preview", "快速预览")
+        add_action(menu, "find_similar", "查找相似图片")
         has_single_context = context_image is not None and len(selected_images) <= 1
-        preview_action.setEnabled(has_single_context)
-        find_similar_action.setEnabled(
+        actions["preview"].setEnabled(has_single_context)
+        actions["find_similar"].setEnabled(
             has_single_context
             and self._similar_image_blocking_reason(context_image, check_vector=False) is None
         )
-        open_action.setEnabled(has_single_context)
-        reveal_action.setEnabled(has_single_context)
-        copy_action.setEnabled(has_single_context)
 
         menu.addSeparator()
-        favorite_action = menu.addAction(f"收藏选中 {len(selected_images)} 张")
-        unfavorite_action = menu.addAction("取消收藏")
-        add_tags_action = menu.addAction("批量添加标签")
-        clear_tags_action = menu.addAction("清除选中图片标签")
-        save_temp_action = menu.addAction("暂存选中图片")
-        export_selection_action = menu.addAction("导出选中图片")
-        save_result_set_action = menu.addAction("暂存当前结果集")
-        group_selection_action = menu.addAction("AI 分组选中图片")
-        temp_project_menu = menu.addMenu("加入已有灵感暂存")
+
+        file_menu = menu.addMenu("文件与导出")
+        add_action(file_menu, "open", "打开源文件")
+        add_action(file_menu, "reveal", "在 Finder 中显示")
+        add_action(file_menu, "copy_path", "复制路径")
+        file_menu.addSeparator()
+        add_action(file_menu, "export_selection", "导出选中图片")
+        file_menu.addSeparator()
+        add_action(file_menu, "delete_source", "删除/移除图片...")
+
+        marker_menu = menu.addMenu("收藏与标签")
+        add_action(marker_menu, "favorite", f"收藏选中 {len(selected_images)} 张")
+        add_action(marker_menu, "unfavorite", "取消收藏")
+        marker_menu.addSeparator()
+        add_action(marker_menu, "add_tags", "批量添加标签")
+        add_action(marker_menu, "clear_tags", "清除选中图片标签")
+
+        inspiration_menu = menu.addMenu("灵感暂存")
+        add_action(inspiration_menu, "save_temp", "暂存选中图片")
+        temp_project_menu = inspiration_menu.addMenu("加入已有灵感暂存")
         temp_project_actions: dict[object, int] = {}
         for project in self.store.list_temporary_projects():
             project_action = temp_project_menu.addAction(f"{project.name} ({project.image_count})")
+            project_action.setData(f"temporary_project:{project.id}")
             temp_project_actions[project_action] = project.id
         if not temp_project_actions:
             empty_action = temp_project_menu.addAction("没有可用暂存项目")
             empty_action.setEnabled(False)
-        remove_from_temp_action = menu.addAction("从当前灵感暂存移除")
-        add_to_collection_action = menu.addAction("添加到文件夹")
-        move_to_collection_action = menu.addAction("移动到文件夹")
-        remove_from_collection_action = menu.addAction("从当前文件夹移出")
-        exclude_from_results_action = menu.addAction("从当前结果排除选中")
-        rebuild_thumbnails_action = menu.addAction("重建缩略图")
-        remove_index_action = menu.addAction("从图库移除索引")
+        add_action(inspiration_menu, "remove_from_temp", "从当前灵感暂存移除")
+        inspiration_menu.addSeparator()
+        add_action(inspiration_menu, "group_selection", "AI 分组选中图片")
+
+        collection_menu = menu.addMenu("文件夹归类")
+        add_action(collection_menu, "add_to_collection", "添加到文件夹")
+        add_action(collection_menu, "move_to_collection", "移动到文件夹")
+        add_action(collection_menu, "remove_from_collection", "从当前文件夹移出")
+
+        result_menu = menu.addMenu("当前结果")
+        add_action(result_menu, "save_result_set", "暂存当前结果集")
+        add_action(result_menu, "exclude_from_results", "从当前结果排除选中")
+
+        menu._eidory_submenus = [  # type: ignore[attr-defined]
+            file_menu,
+            marker_menu,
+            inspiration_menu,
+            temp_project_menu,
+            collection_menu,
+            result_menu,
+        ]
+
         has_selection = bool(selected_images)
         has_visible_results = bool(self.grid_view.images())
         has_result_context = self._has_result_context()
-        for batch_action in [
-            favorite_action,
-            unfavorite_action,
-            add_tags_action,
-            clear_tags_action,
-            save_temp_action,
-            export_selection_action,
-            remove_from_temp_action,
-            add_to_collection_action,
-            move_to_collection_action,
-            remove_from_collection_action,
-            exclude_from_results_action,
-            rebuild_thumbnails_action,
-            remove_index_action,
+        for key in ["open", "reveal", "copy_path"]:
+            actions[key].setEnabled(has_single_context)
+        for key in [
+            "export_selection",
+            "delete_source",
+            "favorite",
+            "unfavorite",
+            "add_tags",
+            "clear_tags",
+            "save_temp",
+            "remove_from_temp",
+            "add_to_collection",
+            "move_to_collection",
+            "remove_from_collection",
+            "exclude_from_results",
         ]:
-            batch_action.setEnabled(has_selection)
-        save_result_set_action.setEnabled(has_visible_results and has_result_context)
-        group_selection_action.setEnabled(len(selected_images) >= 4)
+            actions[key].setEnabled(has_selection)
+        actions["save_result_set"].setEnabled(has_visible_results and has_result_context)
+        actions["group_selection"].setEnabled(len(selected_images) >= 4)
         temp_project_menu.setEnabled(has_selection and bool(temp_project_actions))
-        remove_from_temp_action.setEnabled(has_selection and self.current_result_mode == "temp_project")
+        actions["remove_from_temp"].setEnabled(has_selection and self.current_result_mode == "temp_project")
         has_current_collection = self._selected_collection_id() is not None
-        move_to_collection_action.setEnabled(has_selection and has_current_collection)
-        remove_from_collection_action.setEnabled(has_selection and has_current_collection)
-        exclude_from_results_action.setEnabled(has_selection and has_result_context)
+        actions["move_to_collection"].setEnabled(has_selection and has_current_collection)
+        actions["remove_from_collection"].setEnabled(has_selection and has_current_collection)
+        actions["exclude_from_results"].setEnabled(has_selection and has_result_context)
 
-        action = menu.exec(global_position)
-        if action == preview_action:
-            self._open_image_preview(context_image)
-        elif action == find_similar_action:
-            self._find_similar_to_image(context_image)
-        elif action == open_action:
-            self._open_selected_original()
-        elif action == reveal_action:
-            self._reveal_selected_in_finder()
-        elif action == copy_action:
-            self._copy_selected_path()
-        elif action == favorite_action:
-            self._batch_set_favorite(True)
-        elif action == unfavorite_action:
-            self._batch_set_favorite(False)
-        elif action == add_tags_action:
-            self._batch_add_tags()
-        elif action == clear_tags_action:
-            self._batch_clear_tags()
-        elif action == save_temp_action:
-            self._save_selected_images_as_temporary_project()
-        elif action == export_selection_action:
-            self._export_selected_images()
-        elif action == save_result_set_action:
-            self._save_current_visible_results_as_temporary_project()
-        elif action == group_selection_action:
-            self._group_selected_images_with_ai()
-        elif action in temp_project_actions:
-            self._add_selection_to_temporary_project(temp_project_actions[action])
-        elif action == remove_from_temp_action:
-            self._remove_selection_from_current_temporary_project()
-        elif action == add_to_collection_action:
-            self._add_selection_to_collection_dialog()
-        elif action == move_to_collection_action:
-            self._move_selection_to_collection_dialog()
-        elif action == remove_from_collection_action:
-            self._remove_selection_from_current_collection()
-        elif action == exclude_from_results_action:
-            self._exclude_selection_from_results()
-        elif action == rebuild_thumbnails_action:
-            self._batch_rebuild_thumbnails()
-        elif action == remove_index_action:
-            self._batch_remove_from_library()
+        file_menu.setEnabled(has_single_context or has_selection)
+        marker_menu.setEnabled(has_selection)
+        inspiration_menu.setEnabled(has_selection)
+        collection_menu.setEnabled(has_selection)
+        result_menu.setEnabled(has_result_context and (has_selection or has_visible_results))
+        return menu
 
     def _show_folder_context_menu(self, position) -> None:
         item = self.folder_tree.itemAt(position)
@@ -4177,15 +4303,26 @@ class MainWindow(QMainWindow):
         if len(images) > 1:
             self.selected_image = images[-1]
             self._show_multi_selection_details(images)
+        elif not images:
+            self.selected_image = None
+            self._show_collection_details(self._selected_collection_id())
+        self._refresh_temp_project_save_button()
+
+    def _on_collection_selection_changed(self) -> None:
+        self.selected_image = None
+        self._refresh_current_results_for_filters()
+        self._show_collection_details(self._selected_collection_id())
         self._refresh_temp_project_save_button()
 
     def _set_detail_controls_enabled(self, enabled: bool) -> None:
         for widget in [
+            self.file_name_input,
             self.favorite_checkbox,
             self.tags_input,
             self.clear_tags_button,
             self.note_input,
             self.save_detail_button,
+            self.delete_source_button,
             self.play_pause_button,
             self.open_original_button,
             self.reveal_in_finder_button,
@@ -4200,11 +4337,14 @@ class MainWindow(QMainWindow):
         favorite_count = sum(1 for image in images if image.is_favorite)
 
         self._stop_video_preview()
+        self.image_detail_widget.show()
+        self.collection_detail_widget.hide()
         self.preview_stack.setCurrentWidget(self.preview_label)
         self.preview_label.setPixmap(QPixmap())
         self.preview_label.setText(f"已选择 {count} 张")
-        self.file_name_label.setText(f"已选择 {count} 张")
+        self.file_name_input.setText(f"已选择 {count} 张")
         self._set_path_text("-")
+        self.image_collections_label.setText("-")
         self.size_label.setText(f"{total_size:,} bytes")
         self.modified_label.setText("-")
         self.embedding_label.setText(f"ready {ready_count} / {count}")
@@ -4214,34 +4354,24 @@ class MainWindow(QMainWindow):
         self.note_input.clear()
         self._refresh_feedback_buttons(None)
         self._set_detail_controls_enabled(False)
+        self.delete_source_button.setEnabled(True)
         self._set_batch_tag_controls_visible(True)
         self._refresh_batch_tag_panel(images)
         self.statusBar().showMessage(f"已选择 {count} 张")
 
     def _show_image_details(self, image: ImageItem | None) -> None:
         if image is None:
-            self._stop_video_preview()
-            self.preview_stack.setCurrentWidget(self.preview_label)
-            self.preview_label.setText("未选择图片")
-            self.preview_label.setPixmap(QPixmap())
-            self.file_name_label.setText("-")
-            self._set_path_text("-")
-            self.size_label.setText("-")
-            self.modified_label.setText("-")
-            self.embedding_label.setText("-")
-            self.score_label.setText("-")
-            self.favorite_checkbox.setChecked(False)
-            self.tags_input.clear()
-            self.note_input.clear()
-            self._refresh_feedback_buttons(None)
-            self._set_detail_controls_enabled(False)
-            self._set_batch_tag_controls_visible(False)
+            self._show_collection_details(self._selected_collection_id())
             return
 
         self._set_detail_controls_enabled(True)
         self._set_batch_tag_controls_visible(False)
-        self.file_name_label.setText(image.file_name)
+        self.image_detail_widget.show()
+        self.collection_detail_widget.hide()
+        self.file_name_input.setText(image.file_name)
         self._set_path_text(image.file_path)
+        collection_paths = self.store.collection_paths_for_image(image.id)
+        self.image_collections_label.setText("；".join(collection_paths) if collection_paths else "未归类")
         self.size_label.setText(self._format_media_dimensions(image))
         self.modified_label.setText(image.modified_at or "-")
         self.embedding_label.setText(image.embedding_status)
@@ -4278,6 +4408,45 @@ class MainWindow(QMainWindow):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+
+    def _show_collection_details(self, collection_id: int | None) -> None:
+        if not hasattr(self, "collection_detail_widget"):
+            return
+        self._stop_video_preview()
+        self.selected_image = None
+        self.image_detail_widget.hide()
+        self.collection_detail_widget.show()
+        self._refresh_feedback_buttons(None)
+        self._set_detail_controls_enabled(False)
+        self._set_batch_tag_controls_visible(False)
+
+        if collection_id is None:
+            total = self.store.count_images()
+            missing = self.store.count_missing_images()
+            available = max(0, total - missing)
+            self.collection_detail_name_label.setText("全部文件夹")
+            self.collection_detail_path_label.setText("全部文件夹")
+            self.collection_detail_count_label.setText(f"{available} 个可用，{missing} 个丢失")
+            self.collection_detail_import_dir_label.setText("-")
+            self.open_collection_import_dir_button.setEnabled(False)
+            return
+
+        collection = self._collection_by_id(collection_id)
+        if collection is None:
+            self.collection_detail_name_label.setText("-")
+            self.collection_detail_path_label.setText("-")
+            self.collection_detail_count_label.setText("-")
+            self.collection_detail_import_dir_label.setText("-")
+            self.open_collection_import_dir_button.setEnabled(False)
+            return
+
+        counts = self.store.collection_image_counts()
+        import_dir = self._collection_import_directory(collection_id)
+        self.collection_detail_name_label.setText(collection.name)
+        self.collection_detail_path_label.setText(self._collection_path_text(collection_id))
+        self.collection_detail_count_label.setText(f"{counts.get(collection_id, 0)} 个")
+        self.collection_detail_import_dir_label.setText(str(import_dir))
+        self.open_collection_import_dir_button.setEnabled(True)
 
     def _show_video_details(self, image: ImageItem) -> None:
         self.preview_label.setPixmap(QPixmap())
@@ -4432,7 +4601,10 @@ class MainWindow(QMainWindow):
     def _save_current_details(self) -> None:
         if self.selected_image is None:
             return
-        image_id = self.selected_image.id
+        image = self._rename_selected_image_if_needed(self.selected_image)
+        if image is None:
+            return
+        image_id = image.id
         tags = self._parse_tag_input(self.tags_input.text())
         self.store.update_note(image_id, self.note_input.toPlainText())
         self.store.update_favorite(image_id, self.favorite_checkbox.isChecked())
@@ -4443,6 +4615,52 @@ class MainWindow(QMainWindow):
         self.selected_image = refreshed
         self._show_image_details(refreshed)
         self.statusBar().showMessage("详情已保存")
+
+    def _rename_selected_image_if_needed(self, image: ImageItem) -> ImageItem | None:
+        desired = self.file_name_input.text().strip()
+        if not desired or desired == image.file_name:
+            return image
+        if "/" in desired or "\\" in desired:
+            QMessageBox.warning(self, "Eidory", "文件名不能包含路径分隔符。")
+            return None
+        current_path = Path(image.file_path)
+        if image.is_missing or not current_path.exists():
+            QMessageBox.warning(self, "Eidory", "源文件不存在，不能重命名。")
+            return None
+
+        current_suffix = current_path.suffix
+        desired_path = Path(desired)
+        if not desired_path.suffix:
+            desired = f"{desired}{current_suffix}"
+            desired_path = Path(desired)
+        if desired_path.suffix.lower() != current_suffix.lower():
+            QMessageBox.warning(self, "Eidory", "暂不支持修改文件扩展名。")
+            return None
+
+        target_path = current_path.with_name(desired)
+        if target_path == current_path:
+            return image
+        if target_path.exists():
+            QMessageBox.warning(self, "Eidory", "同目录下已存在这个文件名。")
+            return None
+        try:
+            current_path.rename(target_path)
+            stat = target_path.stat()
+            self.store.update_image_path_after_rename(
+                image.id,
+                file_path=str(target_path),
+                file_size=stat.st_size,
+                modified_time_ns=stat.st_mtime_ns,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Eidory", f"重命名失败：{exc}")
+            return None
+
+        refreshed = self.store.get_image(image.id)
+        if refreshed is not None:
+            self.statusBar().showMessage(f"已重命名为：{refreshed.file_name}")
+            return refreshed
+        return image
 
     def _clear_selected_tags(self) -> None:
         image = self._selected_grid_image()
@@ -4553,6 +4771,8 @@ class MainWindow(QMainWindow):
         collection_id: int,
         paths: list[str],
     ) -> None:
+        if not self._confirm_drop_import(collection_id, {"local_paths": list(paths)}):
+            return
         collection_name = self._collection_name(collection_id) or "文件夹"
         self.statusBar().showMessage(f"导入拖入的文件到“{collection_name}”")
         self.add_folder_button.setEnabled(False)
@@ -4573,8 +4793,10 @@ class MainWindow(QMainWindow):
                 total_new = 0
                 total_changed = 0
                 total_assigned = 0
+                imported_image_ids: list[int] = []
                 if file_paths:
                     result = self.scanner.import_files(file_paths)
+                    imported_image_ids.extend(result.image_ids)
                     total_scanned += result.scanned_files
                     total_new += result.new_files
                     total_changed += result.changed_files
@@ -4584,6 +4806,7 @@ class MainWindow(QMainWindow):
                     )
                 for folder_path in folder_paths:
                     result = self.scanner.scan_folder(folder_path)
+                    imported_image_ids.extend(result.image_ids)
                     total_scanned += result.scanned_files
                     total_new += result.new_files
                     total_changed += result.changed_files
@@ -4593,7 +4816,15 @@ class MainWindow(QMainWindow):
                     )
                 self.events.put((
                     "drop_import_done",
-                    (collection_id, collection_name, total_scanned, total_new, total_changed, total_assigned),
+                    (
+                        collection_id,
+                        collection_name,
+                        total_scanned,
+                        total_new,
+                        total_changed,
+                        total_assigned,
+                        imported_image_ids,
+                    ),
                 ))
             except Exception as exc:
                 self.events.put(("error", f"拖入导入失败：{exc}"))
@@ -4606,6 +4837,267 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("请先选择一个 Eidory 文件夹，再拖入硬盘图片")
             return
         self._import_dropped_files_to_collection(collection_id, paths)
+
+    def _import_drop_payload_to_selected_collection(self, payload: dict[str, object]) -> None:
+        collection_id = self._selected_collection_id()
+        if collection_id is None:
+            self.statusBar().showMessage("请选择左侧具体文件夹后再拖入图片")
+            return
+        self._import_drop_payload_to_collection(collection_id, payload)
+
+    def _import_drop_payload_to_collection(
+        self,
+        collection_id: int,
+        payload: dict[str, object],
+    ) -> None:
+        if not self._confirm_drop_import(collection_id, payload):
+            return
+        collection_name = self._collection_name(collection_id) or "文件夹"
+        target_dir = self._collection_import_directory(collection_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        prepared_payload = dict(payload)
+        dropped_image = prepared_payload.pop("image", None)
+        if dropped_image is not None:
+            image_bytes = self._dropped_image_png_bytes(dropped_image)
+            if image_bytes is not None:
+                prepared_payload["image_png_bytes"] = image_bytes
+
+        self.statusBar().showMessage(f"保存拖入图片到“{collection_name}”")
+        self.add_folder_button.setEnabled(False)
+        self.rescan_button.setEnabled(False)
+
+        def run() -> None:
+            try:
+                saved_paths = self._materialize_drop_payload(prepared_payload, target_dir)
+                if not saved_paths:
+                    raise FileNotFoundError("没有可导入的受支持图片或视频")
+                result = self.scanner.import_files([str(path) for path in saved_paths])
+                assigned = self.store.assign_images_to_collection(
+                    list(result.image_ids),
+                    collection_id,
+                )
+                self.events.put((
+                    "drop_import_done",
+                    (
+                        collection_id,
+                        collection_name,
+                        result.scanned_files,
+                        result.new_files,
+                        result.changed_files,
+                        assigned,
+                        list(result.image_ids),
+                    ),
+                ))
+            except Exception as exc:
+                self.events.put(("error", f"拖入保存失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _confirm_drop_import(self, collection_id: int, payload: dict[str, object]) -> bool:
+        local_paths = payload.get("local_paths", [])
+        if not isinstance(local_paths, list):
+            local_paths = []
+        remote_urls = self._remote_urls_from_drop_payload(payload)
+        has_image_data = payload.get("image") is not None
+        if not local_paths and not remote_urls and not has_image_data:
+            self.statusBar().showMessage("拖入内容里没有可导入的图片或视频")
+            return False
+
+        target_name = self._collection_path_text(collection_id)
+        target_dir = self._collection_import_directory(collection_id)
+        source_lines: list[str] = []
+        if local_paths:
+            source_lines.append(f"本地文件/文件夹：{len(local_paths)} 个")
+        elif remote_urls:
+            source_lines.append("网页图片/链接：将导入第一张可下载图片")
+        elif has_image_data:
+            source_lines.append("网页直接图片数据：1 张")
+        if remote_urls and has_image_data:
+            source_lines.append("如果网页图片链接不可下载，将用网页提供的直接图片数据兜底。")
+
+        message = (
+            f"导入到文件夹：{target_name}\n"
+            f"保存位置：{target_dir}\n\n"
+            + "\n".join(source_lines)
+            + "\n\n导入会复制/下载文件，不移动原文件。继续？"
+        )
+        answer = QMessageBox.question(
+            self,
+            "确认导入图片",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _materialize_drop_payload(
+        self,
+        payload: dict[str, object],
+        target_dir: Path,
+    ) -> list[Path]:
+        raw_paths = payload.get("local_paths", [])
+        if not isinstance(raw_paths, list):
+            raw_paths = []
+        saved_paths: list[Path] = []
+        if raw_paths:
+            for raw_path in raw_paths:
+                saved_paths.extend(self._copy_local_drop_source(str(raw_path), target_dir))
+            return saved_paths
+
+        for url in self._remote_urls_from_drop_payload(payload):
+            downloaded = self._download_remote_media(url, target_dir)
+            if downloaded is not None:
+                return [downloaded]
+
+        image_bytes = payload.get("image_png_bytes")
+        if isinstance(image_bytes, bytes):
+            saved_image = self._write_dropped_image_bytes(image_bytes, target_dir)
+            return [saved_image] if saved_image is not None else []
+        return []
+
+    def _copy_local_drop_source(self, raw_path: str, target_dir: Path) -> list[Path]:
+        source = Path(os.path.abspath(os.path.expanduser(raw_path)))
+        if not source.exists() or source.is_symlink():
+            return []
+        candidates: list[Path]
+        if source.is_dir():
+            candidates = [
+                path
+                for path in source.rglob("*")
+                if path.is_file()
+                and not path.is_symlink()
+                and is_supported_media(str(path))
+            ]
+        elif source.is_file() and is_supported_media(str(source)):
+            candidates = [source]
+        else:
+            return []
+
+        saved_paths: list[Path] = []
+        for candidate in candidates:
+            destination = self._unique_destination_path(
+                target_dir,
+                self._safe_import_filename(candidate.name),
+            )
+            if candidate.resolve() == destination.resolve():
+                saved_paths.append(destination)
+                continue
+            shutil.copy2(candidate, destination)
+            saved_paths.append(destination)
+        return saved_paths
+
+    def _download_remote_media(self, url: str, target_dir: Path) -> Path | None:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return None
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 Eidory/0.1",
+                "Referer": f"{parsed.scheme}://{parsed.netloc}/",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                content_type = response.headers.get_content_type()
+                suffix = self._suffix_for_remote_media(parsed.path, content_type)
+                if suffix not in SUPPORTED_MEDIA_EXTENSIONS:
+                    return None
+                max_bytes = 80 * 1024 * 1024
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError("远程文件超过 80MB")
+                    chunks.append(chunk)
+        except (urllib.error.URLError, TimeoutError):
+            return None
+
+        raw_name = Path(urllib.parse.unquote(parsed.path)).name
+        if not raw_name or Path(raw_name).suffix.lower() not in SUPPORTED_MEDIA_EXTENSIONS:
+            raw_name = f"web-image-{uuid.uuid4().hex[:8]}{suffix}"
+        destination = self._unique_destination_path(target_dir, self._safe_import_filename(raw_name))
+        destination.write_bytes(b"".join(chunks))
+        return destination
+
+    @staticmethod
+    def _suffix_for_remote_media(path: str, content_type: str) -> str:
+        suffix = Path(urllib.parse.unquote(path)).suffix.lower()
+        if suffix in SUPPORTED_MEDIA_EXTENSIONS:
+            return suffix
+        guessed = mimetypes.guess_extension(content_type) or ""
+        if guessed == ".jpe":
+            guessed = ".jpg"
+        return guessed.lower()
+
+    def _dropped_image_png_bytes(self, image_data: object) -> bytes | None:
+        qimage: QImage | None = None
+        if isinstance(image_data, QImage):
+            qimage = image_data
+        elif hasattr(image_data, "toImage"):
+            qimage = image_data.toImage()
+        if qimage is None or qimage.isNull():
+            return None
+        buffer = QBuffer()
+        if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+            return None
+        if not qimage.save(buffer, "PNG"):
+            return None
+        return bytes(buffer.data())
+
+    def _write_dropped_image_bytes(self, image_bytes: bytes, target_dir: Path) -> Path | None:
+        destination = self._unique_destination_path(
+            target_dir,
+            f"clipboard-image-{uuid.uuid4().hex[:8]}.png",
+        )
+        destination.write_bytes(image_bytes)
+        return destination
+
+    def _remote_urls_from_drop_payload(self, payload: dict[str, object]) -> list[str]:
+        candidates: list[str] = []
+        raw_urls = payload.get("urls", [])
+        if isinstance(raw_urls, list):
+            candidates.extend(str(url) for url in raw_urls)
+        for key in ["text", "html"]:
+            value = payload.get(key, "")
+            if isinstance(value, str) and value:
+                candidates.extend(self._urls_from_text_or_html(value))
+
+        unique: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            clean = html_lib.unescape(candidate).strip().strip("'\"")
+            if not clean:
+                continue
+            parsed = urllib.parse.urlparse(clean)
+            if parsed.scheme not in {"http", "https"} or clean in seen:
+                continue
+            seen.add(clean)
+            unique.append(clean)
+        return unique
+
+    @staticmethod
+    def _urls_from_text_or_html(value: str) -> list[str]:
+        urls = re.findall(r"https?://[^\s\"'<>]+", value)
+        urls.extend(
+            match
+            for match in re.findall(r"(?:src|href|data-src)=['\"]([^'\"]+)['\"]", value)
+            if match.startswith(("http://", "https://"))
+        )
+        return urls
+
+    def _open_selected_collection_import_dir(self) -> None:
+        collection_id = self._selected_collection_id()
+        if collection_id is None:
+            self.statusBar().showMessage("请先选择具体文件夹")
+            return
+        directory = self._collection_import_directory(collection_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
 
     def _assign_selected_images_to_collection(
         self,
@@ -4984,15 +5476,238 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        thumbnail_paths = self.store.remove_images_from_library([image.id for image in images])
-        self._delete_thumbnail_files(thumbnail_paths)
+        removed = self._remove_images_from_library_with_undo(
+            images,
+            undo_label=f"移除索引 {len(images)} 个",
+        )
+        self.statusBar().showMessage(f"已从图库移除 {removed} 张，源文件未删除。按 Cmd+Z 可撤销")
+
+    def _delete_selected_source_files(self) -> None:
+        images = self._selected_grid_images()
+        if not images:
+            self.statusBar().showMessage("没有选中图片")
+            return
+        mode = self._ask_delete_or_remove_mode(len(images))
+        if mode == "index":
+            removed = self._remove_images_from_library_with_undo(
+                images,
+                undo_label=f"移除索引 {len(images)} 个",
+            )
+            self.statusBar().showMessage(f"已从图库移除 {removed} 张，源文件未删除。按 Cmd+Z 可撤销")
+        elif mode == "source":
+            self._delete_source_files_with_undo(images)
+
+    def _ask_delete_or_remove_mode(self, count: int) -> str | None:
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setWindowTitle("删除/移除图片")
+        message.setText(f"已选择 {count} 个项目。请选择要执行的操作。")
+        message.setInformativeText(
+            "“只从软件移除”不会删除硬盘源文件。\n"
+            "“删除源文件”会先备份到临时撤销区，再把硬盘源文件移到废纸篓。"
+        )
+        remove_button = message.addButton("只从软件移除", QMessageBox.ButtonRole.ActionRole)
+        delete_button = message.addButton("删除源文件", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = message.addButton(QMessageBox.StandardButton.Cancel)
+        message.setDefaultButton(cancel_button)
+        message.exec()
+        clicked = message.clickedButton()
+        if clicked == remove_button:
+            return "index"
+        if clicked == delete_button:
+            return "source"
+        return None
+
+    def _remove_images_from_library_with_undo(
+        self,
+        images: list[ImageItem],
+        *,
+        undo_label: str,
+        snapshot: dict[str, object] | None = None,
+        source_backups: list[dict[str, object]] | None = None,
+        backup_dir: Path | None = None,
+    ) -> int:
+        clean_images = [image for image in images if image.id > 0]
+        if not clean_images:
+            return 0
+        image_ids = [image.id for image in clean_images]
+        undo_snapshot = snapshot or self.store.snapshot_images_for_restore(image_ids)
+        self.store.remove_images_from_library(image_ids)
         self.vector_index.invalidate()
         self.selected_image = None
+        self._register_removal_undo(
+            image_ids=image_ids,
+            snapshot=undo_snapshot,
+            source_backups=source_backups or [],
+            backup_dir=backup_dir,
+            label=undo_label,
+        )
+        self._refresh_after_library_removal()
+        return len(image_ids)
+
+    def _delete_source_files_with_undo(self, images: list[ImageItem]) -> None:
+        image_ids = [image.id for image in images]
+        snapshot = self.store.snapshot_images_for_restore(image_ids)
+        backup_dir = self.paths.data_dir / "undo-removal" / uuid.uuid4().hex
+        deleted_ids: list[int] = []
+        source_backups: list[dict[str, object]] = []
+        failures: list[str] = []
+
+        for image in images:
+            path = Path(image.file_path)
+            if image.is_missing or not path.exists():
+                deleted_ids.append(image.id)
+                continue
+            if not path.is_file():
+                failures.append(f"{image.file_name}: 不是普通文件")
+                continue
+            backup_path = backup_dir / f"{image.id}-{self._safe_import_filename(path.name)}"
+            try:
+                backup_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, backup_path)
+            except Exception as exc:
+                failures.append(f"{image.file_name}: 无法建立撤销备份：{exc}")
+                continue
+            ok, error = self._move_source_file_to_trash(path)
+            if ok:
+                deleted_ids.append(image.id)
+                source_backups.append(
+                    {
+                        "image_id": image.id,
+                        "original_path": str(path),
+                        "backup_path": str(backup_path),
+                    }
+                )
+            else:
+                backup_path.unlink(missing_ok=True)
+                failures.append(f"{image.file_name}: {error or '删除失败'}")
+
+        if deleted_ids:
+            deleted_images = [image for image in images if image.id in set(deleted_ids)]
+            self._remove_images_from_library_with_undo(
+                deleted_images,
+                undo_label=f"删除源文件 {len(deleted_ids)} 个",
+                snapshot=snapshot,
+                source_backups=source_backups,
+                backup_dir=backup_dir,
+            )
+        elif backup_dir.exists():
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+        if failures:
+            preview = "\n".join(failures[:6])
+            if len(failures) > 6:
+                preview += f"\n……另有 {len(failures) - 6} 个失败"
+            QMessageBox.warning(
+                self,
+                "部分图片删除失败",
+                f"已删除并移除索引 {len(deleted_ids)} 个；失败 {len(failures)} 个。\n\n{preview}",
+            )
+        if deleted_ids:
+            self.statusBar().showMessage(
+                f"已删除源文件并移除索引 {len(deleted_ids)} 个；失败 {len(failures)} 个。按 Cmd+Z 可撤销"
+            )
+        else:
+            self.statusBar().showMessage(f"没有删除源文件；失败 {len(failures)} 个")
+
+    @staticmethod
+    def _move_source_file_to_trash(path: Path) -> tuple[bool, str]:
+        try:
+            result = QFile.moveToTrash(str(path))
+            if isinstance(result, tuple):
+                moved = bool(result[0])
+            else:
+                moved = bool(result)
+            if moved:
+                return True, ""
+        except Exception as exc:
+            return False, str(exc)
+        return False, "无法移到废纸篓"
+
+    def _register_removal_undo(
+        self,
+        *,
+        image_ids: list[int],
+        snapshot: dict[str, object],
+        source_backups: list[dict[str, object]],
+        backup_dir: Path | None,
+        label: str,
+    ) -> None:
+        self._clear_last_removal_undo(cleanup_backups=True)
+        self._last_removal_undo = {
+            "image_ids": list(image_ids),
+            "snapshot": snapshot,
+            "source_backups": list(source_backups),
+            "backup_dir": str(backup_dir) if backup_dir is not None else "",
+            "label": label,
+        }
+        if hasattr(self, "undo_removal_action"):
+            self.undo_removal_action.setEnabled(True)
+
+    def _clear_last_removal_undo(self, *, cleanup_backups: bool) -> None:
+        undo = self._last_removal_undo
+        if undo is not None and cleanup_backups:
+            backup_dir = undo.get("backup_dir")
+            if isinstance(backup_dir, str) and backup_dir:
+                shutil.rmtree(backup_dir, ignore_errors=True)
+        self._last_removal_undo = None
+        if hasattr(self, "undo_removal_action"):
+            self.undo_removal_action.setEnabled(False)
+
+    def _undo_last_library_removal(self) -> None:
+        undo = self._last_removal_undo
+        if undo is None:
+            self.statusBar().showMessage("没有可撤销的删除/移除操作")
+            return
+        image_ids = [int(image_id) for image_id in undo.get("image_ids", [])]  # type: ignore[arg-type]
+        restore_ids = set(image_ids)
+        failures: list[str] = []
+        for backup in undo.get("source_backups", []):  # type: ignore[union-attr]
+            if not isinstance(backup, dict):
+                continue
+            image_id = int(backup.get("image_id", 0) or 0)
+            original_path = Path(str(backup.get("original_path", "")))
+            backup_path = Path(str(backup.get("backup_path", "")))
+            if not original_path.exists():
+                if not backup_path.exists():
+                    failures.append(f"{original_path.name}: 撤销备份不存在")
+                    restore_ids.discard(image_id)
+                    continue
+                try:
+                    original_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(backup_path), str(original_path))
+                except Exception as exc:
+                    failures.append(f"{original_path.name}: 无法恢复源文件：{exc}")
+                    restore_ids.discard(image_id)
+                    continue
+
+        snapshot = undo.get("snapshot")
+        restored = 0
+        if isinstance(snapshot, dict) and restore_ids:
+            restored = self.store.restore_images_snapshot(snapshot, image_ids=sorted(restore_ids))
+            self.vector_index.invalidate()
+        backup_dir = undo.get("backup_dir")
+        self._last_removal_undo = None
+        if hasattr(self, "undo_removal_action"):
+            self.undo_removal_action.setEnabled(False)
+        if isinstance(backup_dir, str) and backup_dir:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        self._refresh_after_library_removal()
+        if failures:
+            QMessageBox.warning(
+                self,
+                "撤销不完整",
+                f"已恢复索引 {restored} 个；失败 {len(failures)} 个。\n\n" + "\n".join(failures[:6]),
+            )
+        self.statusBar().showMessage(f"已撤销：恢复 {restored} 个项目")
+
+    def _refresh_after_library_removal(self) -> None:
         self._refresh_folders()
+        self._refresh_collections()
         self._refresh_tags()
         self._refresh_current_results_for_filters()
         self._refresh_embedding_stats()
-        self.statusBar().showMessage(f"已从图库移除 {len(images)} 张，源文件未删除")
+        self._refresh_temp_project_save_button()
 
     def _batch_rebuild_thumbnails(self) -> None:
         images = self._selected_grid_images()
@@ -5086,7 +5801,19 @@ class MainWindow(QMainWindow):
                     preserve_structure=preserve_structure,
                 )
             elif kind == "drop_import_done":
-                collection_id, collection_name, scanned, new_files, changed_files, assigned = payload
+                imported_image_ids: list[int] = []
+                if len(payload) == 7:
+                    (
+                        collection_id,
+                        collection_name,
+                        scanned,
+                        new_files,
+                        changed_files,
+                        assigned,
+                        imported_image_ids,
+                    ) = payload
+                else:
+                    collection_id, collection_name, scanned, new_files, changed_files, assigned = payload
                 self._handle_drop_import_done(
                     collection_id=collection_id,
                     collection_name=collection_name,
@@ -5094,6 +5821,7 @@ class MainWindow(QMainWindow):
                     new_files=new_files,
                     changed_files=changed_files,
                     assigned=assigned,
+                    imported_image_ids=list(imported_image_ids),
                 )
             elif kind == "search_done":
                 self.search_button.setEnabled(True)
@@ -5280,17 +6008,65 @@ class MainWindow(QMainWindow):
         new_files: int,
         changed_files: int,
         assigned: int,
+        imported_image_ids: list[int] | None = None,
     ) -> None:
         self.add_folder_button.setEnabled(True)
         self.rescan_button.setEnabled(True)
         self._refresh_folders()
         self._refresh_collections(select_collection_id=collection_id)
-        self._reload_images()
+        clean_imported_ids = [
+            int(image_id)
+            for image_id in imported_image_ids or []
+            if int(image_id) > 0
+        ]
+        if clean_imported_ids:
+            self._show_imported_images_first(collection_id, clean_imported_ids)
+        else:
+            self._reload_images()
         self._refresh_embedding_stats()
         self.statusBar().showMessage(
-            f"拖入导入完成：{collection_name}，扫描 {scanned}，"
+            f"拖入导入成功：{collection_name}，扫描 {scanned}，"
             f"新增 {new_files}，变化 {changed_files}，加入 {assigned}"
         )
+
+    def _show_imported_images_first(
+        self,
+        collection_id: int,
+        imported_image_ids: list[int],
+    ) -> None:
+        imported_images = self.store.images_by_ids(imported_image_ids)
+        imported_id_set = {image.id for image in imported_images}
+        remaining_images = [
+            image
+            for image in self.store.list_images(
+                limit=self.page_size,
+                collection_id=collection_id,
+                sort_key=self._database_sort_key(),
+                sort_desc=self.current_sort_desc,
+            )
+            if image.id not in imported_id_set
+        ]
+        images = imported_images + remaining_images
+        self.semantic_search_revision += 1
+        self._clear_result_management_state()
+        self.search_filters.clear()
+        self.current_keyword_query = None
+        self.current_semantic_query = None
+        self.current_result_mode = "library"
+        self.current_offset = len(images)
+        self.load_more_button.setEnabled(len(remaining_images) >= self.page_size)
+        self._refresh_filter_chain_ui()
+        selected_ids = [imported_images[0].id] if imported_images else []
+        current_id = selected_ids[0] if selected_ids else None
+        self.grid_view.set_images(
+            images,
+            selected_image_ids=selected_ids,
+            current_image_id=current_id,
+        )
+        self._set_result_status(
+            f"已导入 {len(imported_images)} 张到“{self._collection_path_text(collection_id)}”"
+        )
+        self.search_diagnostics_label.setText("搜索诊断：-")
 
     def _handle_embedding_progress(self, progress: EmbeddingProgress) -> None:
         self._refresh_embedding_stats()
@@ -5407,6 +6183,8 @@ class MainWindow(QMainWindow):
         if select_collection_id is not None:
             self._expand_folder_tree_parents(self.collection_tree.currentItem())
         self.collection_tree.blockSignals(False)
+        if hasattr(self, "collection_detail_widget") and self.selected_image is None:
+            self._show_collection_details(self._selected_collection_id())
 
     def _refresh_temporary_projects(self, select_project_id: int | None = None) -> None:
         self.temp_project_list.blockSignals(True)
@@ -5802,6 +6580,64 @@ class MainWindow(QMainWindow):
             return None
         collection_id = item.data(0, Qt.ItemDataRole.UserRole)
         return int(collection_id) if collection_id is not None else None
+
+    def _collection_by_id(self, collection_id: int):
+        for collection in self.store.list_collections():
+            if collection.id == collection_id:
+                return collection
+        return None
+
+    def _collection_path_parts(self, collection_id: int) -> list[str]:
+        collections = self.store.list_collections()
+        by_id = {collection.id: collection for collection in collections}
+        parts: list[str] = []
+        current = by_id.get(collection_id)
+        seen: set[int] = set()
+        while current is not None and current.id not in seen:
+            seen.add(current.id)
+            parts.append(current.name)
+            current = by_id.get(current.parent_id) if current.parent_id is not None else None
+        return list(reversed(parts))
+
+    def _collection_path_text(self, collection_id: int) -> str:
+        parts = self._collection_path_parts(collection_id)
+        return " / ".join(parts) if parts else "-"
+
+    def _collection_import_directory(self, collection_id: int) -> Path:
+        parts = self._collection_path_parts(collection_id)
+        safe_parts = [self._safe_path_component(part) for part in parts if part.strip()]
+        if not safe_parts:
+            safe_parts = [f"collection-{collection_id}"]
+        return Path.home() / "Pictures" / "Eidory Imports" / Path(*safe_parts)
+
+    @staticmethod
+    def _safe_path_component(value: str) -> str:
+        clean = re.sub(r"[\\/:*?\"<>|]+", "_", value.strip())
+        clean = re.sub(r"\s+", " ", clean).strip(" .")
+        return clean[:80] or "Untitled"
+
+    @staticmethod
+    def _safe_import_filename(value: str) -> str:
+        name = Path(value).name
+        suffix = Path(name).suffix.lower()
+        stem = Path(name).stem
+        clean_stem = re.sub(r"[\\/:*?\"<>|]+", "_", stem.strip())
+        clean_stem = re.sub(r"\s+", " ", clean_stem).strip(" .")[:120] or "untitled"
+        return f"{clean_stem}{suffix}"
+
+    @staticmethod
+    def _unique_destination_path(target_dir: Path, filename: str) -> Path:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        candidate = target_dir / filename
+        if not candidate.exists():
+            return candidate
+        stem = candidate.stem
+        suffix = candidate.suffix
+        for index in range(1, 10000):
+            candidate = target_dir / f"{stem}-{index}{suffix}"
+            if not candidate.exists():
+                return candidate
+        return target_dir / f"{stem}-{uuid.uuid4().hex[:8]}{suffix}"
 
     def _make_folder_tree_item(
         self,
@@ -6250,9 +7086,10 @@ class MainWindow(QMainWindow):
 
     def _update_color_swatch(self) -> None:
         color_hex = self._format_color_hex(self.current_color_rgb)
-        self.color_swatch_button.setText(color_hex)
+        self.color_swatch_button.setText("")
+        self.color_swatch_button.setToolTip(f"选择颜色：{color_hex}")
         self.color_swatch_button.setStyleSheet(
-            f"background:{color_hex}; color:{self._swatch_text_color(self.current_color_rgb)};"
+            f"background:{color_hex}; border: 1px solid #6f7782;"
         )
 
     def _choose_search_color(self) -> None:

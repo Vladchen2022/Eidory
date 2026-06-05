@@ -798,6 +798,8 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(store.assign_images_to_collection([first, second], indoor), 2)
             self.assertEqual(store.assign_images_to_collection([third], outdoor), 1)
             self.assertEqual(store.assign_images_to_collection([first], indoor), 0)
+            self.assertEqual(store.collection_paths_for_image(first), ["参考 / 室内"])
+            self.assertEqual(store.collection_paths_for_image(third), ["参考 / 室外"])
             self.assertEqual(
                 store.collection_image_counts(),
                 {references: 3, indoor: 2, outdoor: 1},
@@ -826,6 +828,32 @@ class MetadataStoreTest(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 store.create_collection("室外", parent_id=indoor)
+
+    def test_update_image_path_after_rename_refreshes_file_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            root = Path(tmp) / "library"
+            folder_id = store.add_folder(str(root))
+            image_id = self._insert_image(store, folder_id, root / "old-name.jpg", 1)
+
+            new_path = root / "new-name.jpg"
+            store.update_image_path_after_rename(
+                image_id,
+                file_path=str(new_path),
+                file_size=1234,
+                modified_time_ns=99,
+            )
+
+            image = store.get_image(image_id)
+            self.assertIsNotNone(image)
+            assert image is not None
+            self.assertEqual(image.file_path, str(new_path))
+            self.assertEqual(image.file_name, "new-name.jpg")
+            self.assertEqual(image.file_ext, ".jpg")
+            self.assertEqual(image.file_size, 1234)
+            self.assertEqual(image.modified_time_ns, 99)
 
     def test_delete_collection_removes_exclusive_image_indexes_but_keeps_shared_images(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

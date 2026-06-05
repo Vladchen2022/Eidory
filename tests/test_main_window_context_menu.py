@@ -1274,8 +1274,227 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 window.clear_search_button,
             ]:
                 self.assertEqual(button.minimumWidth(), TOOL_BUTTON_MIN_WIDTH)
-            self.assertIs(window.preview_stack.parentWidget(), detail_tab)
+            self.assertEqual(window.color_swatch_button.text(), "")
+            parent = window.preview_stack.parentWidget()
+            while parent is not None and parent is not detail_tab:
+                parent = parent.parentWidget()
+            self.assertIs(parent, detail_tab)
             self.assertEqual(window.right_tab_widget.tabText(0), "详情")
+            window.close()
+
+    def test_grid_context_menu_groups_actions_into_stable_submenus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            image = self._image(1)
+            window.grid_view.set_images([image], selected_image_ids=[image.id])
+            menu = window._build_grid_context_menu(
+                selected_images=[image],
+                context_image=image,
+            )
+
+            self.assertEqual(
+                self._menu_texts(menu),
+                [
+                    "快速预览",
+                    "查找相似图片",
+                    "文件与导出",
+                    "收藏与标签",
+                    "灵感暂存",
+                    "文件夹归类",
+                    "当前结果",
+                ],
+            )
+            self.assertEqual(
+                self._submenu_texts(menu, "文件与导出"),
+                ["打开源文件", "在 Finder 中显示", "复制路径", "导出选中图片", "删除/移除图片..."],
+            )
+            self.assertEqual(
+                self._submenu_texts(menu, "收藏与标签"),
+                ["收藏选中 1 张", "取消收藏", "批量添加标签", "清除选中图片标签"],
+            )
+            self.assertEqual(
+                self._submenu_texts(menu, "灵感暂存"),
+                [
+                    "暂存选中图片",
+                    "加入已有灵感暂存",
+                    "从当前灵感暂存移除",
+                    "AI 分组选中图片",
+                ],
+            )
+            self.assertEqual(
+                self._submenu_texts(menu, "文件夹归类"),
+                ["添加到文件夹", "移动到文件夹", "从当前文件夹移出"],
+            )
+            self.assertEqual(
+                self._submenu_texts(menu, "当前结果"),
+                ["暂存当前结果集", "从当前结果排除选中"],
+            )
+            self.assertTrue(self._action_by_text(menu, "快速预览").isEnabled())
+            self.assertTrue(
+                self._submenu_action_by_text(menu, "文件与导出", "导出选中图片").isEnabled()
+            )
+            self.assertEqual(
+                self._submenu_action_by_text(menu, "文件与导出", "导出选中图片").data(),
+                "export_selection",
+            )
+            self.assertEqual(
+                self._submenu_action_by_text(menu, "文件与导出", "删除/移除图片...").data(),
+                "delete_source",
+            )
+            self.assertEqual(window.export_selection_button.text(), "导出图片")
+            self.assertTrue(window.rebuild_selected_thumbnails_button.isEnabled())
+            self.assertTrue(window.remove_selected_index_button.isEnabled())
+            window.close()
+
+    def test_delete_selected_source_files_trashes_and_removes_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = AppPaths(
+                data_dir=root / "data",
+                thumbnail_dir=root / "data" / "thumbs",
+                database_path=root / "data" / "eidory.sqlite3",
+                log_dir=root / "data" / "logs",
+            )
+            paths.ensure()
+            media_path = root / "source.jpg"
+            media_path.write_bytes(b"fake")
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(media_path),
+                file_size=media_path.stat().st_size,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            image = store.list_images()[0]
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            window.grid_view.set_images([image], selected_image_ids=[image_id])
+            self.app.processEvents()
+
+            with (
+                patch.object(window, "_ask_delete_or_remove_mode", return_value="source"),
+                patch("eidory.ui.main_window.QFile.moveToTrash", return_value=True) as move_to_trash,
+            ):
+                window._delete_selected_source_files()
+
+            move_to_trash.assert_called_once_with(str(media_path))
+            self.assertEqual(store.list_images(), [])
+            window.close()
+
+    def test_delete_selected_index_can_be_undone_with_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = AppPaths(
+                data_dir=root / "data",
+                thumbnail_dir=root / "data" / "thumbs",
+                database_path=root / "data" / "eidory.sqlite3",
+                log_dir=root / "data" / "logs",
+            )
+            paths.ensure()
+            media_path = root / "source.jpg"
+            media_path.write_bytes(b"fake")
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(media_path),
+                file_size=media_path.stat().st_size,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            collection_id = store.create_collection("测试文件夹")
+            store.assign_images_to_collection([image_id], collection_id)
+            store.set_image_tags(image_id, ["室内", "夜晚"])
+            image = store.list_images()[0]
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            window.grid_view.set_images([image], selected_image_ids=[image_id])
+            self.app.processEvents()
+
+            with patch.object(window, "_ask_delete_or_remove_mode", return_value="index"):
+                window._delete_selected_source_files()
+
+            self.assertTrue(media_path.exists())
+            self.assertEqual(store.list_images(), [])
+            self.assertTrue(window.undo_removal_action.isEnabled())
+
+            window._undo_last_library_removal()
+
+            restored_images = store.list_images()
+            self.assertEqual([restored.id for restored in restored_images], [image_id])
+            self.assertEqual(store.get_image_tags(image_id), ["夜晚", "室内"])
+            self.assertEqual([item.id for item in store.list_images(collection_id=collection_id)], [image_id])
+            self.assertFalse(window.undo_removal_action.isEnabled())
+            window.close()
+
+    def test_delete_selected_source_file_can_be_undone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = AppPaths(
+                data_dir=root / "data",
+                thumbnail_dir=root / "data" / "thumbs",
+                database_path=root / "data" / "eidory.sqlite3",
+                log_dir=root / "data" / "logs",
+            )
+            paths.ensure()
+            media_path = root / "source.jpg"
+            media_path.write_bytes(b"fake-source")
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(media_path),
+                file_size=media_path.stat().st_size,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            image = store.list_images()[0]
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            window.grid_view.set_images([image], selected_image_ids=[image_id])
+            self.app.processEvents()
+
+            def fake_trash(path: str) -> bool:
+                Path(path).unlink()
+                return True
+
+            with (
+                patch.object(window, "_ask_delete_or_remove_mode", return_value="source"),
+                patch("eidory.ui.main_window.QFile.moveToTrash", side_effect=fake_trash),
+            ):
+                window._delete_selected_source_files()
+
+            self.assertFalse(media_path.exists())
+            self.assertEqual(store.list_images(), [])
+
+            window._undo_last_library_removal()
+
+            self.assertTrue(media_path.exists())
+            self.assertEqual(media_path.read_bytes(), b"fake-source")
+            self.assertEqual([image.id for image in store.list_images()], [image_id])
             window.close()
 
     def test_metadata_filter_matchers(self) -> None:
@@ -1529,6 +1748,31 @@ class MainWindowContextMenuTest(unittest.TestCase):
             if tag.tag_name == tag_name:
                 return tag.id
         raise AssertionError(f"tag not found: {tag_name}")
+
+    @staticmethod
+    def _menu_texts(menu) -> list[str]:
+        return [action.text() for action in menu.actions() if not action.isSeparator()]
+
+    @classmethod
+    def _submenu_texts(cls, menu, title: str) -> list[str]:
+        for action in menu.actions():
+            if action.text() == title and action.menu() is not None:
+                return cls._menu_texts(action.menu())
+        raise AssertionError(f"submenu not found: {title}")
+
+    @staticmethod
+    def _action_by_text(menu, title: str):
+        for action in menu.actions():
+            if action.text() == title:
+                return action
+        raise AssertionError(f"action not found: {title}")
+
+    @classmethod
+    def _submenu_action_by_text(cls, menu, submenu_title: str, action_title: str):
+        for action in menu.actions():
+            if action.text() == submenu_title and action.menu() is not None:
+                return cls._action_by_text(action.menu(), action_title)
+        raise AssertionError(f"submenu not found: {submenu_title}")
 
 
 if __name__ == "__main__":

@@ -3,13 +3,14 @@ from __future__ import annotations
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QRect, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDrag, QPainter, QPixmap
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication
 
 from eidory.core.media_types import is_supported_video
 from eidory.models import ImageItem
 from eidory.ui.collection_tree import IMAGE_IDS_MIME, CollectionTreeWidget
+from eidory.ui.drop_import_box import payload_from_mime_data, payload_supports_mime_data
 
 
 class JustifiedImageGridView(QAbstractScrollArea):
@@ -19,6 +20,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
     imagePreviewRequested = Signal(object)
     imageContextMenuRequested = Signal(object, object)
     filesDropped = Signal(object)
+    dropPayloadDropped = Signal(object)
 
     def __init__(self, thumbnail_size: int = 180, spacing: int = 4):
         super().__init__()
@@ -44,18 +46,16 @@ class JustifiedImageGridView(QAbstractScrollArea):
     def eventFilter(self, watched, event) -> bool:
         if watched is self.viewport():
             if event.type() in {QEvent.Type.DragEnter, QEvent.Type.DragMove}:
-                if event.mimeData().hasUrls():
+                if self._supports_external_import_drop(event.mimeData()):
                     event.setDropAction(Qt.DropAction.CopyAction)
                     event.accept()
                     return True
             if event.type() == QEvent.Type.Drop:
-                if event.mimeData().hasUrls():
-                    paths = self._local_paths(event.mimeData().urls())
-                    if paths:
-                        self.filesDropped.emit(paths)
-                        event.setDropAction(Qt.DropAction.CopyAction)
-                        event.accept()
-                        return True
+                if self._supports_external_import_drop(event.mimeData()):
+                    self.dropPayloadDropped.emit(payload_from_mime_data(event.mimeData()))
+                    event.setDropAction(Qt.DropAction.CopyAction)
+                    event.accept()
+                    return True
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 self._handle_left_press(event.position().toPoint(), event.modifiers())
                 event.accept()
@@ -232,27 +232,25 @@ class JustifiedImageGridView(QAbstractScrollArea):
         super().mouseReleaseEvent(event)
 
     def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasUrls():
+        if self._supports_external_import_drop(event.mimeData()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:
-        if event.mimeData().hasUrls():
+        if self._supports_external_import_drop(event.mimeData()):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
             return
         super().dragMoveEvent(event)
 
     def dropEvent(self, event) -> None:
-        if event.mimeData().hasUrls():
-            paths = self._local_paths(event.mimeData().urls())
-            if paths:
-                self.filesDropped.emit(paths)
-                event.setDropAction(Qt.DropAction.CopyAction)
-                event.accept()
-                return
+        if self._supports_external_import_drop(event.mimeData()):
+            self.dropPayloadDropped.emit(payload_from_mime_data(event.mimeData()))
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
         super().dropEvent(event)
 
     def wheelEvent(self, event) -> None:
@@ -298,6 +296,9 @@ class JustifiedImageGridView(QAbstractScrollArea):
             return
         mime = QMimeData()
         mime.setData(IMAGE_IDS_MIME, CollectionTreeWidget.encode_image_ids(image_ids))
+        urls = self._selected_file_urls()
+        if urls:
+            mime.setUrls(urls)
         drag = QDrag(self.viewport())
         drag.setMimeData(mime)
         current = self.current_image()
@@ -313,6 +314,20 @@ class JustifiedImageGridView(QAbstractScrollArea):
         drag.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
         self._drag_start_position = None
         self._drag_start_index = -1
+
+    def _selected_file_urls(self) -> list[QUrl]:
+        urls: list[QUrl] = []
+        for image in self.selected_images():
+            path = Path(image.file_path)
+            if not image.is_missing and path.exists():
+                urls.append(QUrl.fromLocalFile(str(path)))
+        return urls
+
+    @staticmethod
+    def _supports_external_import_drop(mime_data: QMimeData) -> bool:
+        if mime_data.hasFormat(IMAGE_IDS_MIME):
+            return False
+        return payload_supports_mime_data(mime_data)
 
     @staticmethod
     def _local_paths(urls) -> list[str]:

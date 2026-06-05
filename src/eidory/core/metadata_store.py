@@ -582,6 +582,36 @@ class MetadataStore:
             for collection_id, image_ids in image_ids_by_collection.items()
         }
 
+    def collection_paths_for_image(self, image_id: int) -> list[str]:
+        collections = self.list_collections()
+        by_id = {collection.id: collection for collection in collections}
+
+        def path_for(collection_id: int) -> str:
+            parts: list[str] = []
+            current = by_id.get(collection_id)
+            seen: set[int] = set()
+            while current is not None and current.id not in seen:
+                seen.add(current.id)
+                parts.append(current.name)
+                current = by_id.get(current.parent_id) if current.parent_id is not None else None
+            return " / ".join(reversed(parts))
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT collection_id
+                FROM image_collections
+                WHERE image_id = ?
+                ORDER BY collection_id
+                """,
+                (image_id,),
+            ).fetchall()
+        return [
+            path_for(int(row["collection_id"]))
+            for row in rows
+            if int(row["collection_id"]) in by_id
+        ]
+
     def collection_descendant_ids(self, collection_id: int) -> list[int]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -1084,6 +1114,58 @@ class MetadataStore:
                 """,
                 (thumbnail_path, status, image_id),
             )
+
+    def update_image_path_after_rename(
+        self,
+        image_id: int,
+        *,
+        file_path: str,
+        file_size: int,
+        modified_time_ns: int,
+    ) -> None:
+        normalized = os.path.abspath(os.path.expanduser(file_path))
+        file_name = os.path.basename(normalized)
+        file_ext = Path(file_name).suffix.lower()
+        modified_at = timestamp_ns_to_iso(modified_time_ns)
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conflict = conn.execute(
+                """
+                SELECT id
+                FROM images
+                WHERE file_path = ?
+                  AND id != ?
+                """,
+                (normalized, image_id),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("another image already uses this path")
+            cur = conn.execute(
+                """
+                UPDATE images
+                SET file_path = ?,
+                    file_name = ?,
+                    file_ext = ?,
+                    file_size = ?,
+                    modified_at = ?,
+                    modified_time_ns = ?,
+                    last_seen_at = ?,
+                    is_missing = 0
+                WHERE id = ?
+                """,
+                (
+                    normalized,
+                    file_name,
+                    file_ext,
+                    file_size,
+                    modified_at,
+                    modified_time_ns,
+                    now,
+                    image_id,
+                ),
+            )
+            if int(cur.rowcount) == 0:
+                raise ValueError("image not found")
 
     def mark_embedding_not_required(self, image_id: int) -> None:
         with self.connect() as conn:
@@ -1810,6 +1892,116 @@ class MetadataStore:
             conn.execute(f"DELETE FROM images WHERE id IN ({placeholders})", tuple(clean_ids))
             self._delete_unused_tags(conn)
             return thumbnail_paths
+
+    def snapshot_images_for_restore(self, image_ids: Sequence[int]) -> dict[str, object]:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return {"image_ids": []}
+        placeholders = ",".join("?" for _ in clean_ids)
+
+        def rows(conn: sqlite3.Connection, sql: str, params: Sequence[object]) -> list[dict[str, object]]:
+            return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+
+        with self.connect() as conn:
+            image_tags = rows(
+                conn,
+                f"SELECT * FROM image_tags WHERE image_id IN ({placeholders})",
+                clean_ids,
+            )
+            tag_ids = sorted({int(row["tag_id"]) for row in image_tags})
+            tag_rows: list[dict[str, object]] = []
+            if tag_ids:
+                tag_placeholders = ",".join("?" for _ in tag_ids)
+                tag_rows = rows(
+                    conn,
+                    f"SELECT * FROM tags WHERE id IN ({tag_placeholders})",
+                    tag_ids,
+                )
+            return {
+                "image_ids": clean_ids,
+                "images": rows(
+                    conn,
+                    f"SELECT * FROM images WHERE id IN ({placeholders})",
+                    clean_ids,
+                ),
+                "tags": tag_rows,
+                "image_tags": image_tags,
+                "embeddings": rows(
+                    conn,
+                    f"SELECT * FROM embeddings WHERE image_id IN ({placeholders})",
+                    clean_ids,
+                ),
+                "color_features": rows(
+                    conn,
+                    f"SELECT * FROM color_features WHERE image_id IN ({placeholders})",
+                    clean_ids,
+                ),
+                "image_collections": rows(
+                    conn,
+                    f"SELECT * FROM image_collections WHERE image_id IN ({placeholders})",
+                    clean_ids,
+                ),
+                "search_feedback": rows(
+                    conn,
+                    f"SELECT * FROM search_feedback WHERE image_id IN ({placeholders})",
+                    clean_ids,
+                ),
+                "temporary_project_images": rows(
+                    conn,
+                    f"SELECT * FROM temporary_project_images WHERE image_id IN ({placeholders})",
+                    clean_ids,
+                ),
+            }
+
+    def restore_images_snapshot(
+        self,
+        snapshot: Mapping[str, object],
+        *,
+        image_ids: Sequence[int] | None = None,
+    ) -> int:
+        snapshot_ids = self._clean_ids(snapshot.get("image_ids", []))  # type: ignore[arg-type]
+        clean_ids = self._clean_ids(image_ids if image_ids is not None else snapshot_ids)
+        if not clean_ids:
+            return 0
+        id_set = set(clean_ids)
+
+        def table_rows(table: str, *, id_key: str = "image_id") -> list[dict[str, object]]:
+            raw_rows = snapshot.get(table, [])
+            if not isinstance(raw_rows, list):
+                return []
+            clean_rows = [dict(row) for row in raw_rows if isinstance(row, Mapping)]
+            if table == "tags":
+                return clean_rows
+            return [row for row in clean_rows if int(row.get(id_key, 0) or 0) in id_set]
+
+        def insert_rows(conn: sqlite3.Connection, table: str, rows_to_insert: list[dict[str, object]]) -> None:
+            if not rows_to_insert:
+                return
+            columns = list(rows_to_insert[0].keys())
+            column_sql = ", ".join(columns)
+            placeholders = ", ".join("?" for _ in columns)
+            conn.executemany(
+                f"INSERT OR IGNORE INTO {table} ({column_sql}) VALUES ({placeholders})",
+                [tuple(row.get(column) for column in columns) for row in rows_to_insert],
+            )
+
+        with self.connect() as conn:
+            insert_rows(conn, "tags", table_rows("tags"))
+            image_rows = table_rows("images", id_key="id")
+            insert_rows(conn, "images", image_rows)
+            insert_rows(conn, "embeddings", table_rows("embeddings"))
+            insert_rows(conn, "color_features", table_rows("color_features"))
+            insert_rows(conn, "image_tags", table_rows("image_tags"))
+            insert_rows(conn, "image_collections", table_rows("image_collections"))
+            insert_rows(conn, "search_feedback", table_rows("search_feedback"))
+            insert_rows(conn, "temporary_project_images", table_rows("temporary_project_images"))
+            self._delete_unused_tags(conn)
+            placeholders = ",".join("?" for _ in clean_ids)
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM images WHERE id IN ({placeholders})",
+                tuple(clean_ids),
+            ).fetchone()
+            return int(row["count"] if row is not None else 0)
 
     def remove_missing_images_from_library(self) -> tuple[list[str], int]:
         with self.connect() as conn:

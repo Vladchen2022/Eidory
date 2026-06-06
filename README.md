@@ -185,10 +185,15 @@ isolated services with fake-provider tests.
 
 ## License
 
-Eidory's source code is licensed under the Apache License, Version 2.0.
-See [LICENSE](LICENSE).
+Eidory's source code is available under the PolyForm Noncommercial License
+1.0.0. See [LICENSE](LICENSE).
+
+This means you may read, use, modify, and redistribute the code for
+non-commercial purposes, but commercial use is not permitted without a separate
+license from the copyright holder. This is a source-available non-commercial
+license, not an OSI-approved open source license.
 
 The default embedding model is still governed by its own license. In particular,
 `jinaai/jina-clip-v2` is licensed separately and is currently treated by this
-project as a non-commercial personal-use default. The Apache-2.0 license applies
-to this repository's code, not to third-party model weights or services.
+project as a non-commercial personal-use default. Eidory's repository license
+applies to this repository's code, not to third-party model weights or services.

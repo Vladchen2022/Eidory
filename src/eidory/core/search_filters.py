@@ -33,10 +33,12 @@ VALID_FILTER_KINDS = {
     "similar",
     "keyword",
     "color",
+    "tag",
     "file_type",
     "orientation",
     "size",
     "ai_vision",
+    "collection",
 }
 SCORED_FILTER_KINDS = {"semantic", "similar", "color"}
 
@@ -118,6 +120,10 @@ def filter_label(
         return f"关键词：{search_filter.value}"
     if search_filter.kind == "color":
         return f"颜色：{format_color_hex(search_filter.value)}"  # type: ignore[arg-type]
+    if search_filter.kind == "tag":
+        return f"标签：{search_filter.value}"
+    if search_filter.kind == "collection":
+        return f"文件夹：{search_filter.value}"
     if search_filter.kind == "file_type":
         return f"类型：{file_type_filter_label(str(search_filter.value))}"
     if search_filter.kind == "orientation":

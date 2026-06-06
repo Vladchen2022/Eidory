@@ -683,6 +683,36 @@ class MetadataStore:
             if int(row["collection_id"]) in by_id
         ]
 
+    def collection_chains_for_image(self, image_id: int) -> list[list[CollectionItem]]:
+        collections = self.list_collections()
+        by_id = {collection.id: collection for collection in collections}
+
+        def chain_for(collection_id: int) -> list[CollectionItem]:
+            chain: list[CollectionItem] = []
+            current = by_id.get(collection_id)
+            seen: set[int] = set()
+            while current is not None and current.id not in seen:
+                seen.add(current.id)
+                chain.append(current)
+                current = by_id.get(current.parent_id) if current.parent_id is not None else None
+            return list(reversed(chain))
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT collection_id
+                FROM image_collections
+                WHERE image_id = ?
+                ORDER BY collection_id
+                """,
+                (image_id,),
+            ).fetchall()
+        return [
+            chain
+            for row in rows
+            if (chain := chain_for(int(row["collection_id"])))
+        ]
+
     def collection_descendant_ids(self, collection_id: int) -> list[int]:
         with self.connect() as conn:
             rows = conn.execute(

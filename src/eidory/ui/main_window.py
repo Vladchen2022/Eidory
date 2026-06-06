@@ -7,6 +7,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import html as html_lib
@@ -263,6 +264,10 @@ class MainWindow(QMainWindow):
         self.current_chain_base_label: str | None = None
         self.current_chain_operation_mode = "replace"
         self.result_excluded_image_ids: set[int] = set()
+        self.result_excluded_collection_ids: set[int] = set()
+        self.result_excluded_collection_image_ids: set[int] = set()
+        self.result_exclusion_filters: list[SearchFilter] = []
+        self.result_exclusion_filter_matches: dict[SearchFilter, list[ImageItem]] = {}
         self.semantic_search_revision = 0
         self.selected_image: ImageItem | None = None
         self.embedding_refresh_counter = 0
@@ -270,8 +275,10 @@ class MainWindow(QMainWindow):
         self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
         self.error_log_messages: list[str] = []
         self._last_removal_undo: dict[str, object] | None = None
+        self._macos_titlebar_applied = False
 
         self.setWindowTitle("Eidory")
+        self._configure_native_titlebar()
         self.setStatusBar(QStatusBar())
         self._build_ui()
         self._apply_runtime_language_settings()
@@ -290,6 +297,118 @@ class MainWindow(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_events)
         self.poll_timer.start(250)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._apply_macos_titlebar()
+
+    def _configure_native_titlebar(self) -> None:
+        if sys.platform != "darwin":
+            return
+        self.setWindowFlag(Qt.WindowType.NoTitleBarBackgroundHint, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        if hasattr(self, "setUnifiedTitleAndToolBarOnMac"):
+            self.setUnifiedTitleAndToolBarOnMac(True)
+        QTimer.singleShot(0, self._apply_macos_titlebar)
+        QTimer.singleShot(250, self._apply_macos_titlebar)
+
+    def _apply_macos_titlebar(self) -> None:
+        if self._macos_titlebar_applied or sys.platform != "darwin":
+            return
+        app = QApplication.instance()
+        if app is None or app.platformName().lower() != "cocoa":
+            return
+        try:
+            if not self._make_macos_titlebar_transparent():
+                return
+        except Exception as exc:
+            self._record_error(f"macOS 标题栏颜色设置失败：{exc}")
+            return
+        self._macos_titlebar_applied = True
+        if hasattr(self, "central_layout"):
+            self.central_layout.setContentsMargins(0, 0, 0, 0)
+
+    def _make_macos_titlebar_transparent(self) -> bool:
+        import ctypes
+        import ctypes.util
+
+        objc_path = ctypes.util.find_library("objc")
+        if not objc_path:
+            return False
+        objc = ctypes.cdll.LoadLibrary(objc_path)
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        msg_send = objc.objc_msgSend
+
+        def cls(name: str) -> int:
+            return int(objc.objc_getClass(name.encode("utf-8")) or 0)
+
+        def sel(name: str) -> int:
+            return int(objc.sel_registerName(name.encode("utf-8")) or 0)
+
+        def send_id(receiver: int, selector: str, *args) -> int:
+            if not receiver:
+                return 0
+            msg_send.restype = ctypes.c_void_p
+            return int(msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), *args) or 0)
+
+        def send_ulong(receiver: int, selector: str) -> int:
+            if not receiver:
+                return 0
+            msg_send.restype = ctypes.c_ulong
+            return int(msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector))) or 0)
+
+        def send_void_bool(receiver: int, selector: str, value: bool) -> None:
+            if receiver:
+                msg_send.restype = None
+                msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), ctypes.c_bool(value))
+
+        def send_void_ulong(receiver: int, selector: str, value: int) -> None:
+            if receiver:
+                msg_send.restype = None
+                msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), ctypes.c_ulong(value))
+
+        def send_void_long(receiver: int, selector: str, value: int) -> None:
+            if receiver:
+                msg_send.restype = None
+                msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), ctypes.c_long(value))
+
+        def send_void_id(receiver: int, selector: str, value: int) -> None:
+            if receiver and value:
+                msg_send.restype = None
+                msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), ctypes.c_void_p(value))
+
+        native_view = int(self.winId())
+        window = send_id(native_view, "window")
+        if not window:
+            return False
+
+        full_size_content_view_mask = 1 << 15
+        style_mask = send_ulong(window, "styleMask")
+        send_void_ulong(window, "setStyleMask:", style_mask | full_size_content_view_mask)
+        send_void_bool(window, "setTitlebarAppearsTransparent:", True)
+        send_void_long(window, "setTitleVisibility:", 0)
+        # A fully draggable background steals drag gestures from controls that live
+        # under the transparent titlebar, including text selection and sliders.
+        send_void_bool(window, "setMovableByWindowBackground:", False)
+
+        ns_string = cls("NSString")
+        ns_appearance = cls("NSAppearance")
+        if ns_string and ns_appearance:
+            appearance_name = send_id(
+                ns_string,
+                "stringWithUTF8String:",
+                ctypes.c_char_p(b"NSAppearanceNameDarkAqua"),
+            )
+            appearance = send_id(
+                ns_appearance,
+                "appearanceNamed:",
+                ctypes.c_void_p(appearance_name),
+            )
+            send_void_id(window, "setAppearance:", appearance)
+        return True
 
     def closeEvent(self, event) -> None:
         self._clear_last_removal_undo(cleanup_backups=True)
@@ -310,6 +429,10 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _build_ui(self) -> None:
+        self.central_shell = QWidget()
+        self.central_layout = QVBoxLayout(self.central_shell)
+        self.central_layout.setContentsMargins(0, 0, 0, 0)
+        self.central_layout.setSpacing(0)
         self.root_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.root_splitter.addWidget(self._build_sidebar())
         self.root_splitter.addWidget(self._build_library_panel())
@@ -317,7 +440,8 @@ class MainWindow(QMainWindow):
         self.root_splitter.setSizes(
             self._setting_int_list("ui.root_splitter_sizes", [220, 944, 216], 3)
         )
-        self.setCentralWidget(self.root_splitter)
+        self.central_layout.addWidget(self.root_splitter)
+        self.setCentralWidget(self.central_shell)
 
     def _build_sidebar(self) -> QWidget:
         panel = QWidget()
@@ -348,17 +472,15 @@ class MainWindow(QMainWindow):
         self.temp_project_list.setMinimumHeight(130)
         self.temp_project_list.setToolTip("保存的临时图片组；删除项目不会影响源文件。")
 
-        self.status_list = QListWidget()
+        self.status_filter_combo = QComboBox()
         for label, value in [
             ("全部", "all"),
             ("收藏", "favorite"),
-            ("未索引", "unindexed"),
+            ("未完成语义", "unindexed"),
             ("文件丢失", "missing"),
         ]:
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, value)
-            self.status_list.addItem(item)
-        self._set_list_current_by_data(self.status_list, self.initial_status_filter)
+            self.status_filter_combo.addItem(label, value)
+        self._set_combo_to_data(self.status_filter_combo, self.initial_status_filter)
 
         self.tag_list = QListWidget()
         self.tag_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -405,6 +527,7 @@ class MainWindow(QMainWindow):
     def _build_library_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setSpacing(4)
 
         search_row = QHBoxLayout()
         self.search_row = search_row
@@ -415,14 +538,15 @@ class MainWindow(QMainWindow):
         self.search_mode_group.setExclusive(True)
         self.color_mode_button = QPushButton("颜色")
         self.color_mode_button.setCheckable(True)
-        self.color_swatch_button = QPushButton()
-        self.color_swatch_button.setToolTip("选择颜色")
-        self._update_color_swatch()
         self.keyword_mode_button = QPushButton("关键词")
         self.keyword_mode_button.setCheckable(True)
         self.semantic_mode_button = QPushButton("语义")
         self.semantic_mode_button.setCheckable(True)
         self.semantic_mode_button.setChecked(True)
+        self.collection_filter_button = QPushButton("文件夹")
+        self.collection_filter_button.setToolTip("选择文件夹作为筛选或反向排除条件")
+        self.tag_filter_button = QPushButton("标签")
+        self.tag_filter_button.setToolTip("选择用户标签作为筛选或反向排除条件")
         self.similar_image_button = QPushButton("相似图")
         self.similar_image_button.setToolTip("用当前选中的图片查找相似图片")
         self.search_mode_group.addButton(self.color_mode_button)
@@ -430,25 +554,40 @@ class MainWindow(QMainWindow):
         self.search_mode_group.addButton(self.semantic_mode_button)
         self.search_button = QPushButton("搜索")
         self.clear_search_button = QPushButton("清空")
+        self.reverse_exclusion_button = QPushButton("反向排除")
+        self.reverse_exclusion_button.setCheckable(True)
+        self.reverse_exclusion_button.setToolTip("打开后，颜色/关键词/语义/标签会从当前结果中反向扣除")
+        self.advanced_search_toggle_button = QPushButton("筛选/排序")
+        self.advanced_search_toggle_button.setCheckable(True)
+        self.advanced_search_toggle_button.setToolTip("展开搜索逻辑、元数据筛选、排序和结果管理")
         for search_action_button in [
+            self.reverse_exclusion_button,
             self.color_mode_button,
-            self.color_swatch_button,
             self.keyword_mode_button,
             self.semantic_mode_button,
+            self.collection_filter_button,
+            self.tag_filter_button,
             self.similar_image_button,
             self.search_button,
             self.clear_search_button,
+            self.advanced_search_toggle_button,
         ]:
             search_action_button.setMinimumWidth(TOOL_BUTTON_MIN_WIDTH)
+        self._update_color_swatch()
         search_row.addWidget(self.search_input, 1)
         search_row.addSpacing(8)
+        search_row.addWidget(self.reverse_exclusion_button)
+        search_row.addSpacing(16)
         search_row.addWidget(self.color_mode_button)
-        search_row.addWidget(self.color_swatch_button)
         search_row.addWidget(self.keyword_mode_button)
         search_row.addWidget(self.semantic_mode_button)
+        search_row.addWidget(self.collection_filter_button)
+        search_row.addWidget(self.tag_filter_button)
         search_row.addWidget(self.similar_image_button)
+        search_row.addSpacing(16)
         search_row.addWidget(self.search_button)
         search_row.addWidget(self.clear_search_button)
+        search_row.addWidget(self.advanced_search_toggle_button)
 
         search_operation_row = QHBoxLayout()
         search_operation_row.setContentsMargins(0, 0, 0, 0)
@@ -477,6 +616,20 @@ class MainWindow(QMainWindow):
             self.search_operation_group.addButton(operation_button)
             search_operation_row.addWidget(operation_button)
         search_operation_row.addStretch(1)
+
+        saved_view_row = QHBoxLayout()
+        saved_view_row.setContentsMargins(0, 0, 0, 0)
+        saved_view_row.setSpacing(6)
+        saved_view_row.addWidget(QLabel("筛选预设"))
+        saved_view_row.addWidget(self.saved_view_combo, 1)
+        saved_view_row.addWidget(self.save_view_button)
+        saved_view_row.addWidget(self.apply_view_button)
+        saved_view_row.addWidget(self.rename_view_button)
+        saved_view_row.addWidget(self.delete_view_button)
+        saved_view_row.addSpacing(12)
+        saved_view_row.addWidget(QLabel("状态"))
+        self.status_filter_combo.setMinimumWidth(110)
+        saved_view_row.addWidget(self.status_filter_combo)
 
         metadata_filter_row = QHBoxLayout()
         self.file_type_filter_combo = QComboBox()
@@ -544,7 +697,6 @@ class MainWindow(QMainWindow):
         self.shuffle_results_button = QPushButton("打乱排序")
         self.shuffle_results_button.setToolTip("随机打乱当前显示的图片顺序，不改变筛选条件")
         self.shuffle_results_button.setMinimumWidth(TOOL_BUTTON_MIN_WIDTH)
-        metadata_filter_row.addWidget(self.shuffle_results_button)
         metadata_filter_row.addStretch(1)
 
         self.filter_chain_widget = QWidget()
@@ -567,18 +719,27 @@ class MainWindow(QMainWindow):
         result_tools_row.addStretch(1)
 
         threshold_row = QHBoxLayout()
+        threshold_row.setContentsMargins(0, 0, 0, 0)
+        threshold_row.setSpacing(8)
         self.score_threshold_slider = QSlider(Qt.Orientation.Horizontal)
         self.score_threshold_slider.setRange(0, 100)
         self.score_threshold_slider.setValue(self.initial_score_threshold)
         self.score_threshold_label = QLabel(
             self._format_score_threshold_label(self.initial_score_threshold)
         )
+        self.score_threshold_label.setMinimumWidth(112)
+        self.score_threshold_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         threshold_row.addWidget(self.score_threshold_label)
         threshold_row.addWidget(self.score_threshold_slider, 1)
 
         self.result_state_label = QLabel("全部图库")
+        self.result_state_label.setWordWrap(False)
+        self.result_state_label.setFixedHeight(20)
+        self.result_state_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.search_diagnostics_label = QLabel("搜索诊断：-")
-        self.search_diagnostics_label.setWordWrap(True)
+        self.search_diagnostics_label.setWordWrap(False)
+        self.search_diagnostics_label.setFixedHeight(20)
+        self.search_diagnostics_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self.grid_view = JustifiedImageGridView(
             thumbnail_size=self.initial_thumbnail_size,
@@ -593,17 +754,32 @@ class MainWindow(QMainWindow):
         self.thumbnail_size_slider.setValue(self.initial_thumbnail_size)
         self.thumbnail_size_slider.setMaximumWidth(220)
         thumbnail_size_row.addStretch(1)
+        thumbnail_size_row.addWidget(self.shuffle_results_button)
+        thumbnail_size_row.addSpacing(12)
         thumbnail_size_row.addWidget(self.thumbnail_size_label)
         thumbnail_size_row.addWidget(self.thumbnail_size_slider)
 
+        self.advanced_search_widget = QWidget()
+        advanced_layout = QVBoxLayout(self.advanced_search_widget)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(4)
+        advanced_layout.addLayout(search_operation_row)
+        advanced_layout.addLayout(saved_view_row)
+        advanced_layout.addLayout(metadata_filter_row)
+        advanced_layout.addLayout(result_tools_row)
+        self.advanced_search_widget.hide()
+
+        compact_status_row = QHBoxLayout()
+        compact_status_row.setContentsMargins(0, 0, 0, 0)
+        compact_status_row.setSpacing(12)
+        compact_status_row.addWidget(self.result_state_label, 2)
+        compact_status_row.addWidget(self.search_diagnostics_label, 3)
+
         layout.addLayout(search_row)
-        layout.addLayout(search_operation_row)
-        layout.addLayout(metadata_filter_row)
+        layout.addWidget(self.advanced_search_widget)
         layout.addWidget(self.filter_chain_widget)
-        layout.addLayout(result_tools_row)
         layout.addLayout(threshold_row)
-        layout.addWidget(self.result_state_label)
-        layout.addWidget(self.search_diagnostics_label)
+        layout.addLayout(compact_status_row)
         layout.addWidget(self.grid_view, 1)
         layout.addWidget(self.load_more_button)
         layout.addLayout(thumbnail_size_row)
@@ -713,6 +889,16 @@ class MainWindow(QMainWindow):
         batch_tags_layout.addWidget(self.batch_tag_summary_label)
         batch_tags_layout.addLayout(batch_add_row)
         batch_tags_layout.addLayout(batch_remove_row)
+
+        self.tag_panel_selection_label = QLabel("未选择图片")
+        self.tag_panel_selection_label.setWordWrap(True)
+        self.tag_panel_input = QLineEdit()
+        self.tag_panel_input.setPlaceholderText("给选中图片添加标签，逗号分隔")
+        self.tag_panel_input.setCompleter(self._make_tag_completer())
+        self.tag_panel_add_button = QPushButton("添加到选中")
+        self.tag_panel_remove_combo = QComboBox()
+        self.tag_panel_remove_button = QPushButton("移除标签")
+        self.tag_panel_clear_button = QPushButton("清空标签")
         self.note_input = QTextEdit()
         self.note_input.setPlaceholderText("备注")
         self.note_input.setAcceptRichText(False)
@@ -886,29 +1072,38 @@ class MainWindow(QMainWindow):
         inspiration_button_row.addWidget(self.search_inspiration_button)
         inspiration_layout.addLayout(inspiration_button_row)
         inspiration_layout.addWidget(self.save_temp_project_button)
+        inspiration_layout.addSpacing(8)
+        inspiration_layout.addWidget(QLabel("AI 场景筛选"))
+        ai_filter_row = QHBoxLayout()
+        ai_filter_row.setContentsMargins(0, 0, 0, 0)
+        ai_filter_row.addWidget(self.ai_vision_field_filter_combo)
+        ai_filter_row.addWidget(self.ai_vision_value_filter_combo)
+        ai_filter_row.addWidget(self.add_ai_vision_filter_button)
+        inspiration_layout.addLayout(ai_filter_row)
 
         filter_tab = QWidget()
         filter_layout = QVBoxLayout(filter_tab)
         filter_layout.setContentsMargins(6, 6, 6, 6)
         filter_layout.setSpacing(6)
-        saved_view_row = QHBoxLayout()
-        saved_view_row.setContentsMargins(0, 0, 0, 0)
-        saved_view_row.addWidget(self.saved_view_combo, 1)
-        saved_view_row.addWidget(self.save_view_button)
-        saved_view_row.addWidget(self.apply_view_button)
-        saved_view_row.addWidget(self.rename_view_button)
-        saved_view_row.addWidget(self.delete_view_button)
-        filter_layout.addWidget(QLabel("视图预设"))
-        filter_layout.addLayout(saved_view_row)
-        self.status_list.setMaximumHeight(96)
-        filter_layout.addWidget(QLabel("状态"))
-        filter_layout.addWidget(self.status_list)
-        filter_layout.addWidget(QLabel("标签"))
+        filter_layout.addWidget(QLabel("给选中图片打标签"))
+        filter_layout.addWidget(self.tag_panel_selection_label)
+        tag_panel_add_row = QHBoxLayout()
+        tag_panel_add_row.setContentsMargins(0, 0, 0, 0)
+        tag_panel_add_row.addWidget(self.tag_panel_input, 1)
+        tag_panel_add_row.addWidget(self.tag_panel_add_button)
+        filter_layout.addLayout(tag_panel_add_row)
+        tag_panel_remove_row = QHBoxLayout()
+        tag_panel_remove_row.setContentsMargins(0, 0, 0, 0)
+        tag_panel_remove_row.addWidget(self.tag_panel_remove_combo, 1)
+        tag_panel_remove_row.addWidget(self.tag_panel_remove_button)
+        tag_panel_remove_row.addWidget(self.tag_panel_clear_button)
+        filter_layout.addLayout(tag_panel_remove_row)
+        filter_layout.addSpacing(8)
+        filter_layout.addWidget(QLabel("标签管理"))
         tag_tools_row = QHBoxLayout()
         tag_tools_row.setContentsMargins(0, 0, 0, 0)
         tag_tools_row.addWidget(self.tag_search_input, 1)
         tag_tools_row.addWidget(self.tag_sort_combo)
-        tag_tools_row.addWidget(self.tag_match_combo)
         filter_layout.addLayout(tag_tools_row)
         filter_layout.addWidget(self.tag_list, 1)
         tag_action_row = QHBoxLayout()
@@ -917,13 +1112,6 @@ class MainWindow(QMainWindow):
         tag_action_row.addWidget(self.delete_tag_button)
         tag_action_row.addWidget(self.merge_tag_button)
         filter_layout.addLayout(tag_action_row)
-        filter_layout.addWidget(QLabel("AI 场景筛选"))
-        ai_filter_row = QHBoxLayout()
-        ai_filter_row.setContentsMargins(0, 0, 0, 0)
-        ai_filter_row.addWidget(self.ai_vision_field_filter_combo)
-        ai_filter_row.addWidget(self.ai_vision_value_filter_combo)
-        ai_filter_row.addWidget(self.add_ai_vision_filter_button)
-        filter_layout.addLayout(ai_filter_row)
 
         index_tab = QWidget()
         index_layout = QVBoxLayout(index_tab)
@@ -1090,7 +1278,7 @@ class MainWindow(QMainWindow):
         self.right_tab_widget.setTabBar(EqualWidthTabBar())
         self.right_tab_widget.addTab(detail_tab, "详情")
         self.right_tab_widget.addTab(inspiration_tab, "AI")
-        self.right_tab_widget.addTab(filter_tab, "筛选")
+        self.right_tab_widget.addTab(filter_tab, "标签")
         self.right_tab_widget.addTab(index_tab, "索引")
         self.right_tab_widget.addTab(settings_tab, "设置")
         self.right_tab_widget.setElideMode(Qt.TextElideMode.ElideRight)
@@ -1116,12 +1304,15 @@ class MainWindow(QMainWindow):
         self.rescan_button.clicked.connect(self._rescan_selected_folder)
         self.add_collection_button.clicked.connect(self._create_collection_from_button)
         self.shuffle_results_button.clicked.connect(self._shuffle_current_grid_images)
+        self.advanced_search_toggle_button.toggled.connect(self._toggle_advanced_search_tools)
         self.search_button.clicked.connect(self._run_search)
         self.clear_search_button.clicked.connect(self._clear_search)
         self.save_result_set_button.clicked.connect(self._save_current_visible_results_as_temporary_project)
         self.search_input.returnPressed.connect(self._run_search)
         self.similar_image_button.clicked.connect(self._find_similar_to_selected_image)
-        self.color_swatch_button.clicked.connect(self._choose_search_color)
+        self.color_mode_button.clicked.connect(self._choose_search_color)
+        self.collection_filter_button.clicked.connect(self._choose_collection_filter)
+        self.tag_filter_button.clicked.connect(self._choose_tag_filter)
         self.add_file_type_filter_button.clicked.connect(self._add_file_type_filter_from_controls)
         self.add_dimension_filter_button.clicked.connect(self._add_dimension_filter_from_controls)
         self.ai_vision_field_filter_combo.currentIndexChanged.connect(self._refresh_ai_vision_value_filter_combo)
@@ -1146,6 +1337,11 @@ class MainWindow(QMainWindow):
         self.undo_removal_action.setEnabled(False)
         self.undo_removal_action.triggered.connect(self._undo_last_library_removal)
         self.addAction(self.undo_removal_action)
+        self.minimize_window_action = QAction("最小化窗口", self)
+        self.minimize_window_action.setShortcuts([QKeySequence("Meta+M"), QKeySequence("Ctrl+M")])
+        self.minimize_window_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.minimize_window_action.triggered.connect(self._minimize_window)
+        self.addAction(self.minimize_window_action)
         self.open_collection_import_dir_button.clicked.connect(self._open_selected_collection_import_dir)
         self.open_original_button.clicked.connect(self._open_selected_original)
         self.reveal_in_finder_button.clicked.connect(self._reveal_selected_in_finder)
@@ -1156,6 +1352,9 @@ class MainWindow(QMainWindow):
         self.batch_add_tags_button.clicked.connect(self._batch_add_tags_from_panel)
         self.batch_remove_tag_button.clicked.connect(self._batch_remove_selected_tag)
         self.batch_clear_tags_button.clicked.connect(self._batch_clear_tags)
+        self.tag_panel_add_button.clicked.connect(self._tag_panel_add_tags)
+        self.tag_panel_remove_button.clicked.connect(self._tag_panel_remove_selected_tag)
+        self.tag_panel_clear_button.clicked.connect(self._tag_panel_clear_tags)
         self.generate_inspiration_button.clicked.connect(self._generate_inspiration_terms_from_panel)
         self.generate_search_plan_button.clicked.connect(self._generate_search_plan_from_panel)
         self.search_inspiration_button.clicked.connect(self._save_and_search_inspiration)
@@ -1192,9 +1391,8 @@ class MainWindow(QMainWindow):
         self.collection_tree.treeReordered.connect(self._save_collection_tree_order)
         self.collection_tree.imagesDropped.connect(self._assign_dropped_images_to_collection)
         self.collection_tree.filesDropped.connect(self._import_dropped_files_to_collection)
-        self.status_list.itemSelectionChanged.connect(self._refresh_current_results_for_filters)
-        self.status_list.itemSelectionChanged.connect(self._save_status_filter)
-        self.tag_list.itemSelectionChanged.connect(self._refresh_current_results_for_filters)
+        self.status_filter_combo.currentIndexChanged.connect(self._refresh_current_results_for_filters)
+        self.status_filter_combo.currentIndexChanged.connect(self._save_status_filter)
         self.tag_list.itemSelectionChanged.connect(self._refresh_tag_action_buttons)
         self.tag_list.itemSelectionChanged.connect(self._save_selected_tag_filter)
         self.tag_search_input.textChanged.connect(self._on_tag_search_changed)
@@ -1225,6 +1423,16 @@ class MainWindow(QMainWindow):
         self.apply_view_button.clicked.connect(self._apply_selected_saved_view)
         self.rename_view_button.clicked.connect(self._rename_selected_saved_view)
         self.delete_view_button.clicked.connect(self._delete_selected_saved_view)
+
+    def _minimize_window(self) -> None:
+        self.showMinimized()
+
+    def _toggle_advanced_search_tools(self, checked: bool) -> None:
+        self.advanced_search_widget.setVisible(checked)
+        if self.current_language == "en":
+            self.advanced_search_toggle_button.setText("Hide Filters" if checked else "Filters / Sort")
+        else:
+            self.advanced_search_toggle_button.setText("收起筛选" if checked else "筛选/排序")
 
     def _load_settings_controls(self) -> None:
         service = self._llm_service_key()
@@ -1646,12 +1854,21 @@ class MainWindow(QMainWindow):
             self.add_collection_button.setText("New Folder")
             self.add_folder_button.setText("Import Here")
             self.search_input.setPlaceholderText("File name, tags, notes, or semantic search text")
-            self.color_mode_button.setText("Color")
             self.keyword_mode_button.setText("Keyword")
             self.semantic_mode_button.setText("Semantic")
+            self.collection_filter_button.setText("Folder")
+            self.collection_filter_button.setToolTip("Choose folders as include or reverse-exclude conditions")
+            self.tag_filter_button.setText("Tags")
+            self.tag_filter_button.setToolTip("Choose user tags as include or reverse-exclude conditions")
             self.similar_image_button.setText("Similar")
             self.search_button.setText("Search")
             self.clear_search_button.setText("Clear")
+            self.reverse_exclusion_button.setText("Exclude")
+            self.reverse_exclusion_button.setToolTip("When enabled, Color/Keyword/Semantic/Tag conditions subtract matches from the current results")
+            self.advanced_search_toggle_button.setText(
+                "Hide Filters" if self.advanced_search_toggle_button.isChecked() else "Filters / Sort"
+            )
+            self.advanced_search_toggle_button.setToolTip("Show search logic, metadata filters, sorting, and result tools")
             self.search_within_results_button.setText("Within Results")
             self.search_merge_results_button.setText("Merge Results")
             self.search_replace_results_button.setText("Replace")
@@ -1661,6 +1878,10 @@ class MainWindow(QMainWindow):
             self.save_detail_button.setText("Save Details")
             self.delete_source_button.setText("Delete / Remove")
             self.delete_source_button.setToolTip("Delete source files, or only remove them from Eidory")
+            self.tag_panel_input.setPlaceholderText("Add tags to selected items, separated by commas")
+            self.tag_panel_add_button.setText("Add to Selected")
+            self.tag_panel_remove_button.setText("Remove Tag")
+            self.tag_panel_clear_button.setText("Clear Tags")
             self.inspiration_brief_input.setPlaceholderText("Describe the image concept in one sentence")
             self.inspiration_answers_input.setPlaceholderText("Extra context: era, weather, lighting, mood, optional")
             self.inspiration_questions_label.setText("AI questions: -")
@@ -1698,19 +1919,28 @@ class MainWindow(QMainWindow):
             self.apply_path_remap_button.setText("Apply Remap")
             self.right_tab_widget.setTabText(0, "Details")
             self.right_tab_widget.setTabText(1, "AI")
-            self.right_tab_widget.setTabText(2, "Filters")
+            self.right_tab_widget.setTabText(2, "Tags")
             self.right_tab_widget.setTabText(3, "Index")
             self.right_tab_widget.setTabText(4, "Settings")
         else:
             self.add_collection_button.setText("新建文件夹")
             self.add_folder_button.setText("导入到当前文件夹")
             self.search_input.setPlaceholderText("文件名、标签、备注，或语义搜索文本")
-            self.color_mode_button.setText("颜色")
             self.keyword_mode_button.setText("关键词")
             self.semantic_mode_button.setText("语义")
+            self.collection_filter_button.setText("文件夹")
+            self.collection_filter_button.setToolTip("选择文件夹作为筛选或反向排除条件")
+            self.tag_filter_button.setText("标签")
+            self.tag_filter_button.setToolTip("选择用户标签作为筛选或反向排除条件")
             self.similar_image_button.setText("相似图")
             self.search_button.setText("搜索")
             self.clear_search_button.setText("清空")
+            self.reverse_exclusion_button.setText("反向排除")
+            self.reverse_exclusion_button.setToolTip("打开后，颜色/关键词/语义/标签会从当前结果中反向扣除")
+            self.advanced_search_toggle_button.setText(
+                "收起筛选" if self.advanced_search_toggle_button.isChecked() else "筛选/排序"
+            )
+            self.advanced_search_toggle_button.setToolTip("展开搜索逻辑、元数据筛选、排序和结果管理")
             self.search_within_results_button.setText("在结果中搜")
             self.search_merge_results_button.setText("合并结果")
             self.search_replace_results_button.setText("重新搜索")
@@ -1720,6 +1950,10 @@ class MainWindow(QMainWindow):
             self.save_detail_button.setText("保存详情")
             self.delete_source_button.setText("删除/移除图片")
             self.delete_source_button.setToolTip("选择删除源文件，或只从 Eidory 移除索引")
+            self.tag_panel_input.setPlaceholderText("给选中图片添加标签，逗号分隔")
+            self.tag_panel_add_button.setText("添加到选中")
+            self.tag_panel_remove_button.setText("移除标签")
+            self.tag_panel_clear_button.setText("清空标签")
             self.inspiration_brief_input.setPlaceholderText("用一句话描述画面的创作主题")
             self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
             self.inspiration_questions_label.setText("AI 追问：-")
@@ -1757,9 +1991,10 @@ class MainWindow(QMainWindow):
             self.apply_path_remap_button.setText("应用重映射")
             self.right_tab_widget.setTabText(0, "详情")
             self.right_tab_widget.setTabText(1, "AI")
-            self.right_tab_widget.setTabText(2, "筛选")
+            self.right_tab_widget.setTabText(2, "标签")
             self.right_tab_widget.setTabText(3, "索引")
             self.right_tab_widget.setTabText(4, "设置")
+        self._update_color_swatch()
         self._refresh_ai_vision_value_filter_combo()
 
     def _choose_folder(self) -> None:
@@ -2097,6 +2332,9 @@ class MainWindow(QMainWindow):
     def _run_search(self) -> None:
         search_filter = self._search_filter_from_controls()
         if search_filter is None:
+            return
+        if self.reverse_exclusion_button.isChecked():
+            self._start_reverse_exclusion_with_filter(search_filter)
             return
         self._start_search_with_filter(search_filter)
 
@@ -2489,8 +2727,8 @@ class MainWindow(QMainWindow):
         revision = self.semantic_search_revision
         folder_path_prefix = self._selected_folder_path_prefix()
         collection_id = self._selected_collection_id()
-        tag_ids = self._selected_tag_ids()
-        tag_match_mode = self._selected_tag_match_mode()
+        tag_ids: list[int] = []
+        tag_match_mode = "any"
         status_filter = self._selected_status_filter()
         self.current_result_mode = "inspiration"
         self.current_inspiration_project_id = project_id
@@ -2636,6 +2874,9 @@ class MainWindow(QMainWindow):
         self._find_similar_to_image(self._selected_grid_image())
 
     def _find_similar_to_image(self, image: ImageItem | None) -> None:
+        if self.reverse_exclusion_button.isChecked():
+            self.statusBar().showMessage("反向排除暂不支持相似图")
+            return
         reason = self._similar_image_blocking_reason(image, check_vector=True)
         if reason is not None:
             self.statusBar().showMessage(reason)
@@ -2711,7 +2952,7 @@ class MainWindow(QMainWindow):
     def _save_current_view(self) -> None:
         name, ok = QInputDialog.getText(
             self,
-            "保存视图预设",
+            "保存筛选预设",
             "预设名称：",
             QLineEdit.EchoMode.Normal,
             self._suggest_saved_view_name(),
@@ -2728,29 +2969,29 @@ class MainWindow(QMainWindow):
             json.dumps(payload, ensure_ascii=False, sort_keys=True),
         )
         self._refresh_saved_views(select_saved_view_id=saved_view_id)
-        self.statusBar().showMessage(f"已保存视图预设：{clean_name}")
+        self.statusBar().showMessage(f"已保存筛选预设：{clean_name}")
 
     def _apply_selected_saved_view(self) -> None:
         saved_view = self._selected_saved_view()
         if saved_view is None:
-            self.statusBar().showMessage("请先选择一个视图预设")
+            self.statusBar().showMessage("请先选择一个筛选预设")
             return
         try:
             payload = json.loads(saved_view.payload_json)
         except json.JSONDecodeError:
-            QMessageBox.warning(self, "Eidory", "该视图预设数据损坏，无法载入。")
+            QMessageBox.warning(self, "Eidory", "该筛选预设数据损坏，无法载入。")
             return
         self._apply_view_payload(payload)
-        self.statusBar().showMessage(f"已载入视图预设：{saved_view.name}")
+        self.statusBar().showMessage(f"已载入筛选预设：{saved_view.name}")
 
     def _rename_selected_saved_view(self) -> None:
         saved_view = self._selected_saved_view()
         if saved_view is None:
-            self.statusBar().showMessage("请先选择一个视图预设")
+            self.statusBar().showMessage("请先选择一个筛选预设")
             return
         name, ok = QInputDialog.getText(
             self,
-            "重命名视图预设",
+            "重命名筛选预设",
             "新名称：",
             QLineEdit.EchoMode.Normal,
             saved_view.name,
@@ -2768,17 +3009,17 @@ class MainWindow(QMainWindow):
             return
         if changed:
             self._refresh_saved_views(select_saved_view_id=saved_view.id)
-            self.statusBar().showMessage(f"视图预设已重命名为：{clean_name}")
+            self.statusBar().showMessage(f"筛选预设已重命名为：{clean_name}")
 
     def _delete_selected_saved_view(self) -> None:
         saved_view = self._selected_saved_view()
         if saved_view is None:
-            self.statusBar().showMessage("请先选择一个视图预设")
+            self.statusBar().showMessage("请先选择一个筛选预设")
             return
         answer = QMessageBox.question(
             self,
-            "删除视图预设",
-            f"删除视图预设“{saved_view.name}”？",
+            "删除筛选预设",
+            f"删除筛选预设“{saved_view.name}”？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -2786,7 +3027,7 @@ class MainWindow(QMainWindow):
             return
         if self.store.delete_saved_view(saved_view.id):
             self._refresh_saved_views()
-            self.statusBar().showMessage(f"已删除视图预设：{saved_view.name}")
+            self.statusBar().showMessage(f"已删除筛选预设：{saved_view.name}")
 
     def _search_filter_from_controls(self) -> SearchFilter | None:
         mode = self._selected_search_mode()
@@ -2818,6 +3059,35 @@ class MainWindow(QMainWindow):
         )
         self._execute_search_chain(operation_mode=operation_mode)
 
+    def _start_reverse_exclusion_with_filter(self, search_filter: SearchFilter) -> None:
+        if search_filter.kind not in {"keyword", "semantic", "color", "tag"}:
+            self.statusBar().showMessage("反向排除暂只支持颜色、关键词、语义和标签")
+            return
+        if not self._has_visible_result_context():
+            self.statusBar().showMessage("先做一次正向筛选，再使用反向排除")
+            return
+        source_images = self._result_exclusion_source_images()
+        if not source_images:
+            self.statusBar().showMessage("当前结果为空，不能反向排除")
+            return
+        source_ids = {image.id for image in source_images}
+        self.semantic_search_revision += 1
+        revision = self.semantic_search_revision
+        self.search_button.setEnabled(False)
+        self._set_result_status(f"反向排除计算中：{self._filter_label(search_filter)}")
+
+        def run() -> None:
+            try:
+                matches = self._compute_result_exclusion_filter_matches(
+                    search_filter,
+                    source_ids,
+                )
+                self.events.put(("result_exclusion_filter_done", (revision, search_filter, matches)))
+            except Exception as exc:
+                self.events.put(("error", f"反向排除失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _add_search_filter(
         self,
         search_filter: SearchFilter,
@@ -2831,6 +3101,102 @@ class MainWindow(QMainWindow):
         self._sync_legacy_search_state_from_filters()
         self._refresh_filter_chain_ui()
 
+    def _add_result_exclusion_filter_from_matches(
+        self,
+        search_filter: SearchFilter,
+        matches: list[ImageItem],
+    ) -> None:
+        if search_filter not in self.result_exclusion_filters:
+            self.result_exclusion_filters.append(search_filter)
+        self.result_exclusion_filter_matches[search_filter] = list(matches)
+        self._refresh_visible_results_after_result_management_change()
+        self.statusBar().showMessage(
+            f"已加入反向排除：{self._filter_label(search_filter)}，命中 {len(matches)} 张"
+        )
+
+    def _remove_result_exclusion_filter(self, index: int) -> None:
+        if index < 0 or index >= len(self.result_exclusion_filters):
+            return
+        search_filter = self.result_exclusion_filters.pop(index)
+        self.result_exclusion_filter_matches.pop(search_filter, None)
+        self._refresh_visible_results_after_result_management_change()
+
+    def _recompute_result_exclusion_filter_matches_for_current_source(self) -> None:
+        if not self.result_exclusion_filters:
+            return
+        source_ids = {image.id for image in self._result_exclusion_source_images()}
+        if not source_ids:
+            self.result_exclusion_filter_matches = {
+                search_filter: []
+                for search_filter in self.result_exclusion_filters
+            }
+            return
+        self.result_exclusion_filter_matches = {
+            search_filter: self._compute_result_exclusion_filter_matches(search_filter, source_ids)
+            for search_filter in self.result_exclusion_filters
+        }
+
+    def _compute_result_exclusion_filter_matches(
+        self,
+        search_filter: SearchFilter,
+        source_ids: set[int],
+    ) -> list[ImageItem]:
+        if not source_ids:
+            return []
+        if search_filter.kind == "keyword":
+            return [
+                image
+                for image in self.store.images_by_ids(sorted(source_ids))
+                if self._image_matches_keyword(image, str(search_filter.value))
+            ]
+        if search_filter.kind == "semantic":
+            return self.search_service.semantic_search(
+                str(search_filter.value),
+                allowed_image_ids=set(source_ids),
+            ).images
+        if search_filter.kind == "color":
+            return self.search_service.color_search(
+                search_filter.value,  # type: ignore[arg-type]
+                allowed_image_ids=set(source_ids),
+            ).images
+        if search_filter.kind == "tag":
+            selected_ids, match_mode = self._tag_filter_parts(search_filter)
+            matching_ids = self._image_ids_for_tags(selected_ids, match_mode) & set(source_ids)
+            return self.store.images_by_ids(sorted(matching_ids))
+        return []
+
+    def _result_exclusion_source_images(self) -> list[ImageItem]:
+        if self.current_result_mode == "search_chain" or self.search_filters:
+            return list(self.current_chain_images)
+        if self.current_result_mode == "inspiration":
+            return list(self.current_inspiration_images)
+        if self.current_result_mode == "temp_project":
+            return list(self.current_temp_project_images)
+        if self.current_result_mode == "semantic":
+            return list(self.current_semantic_images)
+        if self.current_result_mode == "color":
+            return list(self.current_color_images)
+        if self.current_result_mode == "keyword":
+            return list(self.grid_view.images())
+        return []
+
+    def _result_exclusion_filter_image_ids(self) -> set[int]:
+        excluded: set[int] = set()
+        for search_filter in self.result_exclusion_filters:
+            matches = self.result_exclusion_filter_matches.get(search_filter, [])
+            threshold: float | None = None
+            if search_filter.kind == "semantic":
+                threshold = self._semantic_score_threshold(matches)
+            elif search_filter.kind == "color":
+                threshold = self._color_score_threshold(matches)
+            for image in matches:
+                if threshold is not None and (
+                    image.score is None or image.score < threshold
+                ):
+                    continue
+                excluded.add(image.id)
+        return excluded
+
     def _execute_search_chain(self, operation_mode: str = "refine") -> None:
         if not self.search_filters:
             self._reload_images()
@@ -2841,8 +3207,8 @@ class MainWindow(QMainWindow):
         filters = tuple(self.search_filters)
         folder_path_prefix = self._selected_folder_path_prefix()
         collection_id = self._selected_collection_id()
-        tag_ids = self._selected_tag_ids()
-        tag_match_mode = self._selected_tag_match_mode()
+        tag_ids: list[int] = []
+        tag_match_mode = "any"
         status_filter = self._selected_status_filter()
         base_image_ids, base_label, merge_base_images = self._search_operation_context(operation_mode)
 
@@ -3058,6 +3424,38 @@ class MainWindow(QMainWindow):
                     for image in images
                     if image.id in matching_ids
                 ]
+            elif search_filter.kind == "collection":
+                selected_ids = self._collection_filter_ids(search_filter)
+                if allowed_image_ids is None:
+                    images = self._list_chain_base_images(
+                        folder_path_prefix=folder_path_prefix,
+                        collection_id=collection_id,
+                        tag_ids=tag_ids,
+                        tag_match_mode=tag_match_mode,
+                        status_filter=status_filter,
+                    )
+                matching_ids = self._image_ids_for_collections(selected_ids)
+                images = [
+                    image
+                    for image in images
+                    if image.id in matching_ids
+                ]
+            elif search_filter.kind == "tag":
+                selected_ids, match_mode = self._tag_filter_parts(search_filter)
+                if allowed_image_ids is None:
+                    images = self._list_chain_base_images(
+                        folder_path_prefix=folder_path_prefix,
+                        collection_id=collection_id,
+                        tag_ids=tag_ids,
+                        tag_match_mode=tag_match_mode,
+                        status_filter=status_filter,
+                    )
+                matching_ids = self._image_ids_for_tags(selected_ids, match_mode)
+                images = [
+                    image
+                    for image in images
+                    if image.id in matching_ids
+                ]
             allowed_image_ids = {image.id for image in images}
             if not allowed_image_ids:
                 break
@@ -3174,6 +3572,7 @@ class MainWindow(QMainWindow):
         self.current_color_indexed_count = result.color_indexed_count
         self.current_color_candidate_limit = result.color_candidate_limit
         self._sync_legacy_search_state_from_filters()
+        self._recompute_result_exclusion_filter_matches_for_current_source()
         self._apply_search_chain_filters()
         images = self.current_chain_filtered_images
         self.grid_view.set_images(images)
@@ -3204,6 +3603,7 @@ class MainWindow(QMainWindow):
             self.current_inspiration_raw_term_results = []
             self.current_inspiration_images = list(result.images)
             self.current_inspiration_matches = dict(result.matches_by_image_id)
+        self._recompute_result_exclusion_filter_matches_for_current_source()
         self._apply_inspiration_result_filters()
         images = self.current_inspiration_filtered_images
         badges = self._inspiration_badges_by_image_id()
@@ -3239,7 +3639,7 @@ class MainWindow(QMainWindow):
             if len(self.current_inspiration_matches.get(image.id, [])) > 1
         )
         scores = [image.score for image in images if image.score is not None]
-        threshold = self._score_threshold()
+        threshold = self._semantic_score_threshold(self.current_inspiration_images)
         threshold_text = "不限" if threshold is None else f"{threshold:.2f}"
         protected_count = (
             0
@@ -3254,7 +3654,7 @@ class MainWindow(QMainWindow):
             f"显示 {len(images)}",
             f"探针覆盖 {covered_count}/{len(self.current_inspiration_terms)}",
             f"多重命中 {multi_hit_count}",
-            f"阈值 {threshold_text}",
+            f"阈值 {threshold_text}（强度 {self.score_threshold_slider.value()}%）",
         ]
         if self.current_inspiration_plan_filters:
             parts.append(
@@ -3304,8 +3704,8 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_inspiration_result_filters(self) -> None:
-        threshold = self._score_threshold()
         images = self.current_inspiration_images
+        threshold = self._semantic_score_threshold(images)
         if threshold is None:
             filtered = list(images)
         else:
@@ -3393,7 +3793,7 @@ class MainWindow(QMainWindow):
     def _active_score_threshold(self, images: list[ImageItem]) -> float | None:
         score_kind = last_score_filter_kind(self.search_filters)
         if score_kind in {"semantic", "similar"}:
-            return self._score_threshold()
+            return self._semantic_score_threshold(images)
         if score_kind == "color":
             return self._color_score_threshold(images)
         return None
@@ -3427,20 +3827,20 @@ class MainWindow(QMainWindow):
         last_kind = last_score_filter_kind(filters)
         scores = [image.score for image in images if image.score is not None]
         if last_kind == "semantic":
-            threshold = self._score_threshold()
+            threshold = self._semantic_score_threshold(self.current_chain_images)
             threshold_text = "不限" if threshold is None else f"{threshold:.2f}"
             parts.extend([
                 f"语义可搜索 {self.current_semantic_searchable_count}",
                 f"候选上限 {self.current_semantic_candidate_limit}",
-                f"阈值 {threshold_text}",
+                f"阈值 {threshold_text}（强度 {self.score_threshold_slider.value()}%）",
             ])
         elif last_kind == "similar":
-            threshold = self._score_threshold()
+            threshold = self._semantic_score_threshold(self.current_chain_images)
             threshold_text = "不限" if threshold is None else f"{threshold:.2f}"
             parts.extend([
                 f"相似可搜索 {self.current_similar_searchable_count}",
                 f"候选上限 {self.current_similar_candidate_limit}",
-                f"阈值 {threshold_text}",
+                f"阈值 {threshold_text}（强度 {self.score_threshold_slider.value()}%）",
             ])
         elif last_kind == "color":
             threshold = self._color_score_threshold(self.current_chain_images)
@@ -3473,14 +3873,99 @@ class MainWindow(QMainWindow):
                 self.current_semantic_query = str(search_filter.value)
             elif search_filter.kind == "color":
                 self.current_color_rgb = search_filter.value  # type: ignore[assignment]
-        if hasattr(self, "color_swatch_button"):
+        if hasattr(self, "color_mode_button"):
             self._update_color_swatch()
 
     def _format_filter_chain(self, filters: tuple[SearchFilter, ...] | list[SearchFilter]) -> str:
         return format_filter_chain(filters, image_label_for_id=self._image_label_for_id)
 
     def _filter_label(self, search_filter: SearchFilter) -> str:
+        if search_filter.kind == "collection":
+            return f"文件夹：{self._collection_filter_label(search_filter)}"
+        if search_filter.kind == "tag":
+            return f"标签：{self._tag_filter_label(search_filter)}"
         return filter_label(search_filter, image_label_for_id=self._image_label_for_id)
+
+    def _collection_filter_value(self, collection_ids: list[int] | set[int]) -> str:
+        return ",".join(str(collection_id) for collection_id in sorted(set(collection_ids)))
+
+    def _collection_filter_ids(self, search_filter: SearchFilter) -> list[int]:
+        if search_filter.kind != "collection":
+            return []
+        ids: list[int] = []
+        for part in str(search_filter.value).split(","):
+            try:
+                collection_id = int(part.strip())
+            except ValueError:
+                continue
+            if collection_id > 0:
+                ids.append(collection_id)
+        return ids
+
+    def _collection_filter_label(self, search_filter: SearchFilter) -> str:
+        labels = [
+            self._collection_path_text(collection_id)
+            for collection_id in self._collection_filter_ids(search_filter)
+            if self._collection_by_id(collection_id) is not None
+        ]
+        if not labels:
+            return "无"
+        if len(labels) <= 2:
+            return " + ".join(labels)
+        return f"{' + '.join(labels[:2])} 等 {len(labels)} 个"
+
+    def _tag_filter_value(self, tag_ids: list[int] | set[int], match_mode: str) -> str:
+        mode = "any" if match_mode == "any" else "all"
+        ids = ",".join(str(tag_id) for tag_id in sorted(set(tag_ids)))
+        return f"{mode}:{ids}"
+
+    def _tag_filter_parts(self, search_filter: SearchFilter) -> tuple[list[int], str]:
+        if search_filter.kind != "tag":
+            return [], "all"
+        raw_value = str(search_filter.value)
+        raw_mode, separator, raw_ids = raw_value.partition(":")
+        if separator:
+            mode = "any" if raw_mode == "any" else "all"
+            id_text = raw_ids
+        else:
+            mode = "all"
+            id_text = raw_value
+        ids: list[int] = []
+        for part in id_text.split(","):
+            try:
+                tag_id = int(part.strip())
+            except ValueError:
+                continue
+            if tag_id > 0:
+                ids.append(tag_id)
+        return ids, mode
+
+    def _tag_filter_label(self, search_filter: SearchFilter) -> str:
+        tag_ids, mode = self._tag_filter_parts(search_filter)
+        tags_by_id = {tag.id: tag.tag_name for tag in self.store.list_tags()}
+        labels = [tags_by_id[tag_id] for tag_id in tag_ids if tag_id in tags_by_id]
+        if not labels:
+            return "无"
+        prefix = "任一" if mode == "any" else "全部"
+        if len(labels) <= 3:
+            return f"{prefix}：{' + '.join(labels)}"
+        return f"{prefix}：{' + '.join(labels[:3])} 等 {len(labels)} 个"
+
+    def _image_ids_for_tags(self, tag_ids: list[int] | set[int], match_mode: str) -> set[int]:
+        if not tag_ids:
+            return set()
+        images = self.store.list_images(
+            tag_ids=sorted(set(tag_ids)),
+            tag_match_mode="any" if match_mode == "any" else "all",
+            limit=50_000,
+        )
+        return {image.id for image in images}
+
+    def _image_ids_for_collections(self, collection_ids: list[int] | set[int]) -> set[int]:
+        image_ids: set[int] = set()
+        for collection_id in collection_ids:
+            image_ids.update(self.store.image_ids_for_collection(collection_id))
+        return image_ids
 
     def _image_label_for_id(self, image_id: int) -> str:
         image = self.store.get_image(int(image_id))
@@ -3530,6 +4015,15 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda _checked=False, action=callback: action())
             self.filter_chain_layout.addWidget(button)
 
+        for index, search_filter in enumerate(self.result_exclusion_filters):
+            has_filter = True
+            button = QPushButton(f"× 反向排除：{self._filter_label(search_filter)}")
+            button.setToolTip("移除此反向排除条件")
+            button.clicked.connect(
+                lambda _checked=False, filter_index=index: self._remove_result_exclusion_filter(filter_index)
+            )
+            self.filter_chain_layout.addWidget(button)
+
         if not has_filter:
             self.filter_chain_layout.addWidget(QLabel("无"))
         self.filter_chain_layout.addStretch(1)
@@ -3560,29 +4054,27 @@ class MainWindow(QMainWindow):
             collection_name = self._collection_name(collection_id) or "当前文件夹"
             actions.append((f"文件夹：{collection_name}", self._clear_collection_filter))
 
-        tag_names = self._selected_tag_names()
-        if tag_names:
-            label = " + ".join(tag_names[:3])
-            if len(tag_names) > 3:
-                label = f"{label} 等 {len(tag_names)} 个"
-            mode = "全部" if self._selected_tag_match_mode() == "all" else "任一"
-            actions.append((f"标签({mode})：{label}", self._clear_tag_filter))
-
-        status_item = self.status_list.currentItem()
-        if status_item is not None and status_item.data(Qt.ItemDataRole.UserRole) != "all":
-            actions.append((f"状态：{status_item.text()}", self._clear_status_filter))
+        status_value = self.status_filter_combo.currentData()
+        if status_value is not None and status_value != "all":
+            actions.append((f"状态：{self.status_filter_combo.currentText()}", self._clear_status_filter))
         return actions
 
     def _result_management_filter_actions(self) -> list[tuple[str, object]]:
         actions: list[tuple[str, object]] = []
         if self.result_excluded_image_ids:
             actions.append((f"结果排除：{len(self.result_excluded_image_ids)} 张", self._clear_result_exclusions))
+        for collection_id in sorted(self.result_excluded_collection_ids):
+            collection = self._collection_by_id(collection_id)
+            label = self._collection_path_text(collection_id) if collection is not None else f"#{collection_id}"
+            actions.append((
+                f"排除文件夹：{label}",
+                lambda collection_id=collection_id: self._remove_result_collection_exclusion(collection_id),
+            ))
         return actions
 
     def _clear_result_exclusions(self) -> None:
         self.result_excluded_image_ids.clear()
-        self._refresh_filter_chain_ui()
-        self._refresh_current_results_for_filters()
+        self._refresh_visible_results_after_result_management_change()
 
     def _clear_collection_filter(self) -> None:
         item = self.collection_tree.topLevelItem(0)
@@ -3597,9 +4089,217 @@ class MainWindow(QMainWindow):
             item.setSelected(True)
 
     def _clear_status_filter(self) -> None:
-        item = self.status_list.item(0)
-        if item is not None:
-            self.status_list.setCurrentItem(item)
+        self._set_combo_to_data(self.status_filter_combo, "all")
+
+    def _choose_collection_filter(self) -> None:
+        if not self.store.list_collections():
+            self.statusBar().showMessage("还没有可筛选的文件夹")
+            return
+        reverse_mode = self.reverse_exclusion_button.isChecked()
+        if reverse_mode and not self._has_result_context():
+            self.statusBar().showMessage("先做一次正向筛选，再使用反向排除")
+            return
+        selected_ids = self._select_collections_for_search_dialog(
+            reverse_mode=reverse_mode,
+            context_image=self._selected_grid_image(),
+        )
+        if selected_ids is None:
+            return
+        if not selected_ids:
+            self.statusBar().showMessage("没有选择文件夹")
+            return
+        if reverse_mode:
+            self._exclude_collections_from_results(selected_ids)
+            return
+        search_filter = SearchFilter("collection", self._collection_filter_value(selected_ids))
+        self._start_search_with_filter(search_filter)
+
+    def _choose_tag_filter(self) -> None:
+        if not self.store.list_tags():
+            self.right_tab_widget.setCurrentIndex(2)
+            QMessageBox.information(
+                self,
+                "标签筛选",
+                "当前还没有用户标签。先选中图片，在右侧“标签”页添加标签；然后这里才能按标签筛选或反向排除。",
+            )
+            self.statusBar().showMessage("还没有可筛选的标签")
+            return
+        reverse_mode = self.reverse_exclusion_button.isChecked()
+        if reverse_mode and not self._has_result_context():
+            self.statusBar().showMessage("先做一次正向筛选，再使用反向排除")
+            return
+        selection = self._select_tags_for_search_dialog(reverse_mode=reverse_mode)
+        if selection is None:
+            return
+        selected_ids, match_mode = selection
+        if not selected_ids:
+            self.statusBar().showMessage("没有选择标签")
+            return
+        search_filter = SearchFilter("tag", self._tag_filter_value(selected_ids, match_mode))
+        if reverse_mode:
+            self._start_reverse_exclusion_with_filter(search_filter)
+        else:
+            self._start_search_with_filter(search_filter)
+
+    def _select_tags_for_search_dialog(
+        self,
+        *,
+        reverse_mode: bool,
+    ) -> tuple[list[int], str] | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("反向排除标签" if reverse_mode else "标签筛选")
+        layout = QVBoxLayout(dialog)
+        instruction = (
+            "选择要从当前结果中排除的标签。"
+            if reverse_mode
+            else "选择要纳入搜索条件的标签。"
+        )
+        layout.addWidget(QLabel(instruction))
+
+        match_combo = QComboBox()
+        match_combo.addItem("匹配全部", "all")
+        match_combo.addItem("匹配任一", "any")
+        self._set_combo_to_data(match_combo, self._selected_tag_match_mode())
+        layout.addWidget(match_combo)
+
+        tag_list = QListWidget()
+        tag_list.setMinimumHeight(260)
+        current_ids = set(self._selected_tag_ids())
+        for tag, count in self.store.list_tags_with_counts():
+            item = QListWidgetItem(f"{tag.tag_name}    {count}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if tag.id in current_ids else Qt.CheckState.Unchecked
+            )
+            item.setData(Qt.ItemDataRole.UserRole, tag.id)
+            item.setToolTip(tag.tag_name)
+            tag_list.addItem(item)
+        layout.addWidget(tag_list)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        selected_ids: list[int] = []
+        for index in range(tag_list.count()):
+            item = tag_list.item(index)
+            tag_id = item.data(Qt.ItemDataRole.UserRole)
+            if tag_id is not None and item.checkState() == Qt.CheckState.Checked:
+                selected_ids.append(int(tag_id))
+        match_mode = "any" if match_combo.currentData() == "any" else "all"
+        self._set_combo_to_data(self.tag_match_combo, match_mode)
+        return selected_ids, match_mode
+
+    def _select_collections_for_search_dialog(
+        self,
+        *,
+        reverse_mode: bool,
+        context_image: ImageItem | None,
+    ) -> list[int] | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("反向排除文件夹" if reverse_mode else "文件夹筛选")
+        layout = QVBoxLayout(dialog)
+        instruction = (
+            "选择要从当前结果中排除的文件夹。父级文件夹会包含其子文件夹。"
+            if reverse_mode
+            else "选择要纳入搜索范围的文件夹。父级文件夹会包含其子文件夹。"
+        )
+        layout.addWidget(QLabel(instruction))
+
+        chain_list: QListWidget | None = None
+        if reverse_mode and context_image is not None:
+            chain_entries = self._collection_chain_entries_for_image(context_image.id)
+            if chain_entries:
+                layout.addWidget(QLabel("当前图片所在文件夹链"))
+                chain_list = QListWidget()
+                chain_list.setMaximumHeight(96)
+                for label, collection_id in chain_entries:
+                    item = QListWidgetItem(label)
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Unchecked)
+                    item.setData(Qt.ItemDataRole.UserRole, collection_id)
+                    chain_list.addItem(item)
+                layout.addWidget(chain_list)
+
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["文件夹", "张"])
+        tree.setMinimumHeight(260)
+        tree.setAlternatingRowColors(True)
+        rows = self.store.list_collections_with_counts()
+        collection_by_id = {collection.id: collection for collection, _count in rows}
+        counts = {collection.id: count for collection, count in rows}
+        children_by_parent: dict[int | None, list[int]] = {}
+        for collection, _count in rows:
+            children_by_parent.setdefault(collection.parent_id, []).append(collection.id)
+        for children in children_by_parent.values():
+            children.sort(key=lambda collection_id: collection_by_id[collection_id].name.casefold())
+
+        def add_items(parent_item: QTreeWidgetItem | None, parent_id: int | None) -> None:
+            for collection_id in children_by_parent.get(parent_id, []):
+                collection = collection_by_id[collection_id]
+                item = QTreeWidgetItem([collection.name, str(counts.get(collection_id, 0))])
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+                item.setData(0, Qt.ItemDataRole.UserRole, collection_id)
+                if parent_item is None:
+                    tree.addTopLevelItem(item)
+                else:
+                    parent_item.addChild(item)
+                add_items(item, collection_id)
+
+        add_items(None, None)
+        tree.expandAll()
+        tree.resizeColumnToContents(0)
+        layout.addWidget(tree)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        selected_ids: set[int] = set()
+
+        def collect_checked(item: QTreeWidgetItem) -> None:
+            collection_id = item.data(0, Qt.ItemDataRole.UserRole)
+            if collection_id is not None and item.checkState(0) == Qt.CheckState.Checked:
+                selected_ids.add(int(collection_id))
+            for index in range(item.childCount()):
+                collect_checked(item.child(index))
+
+        for index in range(tree.topLevelItemCount()):
+            collect_checked(tree.topLevelItem(index))
+
+        if chain_list is not None:
+            for index in range(chain_list.count()):
+                item = chain_list.item(index)
+                collection_id = item.data(Qt.ItemDataRole.UserRole)
+                if collection_id is not None and item.checkState() == Qt.CheckState.Checked:
+                    selected_ids.add(int(collection_id))
+
+        return sorted(selected_ids)
+
+    def _collection_chain_entries_for_image(self, image_id: int) -> list[tuple[str, int]]:
+        entries: list[tuple[str, int]] = []
+        seen: set[int] = set()
+        for chain in self.store.collection_chains_for_image(image_id):
+            for level, collection in enumerate(reversed(chain)):
+                if collection.id in seen:
+                    continue
+                seen.add(collection.id)
+                path = " / ".join(item.name for item in chain[: len(chain) - level])
+                prefix = "当前" if level == 0 else f"上级 {level}"
+                entries.append((f"{prefix}：{path}", collection.id))
+        return entries
 
     def _reload_images(self) -> None:
         self.current_offset = 0
@@ -3635,8 +4335,8 @@ class MainWindow(QMainWindow):
         self.load_more_button.setEnabled(True)
         images = self.store.list_images(
             status_filter=self._selected_status_filter(),
-            tag_ids=self._selected_tag_ids(),
-            tag_match_mode=self._selected_tag_match_mode(),
+            tag_ids=[],
+            tag_match_mode="any",
             folder_path_prefix=self._selected_folder_path_prefix(),
             collection_id=self._selected_collection_id(),
             limit=self.page_size,
@@ -3671,8 +4371,8 @@ class MainWindow(QMainWindow):
         images = self.store.list_images(
             text_query=self.current_keyword_query,
             status_filter=self._selected_status_filter(),
-            tag_ids=self._selected_tag_ids(),
-            tag_match_mode=self._selected_tag_match_mode(),
+            tag_ids=[],
+            tag_match_mode="any",
             folder_path_prefix=self._selected_folder_path_prefix(),
             collection_id=self._selected_collection_id(),
             limit=self.page_size,
@@ -3750,8 +4450,8 @@ class MainWindow(QMainWindow):
             images = self.store.list_images(
                 text_query=self.current_keyword_query or "",
                 status_filter=self._selected_status_filter(),
-                tag_ids=self._selected_tag_ids(),
-                tag_match_mode=self._selected_tag_match_mode(),
+                tag_ids=[],
+                tag_match_mode="any",
                 folder_path_prefix=self._selected_folder_path_prefix(),
                 collection_id=self._selected_collection_id(),
                 limit=self.page_size,
@@ -3790,6 +4490,64 @@ class MainWindow(QMainWindow):
             self._set_result_status(
                 f"灵感暂存：{name} ｜ {len(images)} 张{suffix}{self._result_management_status_suffix()}"
             )
+            return
+
+        self._reload_images()
+
+    def _refresh_visible_results_after_result_management_change(self) -> None:
+        self._refresh_filter_chain_ui()
+        if self.search_filters or self.current_result_mode == "search_chain":
+            self._apply_search_chain_filters()
+            images = self.current_chain_filtered_images
+            self.grid_view.set_images(images)
+            self._set_search_chain_result_status(tuple(self.search_filters), images)
+            self._update_search_chain_diagnostics(tuple(self.search_filters), images)
+            return
+
+        if self.current_result_mode == "semantic":
+            self._apply_semantic_result_filters()
+            images = self.current_semantic_filtered_images
+            self.grid_view.set_images(images)
+            self._set_semantic_result_status(images)
+            self._update_search_diagnostics(images)
+            return
+
+        if self.current_result_mode == "color":
+            self._apply_color_result_filters()
+            images = self.current_color_filtered_images
+            self.grid_view.set_images(images)
+            self._set_color_result_status(images)
+            self._update_color_search_diagnostics(images)
+            return
+
+        if self.current_result_mode == "inspiration":
+            self._apply_inspiration_result_filters()
+            images = self.current_inspiration_filtered_images
+            self.grid_view.set_images(images, badges_by_image_id=self._inspiration_badges_by_image_id())
+            self._set_inspiration_result_status(images)
+            self._update_inspiration_diagnostics(images)
+            return
+
+        if self.current_result_mode == "temp_project":
+            images = self._apply_result_management_filters(
+                self._apply_sidebar_filters(self.current_temp_project_images)
+            )
+            images = self._sort_images(images)
+            self.grid_view.set_images(images, badges_by_image_id=self.current_temp_project_badges)
+            project = (
+                self.store.get_temporary_project(self.current_temp_project_id)
+                if self.current_temp_project_id is not None
+                else None
+            )
+            name = project.name if project is not None else "灵感暂存"
+            suffix = f" ｜ {project.summary}" if project is not None and project.summary else ""
+            self._set_result_status(
+                f"灵感暂存：{name} ｜ {len(images)} 张{suffix}{self._result_management_status_suffix()}"
+            )
+            return
+
+        if self.current_result_mode == "keyword":
+            self._refresh_current_results_for_filters()
             return
 
         self._reload_images()
@@ -3983,9 +4741,54 @@ class MainWindow(QMainWindow):
         before = len(self.result_excluded_image_ids)
         self.result_excluded_image_ids.update(image.id for image in images)
         added = len(self.result_excluded_image_ids) - before
-        self._refresh_filter_chain_ui()
-        self._refresh_current_results_for_filters()
+        self._refresh_visible_results_after_result_management_change()
         self.statusBar().showMessage(f"已从当前结果排除 {added} 张")
+
+    def _exclude_collection_from_results(self, collection_id: int) -> None:
+        self._exclude_collections_from_results([collection_id])
+
+    def _exclude_collections_from_results(self, collection_ids: list[int]) -> None:
+        if not self._has_result_context():
+            self.statusBar().showMessage("当前不是搜索或暂存结果")
+            return
+        valid_ids = [
+            collection_id
+            for collection_id in collection_ids
+            if self._collection_by_id(collection_id) is not None
+        ]
+        if not valid_ids:
+            self.statusBar().showMessage("所选文件夹已不存在")
+            return
+        before = len(self.result_excluded_collection_ids)
+        self.result_excluded_collection_ids.update(valid_ids)
+        self._rebuild_result_excluded_collection_image_ids()
+        self._refresh_visible_results_after_result_management_change()
+        added = len(self.result_excluded_collection_ids) - before
+        affected = len(self._image_ids_for_collections(valid_ids))
+        label = (
+            self._collection_path_text(valid_ids[0])
+            if len(valid_ids) == 1
+            else f"{len(valid_ids)} 个文件夹"
+        )
+        self.statusBar().showMessage(
+            f"已从当前结果排除文件夹：{label}（新增 {added} 个，影响 {affected} 张）"
+        )
+
+    def _remove_result_collection_exclusion(self, collection_id: int) -> None:
+        self.result_excluded_collection_ids.discard(collection_id)
+        self._rebuild_result_excluded_collection_image_ids()
+        self._refresh_visible_results_after_result_management_change()
+
+    def _clear_result_collection_exclusions(self) -> None:
+        self.result_excluded_collection_ids.clear()
+        self.result_excluded_collection_image_ids.clear()
+        self._refresh_visible_results_after_result_management_change()
+
+    def _rebuild_result_excluded_collection_image_ids(self) -> None:
+        excluded: set[int] = set()
+        for collection_id in self.result_excluded_collection_ids:
+            excluded.update(self.store.image_ids_for_collection(collection_id))
+        self.result_excluded_collection_image_ids = excluded
 
     def _add_selection_to_temporary_project(self, project_id: int) -> None:
         images = self._selected_grid_images()
@@ -4478,6 +5281,8 @@ class MainWindow(QMainWindow):
             self._remove_selection_from_current_collection()
         elif command == "exclude_from_results":
             self._exclude_selection_from_results()
+        elif isinstance(command, str) and command.startswith("exclude_collection:"):
+            self._exclude_collection_from_results(int(command.split(":", 1)[1]))
 
     def _build_grid_context_menu(
         self,
@@ -4544,6 +5349,26 @@ class MainWindow(QMainWindow):
         result_menu = menu.addMenu("当前结果")
         add_action(result_menu, "save_result_set", "暂存当前结果集")
         add_action(result_menu, "exclude_from_results", "从当前结果排除选中")
+        exclude_collection_menu = result_menu.addMenu("排除此图所在的文件夹")
+        exclude_collection_actions: dict[object, int] = {}
+        if context_image is not None:
+            seen_collection_ids: set[int] = set()
+            chains = self.store.collection_chains_for_image(context_image.id)
+            for chain_index, chain in enumerate(chains):
+                if chain_index > 0:
+                    exclude_collection_menu.addSeparator()
+                for level, collection in enumerate(reversed(chain)):
+                    if collection.id in seen_collection_ids:
+                        continue
+                    seen_collection_ids.add(collection.id)
+                    path = " / ".join(item.name for item in chain[: len(chain) - level])
+                    prefix = "当前" if level == 0 else f"上级 {level}"
+                    action = exclude_collection_menu.addAction(f"{prefix}：{path}")
+                    action.setData(f"exclude_collection:{collection.id}")
+                    exclude_collection_actions[action] = collection.id
+        if not exclude_collection_actions:
+            empty_action = exclude_collection_menu.addAction("这张图没有所属文件夹")
+            empty_action.setEnabled(False)
 
         menu._eidory_submenus = [  # type: ignore[attr-defined]
             file_menu,
@@ -4552,6 +5377,7 @@ class MainWindow(QMainWindow):
             temp_project_menu,
             collection_menu,
             result_menu,
+            exclude_collection_menu,
         ]
 
         has_selection = bool(selected_images)
@@ -4582,6 +5408,9 @@ class MainWindow(QMainWindow):
         actions["move_to_collection"].setEnabled(has_selection and has_current_collection)
         actions["remove_from_collection"].setEnabled(has_selection and has_current_collection)
         actions["exclude_from_results"].setEnabled(has_selection and has_result_context)
+        exclude_collection_menu.setEnabled(
+            has_single_context and has_result_context and bool(exclude_collection_actions)
+        )
 
         file_menu.setEnabled(has_single_context or has_selection)
         marker_menu.setEnabled(has_selection)
@@ -4727,6 +5556,7 @@ class MainWindow(QMainWindow):
     def _on_grid_image_selected(self, image: ImageItem | None) -> None:
         self.selected_image = image
         self._show_image_details(image)
+        self._refresh_tag_panel_assignment([image] if image is not None else [])
         self._refresh_temp_project_save_button()
 
     def _on_grid_selection_changed(self, images: list[ImageItem]) -> None:
@@ -4736,12 +5566,14 @@ class MainWindow(QMainWindow):
         elif not images:
             self.selected_image = None
             self._show_collection_details(self._selected_collection_id())
+        self._refresh_tag_panel_assignment(images)
         self._refresh_temp_project_save_button()
 
     def _on_collection_selection_changed(self) -> None:
         self.selected_image = None
         self._refresh_current_results_for_filters()
         self._show_collection_details(self._selected_collection_id())
+        self._refresh_tag_panel_assignment([])
         self._refresh_temp_project_save_button()
 
     def _set_detail_controls_enabled(self, enabled: bool) -> None:
@@ -4990,6 +5822,50 @@ class MainWindow(QMainWindow):
         self.batch_clear_tags_button.setEnabled(has_tags)
         self.batch_add_tags_button.setEnabled(bool(images))
         self.batch_tags_input.setEnabled(bool(images))
+
+    def _refresh_tag_panel_assignment(self, images: list[ImageItem] | None = None) -> None:
+        if not hasattr(self, "tag_panel_selection_label"):
+            return
+        selected = list(images) if images is not None else self._selected_grid_images()
+        image_ids = [image.id for image in selected]
+        count = len(image_ids)
+        if count == 0:
+            self.tag_panel_selection_label.setText("未选择图片")
+            tag_counts: dict[str, int] = {}
+        elif count == 1:
+            self.tag_panel_selection_label.setText(f"已选择 1 张：{selected[0].file_name}")
+            tag_counts = self.store.tag_counts_for_images(image_ids)
+        else:
+            tag_counts = self.store.tag_counts_for_images(image_ids)
+            common = [
+                tag_name
+                for tag_name, tag_count in tag_counts.items()
+                if tag_count == count
+            ]
+            partial = [
+                f"{tag_name} ({tag_count}/{count})"
+                for tag_name, tag_count in tag_counts.items()
+                if tag_count < count
+            ]
+            common_text = "、".join(common) if common else "无"
+            partial_text = "、".join(partial) if partial else "无"
+            self.tag_panel_selection_label.setText(
+                f"已选择 {count} 张\n共同标签：{common_text}\n部分标签：{partial_text}"
+            )
+
+        self.tag_panel_remove_combo.blockSignals(True)
+        self.tag_panel_remove_combo.clear()
+        for tag_name, tag_count in tag_counts.items():
+            label = tag_name if count <= 1 else f"{tag_name} ({tag_count}/{count})"
+            self.tag_panel_remove_combo.addItem(label, tag_name)
+        self.tag_panel_remove_combo.blockSignals(False)
+        has_selection = count > 0
+        has_tags = bool(tag_counts)
+        self.tag_panel_input.setEnabled(has_selection)
+        self.tag_panel_add_button.setEnabled(has_selection)
+        self.tag_panel_remove_combo.setEnabled(has_tags)
+        self.tag_panel_remove_button.setEnabled(has_tags)
+        self.tag_panel_clear_button.setEnabled(has_tags)
 
     @staticmethod
     def _format_batch_tag_summary(
@@ -5845,6 +6721,67 @@ class MainWindow(QMainWindow):
         action = "收藏" if is_favorite else "取消收藏"
         self.statusBar().showMessage(f"已{action} {count} 张")
 
+    def _tag_panel_add_tags(self) -> None:
+        images = self._selected_grid_images()
+        if not images:
+            self.statusBar().showMessage("没有选中图片")
+            return
+        tags = self._parse_tag_input(self.tag_panel_input.text())
+        if not tags:
+            self.statusBar().showMessage("没有输入标签")
+            return
+        inserted = self.store.add_tags_to_images([image.id for image in images], tags)
+        self.tag_panel_input.clear()
+        self._refresh_after_tag_assignment(images)
+        self.statusBar().showMessage(f"已添加 {inserted} 个标签关联")
+
+    def _tag_panel_remove_selected_tag(self) -> None:
+        images = self._selected_grid_images()
+        if not images:
+            self.statusBar().showMessage("没有选中图片")
+            return
+        tag_name = self.tag_panel_remove_combo.currentData()
+        if not tag_name:
+            self.statusBar().showMessage("没有可移除的标签")
+            return
+        removed = self.store.remove_tags_from_images(
+            [image.id for image in images],
+            [str(tag_name)],
+        )
+        self._refresh_after_tag_assignment(images)
+        self.statusBar().showMessage(f"已移除 {removed} 个标签关联：{tag_name}")
+
+    def _tag_panel_clear_tags(self) -> None:
+        images = self._selected_grid_images()
+        if not images:
+            self.statusBar().showMessage("没有选中图片")
+            return
+        answer = QMessageBox.question(
+            self,
+            "清除标签",
+            f"清除选中 {len(images)} 张图片的全部标签。继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        removed = self.store.clear_tags_for_images([image.id for image in images])
+        self._refresh_after_tag_assignment(images)
+        self.statusBar().showMessage(f"已清除 {removed} 个标签关联")
+
+    def _refresh_after_tag_assignment(self, previous_selection: list[ImageItem]) -> None:
+        self._refresh_tags()
+        self._refresh_current_results_for_filters()
+        refreshed = self.grid_view.selected_images() or self.store.images_by_ids(
+            [image.id for image in previous_selection]
+        )
+        if len(refreshed) == 1:
+            self.selected_image = refreshed[0]
+            self._show_image_details(refreshed[0])
+        elif len(refreshed) > 1:
+            self._show_multi_selection_details(refreshed)
+        self._refresh_tag_panel_assignment(refreshed)
+
     def _batch_add_tags_from_panel(self) -> None:
         images = self._selected_grid_images()
         if not images:
@@ -6363,6 +7300,7 @@ class MainWindow(QMainWindow):
                 self.current_semantic_images = list(result.images)
                 self.current_semantic_searchable_count = result.searchable_count
                 self.current_semantic_candidate_limit = result.candidate_limit
+                self._recompute_result_exclusion_filter_matches_for_current_source()
                 self._apply_semantic_result_filters()
                 images = self.current_semantic_filtered_images
                 self.grid_view.set_images(images)
@@ -6377,6 +7315,7 @@ class MainWindow(QMainWindow):
                 self.current_color_searchable_count = result.searchable_count
                 self.current_color_indexed_count = result.indexed_count
                 self.current_color_candidate_limit = result.candidate_limit
+                self._recompute_result_exclusion_filter_matches_for_current_source()
                 self._apply_color_result_filters()
                 images = self.current_color_filtered_images
                 self.grid_view.set_images(images)
@@ -6388,6 +7327,12 @@ class MainWindow(QMainWindow):
                 if revision != self.semantic_search_revision:
                     continue
                 self._handle_search_chain_done(filters=filters, result=result)
+            elif kind == "result_exclusion_filter_done":
+                self.search_button.setEnabled(True)
+                revision, search_filter, matches = payload
+                if revision != self.semantic_search_revision:
+                    continue
+                self._add_result_exclusion_filter_from_matches(search_filter, matches)
             elif kind == "inspiration_proposal":
                 self.generate_inspiration_button.setEnabled(True)
                 self._show_inspiration_proposal(payload)
@@ -7057,7 +8002,6 @@ class MainWindow(QMainWindow):
         current_ids = set(self._selected_tag_ids())
         if not current_ids and self._pending_tag_restore_ids is not None:
             current_ids = set(self._pending_tag_restore_ids)
-        previous_ids = set(current_ids)
         self.tag_list.blockSignals(True)
         self.tag_list.clear()
         selected_item: QListWidgetItem | None = None
@@ -7089,8 +8033,6 @@ class MainWindow(QMainWindow):
         self._pending_tag_restore_ids = None
         self._refresh_tag_action_buttons()
         self._save_selected_tag_filter()
-        if previous_ids != set(self._selected_tag_ids()):
-            self._refresh_current_results_for_filters()
 
     def _visible_tags_with_counts(self) -> list[tuple[object, int]]:
         filter_text = self.tag_search_input.text().strip().casefold()
@@ -7115,11 +8057,9 @@ class MainWindow(QMainWindow):
 
     def _on_tag_match_changed(self) -> None:
         self.store.set_setting("ui.tag_match_mode", self._selected_tag_match_mode())
-        self._refresh_current_results_for_filters()
 
     def _save_status_filter(self) -> None:
-        item = self.status_list.currentItem()
-        value = item.data(Qt.ItemDataRole.UserRole) if item is not None else "all"
+        value = self.status_filter_combo.currentData()
         self.store.set_setting("ui.status_filter", str(value or "all"))
 
     def _save_selected_tag_filter(self) -> None:
@@ -7306,8 +8246,8 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _format_score_threshold_label(value: int) -> str:
         if value <= 0:
-            return "最低相似度：不限"
-        return f"最低相似度：{value / 100.0:.2f}"
+            return "相似度筛选：不限"
+        return f"相似度筛选：{value}%"
 
     def _selected_tag_id(self) -> int | None:
         item = self.tag_list.currentItem()
@@ -7371,10 +8311,7 @@ class MainWindow(QMainWindow):
         ]
 
     def _selected_status_filter(self) -> str | None:
-        item = self.status_list.currentItem()
-        if item is None:
-            return None
-        value = item.data(Qt.ItemDataRole.UserRole)
+        value = self.status_filter_combo.currentData()
         return None if value == "all" else value
 
     def _selected_search_mode(self) -> str:
@@ -7442,10 +8379,10 @@ class MainWindow(QMainWindow):
 
     def _apply_view_payload(self, payload: object) -> None:
         if not isinstance(payload, dict):
-            QMessageBox.warning(self, "Eidory", "该视图预设格式无效。")
+            QMessageBox.warning(self, "Eidory", "该筛选预设格式无效。")
             return
         signal_widgets = [
-            self.status_list,
+            self.status_filter_combo,
             self.tag_match_combo,
             self.sort_combo,
             self.sort_order_combo,
@@ -7513,7 +8450,7 @@ class MainWindow(QMainWindow):
 
     def _apply_status_from_payload(self, raw_status: object) -> None:
         status = raw_status if raw_status in {"all", "favorite", "unindexed", "missing"} else "all"
-        self._set_list_current_by_data(self.status_list, str(status))
+        self._set_combo_to_data(self.status_filter_combo, str(status))
 
     def _apply_tags_from_payload(self, raw_tag_ids: object) -> None:
         tag_ids: set[int] = set()
@@ -7657,10 +8594,18 @@ class MainWindow(QMainWindow):
 
     def _update_color_swatch(self) -> None:
         color_hex = self._format_color_hex(self.current_color_rgb)
-        self.color_swatch_button.setText("")
-        self.color_swatch_button.setToolTip(f"选择颜色：{color_hex}")
-        self.color_swatch_button.setStyleSheet(
-            f"background:{color_hex}; border: 1px solid #6f7782;"
+        label = "Color" if getattr(self, "current_language", "zh") == "en" else "颜色"
+        self.color_mode_button.setText(label)
+        self.color_mode_button.setToolTip(f"选择颜色：{color_hex}")
+        self.color_mode_button.setStyleSheet(
+            "QPushButton {"
+            f"background:{color_hex};"
+            "border: 1px solid #6f7782;"
+            f"color:{self._swatch_text_color(self.current_color_rgb)};"
+            "}"
+            "QPushButton:checked {"
+            "border: 1px solid #8fb2ff;"
+            "}"
         )
 
     def _choose_search_color(self) -> None:
@@ -7675,16 +8620,28 @@ class MainWindow(QMainWindow):
         self._run_search()
 
     def _apply_result_management_filters(self, images: list[ImageItem]) -> list[ImageItem]:
+        excluded_image_ids = (
+            self.result_excluded_image_ids
+            | self.result_excluded_collection_image_ids
+            | self._result_exclusion_filter_image_ids()
+        )
         return [
             image
             for image in images
-            if image.id not in self.result_excluded_image_ids
+            if image.id not in excluded_image_ids
         ]
 
     def _result_management_status_suffix(self) -> str:
         parts: list[str] = []
         if self.result_excluded_image_ids:
             parts.append(f"排除 {len(self.result_excluded_image_ids)}")
+        if self.result_excluded_collection_ids:
+            parts.append(f"排除文件夹 {len(self.result_excluded_collection_ids)}")
+        if self.result_exclusion_filters:
+            parts.append(
+                f"反向排除 {len(self.result_exclusion_filters)} 项/"
+                f"{len(self._result_exclusion_filter_image_ids())} 张"
+            )
         return "，" + "，".join(parts) if parts else ""
 
     def _has_result_context(self) -> bool:
@@ -7709,6 +8666,10 @@ class MainWindow(QMainWindow):
 
     def _clear_result_management_state(self) -> None:
         self.result_excluded_image_ids.clear()
+        self.result_excluded_collection_ids.clear()
+        self.result_excluded_collection_image_ids.clear()
+        self.result_exclusion_filters.clear()
+        self.result_exclusion_filter_matches.clear()
 
     @staticmethod
     def _swatch_text_color(rgb: tuple[int, int, int]) -> str:
@@ -7753,15 +8714,22 @@ class MainWindow(QMainWindow):
             self._set_inspiration_result_status(images)
             self._update_inspiration_diagnostics(images)
 
-    def _score_threshold(self) -> float | None:
+    def _semantic_score_threshold(self, images: list[ImageItem]) -> float | None:
         value = self.score_threshold_slider.value()
-        if value <= 0:
+        if value <= 0 or not images:
             return None
-        return value / 100.0
+        scores = [float(image.score) for image in images if image.score is not None]
+        if not scores:
+            return None
+        low = min(scores)
+        high = max(scores)
+        if high <= low:
+            return high if value >= 100 else low
+        return low + (high - low) * (value / 100.0)
 
     def _apply_semantic_result_filters(self) -> None:
-        threshold = self._score_threshold()
         images = self.current_semantic_images
+        threshold = self._semantic_score_threshold(images)
         if threshold is not None:
             images = [
                 image
@@ -7820,7 +8788,7 @@ class MainWindow(QMainWindow):
             self.search_diagnostics_label.setText("搜索诊断：无相似度分数")
             return
 
-        threshold = self._score_threshold()
+        threshold = self._semantic_score_threshold(self.current_semantic_images)
         threshold_text = "不限" if threshold is None else f"{threshold:.2f}"
         avg_score = sum(scores) / len(scores)
         self.search_diagnostics_label.setText(
@@ -7828,7 +8796,7 @@ class MainWindow(QMainWindow):
             f"显示 {len(images)}，可搜索 {self.current_semantic_searchable_count}，"
             f"候选上限 {self.current_semantic_candidate_limit}，"
             f"最高 {max(scores):.3f}，最低 {min(scores):.3f}，"
-            f"平均 {avg_score:.3f}，阈值 {threshold_text}"
+            f"平均 {avg_score:.3f}，阈值 {threshold_text}（强度 {self.score_threshold_slider.value()}%）"
         )
 
     def _update_color_search_diagnostics(self, images: list[ImageItem]) -> None:
@@ -7943,8 +8911,6 @@ class MainWindow(QMainWindow):
             else None
         )
         status = self._selected_status_filter()
-        tag_names = self._selected_tag_names()
-        tag_match_mode = self._selected_tag_match_mode()
 
         filtered: list[ImageItem] = []
         for image in images:
@@ -7958,14 +8924,6 @@ class MainWindow(QMainWindow):
                 continue
             if status == "missing" and not image.is_missing:
                 continue
-            if tag_names:
-                image_tags = set(self.store.get_image_tags(image.id))
-                selected_tags = set(tag_names)
-                if tag_match_mode == "all":
-                    if not selected_tags.issubset(image_tags):
-                        continue
-                elif image_tags.isdisjoint(selected_tags):
-                    continue
             filtered.append(image)
         return filtered
 

@@ -63,6 +63,14 @@ from PySide6.QtWidgets import (
 )
 
 from eidory.config import AppPaths
+from eidory.core.ai_vision import (
+    AI_VISION_FIELD_VALUES,
+    AI_VISION_LIGHTING_VALUES,
+    AI_VISION_PROMPT_VERSION,
+    AIVisionProvider,
+    ai_vision_label,
+)
+from eidory.core.ai_vision_worker import AIVisionProgress, AIVisionWorker
 from eidory.core.embedding_provider import JinaClipV2Provider
 from eidory.core.embedding_worker import EmbeddingProgress, EmbeddingWorker
 from eidory.core.exporter import (
@@ -75,7 +83,7 @@ from eidory.core.inspiration import (
     InspirationTerm,
     mix_inspiration_search_results,
 )
-from eidory.core.llm_provider import LMStudioProvider, LLMProviderError
+from eidory.core.llm_provider import LMStudioProvider, LLMProviderError, SearchPlanFilter
 from eidory.core.media_types import (
     SUPPORTED_MEDIA_EXTENSIONS,
     SUPPORTED_IMAGE_EXTENSIONS,
@@ -90,6 +98,7 @@ from eidory.core.scanner import ImageScanner, ScanResult
 from eidory.core.search_filters import (
     SearchChainResult,
     SearchFilter,
+    ai_vision_filter_parts,
     file_type_filter_label,
     filter_label,
     format_color_hex,
@@ -195,6 +204,7 @@ class MainWindow(QMainWindow):
             vector_index=self.vector_index,
         )
         self.embedding_worker: EmbeddingWorker | None = None
+        self.ai_vision_worker: AIVisionWorker | None = None
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.current_offset = 0
         self.page_size = 500
@@ -233,10 +243,13 @@ class MainWindow(QMainWindow):
         self.current_search_scope_count: int | None = None
         self.current_inspiration_project_id: int | None = None
         self.current_inspiration_terms: list[InspirationTerm] = []
+        self.current_inspiration_raw_term_results: list[tuple[InspirationTerm, list[ImageItem]]] = []
         self.current_inspiration_images: list[ImageItem] = []
         self.current_inspiration_filtered_images: list[ImageItem] = []
         self.current_inspiration_matches: dict[int, list[InspirationMatch]] = {}
+        self.current_inspiration_plan_filters: list[SearchPlanFilter] = []
         self.inspiration_proposal_terms: list[InspirationTerm] = []
+        self.inspiration_plan_filters: list[SearchPlanFilter] = []
         self.inspiration_questions: list[str] = []
         self.inspiration_model_name = ""
         self.current_temp_project_id: int | None = None
@@ -265,11 +278,13 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._refresh_folders()
         self._refresh_collections()
+        self.store.seed_default_ai_vision_collection_rules()
         self._refresh_temporary_projects()
         self._refresh_tags()
         self._refresh_saved_views()
         self._reload_images()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         QTimer.singleShot(1200, self._run_startup_self_check)
 
         self.poll_timer = QTimer(self)
@@ -280,6 +295,8 @@ class MainWindow(QMainWindow):
         self._clear_last_removal_undo(cleanup_backups=True)
         if self.embedding_worker is not None:
             self.embedding_worker.stop()
+        if self.ai_vision_worker is not None:
+            self.ai_vision_worker.stop()
         if hasattr(self, "video_player"):
             self.video_player.stop()
         if hasattr(self, "root_splitter"):
@@ -633,6 +650,9 @@ class MainWindow(QMainWindow):
         self.modified_label = QLabel("-")
         self.embedding_label = QLabel("-")
         self.score_label = QLabel("-")
+        self.ai_vision_detail_label = QLabel("-")
+        self.ai_vision_detail_label.setWordWrap(True)
+        self.ai_vision_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.image_collections_label = QLabel("-")
         self.image_collections_label.setWordWrap(True)
         self.image_collections_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -727,13 +747,49 @@ class MainWindow(QMainWindow):
         self.inspiration_term_list = QListWidget()
         self.inspiration_term_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.inspiration_term_list.setMinimumHeight(360)
+        self.inspiration_filter_list = QListWidget()
+        self.inspiration_filter_list.setMaximumHeight(130)
         self.inspiration_status_label = QLabel("生成后最多选择 7 个语义探针。")
         self.inspiration_status_label.setWordWrap(True)
+        self.generate_search_plan_button = QPushButton("生成搜索规划")
         self.generate_inspiration_button = QPushButton("生成语义探针")
         self.search_inspiration_button = QPushButton("保存并搜索")
         self.search_inspiration_button.setEnabled(False)
         self.save_temp_project_button = QPushButton("暂存选中图片")
         self.save_temp_project_button.setEnabled(False)
+
+        self.ai_vision_field_filter_combo = QComboBox()
+        self.ai_vision_value_filter_combo = QComboBox()
+        self.add_ai_vision_filter_button = QPushButton("添加AI筛选")
+        for field, label in [
+            ("scene_location", "室内外"),
+            ("environment_type", "环境"),
+            ("time_of_day", "时间"),
+            ("weather", "天气"),
+            ("shot_scale", "景别"),
+            ("view_angle", "视角"),
+            ("lighting", "光照"),
+        ]:
+            self.ai_vision_field_filter_combo.addItem(label, field)
+        self._refresh_ai_vision_value_filter_combo()
+
+        self.ai_vision_progress_bar = QProgressBar()
+        self.ai_vision_progress_bar.setRange(0, 100)
+        self.ai_vision_progress_bar.setValue(0)
+        self.ai_vision_stats_label = QLabel("AI 场景标签：0 / 0")
+        self.ai_vision_stats_label.setWordWrap(True)
+        self.ai_vision_rule_tree = QTreeWidget()
+        self.ai_vision_rule_tree.setColumnCount(6)
+        self.ai_vision_rule_tree.setHeaderLabels(["规则", "文件夹", "完成", "失败", "未处理", "总数"])
+        self.ai_vision_rule_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.ai_vision_rule_tree.setMaximumHeight(180)
+        self.add_ai_vision_include_rule_button = QPushButton("识别选中文件夹")
+        self.add_ai_vision_exclude_rule_button = QPushButton("排除选中文件夹")
+        self.remove_ai_vision_rule_button = QPushButton("移除规则")
+        self.start_ai_vision_button = QPushButton("开始AI识别")
+        self.pause_ai_vision_button = QPushButton("暂停AI识别")
+        self.retry_failed_ai_vision_button = QPushButton("重试AI失败")
+        self.refresh_ai_vision_button = QPushButton("刷新AI统计")
 
         form = QFormLayout()
         self.detail_form = form
@@ -746,6 +802,7 @@ class MainWindow(QMainWindow):
         form.addRow("尺寸", self.size_label)
         form.addRow("修改时间", self.modified_label)
         form.addRow("索引状态", self.embedding_label)
+        form.addRow("AI 标签", self.ai_vision_detail_label)
         form.addRow("相似度", self.score_label)
         form.addRow("", self.favorite_checkbox)
         form.addRow("标签", tags_widget)
@@ -819,9 +876,12 @@ class MainWindow(QMainWindow):
         inspiration_layout.addWidget(self.inspiration_history_list)
         inspiration_layout.addWidget(QLabel("语义探针"))
         inspiration_layout.addWidget(self.inspiration_term_list, 1)
+        inspiration_layout.addWidget(QLabel("规划筛选"))
+        inspiration_layout.addWidget(self.inspiration_filter_list)
         inspiration_layout.addWidget(self.inspiration_status_label)
         inspiration_button_row = QHBoxLayout()
         inspiration_button_row.setContentsMargins(0, 0, 0, 0)
+        inspiration_button_row.addWidget(self.generate_search_plan_button)
         inspiration_button_row.addWidget(self.generate_inspiration_button)
         inspiration_button_row.addWidget(self.search_inspiration_button)
         inspiration_layout.addLayout(inspiration_button_row)
@@ -857,16 +917,45 @@ class MainWindow(QMainWindow):
         tag_action_row.addWidget(self.delete_tag_button)
         tag_action_row.addWidget(self.merge_tag_button)
         filter_layout.addLayout(tag_action_row)
+        filter_layout.addWidget(QLabel("AI 场景筛选"))
+        ai_filter_row = QHBoxLayout()
+        ai_filter_row.setContentsMargins(0, 0, 0, 0)
+        ai_filter_row.addWidget(self.ai_vision_field_filter_combo)
+        ai_filter_row.addWidget(self.ai_vision_value_filter_combo)
+        ai_filter_row.addWidget(self.add_ai_vision_filter_button)
+        filter_layout.addLayout(ai_filter_row)
 
         index_tab = QWidget()
         index_layout = QVBoxLayout(index_tab)
         index_layout.setContentsMargins(6, 6, 6, 6)
         index_layout.setSpacing(6)
+        index_layout.addWidget(QLabel("语义 embedding"))
         index_layout.addWidget(self.embedding_progress_bar)
         index_layout.addWidget(self.embedding_stats_label)
         index_layout.addWidget(self.start_embedding_button)
         index_layout.addWidget(self.pause_embedding_button)
         index_layout.addWidget(self.retry_failed_button)
+        index_layout.addSpacing(8)
+        index_layout.addWidget(QLabel("AI 场景视觉标签"))
+        index_layout.addWidget(self.ai_vision_progress_bar)
+        index_layout.addWidget(self.ai_vision_stats_label)
+        index_layout.addWidget(self.ai_vision_rule_tree)
+        ai_rule_row = QHBoxLayout()
+        ai_rule_row.setContentsMargins(0, 0, 0, 0)
+        ai_rule_row.addWidget(self.add_ai_vision_include_rule_button)
+        ai_rule_row.addWidget(self.add_ai_vision_exclude_rule_button)
+        index_layout.addLayout(ai_rule_row)
+        ai_rule_action_row = QHBoxLayout()
+        ai_rule_action_row.setContentsMargins(0, 0, 0, 0)
+        ai_rule_action_row.addWidget(self.remove_ai_vision_rule_button)
+        ai_rule_action_row.addWidget(self.refresh_ai_vision_button)
+        index_layout.addLayout(ai_rule_action_row)
+        ai_worker_row = QHBoxLayout()
+        ai_worker_row.setContentsMargins(0, 0, 0, 0)
+        ai_worker_row.addWidget(self.start_ai_vision_button)
+        ai_worker_row.addWidget(self.pause_ai_vision_button)
+        ai_worker_row.addWidget(self.retry_failed_ai_vision_button)
+        index_layout.addLayout(ai_worker_row)
         index_layout.addStretch(1)
 
         settings_tab = QWidget()
@@ -1035,6 +1124,8 @@ class MainWindow(QMainWindow):
         self.color_swatch_button.clicked.connect(self._choose_search_color)
         self.add_file_type_filter_button.clicked.connect(self._add_file_type_filter_from_controls)
         self.add_dimension_filter_button.clicked.connect(self._add_dimension_filter_from_controls)
+        self.ai_vision_field_filter_combo.currentIndexChanged.connect(self._refresh_ai_vision_value_filter_combo)
+        self.add_ai_vision_filter_button.clicked.connect(self._add_ai_vision_filter_from_controls)
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         self.sort_order_combo.currentIndexChanged.connect(self._on_sort_changed)
         self.score_threshold_slider.valueChanged.connect(self._update_score_threshold)
@@ -1066,11 +1157,13 @@ class MainWindow(QMainWindow):
         self.batch_remove_tag_button.clicked.connect(self._batch_remove_selected_tag)
         self.batch_clear_tags_button.clicked.connect(self._batch_clear_tags)
         self.generate_inspiration_button.clicked.connect(self._generate_inspiration_terms_from_panel)
+        self.generate_search_plan_button.clicked.connect(self._generate_search_plan_from_panel)
         self.search_inspiration_button.clicked.connect(self._save_and_search_inspiration)
         self.inspiration_history_list.itemClicked.connect(self._load_selected_inspiration_history)
         self.inspiration_history_list.customContextMenuRequested.connect(self._show_inspiration_history_context_menu)
         self.inspiration_term_list.itemChanged.connect(self._enforce_inspiration_selection_limit)
         self.inspiration_term_list.customContextMenuRequested.connect(self._show_inspiration_term_context_menu)
+        self.inspiration_filter_list.itemChanged.connect(self._handle_inspiration_filter_changed)
         self.save_temp_project_button.clicked.connect(self._save_selected_images_as_temporary_project)
         self.feedback_relevant_button.clicked.connect(lambda: self._save_search_feedback("relevant"))
         self.feedback_irrelevant_button.clicked.connect(lambda: self._save_search_feedback("irrelevant"))
@@ -1078,6 +1171,13 @@ class MainWindow(QMainWindow):
         self.start_embedding_button.clicked.connect(self._start_embedding)
         self.pause_embedding_button.clicked.connect(self._pause_embedding)
         self.retry_failed_button.clicked.connect(self._retry_failed_embeddings)
+        self.add_ai_vision_include_rule_button.clicked.connect(lambda: self._set_ai_vision_rule_for_selected_collection("include"))
+        self.add_ai_vision_exclude_rule_button.clicked.connect(lambda: self._set_ai_vision_rule_for_selected_collection("exclude"))
+        self.remove_ai_vision_rule_button.clicked.connect(self._remove_selected_ai_vision_rule)
+        self.start_ai_vision_button.clicked.connect(self._start_ai_vision)
+        self.pause_ai_vision_button.clicked.connect(self._pause_ai_vision)
+        self.retry_failed_ai_vision_button.clicked.connect(self._retry_failed_ai_vision)
+        self.refresh_ai_vision_button.clicked.connect(self._refresh_ai_vision_stats)
         self.rescan_all_button.clicked.connect(self._rescan_all_folders)
         self.rescan_new_button.clicked.connect(self._rescan_new_or_changed_folders)
         self.rescan_missing_button.clicked.connect(self._rescan_missing_folders)
@@ -1177,6 +1277,23 @@ class MainWindow(QMainWindow):
             temperature=self._llm_temperature(),
         )
 
+    def _make_ai_vision_provider(self) -> AIVisionProvider:
+        service = self._llm_service_key()
+        return AIVisionProvider(
+            base_url=self._llm_endpoint(service),
+            model_name=self._llm_model(service) or None,
+            api_key=self._llm_api_key(service),
+            service_name=self._llm_service_label(service),
+            temperature=0.1,
+        )
+
+    def _ai_vision_provider_name(self) -> str:
+        return self._llm_service_label(self._llm_service_key())
+
+    def _ai_vision_model_name_for_stats(self) -> str:
+        service = self._llm_service_key()
+        return self._llm_model(service) or "local-vision-model"
+
     def _load_llm_service_controls(self, service: str) -> None:
         self.llm_endpoint_input.setText(self._llm_endpoint(service))
         self.llm_model_input.setText(self._llm_model(service))
@@ -1197,6 +1314,7 @@ class MainWindow(QMainWindow):
         self.store.set_setting("ui.language", language)
         self.current_language = language
         self._apply_runtime_language_settings()
+        self._refresh_ai_vision_stats()
         self.settings_status_label.setText("设置已保存。API Key 不会写入日志。")
         self.statusBar().showMessage("设置已保存")
 
@@ -1256,6 +1374,8 @@ class MainWindow(QMainWindow):
         try:
             if self.embedding_worker is not None:
                 self.embedding_worker.stop()
+            if self.ai_vision_worker is not None:
+                self.ai_vision_worker.stop()
             backup_path = self._backup_database_to_default_location()
             self.paths.database_path.parent.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1545,9 +1665,18 @@ class MainWindow(QMainWindow):
             self.inspiration_answers_input.setPlaceholderText("Extra context: era, weather, lighting, mood, optional")
             self.inspiration_questions_label.setText("AI questions: -")
             self.inspiration_status_label.setText("Select up to 7 semantic probes.")
+            self.generate_search_plan_button.setText("Generate Plan")
             self.generate_inspiration_button.setText("Generate Probes")
             self.search_inspiration_button.setText("Save and Search")
             self.save_temp_project_button.setText("Save Selected")
+            self.add_ai_vision_filter_button.setText("Add AI Filter")
+            self.add_ai_vision_include_rule_button.setText("Include Folder")
+            self.add_ai_vision_exclude_rule_button.setText("Exclude Folder")
+            self.remove_ai_vision_rule_button.setText("Remove Rule")
+            self.start_ai_vision_button.setText("Start AI Vision")
+            self.pause_ai_vision_button.setText("Pause AI Vision")
+            self.retry_failed_ai_vision_button.setText("Retry Failed")
+            self.refresh_ai_vision_button.setText("Refresh Stats")
             self.rescan_all_button.setText("Scan All")
             self.rescan_new_button.setText("Scan New")
             self.rescan_missing_button.setText("Scan Missing")
@@ -1595,9 +1724,18 @@ class MainWindow(QMainWindow):
             self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
             self.inspiration_questions_label.setText("AI 追问：-")
             self.inspiration_status_label.setText("生成后最多选择 7 个语义探针。")
+            self.generate_search_plan_button.setText("生成搜索规划")
             self.generate_inspiration_button.setText("生成语义探针")
             self.search_inspiration_button.setText("保存并搜索")
             self.save_temp_project_button.setText("暂存选中图片")
+            self.add_ai_vision_filter_button.setText("添加AI筛选")
+            self.add_ai_vision_include_rule_button.setText("识别选中文件夹")
+            self.add_ai_vision_exclude_rule_button.setText("排除选中文件夹")
+            self.remove_ai_vision_rule_button.setText("移除规则")
+            self.start_ai_vision_button.setText("开始AI识别")
+            self.pause_ai_vision_button.setText("暂停AI识别")
+            self.retry_failed_ai_vision_button.setText("重试AI失败")
+            self.refresh_ai_vision_button.setText("刷新AI统计")
             self.rescan_all_button.setText("扫描全部")
             self.rescan_new_button.setText("扫描新增")
             self.rescan_missing_button.setText("扫描缺失")
@@ -1622,6 +1760,7 @@ class MainWindow(QMainWindow):
             self.right_tab_widget.setTabText(2, "筛选")
             self.right_tab_widget.setTabText(3, "索引")
             self.right_tab_widget.setTabText(4, "设置")
+        self._refresh_ai_vision_value_filter_combo()
 
     def _choose_folder(self) -> None:
         collection_id = self._selected_collection_id()
@@ -1966,6 +2105,10 @@ class MainWindow(QMainWindow):
         if not brief:
             self.inspiration_status_label.setText("先输入创作主题。")
             return
+        self.inspiration_plan_filters = []
+        self.current_inspiration_plan_filters = []
+        self.current_inspiration_raw_term_results = []
+        self._populate_inspiration_filter_list([])
         self.generate_inspiration_button.setEnabled(False)
         self.search_inspiration_button.setEnabled(False)
         service = self._llm_service_key()
@@ -1986,15 +2129,62 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _generate_search_plan_from_panel(self) -> None:
+        brief = self.inspiration_brief_input.toPlainText().strip()
+        if not brief:
+            self.inspiration_status_label.setText("先输入创作主题。")
+            return
+        self.generate_search_plan_button.setEnabled(False)
+        self.generate_inspiration_button.setEnabled(False)
+        self.search_inspiration_button.setEnabled(False)
+        service = self._llm_service_key()
+        self.inspiration_status_label.setText(f"正在请求 {self._llm_service_label(service)} 生成搜索规划...")
+        provider = self._make_llm_provider()
+        answers = self.inspiration_answers_input.toPlainText()
+
+        def run() -> None:
+            try:
+                proposal = provider.generate_search_plan(
+                    brief=brief,
+                    answers=answers,
+                    language=self.current_language,
+                )
+                self.events.put(("search_plan_proposal", proposal))
+            except Exception as exc:
+                self.events.put(("search_plan_error", exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _show_inspiration_proposal(self, proposal) -> None:
         self.current_inspiration_project_id = None
         self.inspiration_proposal_terms = list(proposal.terms)
+        self.inspiration_plan_filters = []
+        self.current_inspiration_plan_filters = []
+        self.current_inspiration_raw_term_results = []
         self.inspiration_questions = list(proposal.questions)
         self.inspiration_model_name = proposal.model_name
         self._populate_inspiration_term_list(
             self.inspiration_proposal_terms,
             default_selected_count=5,
         )
+        self._populate_inspiration_filter_list([])
+        self._sync_inspiration_questions_label()
+        self._refresh_inspiration_status()
+        self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
+
+    def _show_search_plan_proposal(self, proposal) -> None:
+        self.current_inspiration_project_id = None
+        self.inspiration_proposal_terms = list(proposal.terms)
+        self.inspiration_plan_filters = list(proposal.filters)
+        self.current_inspiration_plan_filters = []
+        self.current_inspiration_raw_term_results = []
+        self.inspiration_questions = list(proposal.questions)
+        self.inspiration_model_name = proposal.model_name
+        self._populate_inspiration_term_list(
+            self.inspiration_proposal_terms,
+            default_selected_count=5,
+        )
+        self._populate_inspiration_filter_list(self.inspiration_plan_filters)
         self._sync_inspiration_questions_label()
         self._refresh_inspiration_status()
         self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
@@ -2019,6 +2209,32 @@ class MainWindow(QMainWindow):
             item.setToolTip(f"{term.query}\n{term.reason}")
             self.inspiration_term_list.addItem(item)
         self.inspiration_term_list.blockSignals(False)
+
+    def _populate_inspiration_filter_list(self, filters: list[SearchPlanFilter]) -> None:
+        if not hasattr(self, "inspiration_filter_list"):
+            return
+        self.inspiration_filter_list.blockSignals(True)
+        self.inspiration_filter_list.clear()
+        for plan_filter in filters:
+            label = ai_vision_label(
+                plan_filter.field,
+                plan_filter.value,
+                language=self.current_language,
+            )
+            prefix = "Optional" if self.current_language == "en" else "可选"
+            text = label if not plan_filter.optional else f"{prefix}：{label}"
+            if plan_filter.reason:
+                text = f"{text}\n{plan_filter.reason}"
+            item = QListWidgetItem(text)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Unchecked if plan_filter.optional else Qt.CheckState.Checked
+            )
+            item.setData(Qt.ItemDataRole.UserRole, plan_filter)
+            item.setSizeHint(QSize(0, 42 if plan_filter.reason else 28))
+            item.setToolTip(text)
+            self.inspiration_filter_list.addItem(item)
+        self.inspiration_filter_list.blockSignals(False)
 
     def _sync_inspiration_questions_label(self) -> None:
         question_prefix = "AI questions: " if self.current_language == "en" else "AI 追问："
@@ -2076,11 +2292,15 @@ class MainWindow(QMainWindow):
         terms = self.store.inspiration_terms_for_project(project_id)
         self.current_inspiration_project_id = project.id
         self.inspiration_proposal_terms = list(terms)
+        self.inspiration_plan_filters = []
+        self.current_inspiration_plan_filters = []
+        self.current_inspiration_raw_term_results = []
         self.inspiration_questions = list(project.questions)
         self.inspiration_model_name = project.model_name
         self.inspiration_brief_input.setPlainText(project.brief)
         self.inspiration_answers_input.setPlainText(project.answers)
         self._populate_inspiration_term_list(self.inspiration_proposal_terms)
+        self._populate_inspiration_filter_list([])
         self._sync_inspiration_questions_label()
         self._refresh_inspiration_status()
         self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
@@ -2140,11 +2360,19 @@ class MainWindow(QMainWindow):
     def _refresh_inspiration_status(self) -> None:
         count = len(self._selected_inspiration_terms())
         total = self.inspiration_term_list.count()
+        filter_count = len(self._selected_inspiration_plan_filters())
         if total == 0:
             self.inspiration_status_label.setText("生成后最多选择 7 个语义探针；右键探针可单条搜索。")
         else:
+            scoped_count = sum(
+                1
+                for term in self._selected_inspiration_terms()
+                if self._inspiration_term_uses_plan_filters(term)
+            )
             self.inspiration_status_label.setText(
-                f"已选择 {count} / 7 个语义探针；保存并搜索会混排所有已选探针，右键可单条搜索。"
+                f"已选择 {count} / 7 个语义探针，{filter_count} 个规划筛选；"
+                "保存并搜索会混排所有已选探针，"
+                f"筛选作用于 {scoped_count} 个场景类探针。"
             )
 
     def _selected_inspiration_terms(self) -> list[InspirationTerm]:
@@ -2164,6 +2392,17 @@ class MainWindow(QMainWindow):
                     selected=True,
                 ))
         return terms
+
+    def _selected_inspiration_plan_filters(self) -> list[SearchPlanFilter]:
+        filters: list[SearchPlanFilter] = []
+        for row in range(self.inspiration_filter_list.count()):
+            item = self.inspiration_filter_list.item(row)
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+            plan_filter = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(plan_filter, SearchPlanFilter):
+                filters.append(plan_filter)
+        return filters
 
     def _show_inspiration_term_context_menu(self, position) -> None:
         item = self.inspiration_term_list.itemAt(position)
@@ -2198,6 +2437,7 @@ class MainWindow(QMainWindow):
                     selected=True,
                 )
             ],
+            plan_filters=self._selected_inspiration_plan_filters(),
         )
 
     def _save_and_search_inspiration(self) -> None:
@@ -2213,6 +2453,7 @@ class MainWindow(QMainWindow):
             self.inspiration_status_label.setText("先输入创作主题。")
             return
         selected_titles = {term.title for term in selected_terms}
+        plan_filters = self._selected_inspiration_plan_filters()
         project_id = self.current_inspiration_project_id
         if project_id is not None and self.store.get_inspiration_project(project_id) is not None:
             self.store.update_inspiration_project_selection(
@@ -2232,12 +2473,14 @@ class MainWindow(QMainWindow):
                 selected_titles=selected_titles,
             )
         self._refresh_inspiration_history(select_project_id=project_id)
-        self._run_inspiration_search(project_id, selected_terms)
+        self._run_inspiration_search(project_id, selected_terms, plan_filters=plan_filters)
 
     def _run_inspiration_search(
         self,
         project_id: int,
         selected_terms: list[InspirationTerm],
+        *,
+        plan_filters: list[SearchPlanFilter] | None = None,
     ) -> None:
         if not selected_terms:
             self.statusBar().showMessage("没有可搜索的语义探针")
@@ -2252,6 +2495,8 @@ class MainWindow(QMainWindow):
         self.current_result_mode = "inspiration"
         self.current_inspiration_project_id = project_id
         self.current_inspiration_terms = list(selected_terms)
+        self.current_inspiration_plan_filters = list(plan_filters or [])
+        self.current_inspiration_raw_term_results = []
         self.current_inspiration_images = []
         self.current_inspiration_filtered_images = []
         self.current_inspiration_matches = {}
@@ -2261,9 +2506,14 @@ class MainWindow(QMainWindow):
         self.search_filters.clear()
         self.current_offset = 0
         self.load_more_button.setEnabled(False)
+        self.generate_search_plan_button.setEnabled(False)
         self.generate_inspiration_button.setEnabled(False)
         self.search_inspiration_button.setEnabled(False)
-        self._set_result_status(f"灵感项目搜索中：{len(selected_terms)} 个语义探针")
+        filter_text = (
+            f"，{len(self.current_inspiration_plan_filters)} 个规划筛选"
+            if self.current_inspiration_plan_filters else ""
+        )
+        self._set_result_status(f"灵感项目搜索中：{len(selected_terms)} 个语义探针{filter_text}")
         self.search_diagnostics_label.setText("搜索诊断：-")
 
         def run() -> None:
@@ -2278,13 +2528,109 @@ class MainWindow(QMainWindow):
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
                     )
-                    term_results.append((term, result.images[:100]))
-                mixed = mix_inspiration_search_results(term_results, limit=500)
-                self.events.put(("inspiration_done", (revision, project_id, selected_terms, mixed)))
+                    term_results.append((term, list(result.images)))
+                self.events.put((
+                    "inspiration_done",
+                    (revision, project_id, selected_terms, term_results, list(plan_filters or [])),
+                ))
             except Exception as exc:
                 self.events.put(("error", f"灵感项目搜索失败：{exc}"))
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _handle_inspiration_filter_changed(self, _item: QListWidgetItem | None = None) -> None:
+        self._refresh_inspiration_status()
+        if self.current_result_mode != "inspiration" or not self.current_inspiration_raw_term_results:
+            return
+        self.current_inspiration_plan_filters = self._selected_inspiration_plan_filters()
+        self._rebuild_current_inspiration_results_from_raw()
+        self._apply_inspiration_result_filters()
+        images = self.current_inspiration_filtered_images
+        self.grid_view.set_images(images, badges_by_image_id=self._inspiration_badges_by_image_id())
+        self._set_inspiration_result_status(images)
+        self._update_inspiration_diagnostics(images)
+
+    def _rebuild_current_inspiration_results_from_raw(self) -> None:
+        result = self._mix_inspiration_raw_term_results(
+            self.current_inspiration_raw_term_results,
+            self.current_inspiration_plan_filters,
+        )
+        self.current_inspiration_images = list(result.images)
+        self.current_inspiration_matches = dict(result.matches_by_image_id)
+
+    def _mix_inspiration_raw_term_results(
+        self,
+        term_results: list[tuple[InspirationTerm, list[ImageItem]]],
+        plan_filters: list[SearchPlanFilter],
+    ):
+        scoped_results: list[tuple[InspirationTerm, list[ImageItem]]] = []
+        for term, images in term_results:
+            scoped_images = self._images_for_inspiration_term_with_plan_filters(
+                term,
+                list(images),
+                plan_filters,
+            )
+            scoped_results.append((term, scoped_images[:100]))
+        return mix_inspiration_search_results(scoped_results, limit=500)
+
+    def _images_for_inspiration_term_with_plan_filters(
+        self,
+        term: InspirationTerm,
+        images: list[ImageItem],
+        plan_filters: list[SearchPlanFilter],
+    ) -> list[ImageItem]:
+        if not plan_filters or not self._inspiration_term_uses_plan_filters(term):
+            return list(images)
+        return self._apply_inspiration_plan_filters_to_images(images, plan_filters)
+
+    def _inspiration_term_uses_plan_filters(self, term: InspirationTerm) -> bool:
+        axis = term.axis.strip().casefold()
+        scene_axes = {"environment", "lighting", "mood", "composition", "era"}
+        object_axes = {"object_detail", "object", "material", "character", "vehicle", "prop"}
+        if axis in scene_axes:
+            return True
+        if axis in object_axes:
+            return False
+        text = f"{term.title} {term.query} {term.reason}".casefold()
+        object_markers = (
+            "摩托", "车辆", "飞行器", "引擎", "发动机", "机械", "结构", "造型", "细节",
+            "物件", "道具", "装备", "服装", "材质", "纹理", "machine", "vehicle",
+            "motorcycle", "engine", "object", "prop", "material", "texture", "detail",
+        )
+        scene_markers = (
+            "室内", "室外", "场景", "环境", "天气", "白天", "夜晚", "清晨", "黄昏",
+            "光照", "逆光", "侧光", "低调", "高调", "气氛", "氛围", "构图", "视角",
+            "interior", "exterior", "environment", "scene", "weather", "day", "night",
+            "dawn", "dusk", "lighting", "mood", "atmosphere", "composition", "angle",
+        )
+        if any(marker in text for marker in object_markers):
+            return False
+        return any(marker in text for marker in scene_markers)
+
+    def _apply_inspiration_plan_filters_to_images(
+        self,
+        images: list[ImageItem],
+        plan_filters: list[SearchPlanFilter],
+    ) -> list[ImageItem]:
+        if not images or not plan_filters:
+            return list(images)
+        allowed_by_field: dict[str, set[int]] = {}
+        for plan_filter in plan_filters:
+            matching_ids = self.store.image_ids_matching_ai_vision(
+                plan_filter.field,
+                plan_filter.value,
+            )
+            if plan_filter.field in allowed_by_field:
+                allowed_by_field[plan_filter.field].update(matching_ids)
+            else:
+                allowed_by_field[plan_filter.field] = set(matching_ids)
+        if not allowed_by_field:
+            return list(images)
+        return [
+            image
+            for image in images
+            if all(image.id in allowed_ids for allowed_ids in allowed_by_field.values())
+        ]
 
     def _find_similar_to_selected_image(self) -> None:
         self._find_similar_to_image(self._selected_grid_image())
@@ -2337,6 +2683,30 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("未知的尺寸筛选条件")
             return
         self._start_search_with_filter(SearchFilter(kind, filter_value))
+
+    def _refresh_ai_vision_value_filter_combo(self) -> None:
+        if not hasattr(self, "ai_vision_field_filter_combo"):
+            return
+        field = str(self.ai_vision_field_filter_combo.currentData() or "scene_location")
+        previous = self.ai_vision_value_filter_combo.currentData() if hasattr(self, "ai_vision_value_filter_combo") else None
+        values = AI_VISION_LIGHTING_VALUES if field == "lighting" else AI_VISION_FIELD_VALUES.get(field, [])
+        self.ai_vision_value_filter_combo.blockSignals(True)
+        self.ai_vision_value_filter_combo.clear()
+        for value in values:
+            label = ai_vision_label(field, value, language=self.current_language)
+            label = label.split(": ", 1)[1] if ": " in label else label
+            self.ai_vision_value_filter_combo.addItem(label, value)
+        if previous is not None:
+            self._set_combo_to_data(self.ai_vision_value_filter_combo, previous)
+        self.ai_vision_value_filter_combo.blockSignals(False)
+
+    def _add_ai_vision_filter_from_controls(self) -> None:
+        field = str(self.ai_vision_field_filter_combo.currentData() or "")
+        value = str(self.ai_vision_value_filter_combo.currentData() or "")
+        if not field or not value:
+            self.statusBar().showMessage("请选择 AI 场景筛选条件")
+            return
+        self._start_search_with_filter(SearchFilter("ai_vision", f"{field}:{value}"))
 
     def _save_current_view(self) -> None:
         name, ok = QInputDialog.getText(
@@ -2672,6 +3042,22 @@ class MainWindow(QMainWindow):
                     for image in images
                     if self._image_matches_size(image, str(search_filter.value))
                 ]
+            elif search_filter.kind == "ai_vision":
+                if allowed_image_ids is None:
+                    images = self._list_chain_base_images(
+                        folder_path_prefix=folder_path_prefix,
+                        collection_id=collection_id,
+                        tag_ids=tag_ids,
+                        tag_match_mode=tag_match_mode,
+                        status_filter=status_filter,
+                    )
+                field, value = ai_vision_filter_parts(str(search_filter.value))
+                matching_ids = self.store.image_ids_matching_ai_vision(field, value)
+                images = [
+                    image
+                    for image in images
+                    if image.id in matching_ids
+                ]
             allowed_image_ids = {image.id for image in images}
             if not allowed_image_ids:
                 break
@@ -2800,13 +3186,24 @@ class MainWindow(QMainWindow):
         *,
         project_id: int,
         selected_terms: list[InspirationTerm],
-        result,
+        result=None,
+        raw_term_results: list[tuple[InspirationTerm, list[ImageItem]]] | None = None,
+        plan_filters: list[SearchPlanFilter] | None = None,
     ) -> None:
         self.current_result_mode = "inspiration"
         self.current_inspiration_project_id = project_id
         self.current_inspiration_terms = list(selected_terms)
-        self.current_inspiration_images = list(result.images)
-        self.current_inspiration_matches = dict(result.matches_by_image_id)
+        self.current_inspiration_plan_filters = list(plan_filters or [])
+        if raw_term_results is not None:
+            self.current_inspiration_raw_term_results = [
+                (term, list(images))
+                for term, images in raw_term_results
+            ]
+            self._rebuild_current_inspiration_results_from_raw()
+        elif result is not None:
+            self.current_inspiration_raw_term_results = []
+            self.current_inspiration_images = list(result.images)
+            self.current_inspiration_matches = dict(result.matches_by_image_id)
         self._apply_inspiration_result_filters()
         images = self.current_inspiration_filtered_images
         badges = self._inspiration_badges_by_image_id()
@@ -2859,6 +3256,12 @@ class MainWindow(QMainWindow):
             f"多重命中 {multi_hit_count}",
             f"阈值 {threshold_text}",
         ]
+        if self.current_inspiration_plan_filters:
+            parts.append(
+                "规划筛选 "
+                f"{len(self.current_inspiration_plan_filters)}，"
+                f"作用 {self._inspiration_plan_filtered_term_count()}/{len(self.current_inspiration_terms)}"
+            )
         if protected_count:
             parts.append(f"覆盖保留 {protected_count}")
         if scores:
@@ -2872,13 +3275,33 @@ class MainWindow(QMainWindow):
     def _set_inspiration_result_status(self, images: list[ImageItem]) -> None:
         source_count = len(self.current_inspiration_images)
         term_titles = "、".join(term.title for term in self.current_inspiration_terms)
+        filter_suffix = (
+            " ｜ 筛选："
+            f"{self._format_plan_filter_summary(self.current_inspiration_plan_filters)}"
+            f"（作用 {self._inspiration_plan_filtered_term_count()}/{len(self.current_inspiration_terms)} 个探针）"
+            if self.current_inspiration_plan_filters else ""
+        )
         suffix = self._result_management_status_suffix()
         if len(images) == source_count:
-            self._set_result_status(f"灵感项目结果：{len(images)} 张 ｜ {term_titles}{suffix}")
+            self._set_result_status(f"灵感项目结果：{len(images)} 张 ｜ {term_titles}{filter_suffix}{suffix}")
         else:
             self._set_result_status(
-                f"灵感项目结果：{len(images)} / 原始 {source_count} ｜ {term_titles}{suffix}"
+                f"灵感项目结果：{len(images)} / 原始 {source_count} ｜ {term_titles}{filter_suffix}{suffix}"
             )
+
+    def _format_plan_filter_summary(self, filters: list[SearchPlanFilter]) -> str:
+        labels = [
+            ai_vision_label(plan_filter.field, plan_filter.value, language=self.current_language)
+            for plan_filter in filters
+        ]
+        return "、".join(label.split(": ", 1)[-1] for label in labels[:6])
+
+    def _inspiration_plan_filtered_term_count(self) -> int:
+        return sum(
+            1
+            for term in self.current_inspiration_terms
+            if self._inspiration_term_uses_plan_filters(term)
+        )
 
     def _apply_inspiration_result_filters(self) -> None:
         threshold = self._score_threshold()
@@ -3195,6 +3618,8 @@ class MainWindow(QMainWindow):
         self.current_search_scope_count = None
         self.current_inspiration_project_id = None
         self.current_inspiration_terms = []
+        self.current_inspiration_plan_filters = []
+        self.current_inspiration_raw_term_results = []
         self.current_inspiration_images = []
         self.current_inspiration_filtered_images = []
         self.current_inspiration_matches = {}
@@ -3276,6 +3701,8 @@ class MainWindow(QMainWindow):
         self.current_search_scope_count = None
         self.current_inspiration_project_id = None
         self.current_inspiration_terms = []
+        self.current_inspiration_plan_filters = []
+        self.current_inspiration_raw_term_results = []
         self.current_inspiration_images = []
         self.current_inspiration_filtered_images = []
         self.current_inspiration_matches = {}
@@ -3342,6 +3769,8 @@ class MainWindow(QMainWindow):
             self._run_inspiration_search(
                 self.current_inspiration_project_id or 0,
                 self.current_inspiration_terms,
+                plan_filters=self._selected_inspiration_plan_filters()
+                or self.current_inspiration_plan_filters,
             )
             return
 
@@ -3923,6 +4352,7 @@ class MainWindow(QMainWindow):
         else:
             self._refresh_current_results_for_filters()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         self.statusBar().showMessage(f"已从图库移除索引：{image.file_name}")
 
     def _refresh_feedback_buttons(self, image: ImageItem | None) -> None:
@@ -4348,6 +4778,7 @@ class MainWindow(QMainWindow):
         self.size_label.setText(f"{total_size:,} bytes")
         self.modified_label.setText("-")
         self.embedding_label.setText(f"ready {ready_count} / {count}")
+        self.ai_vision_detail_label.setText("-")
         self.score_label.setText("-")
         self.favorite_checkbox.setChecked(favorite_count == count)
         self.tags_input.clear()
@@ -4375,6 +4806,7 @@ class MainWindow(QMainWindow):
         self.size_label.setText(self._format_media_dimensions(image))
         self.modified_label.setText(image.modified_at or "-")
         self.embedding_label.setText(image.embedding_status)
+        self.ai_vision_detail_label.setText(self._format_ai_vision_details(image.id))
         if self.current_result_mode == "inspiration" and image.id in self.current_inspiration_matches:
             matches = self.current_inspiration_matches[image.id]
             titles = "、".join(match.term_title for match in matches[:3])
@@ -4429,6 +4861,7 @@ class MainWindow(QMainWindow):
             self.collection_detail_count_label.setText(f"{available} 个可用，{missing} 个丢失")
             self.collection_detail_import_dir_label.setText("-")
             self.open_collection_import_dir_button.setEnabled(False)
+            self.ai_vision_detail_label.setText("-")
             return
 
         collection = self._collection_by_id(collection_id)
@@ -4438,6 +4871,7 @@ class MainWindow(QMainWindow):
             self.collection_detail_count_label.setText("-")
             self.collection_detail_import_dir_label.setText("-")
             self.open_collection_import_dir_button.setEnabled(False)
+            self.ai_vision_detail_label.setText("-")
             return
 
         counts = self.store.collection_image_counts()
@@ -4462,6 +4896,41 @@ class MainWindow(QMainWindow):
             self.preview_label.setText("视频文件不存在")
             return
         self.video_player.setSource(QUrl.fromLocalFile(image.file_path))
+
+    def _format_ai_vision_details(self, image_id: int) -> str:
+        tags = self.store.ai_vision_tags_for_image(image_id)
+        if tags is None:
+            return "未识别" if self.current_language != "en" else "Not indexed"
+        status = str(tags.get("status") or "")
+        if status != "ready":
+            error = str(tags.get("error_message") or "").strip()
+            if error:
+                return f"{status}: {error[:120]}"
+            return status
+        parts: list[str] = []
+        for field in [
+            "scene_location",
+            "environment_type",
+            "time_of_day",
+            "weather",
+            "shot_scale",
+            "view_angle",
+        ]:
+            value = tags.get(field)
+            if isinstance(value, str) and value:
+                parts.append(ai_vision_label(field, value, language=self.current_language))
+        lighting = tags.get("lighting")
+        if isinstance(lighting, list) and lighting:
+            label = " / ".join(
+                ai_vision_label("lighting", str(value), language=self.current_language).split(": ", 1)[-1]
+                for value in lighting
+            )
+            field_label = "Lighting" if self.current_language == "en" else "光照"
+            parts.append(f"{field_label}: {label}")
+        notes = str(tags.get("notes") or "").strip()
+        if notes:
+            parts.append(notes)
+        return "\n".join(parts) if parts else "-"
 
     def _set_path_text(self, path_text: str) -> None:
         self.path_label.setPlainText(path_text)
@@ -4741,6 +5210,7 @@ class MainWindow(QMainWindow):
         self._refresh_tags()
         self._refresh_current_results_for_filters()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         self.statusBar().showMessage(
             f"已删除文件夹，移除 {affected_links} 个归类关联，"
             f"从 Eidory 移除 {deleted_images} 张图片索引，源文件未删除"
@@ -5182,6 +5652,7 @@ class MainWindow(QMainWindow):
         self._refresh_collections(select_collection_id=source_collection_id)
         self._refresh_current_results_for_filters()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         self.statusBar().showMessage(
             f"已移动到“{target_name}”：新增关联 {inserted}，移出关联 {removed_links}"
         )
@@ -5216,6 +5687,7 @@ class MainWindow(QMainWindow):
         self._refresh_collections(select_collection_id=collection_id)
         self._refresh_current_results_for_filters()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         self.statusBar().showMessage(
             f"已移出关联 {removed_links} 个；从图库移除索引 {deleted_images} 个，源文件未删除"
         )
@@ -5282,6 +5754,7 @@ class MainWindow(QMainWindow):
         self._refresh_tags()
         self._refresh_current_results_for_filters()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         self.statusBar().showMessage(f"已移除 {removed} 张图片索引，源文件未删除")
 
     def _rename_tag(self, tag_id: int, current_name: str) -> None:
@@ -5777,6 +6250,65 @@ class MainWindow(QMainWindow):
         self._refresh_embedding_stats()
         self._start_embedding()
 
+    def _start_ai_vision(self) -> None:
+        if self.ai_vision_worker is not None and self.ai_vision_worker.is_alive():
+            self.ai_vision_worker.resume_work()
+            self._refresh_ai_vision_stats()
+            return
+        provider = self._make_ai_vision_provider()
+        self.ai_vision_worker = AIVisionWorker(
+            store=self.store,
+            provider=provider,
+            on_progress=lambda progress: self.events.put(("ai_vision", progress)),
+        )
+        self.ai_vision_worker.start()
+        self._refresh_ai_vision_stats()
+
+    def _pause_ai_vision(self) -> None:
+        if self.ai_vision_worker is not None:
+            self.ai_vision_worker.pause()
+
+    def _retry_failed_ai_vision(self) -> None:
+        count = self.store.retry_failed_ai_vision()
+        self.statusBar().showMessage(f"已重试 {count} 个 AI 识别失败项")
+        self._refresh_ai_vision_stats()
+        if count:
+            self._start_ai_vision()
+
+    def _set_ai_vision_rule_for_selected_collection(self, mode: str) -> None:
+        collection_id = self._selected_collection_id()
+        if collection_id is None:
+            self.statusBar().showMessage("请先在左侧选择一个普通文件夹")
+            return
+        self.store.set_ai_vision_collection_rule(collection_id, mode=mode, include_descendants=True)
+        self._refresh_ai_vision_stats()
+        label = "识别" if mode == "include" else "排除"
+        self.statusBar().showMessage(f"已设置 AI 场景标签规则：{label} {self._collection_path_text(collection_id)}")
+
+    def _remove_selected_ai_vision_rule(self) -> None:
+        item = self.ai_vision_rule_tree.currentItem()
+        if item is None:
+            self.statusBar().showMessage("请先选择一条 AI 规则")
+            return
+        collection_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if collection_id is None:
+            return
+        removed = self.store.remove_ai_vision_collection_rule(int(collection_id))
+        self._refresh_ai_vision_stats()
+        self.statusBar().showMessage("已移除 AI 规则" if removed else "AI 规则不存在")
+
+    def _handle_ai_vision_progress(self, progress: AIVisionProgress) -> None:
+        self._refresh_ai_vision_stats()
+        if progress.image_id is None:
+            self.statusBar().showMessage(progress.message)
+        else:
+            self.statusBar().showMessage(f"{progress.file_name}: {progress.status}")
+            if self.selected_image is not None and self.selected_image.id == progress.image_id:
+                image = self.store.get_image(progress.image_id)
+                if image is not None:
+                    self.selected_image = image
+                    self._show_image_details(image)
+
     def _poll_events(self) -> None:
         while True:
             try:
@@ -5863,16 +6395,34 @@ class MainWindow(QMainWindow):
                 self.generate_inspiration_button.setEnabled(True)
                 self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
                 self._show_inspiration_error(payload)
-            elif kind == "inspiration_done":
+            elif kind == "search_plan_proposal":
+                self.generate_search_plan_button.setEnabled(True)
+                self.generate_inspiration_button.setEnabled(True)
+                self._show_search_plan_proposal(payload)
+            elif kind == "search_plan_error":
+                self.generate_search_plan_button.setEnabled(True)
                 self.generate_inspiration_button.setEnabled(True)
                 self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
-                revision, project_id, selected_terms, result = payload
+                self._show_inspiration_error(payload)
+            elif kind == "inspiration_done":
+                self.generate_search_plan_button.setEnabled(True)
+                self.generate_inspiration_button.setEnabled(True)
+                self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
+                plan_filters = None
+                raw_term_results = None
+                result = None
+                if isinstance(payload, tuple) and len(payload) == 5:
+                    revision, project_id, selected_terms, raw_term_results, plan_filters = payload
+                else:
+                    revision, project_id, selected_terms, result = payload
                 if revision != self.semantic_search_revision:
                     continue
                 self._handle_inspiration_done(
                     project_id=project_id,
                     selected_terms=selected_terms,
                     result=result,
+                    raw_term_results=raw_term_results,
+                    plan_filters=plan_filters,
                 )
             elif kind == "temp_project_suggestion":
                 self._apply_temporary_project_suggestion(payload)
@@ -5890,13 +6440,20 @@ class MainWindow(QMainWindow):
                 self._handle_export_done(payload)
             elif kind == "embedding":
                 self._handle_embedding_progress(payload)
+            elif kind == "ai_vision":
+                self._handle_ai_vision_progress(payload)
             elif kind == "error":
                 self._record_error(str(payload))
                 self.search_button.setEnabled(True)
+                self.generate_search_plan_button.setEnabled(True)
                 self.generate_inspiration_button.setEnabled(True)
                 self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
                 self.add_folder_button.setEnabled(True)
                 self.rescan_button.setEnabled(True)
+                if hasattr(self, "start_ai_vision_button"):
+                    self.start_ai_vision_button.setEnabled(True)
+                    self.pause_ai_vision_button.setEnabled(True)
+                    self.retry_failed_ai_vision_button.setEnabled(True)
                 self._set_maintenance_controls_enabled(True)
                 if hasattr(self, "export_library_button"):
                     self._set_export_controls_enabled(True)
@@ -5908,8 +6465,10 @@ class MainWindow(QMainWindow):
         self._set_maintenance_controls_enabled(True)
         self._refresh_folders()
         self._refresh_collections()
+        self.store.seed_default_ai_vision_collection_rules()
         self._reload_images()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         self._refresh_path_remap_candidates()
         self.statusBar().showMessage(
             f"扫描完成：新增 {result.new_files}，变化 {result.changed_files}，丢失 {result.missing_marked}"
@@ -5921,8 +6480,10 @@ class MainWindow(QMainWindow):
         self._set_maintenance_controls_enabled(True)
         self._refresh_folders()
         self._refresh_collections()
+        self.store.seed_default_ai_vision_collection_rules()
         self._reload_images()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         self._refresh_path_remap_candidates()
         scanned = sum(result.scanned_files for result in results)
         new_files = sum(result.new_files for result in results)
@@ -5941,8 +6502,10 @@ class MainWindow(QMainWindow):
         self._set_maintenance_controls_enabled(True)
         self._refresh_folders()
         self._refresh_collections()
+        self.store.seed_default_ai_vision_collection_rules()
         self._reload_images()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         self._refresh_path_remap_candidates()
         scanned = sum(result.scanned_files for result in results)
         new_files = sum(result.new_files for result in results)
@@ -5960,8 +6523,10 @@ class MainWindow(QMainWindow):
         self._set_maintenance_controls_enabled(True)
         self._refresh_folders()
         self._refresh_collections()
+        self.store.seed_default_ai_vision_collection_rules()
         self._reload_images()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         self._refresh_path_remap_candidates()
         scanned = sum(result.scanned_files for result in results)
         recovered = sum(result.changed_files for result in results)
@@ -5991,8 +6556,10 @@ class MainWindow(QMainWindow):
         self.rescan_button.setEnabled(True)
         self._refresh_folders()
         self._refresh_collections(select_collection_id=collection_id)
+        self.store.seed_default_ai_vision_collection_rules()
         self._reload_images()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         mode = "按目录结构导入" if preserve_structure else "导入"
         self.statusBar().showMessage(
             f"{mode}完成：{collection_name}，扫描 {result.scanned_files}，"
@@ -6014,6 +6581,7 @@ class MainWindow(QMainWindow):
         self.rescan_button.setEnabled(True)
         self._refresh_folders()
         self._refresh_collections(select_collection_id=collection_id)
+        self.store.seed_default_ai_vision_collection_rules()
         clean_imported_ids = [
             int(image_id)
             for image_id in imported_image_ids or []
@@ -6024,6 +6592,7 @@ class MainWindow(QMainWindow):
         else:
             self._reload_images()
         self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
         self.statusBar().showMessage(
             f"拖入导入成功：{collection_name}，扫描 {scanned}，"
             f"新增 {new_files}，变化 {changed_files}，加入 {assigned}"
@@ -6244,6 +6813,8 @@ class MainWindow(QMainWindow):
         self.current_temp_project_badges = dict(badges)
         self.current_inspiration_project_id = None
         self.current_inspiration_terms = []
+        self.current_inspiration_plan_filters = []
+        self.current_inspiration_raw_term_results = []
         self.current_inspiration_images = []
         self.current_inspiration_filtered_images = []
         self.current_inspiration_matches = {}
@@ -7313,6 +7884,55 @@ class MainWindow(QMainWindow):
             f"剩余：{pending}    处理中：{processing}\n"
             f"失败：{failed}    进度：{percent}%"
         )
+
+    def _refresh_ai_vision_stats(self) -> None:
+        if not hasattr(self, "ai_vision_progress_bar"):
+            return
+        provider_name = self._ai_vision_provider_name()
+        model_name = self._ai_vision_model_name_for_stats()
+        stats = self.store.ai_vision_stats(
+            provider_name=provider_name,
+            model_name=model_name,
+            prompt_version=AI_VISION_PROMPT_VERSION,
+        )
+        total = stats["total"]
+        ready = stats["ready"]
+        failed = stats["failed"]
+        processing = stats["processing"]
+        pending = stats["pending"] + stats["stale"]
+        percent = int((ready / total) * 100) if total else 0
+        self.ai_vision_progress_bar.setValue(percent)
+        self.ai_vision_stats_label.setText(
+            f"已完成：{ready} / {total}\n"
+            f"剩余：{pending}    处理中：{processing}\n"
+            f"失败：{failed}    进度：{percent}%"
+        )
+        self.ai_vision_rule_tree.blockSignals(True)
+        self.ai_vision_rule_tree.clear()
+        for rule in self.store.list_ai_vision_collection_rules_with_stats(
+            provider_name=provider_name,
+            model_name=model_name,
+            prompt_version=AI_VISION_PROMPT_VERSION,
+        ):
+            rule_stats = rule["stats"]
+            assert isinstance(rule_stats, dict)
+            mode = "识别" if rule["mode"] == "include" else "排除"
+            if self.current_language == "en":
+                mode = "Include" if rule["mode"] == "include" else "Exclude"
+            pending_count = int(rule_stats["pending"]) + int(rule_stats["stale"])
+            item = QTreeWidgetItem(
+                [
+                    mode,
+                    str(rule["path"]),
+                    str(rule_stats["ready"]),
+                    str(rule_stats["failed"]),
+                    str(pending_count),
+                    str(rule_stats["total"]),
+                ]
+            )
+            item.setData(0, Qt.ItemDataRole.UserRole, int(rule["collection_id"]))
+            self.ai_vision_rule_tree.addTopLevelItem(item)
+        self.ai_vision_rule_tree.blockSignals(False)
 
     def _apply_sidebar_filters(self, images: list[ImageItem]) -> list[ImageItem]:
         folder_path_prefix = self._selected_folder_path_prefix()

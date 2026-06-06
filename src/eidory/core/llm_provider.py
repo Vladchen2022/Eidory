@@ -6,6 +6,11 @@ from dataclasses import dataclass
 
 import requests
 
+from eidory.core.ai_vision import (
+    AI_VISION_FIELD_VALUES,
+    AI_VISION_LIGHTING_VALUES,
+    normalize_ai_vision_value,
+)
 from eidory.core.inspiration import InspirationTerm, normalize_inspiration_terms
 
 
@@ -13,6 +18,22 @@ from eidory.core.inspiration import InspirationTerm, normalize_inspiration_terms
 class InspirationProposal:
     questions: list[str]
     terms: list[InspirationTerm]
+    model_name: str
+
+
+@dataclass(frozen=True)
+class SearchPlanFilter:
+    field: str
+    value: str
+    optional: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class SearchPlanProposal:
+    questions: list[str]
+    terms: list[InspirationTerm]
+    filters: list[SearchPlanFilter]
     model_name: str
 
 
@@ -89,6 +110,49 @@ class LMStudioProvider:
             )
             try:
                 return parse_inspiration_proposal(repaired_content, model_name=model_name)
+            except LLMProviderError as second_error:
+                raise LLMProviderError(
+                    f"{first_error}；自动修复也失败：{second_error}"
+                ) from second_error
+
+    def generate_search_plan(
+        self,
+        *,
+        brief: str,
+        answers: str = "",
+        language: str = "zh",
+    ) -> SearchPlanProposal:
+        clean_brief = brief.strip()
+        if not clean_brief:
+            raise LLMProviderError("创作主题不能为空")
+        model_name = self.model_name or self._first_available_model()
+        messages = [
+            {
+                "role": "system",
+                "content": _search_plan_system_prompt(language),
+            },
+            {
+                "role": "user",
+                "content": _build_search_plan_prompt(clean_brief, answers.strip(), language=language),
+            },
+        ]
+        content = self._chat_completion(
+            model_name=model_name,
+            messages=messages,
+            prefer_json=True,
+            response_format=_search_plan_response_format(),
+            temperature=0.55,
+            max_tokens=2600,
+        )
+        try:
+            return parse_search_plan_proposal(content, model_name=model_name)
+        except LLMProviderError as first_error:
+            repaired_content = self._repair_search_plan_json_response(
+                model_name=model_name,
+                original_content=content,
+            )
+            try:
+                return parse_search_plan_proposal(repaired_content, model_name=model_name)
             except LLMProviderError as second_error:
                 raise LLMProviderError(
                     f"{first_error}；自动修复也失败：{second_error}"
@@ -239,6 +303,31 @@ class LMStudioProvider:
             max_tokens=2200,
         )
 
+    def _repair_search_plan_json_response(self, *, model_name: str, original_content: str) -> str:
+        messages = [
+            {
+                "role": "system",
+                "content": "你只做格式修复。把用户提供的内容转换成严格 JSON，不要解释。",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "把下面内容整理成 JSON："
+                    '{"questions":[],"terms":[{"title":"","query":"","axis":"visual","reason":""}],'
+                    '"filters":[{"field":"scene_location","value":"indoor","optional":false,"reason":""}]}\n\n'
+                    f"{original_content}"
+                ),
+            },
+        ]
+        return self._chat_completion(
+            model_name=model_name,
+            messages=messages,
+            prefer_json=True,
+            response_format=_search_plan_response_format(),
+            temperature=0.2,
+            max_tokens=2600,
+        )
+
     def _first_available_model(self) -> str:
         try:
             response = requests.get(f"{self.base_url}/models", headers=self._headers(), timeout=5)
@@ -273,6 +362,56 @@ def parse_inspiration_proposal(content: str, *, model_name: str) -> InspirationP
         questions=questions,
         terms=terms[:30],
         model_name=model_name,
+    )
+
+
+def parse_search_plan_proposal(content: str, *, model_name: str) -> SearchPlanProposal:
+    payload = _load_json_object(content)
+    questions = [
+        " ".join(question.strip().split())[:120]
+        for question in payload.get("questions", [])
+        if isinstance(question, str) and question.strip()
+    ][:3]
+    terms = normalize_inspiration_terms(payload.get("terms", []))
+    if len(terms) < 5:
+        raise LLMProviderError("AI 生成的语义探针太少，请换个主题或重试")
+    raw_filters = payload.get("filters", [])
+    if not isinstance(raw_filters, list):
+        raw_filters = []
+    filters: list[SearchPlanFilter] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_filter in raw_filters:
+        parsed = _search_plan_filter_from_payload(raw_filter)
+        if parsed is None:
+            continue
+        key = (parsed.field, parsed.value)
+        if key in seen:
+            continue
+        seen.add(key)
+        filters.append(parsed)
+    return SearchPlanProposal(
+        questions=questions,
+        terms=terms[:30],
+        filters=filters[:14],
+        model_name=model_name,
+    )
+
+
+def _search_plan_filter_from_payload(payload: object) -> SearchPlanFilter | None:
+    if not isinstance(payload, dict):
+        return None
+    field = str(payload.get("field") or "").strip()
+    if field not in AI_VISION_FIELD_VALUES and field != "lighting":
+        return None
+    value = normalize_ai_vision_value(field, payload.get("value"))
+    allowed = AI_VISION_LIGHTING_VALUES if field == "lighting" else AI_VISION_FIELD_VALUES[field]
+    if value not in allowed:
+        return None
+    return SearchPlanFilter(
+        field=field,
+        value=value,
+        optional=bool(payload.get("optional")),
+        reason=_clean_project_text(payload.get("reason"), max_length=120),
     )
 
 
@@ -395,6 +534,51 @@ def _group_names_response_format() -> dict[str, object]:
     }
 
 
+def _search_plan_response_format() -> dict[str, object]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "eidory_search_plan",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "terms": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "query": {"type": "string"},
+                                "axis": {"type": "string"},
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["title", "query"],
+                        },
+                    },
+                    "filters": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "field": {"type": "string"},
+                                "value": {"type": "string"},
+                                "optional": {"type": "boolean"},
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["field", "value", "optional"],
+                        },
+                    },
+                },
+                "required": ["questions", "terms", "filters"],
+            },
+        },
+    }
+
+
 def _load_embedded_json_object(content: str) -> object:
     decoder = json.JSONDecoder()
     for index, char in enumerate(content):
@@ -493,6 +677,117 @@ def _system_prompt(language: str) -> str:
         "你的任务不是写故事，也不是生成绘图提示词，而是把模糊创作想法拆成可用于图片语义检索的视觉短语。"
         "输出必须是严格 JSON，不要使用 Markdown。"
     )
+
+
+def _search_plan_system_prompt(language: str) -> str:
+    if language == "en":
+        return (
+            "You are a search planner for a local visual reference library. "
+            "Do not inspect individual images. Convert the user's concept into semantic probes "
+            "and reliable structured visual filters. Return strict JSON only."
+        )
+    return (
+        "你是一个本地视觉参考图库的搜索规划器。"
+        "你不逐张看图，只把用户创作意图拆成语义探针和可靠的结构化视觉筛选条件。"
+        "只输出严格 JSON。"
+    )
+
+
+def _build_search_plan_prompt(brief: str, answers: str, *, language: str = "zh") -> str:
+    answers_block = answers if answers else (
+        "The user has not provided extra constraints."
+        if language == "en"
+        else "用户尚未补充。"
+    )
+    allowed_fields = {
+        **AI_VISION_FIELD_VALUES,
+        "lighting": AI_VISION_LIGHTING_VALUES,
+    }
+    field_notes = "\n".join(
+        f"- {field}: {values}"
+        for field, values in allowed_fields.items()
+    )
+    if language == "en":
+        return f"""
+Creative brief:
+{brief}
+
+Additional context:
+{answers_block}
+
+Return JSON:
+{{
+  "questions": ["up to 3 useful follow-up questions"],
+  "terms": [
+    {{
+      "title": "short label",
+      "query": "English semantic image-search phrase, concrete and visual",
+      "axis": "object_detail | environment | character | lighting | mood | composition | material | era",
+      "reason": "why this probe helps"
+    }}
+  ],
+  "filters": [
+    {{
+      "field": "scene_location",
+      "value": "indoor",
+      "optional": false,
+      "reason": "why this structured filter fits"
+    }}
+  ]
+}}
+
+Allowed structured fields and values:
+{field_notes}
+
+Rules:
+1. Output 12 to 20 semantic terms.
+2. Output 2 to 8 structured filters only when the visual condition is likely useful.
+3. Mark filters optional=true when they are plausible but not necessary.
+4. Use only the allowed field/value strings above.
+5. Use axis precisely: object_detail/material/character probes are standalone references and should not depend on the structured filters; environment/lighting/mood/composition/era probes are scene-context references and may depend on the structured filters.
+6. Avoid fragile high-risk claims such as occupation, identity, artist, IP, exact era, or story events.
+7. Do not output Markdown or any text outside JSON.
+""".strip()
+    return f"""
+创作主题：
+{brief}
+
+用户补充：
+{answers_block}
+
+请输出 JSON：
+{{
+  "questions": ["最多 3 个有助于缩小视觉方向的问题"],
+  "terms": [
+    {{
+      "title": "短标题",
+      "query": "中文语义搜图短语，必须具体、可视觉化",
+      "axis": "object_detail | environment | character | lighting | mood | composition | material | era",
+      "reason": "为什么这个探针对找参考有价值"
+    }}
+  ],
+  "filters": [
+    {{
+      "field": "scene_location",
+      "value": "indoor",
+      "optional": false,
+      "reason": "为什么这个结构化筛选适合"
+    }}
+  ]
+}}
+
+允许的结构化字段和值：
+{field_notes}
+
+规则：
+1. terms 输出 12 到 20 条。
+2. filters 输出 2 到 8 条，只输出对找图有实际帮助的稳定视觉条件。
+3. 如果条件只是可能相关但不必要，optional 必须为 true。
+4. field/value 只能使用上面列出的英文枚举值。
+5. axis 必须准确：object_detail/material/character 是独立物件或主体参考，不依赖结构化筛选；environment/lighting/mood/composition/era 是场景语境参考，可以叠加结构化筛选。
+6. 不要输出职业、身份、艺术家、IP、精确年代、剧情事件等高幻觉条件。
+7. 不要输出 Markdown，不要解释 JSON 之外的内容。
+""".strip()
 
 
 def _build_inspiration_prompt(brief: str, answers: str, *, language: str = "zh") -> str:

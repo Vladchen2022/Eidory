@@ -5,6 +5,7 @@ import unittest
 import sqlite3
 from pathlib import Path
 
+from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
 from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
 
 
@@ -987,6 +988,145 @@ class MetadataStoreTest(unittest.TestCase):
             )
             self.assertNotIn(root_image, store.image_ids_for_collection(leaf))
             self.assertNotIn(person, store.image_ids_for_collection(leaf))
+
+    def test_ai_vision_default_rules_jobs_stats_filtering_and_stale_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            root = Path(tmp) / "library"
+            folder_id = store.add_folder(str(root))
+            black = store.create_collection("黑白摄影")
+            references = store.create_collection("创作参考")
+            global_ref = store.create_collection("全局参考", references)
+            still_life = store.create_collection("具体造型")
+
+            first = self._insert_image(store, folder_id, root / "first.jpg", 1)
+            second = self._insert_image(store, folder_id, root / "second.jpg", 2)
+            excluded = self._insert_image(store, folder_id, root / "excluded.jpg", 3)
+            store.assign_images_to_collection([first], black)
+            store.assign_images_to_collection([second], global_ref)
+            store.assign_images_to_collection([excluded], still_life)
+
+            self.assertEqual(store.seed_default_ai_vision_collection_rules(), 2)
+            stats = store.ai_vision_stats(
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=AI_VISION_PROMPT_VERSION,
+            )
+            self.assertEqual(stats["total"], 2)
+            self.assertEqual(stats["pending"], 2)
+            self.assertEqual(
+                [image.id for image in store.next_ai_vision_jobs(
+                    provider_name="LM Studio",
+                    model_name="vision-model",
+                    prompt_version=AI_VISION_PROMPT_VERSION,
+                    limit=10,
+                )],
+                [first, second],
+            )
+            self.assertTrue(store.mark_image_missing(second))
+            stats = store.ai_vision_stats(
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=AI_VISION_PROMPT_VERSION,
+            )
+            self.assertEqual(stats["total"], 1)
+            self.assertEqual(
+                [image.id for image in store.next_ai_vision_jobs(
+                    provider_name="LM Studio",
+                    model_name="vision-model",
+                    prompt_version=AI_VISION_PROMPT_VERSION,
+                    limit=10,
+                )],
+                [first],
+            )
+            store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(root / "second.jpg"),
+                file_size=2,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=2,
+            )
+
+            store.upsert_ai_vision_success(
+                image_id=first,
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=AI_VISION_PROMPT_VERSION,
+                analysis=self._ai_vision_analysis(),
+                source_modified_time_ns=1,
+            )
+            self.assertEqual(
+                store.image_ids_matching_ai_vision("scene_location", "outdoor"),
+                {first},
+            )
+            self.assertEqual(
+                store.image_ids_matching_ai_vision("lighting", "back_light"),
+                {first},
+            )
+            stats = store.ai_vision_stats(
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=AI_VISION_PROMPT_VERSION,
+            )
+            self.assertEqual(stats["ready"], 1)
+            self.assertEqual(stats["pending"], 1)
+
+            store.mark_ai_vision_failed(
+                image_id=second,
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=AI_VISION_PROMPT_VERSION,
+                error_message="model failed",
+            )
+            self.assertEqual(store.retry_failed_ai_vision(), 1)
+            self.assertEqual(store.ai_vision_tags_for_image(second)["status"], "pending")
+
+            store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(root / "first.jpg"),
+                file_size=999,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=99,
+            )
+            self.assertEqual(store.ai_vision_tags_for_image(first)["status"], "stale")
+
+            store.set_ai_vision_collection_rule(global_ref, mode="exclude")
+            stats = store.ai_vision_stats(
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=AI_VISION_PROMPT_VERSION,
+            )
+            self.assertEqual(stats["total"], 1)
+
+    @staticmethod
+    def _ai_vision_analysis() -> AIVisionAnalysis:
+        return AIVisionAnalysis(
+            scene_location="outdoor",
+            environment_type="natural",
+            time_of_day="day",
+            weather="sunny",
+            shot_scale="long",
+            view_angle="eye_level",
+            lighting=["back_light", "diffuse"],
+            confidence={
+                "scene_location": 0.9,
+                "environment_type": 0.8,
+                "time_of_day": 0.8,
+                "weather": 0.7,
+                "shot_scale": 0.8,
+                "view_angle": 0.8,
+                "lighting:back_light": 0.7,
+                "lighting:diffuse": 0.6,
+            },
+            notes="test",
+            raw_json={},
+        )
 
     @staticmethod
     def _insert_image(

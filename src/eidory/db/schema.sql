@@ -75,6 +75,48 @@ CREATE TABLE IF NOT EXISTS color_features (
 CREATE INDEX IF NOT EXISTS idx_color_features_lookup
 ON color_features(vector_version, vector_dim, status);
 
+CREATE TABLE IF NOT EXISTS ai_vision_collection_rules (
+    collection_id INTEGER PRIMARY KEY,
+    mode TEXT NOT NULL,
+    include_descendants INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+    CHECK(mode IN ('include', 'exclude'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_vision_collection_rules_mode
+ON ai_vision_collection_rules(mode);
+
+CREATE TABLE IF NOT EXISTS ai_vision_tags (
+    image_id INTEGER PRIMARY KEY,
+    provider_name TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    scene_location TEXT,
+    environment_type TEXT,
+    time_of_day TEXT,
+    weather TEXT,
+    shot_scale TEXT,
+    view_angle TEXT,
+    lighting_json TEXT NOT NULL DEFAULT '[]',
+    confidence_json TEXT NOT NULL DEFAULT '{}',
+    notes TEXT,
+    error_message TEXT,
+    source_modified_time_ns INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE,
+    CHECK(status IN ('pending', 'processing', 'ready', 'failed', 'stale', 'skipped'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_vision_tags_status
+ON ai_vision_tags(status);
+
+CREATE INDEX IF NOT EXISTS idx_ai_vision_tags_fields
+ON ai_vision_tags(scene_location, environment_type, time_of_day, weather, shot_scale, view_angle);
+
 CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tag_name TEXT NOT NULL UNIQUE,

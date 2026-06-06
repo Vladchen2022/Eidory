@@ -10,6 +10,7 @@ from eidory.core.llm_provider import (
     parse_group_name_suggestions,
     parse_inspiration_proposal,
     parse_project_suggestion,
+    parse_search_plan_proposal,
 )
 from eidory.core.metadata_store import MetadataStore
 from eidory.models import ImageItem
@@ -97,6 +98,40 @@ class InspirationTest(unittest.TestCase):
 
         self.assertEqual(name, "潮湿机械住处")
         self.assertEqual(summary, "用于寻找落魄工程师住处和机械细节的参考。")
+
+    def test_parse_search_plan_proposal_normalizes_filters(self) -> None:
+        proposal = parse_search_plan_proposal(
+            """
+{
+  "questions": ["更偏室内还是室外？"],
+  "terms": [
+    {"title":"破旧工坊","query":"破旧狭小工坊，机械零件，昏暗灯光"},
+    {"title":"引擎细节","query":"老旧引擎结构，油污金属零件，近景"},
+    {"title":"单点台灯","query":"夜晚室内单点台灯，工作台阴影"},
+    {"title":"凌乱住处","query":"凌乱出租屋，旧家具，生活痕迹"},
+    {"title":"改装载具","query":"临时改装交通工具，科幻摩托结构"}
+  ],
+  "filters": [
+    {"field":"scene_location","value":"indoors","optional":false,"reason":"住处或工坊"},
+    {"field":"weather","value":"clear","optional":true,"reason":"如果要晴朗外部光"},
+    {"field":"shot_scale","value":"full_shot","optional":false,"reason":"人物和环境关系"},
+    {"field":"occupation","value":"engineer","optional":false,"reason":"非法字段应丢弃"}
+  ]
+}
+            """,
+            model_name="fake",
+        )
+
+        self.assertEqual(proposal.questions, ["更偏室内还是室外？"])
+        self.assertEqual(len(proposal.terms), 5)
+        self.assertEqual(
+            [(item.field, item.value, item.optional) for item in proposal.filters],
+            [
+                ("scene_location", "indoor", False),
+                ("weather", "sunny", True),
+                ("shot_scale", "long", False),
+            ],
+        )
 
     def test_parse_group_name_suggestions_fills_missing_groups(self) -> None:
         suggestions = parse_group_name_suggestions(

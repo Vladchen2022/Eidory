@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from eidory.core.ai_vision import ai_vision_label
 from eidory.models import ImageItem
 
 
@@ -35,6 +36,7 @@ VALID_FILTER_KINDS = {
     "file_type",
     "orientation",
     "size",
+    "ai_vision",
 }
 SCORED_FILTER_KINDS = {"semantic", "similar", "color"}
 
@@ -122,7 +124,19 @@ def filter_label(
         return f"方向：{orientation_filter_label(str(search_filter.value))}"
     if search_filter.kind == "size":
         return f"尺寸：{size_filter_label(str(search_filter.value))}"
+    if search_filter.kind == "ai_vision":
+        field, value = ai_vision_filter_parts(str(search_filter.value))
+        return f"AI：{ai_vision_label(field, value)}" if field and value else f"AI：{search_filter.value}"
     return str(search_filter.value)
+
+
+def ai_vision_filter_parts(value: str) -> tuple[str, str]:
+    if ":" not in value:
+        return "", ""
+    field, raw_value = value.split(":", 1)
+    field = field.strip()
+    raw_value = raw_value.strip()
+    return field, raw_value
 
 
 def format_color_hex(rgb: tuple[int, int, int]) -> str:

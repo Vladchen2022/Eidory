@@ -10,6 +10,7 @@ from typing import Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 
+from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
 from eidory.core.color_features import COLOR_VECTOR_DIM, COLOR_VECTOR_VERSION
 from eidory.core.inspiration import InspirationTerm
 from eidory.core.media_types import SUPPORTED_IMAGE_EXTENSIONS
@@ -41,6 +42,15 @@ TEMPORARY_PROJECT_COLORS = (
     "#735846",
     "#586E78",
     "#6F5970",
+)
+
+DEFAULT_AI_VISION_COLLECTION_PATHS = (
+    ("黑白摄影",),
+    ("创作参考",),
+    ("ML-04 简单小景",),
+    ("ML-05 复杂场景",),
+    ("ML-06 场景带角色",),
+    ("ML-07 黑白摄影",),
 )
 
 
@@ -196,6 +206,67 @@ class MetadataStore:
             """
             CREATE INDEX IF NOT EXISTS idx_inspiration_terms_project_order
             ON inspiration_terms(project_id, sort_order)
+            """
+        )
+        MetadataStore._ensure_ai_vision_schema(conn)
+
+    @staticmethod
+    def _ensure_ai_vision_schema(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_vision_collection_rules (
+                collection_id INTEGER PRIMARY KEY,
+                mode TEXT NOT NULL,
+                include_descendants INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+                CHECK(mode IN ('include', 'exclude'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_vision_collection_rules_mode
+            ON ai_vision_collection_rules(mode)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_vision_tags (
+                image_id INTEGER PRIMARY KEY,
+                provider_name TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                scene_location TEXT,
+                environment_type TEXT,
+                time_of_day TEXT,
+                weather TEXT,
+                shot_scale TEXT,
+                view_angle TEXT,
+                lighting_json TEXT NOT NULL DEFAULT '[]',
+                confidence_json TEXT NOT NULL DEFAULT '{}',
+                notes TEXT,
+                error_message TEXT,
+                source_modified_time_ns INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE,
+                CHECK(status IN ('pending', 'processing', 'ready', 'failed', 'stale', 'skipped'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_vision_tags_status
+            ON ai_vision_tags(status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_vision_tags_fields
+            ON ai_vision_tags(scene_location, environment_type, time_of_day, weather, shot_scale, view_angle)
             """
         )
 
@@ -1075,32 +1146,7 @@ class MetadataStore:
                 ),
             )
             if changed:
-                conn.execute(
-                    """
-                    UPDATE images
-                    SET thumbnail_status = 'pending',
-                        thumbnail_path = NULL,
-                        embedding_status = 'pending'
-                    WHERE id = ?
-                    """,
-                    (existing["id"],),
-                )
-                conn.execute(
-                    """
-                    UPDATE embeddings
-                    SET status = 'stale', vector_blob = NULL, updated_at = ?
-                    WHERE image_id = ?
-                    """,
-                    (now, existing["id"]),
-                )
-                conn.execute(
-                    """
-                    UPDATE color_features
-                    SET status = 'stale', hist_blob = NULL, updated_at = ?
-                    WHERE image_id = ?
-                    """,
-                    (now, existing["id"]),
-                )
+                self._mark_image_media_stale(conn, int(existing["id"]), now)
                 return int(existing["id"]), "changed"
             return int(existing["id"]), "unchanged"
 
@@ -1214,6 +1260,20 @@ class MetadataStore:
             )
             conn.execute("DELETE FROM seen_scan_paths")
             return int(cur.rowcount)
+
+    def mark_image_missing(self, image_id: int) -> bool:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE images
+                SET is_missing = 1, last_seen_at = ?
+                WHERE id = ?
+                  AND is_missing = 0
+                """,
+                (now, image_id),
+            )
+            return int(cur.rowcount) > 0
 
     def finish_folder_scan(self, folder_id: int) -> None:
         with self.connect() as conn:
@@ -3247,6 +3307,435 @@ class MetadataStore:
         stats["pending"] = max(0, stats["total"] - known)
         return stats
 
+    def seed_default_ai_vision_collection_rules(
+        self,
+        default_paths: Sequence[Sequence[str]] = DEFAULT_AI_VISION_COLLECTION_PATHS,
+    ) -> int:
+        setting_key = "ai_vision.default_rules_seeded"
+        with self.connect() as conn:
+            seeded_row = conn.execute(
+                "SELECT value FROM app_settings WHERE key = ?",
+                (setting_key,),
+            ).fetchone()
+            if seeded_row is not None and str(seeded_row["value"]) == "1":
+                return 0
+            row = conn.execute("SELECT COUNT(*) AS count FROM ai_vision_collection_rules").fetchone()
+            if int(row["count"]) > 0:
+                now = utc_now_iso()
+                conn.execute(
+                    """
+                    INSERT INTO app_settings(key, value, updated_at)
+                    VALUES (?, '1', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at
+                    """,
+                    (setting_key, now),
+                )
+                return 0
+
+        collection_ids_by_path = {
+            tuple(path): collection.id
+            for collection, path in self.collection_export_paths()
+        }
+        now = utc_now_iso()
+        inserted = 0
+        with self.connect() as conn:
+            for path in default_paths:
+                collection_id = collection_ids_by_path.get(tuple(path))
+                if collection_id is None:
+                    continue
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO ai_vision_collection_rules(
+                        collection_id, mode, include_descendants, created_at, updated_at
+                    )
+                    VALUES (?, 'include', 1, ?, ?)
+                    """,
+                    (collection_id, now, now),
+                )
+                inserted += int(cur.rowcount)
+            if inserted:
+                conn.execute(
+                    """
+                    INSERT INTO app_settings(key, value, updated_at)
+                    VALUES (?, '1', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at
+                    """,
+                    (setting_key, now),
+                )
+        return inserted
+
+    def set_ai_vision_collection_rule(
+        self,
+        collection_id: int,
+        *,
+        mode: str,
+        include_descendants: bool = True,
+    ) -> None:
+        if mode not in {"include", "exclude"}:
+            raise ValueError("AI vision rule mode must be include or exclude")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            collection = conn.execute(
+                "SELECT id FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone()
+            if collection is None:
+                raise ValueError("collection not found")
+            conn.execute(
+                """
+                INSERT INTO ai_vision_collection_rules(
+                    collection_id, mode, include_descendants, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(collection_id) DO UPDATE SET
+                    mode = excluded.mode,
+                    include_descendants = excluded.include_descendants,
+                    updated_at = excluded.updated_at
+                """,
+                (collection_id, mode, 1 if include_descendants else 0, now, now),
+            )
+
+    def remove_ai_vision_collection_rule(self, collection_id: int) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM ai_vision_collection_rules WHERE collection_id = ?",
+                (collection_id,),
+            )
+            return int(cur.rowcount) > 0
+
+    def list_ai_vision_collection_rules_with_stats(
+        self,
+        *,
+        provider_name: str,
+        model_name: str,
+        prompt_version: str = AI_VISION_PROMPT_VERSION,
+    ) -> list[dict[str, object]]:
+        path_by_id = {
+            collection.id: " / ".join(path)
+            for collection, path in self.collection_export_paths()
+        }
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT r.collection_id, r.mode, r.include_descendants, c.name
+                FROM ai_vision_collection_rules r
+                JOIN collections c ON c.id = r.collection_id
+                ORDER BY r.mode DESC, c.name COLLATE NOCASE
+                """
+            ).fetchall()
+        rules: list[dict[str, object]] = []
+        for row in rows:
+            collection_id = int(row["collection_id"])
+            stats = self.ai_vision_rule_stats(
+                collection_id=collection_id,
+                include_descendants=bool(row["include_descendants"]),
+                provider_name=provider_name,
+                model_name=model_name,
+                prompt_version=prompt_version,
+            )
+            rules.append(
+                {
+                    "collection_id": collection_id,
+                    "name": str(row["name"]),
+                    "path": path_by_id.get(collection_id, str(row["name"])),
+                    "mode": str(row["mode"]),
+                    "include_descendants": bool(row["include_descendants"]),
+                    "stats": stats,
+                }
+            )
+        return rules
+
+    def ai_vision_rule_stats(
+        self,
+        *,
+        collection_id: int,
+        include_descendants: bool,
+        provider_name: str,
+        model_name: str,
+        prompt_version: str = AI_VISION_PROMPT_VERSION,
+    ) -> dict[str, int]:
+        with self.connect() as conn:
+            image_ids = self._ai_vision_rule_image_ids(
+                conn,
+                collection_id,
+                include_descendants=include_descendants,
+            )
+            return self._ai_vision_stats_for_image_ids(
+                conn,
+                image_ids,
+                provider_name=provider_name,
+                model_name=model_name,
+                prompt_version=prompt_version,
+            )
+
+    def ai_vision_stats(
+        self,
+        *,
+        provider_name: str,
+        model_name: str,
+        prompt_version: str = AI_VISION_PROMPT_VERSION,
+    ) -> dict[str, int]:
+        with self.connect() as conn:
+            image_ids = self._ai_vision_effective_image_ids(conn)
+            return self._ai_vision_stats_for_image_ids(
+                conn,
+                image_ids,
+                provider_name=provider_name,
+                model_name=model_name,
+                prompt_version=prompt_version,
+            )
+
+    def next_ai_vision_jobs(
+        self,
+        *,
+        provider_name: str,
+        model_name: str,
+        prompt_version: str,
+        limit: int,
+    ) -> list[ImageItem]:
+        with self.connect() as conn:
+            image_ids = sorted(self._ai_vision_effective_image_ids(conn))
+            if not image_ids:
+                return []
+            placeholders = ",".join("?" for _ in image_ids)
+            rows = conn.execute(
+                f"""
+                SELECT i.*
+                FROM images i
+                LEFT JOIN ai_vision_tags t ON t.image_id = i.id
+                WHERE i.id IN ({placeholders})
+                  AND (
+                    t.image_id IS NULL
+                    OR t.status IN ('pending', 'stale')
+                    OR t.provider_name != ?
+                    OR t.model_name != ?
+                    OR t.prompt_version != ?
+                  )
+                ORDER BY i.id
+                LIMIT ?
+                """,
+                (*image_ids, provider_name, model_name, prompt_version, limit),
+            ).fetchall()
+            return [self._image_from_row(row) for row in rows]
+
+    def mark_ai_vision_processing(
+        self,
+        *,
+        image_id: int,
+        provider_name: str,
+        model_name: str,
+        prompt_version: str,
+    ) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_vision_tags(
+                    image_id, provider_name, model_name, prompt_version, status,
+                    lighting_json, confidence_json, error_message, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 'processing', '[]', '{}', NULL, ?, ?)
+                ON CONFLICT(image_id) DO UPDATE SET
+                    provider_name = excluded.provider_name,
+                    model_name = excluded.model_name,
+                    prompt_version = excluded.prompt_version,
+                    status = 'processing',
+                    error_message = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (image_id, provider_name, model_name, prompt_version, now, now),
+            )
+
+    def upsert_ai_vision_success(
+        self,
+        *,
+        image_id: int,
+        provider_name: str,
+        model_name: str,
+        prompt_version: str,
+        analysis: AIVisionAnalysis,
+        source_modified_time_ns: int,
+    ) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_vision_tags(
+                    image_id, provider_name, model_name, prompt_version, status,
+                    scene_location, environment_type, time_of_day, weather,
+                    shot_scale, view_angle, lighting_json, confidence_json, notes,
+                    error_message, source_modified_time_ns, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                ON CONFLICT(image_id) DO UPDATE SET
+                    provider_name = excluded.provider_name,
+                    model_name = excluded.model_name,
+                    prompt_version = excluded.prompt_version,
+                    status = 'ready',
+                    scene_location = excluded.scene_location,
+                    environment_type = excluded.environment_type,
+                    time_of_day = excluded.time_of_day,
+                    weather = excluded.weather,
+                    shot_scale = excluded.shot_scale,
+                    view_angle = excluded.view_angle,
+                    lighting_json = excluded.lighting_json,
+                    confidence_json = excluded.confidence_json,
+                    notes = excluded.notes,
+                    error_message = NULL,
+                    source_modified_time_ns = excluded.source_modified_time_ns,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    image_id,
+                    provider_name,
+                    model_name,
+                    prompt_version,
+                    analysis.scene_location,
+                    analysis.environment_type,
+                    analysis.time_of_day,
+                    analysis.weather,
+                    analysis.shot_scale,
+                    analysis.view_angle,
+                    json.dumps(analysis.lighting, ensure_ascii=False),
+                    json.dumps(analysis.confidence, ensure_ascii=False),
+                    analysis.notes,
+                    source_modified_time_ns,
+                    now,
+                    now,
+                ),
+            )
+
+    def mark_ai_vision_failed(
+        self,
+        *,
+        image_id: int,
+        provider_name: str,
+        model_name: str,
+        prompt_version: str,
+        error_message: str,
+    ) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_vision_tags(
+                    image_id, provider_name, model_name, prompt_version, status,
+                    lighting_json, confidence_json, error_message, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 'failed', '[]', '{}', ?, ?, ?)
+                ON CONFLICT(image_id) DO UPDATE SET
+                    provider_name = excluded.provider_name,
+                    model_name = excluded.model_name,
+                    prompt_version = excluded.prompt_version,
+                    status = 'failed',
+                    scene_location = NULL,
+                    environment_type = NULL,
+                    time_of_day = NULL,
+                    weather = NULL,
+                    shot_scale = NULL,
+                    view_angle = NULL,
+                    lighting_json = '[]',
+                    confidence_json = '{}',
+                    error_message = excluded.error_message,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    image_id,
+                    provider_name,
+                    model_name,
+                    prompt_version,
+                    error_message[:2000],
+                    now,
+                    now,
+                ),
+            )
+
+    def retry_failed_ai_vision(self) -> int:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            image_ids = sorted(self._ai_vision_effective_image_ids(conn))
+            if not image_ids:
+                return 0
+            placeholders = ",".join("?" for _ in image_ids)
+            cur = conn.execute(
+                f"""
+                UPDATE ai_vision_tags
+                SET status = 'pending', error_message = NULL, updated_at = ?
+                WHERE image_id IN ({placeholders})
+                  AND status IN ('failed', 'processing')
+                """,
+                (now, *image_ids),
+            )
+            return int(cur.rowcount)
+
+    def ai_vision_tags_for_image(self, image_id: int) -> dict[str, object] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM ai_vision_tags WHERE image_id = ?",
+                (image_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            lighting = json.loads(str(row["lighting_json"] or "[]"))
+        except json.JSONDecodeError:
+            lighting = []
+        try:
+            confidence = json.loads(str(row["confidence_json"] or "{}"))
+        except json.JSONDecodeError:
+            confidence = {}
+        return {
+            "image_id": int(row["image_id"]),
+            "provider_name": str(row["provider_name"]),
+            "model_name": str(row["model_name"]),
+            "prompt_version": str(row["prompt_version"]),
+            "status": str(row["status"]),
+            "scene_location": row["scene_location"],
+            "environment_type": row["environment_type"],
+            "time_of_day": row["time_of_day"],
+            "weather": row["weather"],
+            "shot_scale": row["shot_scale"],
+            "view_angle": row["view_angle"],
+            "lighting": lighting if isinstance(lighting, list) else [],
+            "confidence": confidence if isinstance(confidence, dict) else {},
+            "notes": str(row["notes"] or ""),
+            "error_message": str(row["error_message"] or ""),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def image_ids_matching_ai_vision(self, field: str, value: str) -> set[int]:
+        if field == "lighting":
+            with self.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT image_id
+                    FROM ai_vision_tags
+                    WHERE status = 'ready'
+                      AND lighting_json LIKE ?
+                    """,
+                    (f'%"{value}"%',),
+                ).fetchall()
+            return {int(row["image_id"]) for row in rows}
+        if field not in {
+            "scene_location",
+            "environment_type",
+            "time_of_day",
+            "weather",
+            "shot_scale",
+            "view_angle",
+        }:
+            return set()
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT image_id
+                FROM ai_vision_tags
+                WHERE status = 'ready'
+                  AND {field} = ?
+                """,
+                (value,),
+            ).fetchall()
+        return {int(row["image_id"]) for row in rows}
+
     def set_setting(self, key: str, value: str) -> None:
         now = utc_now_iso()
         with self.connect() as conn:
@@ -3275,6 +3764,107 @@ class MetadataStore:
                 """
             ).fetchall()
         return {str(row["thumbnail_path"]) for row in rows}
+
+    @classmethod
+    def _ai_vision_rule_image_ids(
+        cls,
+        conn: sqlite3.Connection,
+        collection_id: int,
+        *,
+        include_descendants: bool,
+    ) -> set[int]:
+        collection_ids = (
+            cls._collection_subtree_ids(conn, collection_id)
+            if include_descendants
+            else [collection_id]
+        )
+        if not collection_ids:
+            return set()
+        collection_placeholders = ",".join("?" for _ in collection_ids)
+        image_placeholders = ",".join("?" for _ in SUPPORTED_IMAGE_EXTENSIONS)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT i.id
+            FROM images i
+            JOIN image_collections ic ON ic.image_id = i.id
+            WHERE ic.collection_id IN ({collection_placeholders})
+              AND i.is_missing = 0
+              AND i.file_ext IN ({image_placeholders})
+            """,
+            (*collection_ids, *sorted(SUPPORTED_IMAGE_EXTENSIONS)),
+        ).fetchall()
+        return {int(row["id"]) for row in rows}
+
+    @classmethod
+    def _ai_vision_effective_image_ids(cls, conn: sqlite3.Connection) -> set[int]:
+        rule_rows = conn.execute(
+            """
+            SELECT collection_id, mode, include_descendants
+            FROM ai_vision_collection_rules
+            ORDER BY mode
+            """
+        ).fetchall()
+        include_ids: set[int] = set()
+        exclude_ids: set[int] = set()
+        for row in rule_rows:
+            ids = cls._ai_vision_rule_image_ids(
+                conn,
+                int(row["collection_id"]),
+                include_descendants=bool(row["include_descendants"]),
+            )
+            if str(row["mode"]) == "exclude":
+                exclude_ids.update(ids)
+            else:
+                include_ids.update(ids)
+        return include_ids - exclude_ids
+
+    @staticmethod
+    def _ai_vision_stats_for_image_ids(
+        conn: sqlite3.Connection,
+        image_ids: set[int],
+        *,
+        provider_name: str,
+        model_name: str,
+        prompt_version: str,
+    ) -> dict[str, int]:
+        stats = {
+            "total": len(image_ids),
+            "ready": 0,
+            "failed": 0,
+            "processing": 0,
+            "stale": 0,
+            "pending": 0,
+            "skipped": 0,
+        }
+        if not image_ids:
+            return stats
+        placeholders = ",".join("?" for _ in image_ids)
+        rows = conn.execute(
+            f"""
+            SELECT image_id, provider_name, model_name, prompt_version, status
+            FROM ai_vision_tags
+            WHERE image_id IN ({placeholders})
+            """,
+            tuple(sorted(image_ids)),
+        ).fetchall()
+        seen: set[int] = set()
+        for row in rows:
+            image_id = int(row["image_id"])
+            seen.add(image_id)
+            if (
+                str(row["provider_name"]) != provider_name
+                or str(row["model_name"]) != model_name
+                or str(row["prompt_version"]) != prompt_version
+            ):
+                stats["stale"] += 1
+                continue
+            status = str(row["status"])
+            if status in stats:
+                stats[status] += 1
+            else:
+                stats["pending"] += 1
+        stats["pending"] += max(0, len(image_ids) - len(seen))
+        return stats
 
     @staticmethod
     def _folder_from_row(row: sqlite3.Row) -> FolderItem:
@@ -3383,6 +3973,25 @@ class MetadataStore:
             """
             UPDATE color_features
             SET status = 'stale', hist_blob = NULL, updated_at = ?
+            WHERE image_id = ?
+            """,
+            (updated_at, image_id),
+        )
+        conn.execute(
+            """
+            UPDATE ai_vision_tags
+            SET status = 'stale',
+                scene_location = NULL,
+                environment_type = NULL,
+                time_of_day = NULL,
+                weather = NULL,
+                shot_scale = NULL,
+                view_angle = NULL,
+                lighting_json = '[]',
+                confidence_json = '{}',
+                notes = NULL,
+                error_message = NULL,
+                updated_at = ?
             WHERE image_id = ?
             """,
             (updated_at, image_id),

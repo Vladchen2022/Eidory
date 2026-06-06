@@ -13,8 +13,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QListWidgetItem, QMessageBox, QTreeWidget, QTreeWidgetItem
 
 from eidory.config import AppPaths
+from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
 from eidory.core.inspiration import InspirationMatch, InspirationTerm
-from eidory.core.llm_provider import GroupNameSuggestion, ProjectSuggestion
+from eidory.core.llm_provider import GroupNameSuggestion, ProjectSuggestion, SearchPlanFilter
 from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
 from eidory.core.reference_grouping import ReferenceGroup
 from eidory.core.search_filters import (
@@ -1548,6 +1549,99 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ),
             "similar",
         )
+        ai_filter = SearchFilter("ai_vision", "scene_location:outdoor")
+        self.assertEqual(search_filter_from_payload(search_filter_to_payload(ai_filter)), ai_filter)
+
+    def test_inspiration_plan_filters_use_or_inside_field_and_and_between_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids = []
+            for index in range(4):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{index}.jpg"),
+                    file_size=123,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=index + 1,
+                )
+                image_ids.append(image_id)
+            analyses = [
+                self._ai_vision_analysis(scene_location="indoor", time_of_day="night"),
+                self._ai_vision_analysis(scene_location="threshold", time_of_day="night"),
+                self._ai_vision_analysis(scene_location="outdoor", time_of_day="night"),
+                self._ai_vision_analysis(scene_location="indoor", time_of_day="day"),
+            ]
+            for image_id, analysis in zip(image_ids, analyses, strict=True):
+                store.upsert_ai_vision_success(
+                    image_id=image_id,
+                    provider_name="LM Studio",
+                    model_name="vision-model",
+                    prompt_version=AI_VISION_PROMPT_VERSION,
+                    analysis=analysis,
+                    source_modified_time_ns=image_id,
+                )
+            window = MainWindow(paths=paths, store=store)
+            images = [self._image(image_id) for image_id in image_ids]
+            plan_filters = [
+                SearchPlanFilter("scene_location", "indoor"),
+                SearchPlanFilter("scene_location", "threshold"),
+                SearchPlanFilter("time_of_day", "night"),
+            ]
+
+            filtered = window._apply_inspiration_plan_filters_to_images(
+                images,
+                plan_filters,
+            )
+
+            self.assertEqual([image.id for image in filtered], image_ids[:2])
+            scene_term = InspirationTerm(title="夜晚室内环境", query="夜晚室内环境", axis="environment")
+            object_term = InspirationTerm(title="摩托车造型", query="摩托车结构细节", axis="object_detail")
+            self.assertEqual(
+                [
+                    image.id
+                    for image in window._images_for_inspiration_term_with_plan_filters(
+                        scene_term,
+                        images,
+                        plan_filters,
+                    )
+                ],
+                image_ids[:2],
+            )
+            self.assertEqual(
+                [
+                    image.id
+                    for image in window._images_for_inspiration_term_with_plan_filters(
+                        object_term,
+                        images,
+                        plan_filters,
+                    )
+                ],
+                image_ids,
+            )
+
+            window.current_inspiration_terms = [scene_term]
+            window.current_inspiration_raw_term_results = [(scene_term, images)]
+            window.current_inspiration_plan_filters = plan_filters
+            window._rebuild_current_inspiration_results_from_raw()
+            self.assertEqual([image.id for image in window.current_inspiration_images], image_ids[:2])
+            window.current_inspiration_plan_filters = plan_filters[:2]
+            window._rebuild_current_inspiration_results_from_raw()
+            self.assertEqual(
+                [image.id for image in window.current_inspiration_images],
+                [image_ids[0], image_ids[1], image_ids[3]],
+            )
+            window.close()
 
     def test_batch_tag_summary_and_tag_input_parsing(self) -> None:
         self.assertEqual(
@@ -1707,6 +1801,38 @@ class MainWindowContextMenuTest(unittest.TestCase):
             is_favorite=False,
             note=None,
             score=score,
+        )
+
+    @staticmethod
+    def _ai_vision_analysis(
+        *,
+        scene_location: str = "outdoor",
+        environment_type: str = "built",
+        time_of_day: str = "day",
+        weather: str = "sunny",
+        shot_scale: str = "long",
+        view_angle: str = "eye_level",
+        lighting: list[str] | None = None,
+    ) -> AIVisionAnalysis:
+        return AIVisionAnalysis(
+            scene_location=scene_location,
+            environment_type=environment_type,
+            time_of_day=time_of_day,
+            weather=weather,
+            shot_scale=shot_scale,
+            view_angle=view_angle,
+            lighting=lighting or ["diffuse"],
+            confidence={
+                "scene_location": 0.9,
+                "environment_type": 0.8,
+                "time_of_day": 0.8,
+                "weather": 0.7,
+                "shot_scale": 0.8,
+                "view_angle": 0.8,
+                "lighting:diffuse": 0.7,
+            },
+            notes="",
+            raw_json={},
         )
 
     @staticmethod

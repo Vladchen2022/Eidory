@@ -106,6 +106,61 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(window.search_merge_results_button.isEnabled())
             window.close()
 
+    def test_scan_refresh_preserves_active_result_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            for mode in [
+                "semantic",
+                "color",
+                "keyword",
+                "inspiration",
+                "temp_project",
+                "duplicate_group",
+            ]:
+                window.current_result_mode = mode
+                window.search_filters.clear()
+                with patch.object(window, "_reload_images") as reload_images, patch.object(
+                    window,
+                    "_refresh_current_results_for_filters",
+                ) as refresh_results:
+                    window._refresh_after_scan_database_change()
+                    self.assertFalse(reload_images.called, mode)
+                    self.assertTrue(refresh_results.called, mode)
+
+            window.current_result_mode = "library"
+            window.search_filters = [object()]  # type: ignore[list-item]
+            with patch.object(window, "_reload_images") as reload_images, patch.object(
+                window,
+                "_refresh_current_results_for_filters",
+            ) as refresh_results:
+                window._refresh_after_scan_database_change()
+                self.assertFalse(reload_images.called)
+                self.assertTrue(refresh_results.called)
+
+            window.current_result_mode = "library"
+            window.search_filters.clear()
+            with patch.object(window, "_reload_images") as reload_images, patch.object(
+                window,
+                "_refresh_current_results_for_filters",
+            ) as refresh_results:
+                window._refresh_after_scan_database_change()
+                self.assertTrue(reload_images.called)
+                self.assertFalse(refresh_results.called)
+
+            window.close()
+
     def test_empty_side_panels_explain_next_action(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -1563,6 +1618,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 self._menu_texts(menu),
                 [
                     "快速预览",
+                    "对比查看",
                     "查找相似图片",
                     "文件与导出",
                     "收藏与标签",
@@ -1597,6 +1653,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 ["暂存当前结果集", "从当前结果排除选中", "排除此图所在的文件夹"],
             )
             self.assertTrue(self._action_by_text(menu, "快速预览").isEnabled())
+            self.assertFalse(self._action_by_text(menu, "对比查看").isEnabled())
             self.assertTrue(
                 self._submenu_action_by_text(menu, "文件与导出", "导出选中图片").isEnabled()
             )
@@ -1834,6 +1891,160 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 [1, 2],
             )
             self.assertIn("43%", window.score_threshold_label.text())
+            window.close()
+
+    def test_score_threshold_reexpands_from_unfiltered_source_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            source_images = [
+                self._image(1, score=0.90),
+                self._image(2, score=0.75),
+                self._image(3, score=0.50),
+                self._image(4, score=0.20),
+            ]
+            window.current_result_mode = "search_chain"
+            window.search_filters = [SearchFilter("semantic", "水")]
+            window.current_chain_images = list(source_images)
+            window.grid_view.set_images(list(source_images))
+
+            window.score_threshold_slider.setValue(100)
+            self.app.processEvents()
+            self.assertEqual([image.id for image in window.grid_view.images()], [1])
+
+            window.score_threshold_slider.setValue(0)
+            self.app.processEvents()
+            self.assertEqual(
+                [image.id for image in window.grid_view.images()],
+                [1, 2, 3, 4],
+            )
+            self.assertEqual(
+                [image.id for image in window.current_chain_images],
+                [1, 2, 3, 4],
+            )
+
+            color_source_images = [
+                self._image(5, score=1.00),
+                self._image(6, score=0.60),
+                self._image(7, score=0.25),
+            ]
+            window.search_filters = [SearchFilter("color", (240, 152, 196))]
+            window.current_chain_images = list(color_source_images)
+            window.grid_view.set_images(list(color_source_images))
+            window.score_threshold_slider.setValue(100)
+            self.app.processEvents()
+            self.assertEqual([image.id for image in window.grid_view.images()], [5])
+            window.score_threshold_slider.setValue(0)
+            self.app.processEvents()
+            self.assertEqual([image.id for image in window.grid_view.images()], [5, 6, 7])
+            window.close()
+
+    def test_search_chain_refresh_recomputes_without_visible_result_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            source_images = [
+                self._image(1, score=0.90),
+                self._image(2, score=0.75),
+                self._image(3, score=0.50),
+                self._image(4, score=0.20),
+            ]
+            window.current_result_mode = "search_chain"
+            window.search_filters = [SearchFilter("semantic", "水")]
+            window.current_chain_images = list(source_images)
+            window.current_chain_base_image_ids = {image.id for image in source_images}
+            window.current_chain_base_label = "在当前结果中"
+            window.grid_view.set_images([source_images[0]])
+
+            with patch.object(window, "_execute_search_chain") as execute_search_chain:
+                window._refresh_current_results_for_filters()
+
+            execute_search_chain.assert_called_once_with(operation_mode="recompute")
+            base_ids, base_label, merge_base_images = window._search_operation_context("recompute")
+            self.assertEqual(base_ids, {1, 2, 3, 4})
+            self.assertEqual(base_label, "在当前结果中")
+            self.assertIsNone(merge_base_images)
+            window.close()
+
+    def test_score_threshold_reexpands_color_and_inspiration_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            color_images = [
+                self._image(1, score=1.00),
+                self._image(2, score=0.65),
+                self._image(3, score=0.30),
+            ]
+            window.current_result_mode = "color"
+            window.current_color_images = list(color_images)
+            window.grid_view.set_images(list(color_images))
+            window.score_threshold_slider.setValue(100)
+            self.app.processEvents()
+            self.assertEqual([image.id for image in window.grid_view.images()], [1])
+            window.score_threshold_slider.setValue(0)
+            self.app.processEvents()
+            self.assertEqual([image.id for image in window.grid_view.images()], [1, 2, 3])
+
+            term = InspirationTerm(
+                id=None,
+                title="水面",
+                query="水面",
+                axis="environment",
+                reason="",
+                selected=True,
+            )
+            inspiration_images = [
+                self._image(4, score=0.80),
+                self._image(5, score=0.55),
+                self._image(6, score=0.10),
+            ]
+            window.current_result_mode = "inspiration"
+            window.current_inspiration_terms = [term]
+            window.current_inspiration_images = list(inspiration_images)
+            window.current_inspiration_matches = {
+                image.id: [InspirationMatch(term_title="水面", query="水面", score=image.score or 0, reason="")]
+                for image in inspiration_images
+            }
+            window.grid_view.set_images(list(inspiration_images))
+            window.score_threshold_slider.setValue(100)
+            self.app.processEvents()
+            self.assertEqual([image.id for image in window.grid_view.images()], [4])
+            window.score_threshold_slider.setValue(0)
+            self.app.processEvents()
+            self.assertEqual([image.id for image in window.grid_view.images()], [4, 5, 6])
             window.close()
 
     def test_inspiration_plan_filters_use_or_inside_field_and_and_between_fields(self) -> None:

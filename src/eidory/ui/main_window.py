@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QFile, QBuffer, QIODevice, QSize, QStringListModel, Qt, QTimer, QUrl
+from PySide6.QtCore import QFile, QBuffer, QFileSystemWatcher, QIODevice, QSize, QStringListModel, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QImage, QKeySequence, QPixmap, QTextOption
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -49,10 +49,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSplitter,
     QStackedWidget,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QTabBar,
     QTabWidget,
     QTextEdit,
@@ -71,6 +74,7 @@ from eidory.core.ai_vision import (
     AIVisionProvider,
     ai_vision_label,
 )
+from eidory.core.duplicate_detection import DuplicateGroup, find_duplicate_groups
 from eidory.core.ai_vision_worker import AIVisionProgress, AIVisionWorker
 from eidory.core.embedding_provider import JinaClipV2Provider
 from eidory.core.embedding_worker import EmbeddingProgress, EmbeddingWorker
@@ -89,6 +93,7 @@ from eidory.core.media_types import (
     SUPPORTED_MEDIA_EXTENSIONS,
     SUPPORTED_IMAGE_EXTENSIONS,
     SUPPORTED_VIDEO_EXTENSIONS,
+    is_supported_image,
     is_supported_media,
     is_supported_video,
 )
@@ -163,6 +168,222 @@ class EqualWidthTabBar(QTabBar):
 
 
 TOOL_BUTTON_MIN_WIDTH = EqualWidthTabBar.MIN_TAB_WIDTH
+
+
+class MissingFilesDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        images: list[ImageItem],
+        folder_labels: dict[int, str],
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("缺失文件修复")
+        self.resize(980, 520)
+        layout = QVBoxLayout(self)
+        intro = QLabel("这些文件的索引还在，但源文件已经不在原路径。可以单个重新定位，也可以按旧目录批量重映射。")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["文件名", "原路径", "所在文件夹", "尺寸", "大小"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().hide()
+        self.table.setColumnWidth(0, 180)
+        self.table.setColumnWidth(1, 430)
+        self.table.setColumnWidth(2, 210)
+        self.table.setColumnWidth(3, 90)
+        self.table.setColumnWidth(4, 90)
+        layout.addWidget(self.table, 1)
+
+        row = QHBoxLayout()
+        self.relink_button = QPushButton("重新指定选中文件")
+        self.remap_button = QPushButton("按目录批量重定位")
+        self.remove_button = QPushButton("从图库移除选中")
+        self.close_button = QPushButton("关闭")
+        row.addWidget(self.relink_button)
+        row.addWidget(self.remap_button)
+        row.addWidget(self.remove_button)
+        row.addStretch(1)
+        row.addWidget(self.close_button)
+        layout.addLayout(row)
+        self.close_button.clicked.connect(self.reject)
+        self.set_images(images, folder_labels)
+
+    def set_images(self, images: list[ImageItem], folder_labels: dict[int, str]) -> None:
+        self.table.setRowCount(0)
+        for image in images:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            values = [
+                image.file_name,
+                image.file_path,
+                folder_labels.get(image.id, "-"),
+                self._dimension_text(image),
+                self._size_text(image.file_size),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, image.id)
+                self.table.setItem(row, column, item)
+        has_rows = bool(images)
+        self.relink_button.setEnabled(has_rows)
+        self.remap_button.setEnabled(has_rows)
+        self.remove_button.setEnabled(has_rows)
+        if has_rows:
+            self.table.selectRow(0)
+
+    def selected_image_ids(self) -> list[int]:
+        ids: list[int] = []
+        for item in self.table.selectedItems():
+            image_id = item.data(Qt.ItemDataRole.UserRole)
+            if image_id is not None:
+                ids.append(int(image_id))
+        return sorted(set(ids))
+
+    def current_image_id(self) -> int | None:
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        if item is None:
+            return None
+        value = item.data(Qt.ItemDataRole.UserRole)
+        return int(value) if value is not None else None
+
+    @staticmethod
+    def _dimension_text(image: ImageItem) -> str:
+        if image.width and image.height:
+            return f"{image.width} x {image.height}"
+        return "-"
+
+    @staticmethod
+    def _size_text(file_size: int) -> str:
+        if file_size >= 1024 * 1024:
+            return f"{file_size / (1024 * 1024):.1f} MB"
+        if file_size >= 1024:
+            return f"{file_size / 1024:.1f} KB"
+        return f"{file_size} B"
+
+
+class DuplicateResultsDialog(QDialog):
+    def __init__(self, groups: list[DuplicateGroup], *, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("重复 / 近重复图片")
+        self.resize(1040, 620)
+        self.selected_group_image_ids: list[int] = []
+        layout = QVBoxLayout(self)
+        intro = QLabel("完全重复是文件内容相同；近重复是同图不同尺寸、轻微裁切或同构图变体的候选。不要默认删除，先看所在文件夹。")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["项目", "所在文件夹", "尺寸", "大小", "路径"])
+        self.tree.setColumnWidth(0, 260)
+        self.tree.setColumnWidth(1, 260)
+        self.tree.setColumnWidth(2, 100)
+        self.tree.setColumnWidth(3, 90)
+        self.tree.setColumnWidth(4, 420)
+        layout.addWidget(self.tree, 1)
+
+        for index, group in enumerate(groups, start=1):
+            title = "完全重复" if group.kind == "exact" else "近重复"
+            parent_item = QTreeWidgetItem([
+                f"{title} #{index}：{len(group.members)} 张",
+                group.reason,
+                "",
+                "",
+                "",
+            ])
+            parent_item.setData(0, Qt.ItemDataRole.UserRole, [member.image.id for member in group.members])
+            self.tree.addTopLevelItem(parent_item)
+            for member in group.members:
+                image = member.image
+                child = QTreeWidgetItem([
+                    image.file_name,
+                    member.folder_label or "-",
+                    MissingFilesDialog._dimension_text(image),
+                    MissingFilesDialog._size_text(image.file_size),
+                    image.file_path,
+                ])
+                child.setData(0, Qt.ItemDataRole.UserRole, [image.id])
+                parent_item.addChild(child)
+            parent_item.setExpanded(index <= 8)
+
+        row = QHBoxLayout()
+        self.load_group_button = QPushButton("载入选中组")
+        close_button = QPushButton("关闭")
+        row.addWidget(self.load_group_button)
+        row.addStretch(1)
+        row.addWidget(close_button)
+        layout.addLayout(row)
+        self.load_group_button.clicked.connect(self._accept_selected_group)
+        close_button.clicked.connect(self.reject)
+
+    def _accept_selected_group(self) -> None:
+        item = self.tree.currentItem()
+        if item is None:
+            return
+        value = item.data(0, Qt.ItemDataRole.UserRole)
+        if not value:
+            return
+        self.selected_group_image_ids = [int(image_id) for image_id in value]
+        self.accept()
+
+
+class ImageCompareDialog(QDialog):
+    def __init__(self, images: list[ImageItem], *, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("对比查看")
+        self.resize(1280, 760)
+        layout = QVBoxLayout(self)
+        hint = QLabel("多图对比用于最终判断。需要精细缩放时，双击单张图进入快速预览。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        grid = QHBoxLayout(content)
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setSpacing(10)
+        for image in images[:6]:
+            column = QVBoxLayout()
+            preview = QLabel()
+            preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            preview.setMinimumSize(260, 380)
+            preview.setStyleSheet("background: #20262e; border: 1px solid #47515d;")
+            pixmap = QPixmap()
+            if not image.is_missing and Path(image.file_path).exists() and not is_supported_video(image.file_path):
+                pixmap = QPixmap(image.file_path)
+            if not pixmap.isNull():
+                preview.setPixmap(
+                    pixmap.scaled(
+                        520,
+                        520,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+            else:
+                preview.setText("无法预览")
+            info = QLabel(
+                f"{image.file_name}\n"
+                f"{MissingFilesDialog._dimension_text(image)} / {MissingFilesDialog._size_text(image.file_size)}\n"
+                f"{image.file_path}"
+            )
+            info.setWordWrap(True)
+            column.addWidget(preview, 1)
+            column.addWidget(info)
+            grid.addLayout(column, 1)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
 
 class MainWindow(QMainWindow):
@@ -263,6 +484,7 @@ class MainWindow(QMainWindow):
         self.current_chain_base_image_ids: set[int] | None = None
         self.current_chain_base_label: str | None = None
         self.current_chain_operation_mode = "replace"
+        self.current_duplicate_images: list[ImageItem] = []
         self.result_excluded_image_ids: set[int] = set()
         self.result_excluded_collection_ids: set[int] = set()
         self.result_excluded_collection_image_ids: set[int] = set()
@@ -274,8 +496,16 @@ class MainWindow(QMainWindow):
         self._applying_view_payload = False
         self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
         self.error_log_messages: list[str] = []
+        self.operation_history_messages: list[str] = []
         self._last_removal_undo: dict[str, object] | None = None
         self._macos_titlebar_applied = False
+        self.file_watch_enabled = self._setting_choice("ui.file_watch_enabled", "1", {"0", "1"}) == "1"
+        self.file_watcher = QFileSystemWatcher(self)
+        self._watch_path_roots: dict[str, str] = {}
+        self._pending_watch_scan_roots: set[str] = set()
+        self.watch_scan_timer = QTimer(self)
+        self.watch_scan_timer.setSingleShot(True)
+        self.watch_scan_timer.timeout.connect(self._run_pending_watch_scans)
 
         self.setWindowTitle("Eidory")
         self._configure_native_titlebar()
@@ -294,6 +524,7 @@ class MainWindow(QMainWindow):
         self._refresh_search_operation_controls()
         self._refresh_embedding_stats()
         self._refresh_ai_vision_stats()
+        self._refresh_file_watcher()
         QTimer.singleShot(1200, self._run_startup_self_check)
 
         self.poll_timer = QTimer(self)
@@ -725,6 +956,7 @@ class MainWindow(QMainWindow):
         threshold_row.setSpacing(8)
         self.score_threshold_slider = QSlider(Qt.Orientation.Horizontal)
         self.score_threshold_slider.setRange(0, 100)
+        self.score_threshold_slider.setTracking(False)
         self.score_threshold_slider.setValue(self.initial_score_threshold)
         self.score_threshold_label = QLabel(
             self._format_score_threshold_label(self.initial_score_threshold)
@@ -1196,9 +1428,14 @@ class MainWindow(QMainWindow):
         self.restore_database_button = QPushButton("恢复数据库")
         self.run_self_check_button = QPushButton("运行启动自检")
         self.show_error_log_button = QPushButton("查看错误日志")
+        self.show_operation_history_button = QPushButton("操作历史")
+        self.file_watch_checkbox = QCheckBox("自动监听文件变化")
+        self.file_watch_checkbox.setChecked(self.file_watch_enabled)
+        self.show_missing_files_button = QPushButton("查看/修复丢失文件")
         self.rescan_new_button = QPushButton("扫描新增/变化")
         self.rescan_missing_button = QPushButton("扫描缺失所在目录")
         self.clean_missing_index_button = QPushButton("清理丢失索引")
+        self.detect_duplicates_button = QPushButton("检测重复/近重复")
         self.rebuild_selected_thumbnails_button = QPushButton("重建选中缩略图")
         self.remove_selected_index_button = QPushButton("移除选中索引")
         self.rebuild_selected_thumbnails_button.setEnabled(False)
@@ -1236,6 +1473,7 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.apply_path_remap_button)
         settings_layout.addSpacing(4)
         settings_layout.addWidget(QLabel("图库维护"))
+        settings_layout.addWidget(self.file_watch_checkbox)
         maintenance_scan_row = QHBoxLayout()
         maintenance_scan_row.setContentsMargins(0, 0, 0, 0)
         maintenance_scan_row.addWidget(self.rescan_all_button)
@@ -1243,9 +1481,14 @@ class MainWindow(QMainWindow):
         settings_layout.addLayout(maintenance_scan_row)
         maintenance_clean_row = QHBoxLayout()
         maintenance_clean_row.setContentsMargins(0, 0, 0, 0)
+        maintenance_clean_row.addWidget(self.show_missing_files_button)
         maintenance_clean_row.addWidget(self.rescan_missing_button)
-        maintenance_clean_row.addWidget(self.clean_missing_index_button)
         settings_layout.addLayout(maintenance_clean_row)
+        maintenance_missing_row = QHBoxLayout()
+        maintenance_missing_row.setContentsMargins(0, 0, 0, 0)
+        maintenance_missing_row.addWidget(self.clean_missing_index_button)
+        maintenance_missing_row.addWidget(self.detect_duplicates_button)
+        settings_layout.addLayout(maintenance_missing_row)
         maintenance_extra_row = QHBoxLayout()
         maintenance_extra_row.setContentsMargins(0, 0, 0, 0)
         maintenance_extra_row.addWidget(self.clean_orphan_thumbnails_button)
@@ -1276,6 +1519,7 @@ class MainWindow(QMainWindow):
         settings_health_row.addWidget(self.run_self_check_button)
         settings_health_row.addWidget(self.show_error_log_button)
         settings_layout.addLayout(settings_health_row)
+        settings_layout.addWidget(self.show_operation_history_button)
         settings_layout.addWidget(self.settings_status_label)
         settings_layout.addStretch(1)
         self._load_settings_controls()
@@ -1327,7 +1571,9 @@ class MainWindow(QMainWindow):
         self.add_ai_vision_filter_button.clicked.connect(self._add_ai_vision_filter_from_controls)
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         self.sort_order_combo.currentIndexChanged.connect(self._on_sort_changed)
+        self.score_threshold_slider.sliderMoved.connect(self._preview_score_threshold)
         self.score_threshold_slider.valueChanged.connect(self._update_score_threshold)
+        self.score_threshold_slider.sliderReleased.connect(self._update_score_threshold)
         self.thumbnail_size_slider.valueChanged.connect(self._update_thumbnail_size)
         self.load_more_button.clicked.connect(self._load_more)
         self.grid_view.selectionChanged.connect(self._on_grid_image_selected)
@@ -1388,7 +1634,10 @@ class MainWindow(QMainWindow):
         self.rescan_all_button.clicked.connect(self._rescan_all_folders)
         self.rescan_new_button.clicked.connect(self._rescan_new_or_changed_folders)
         self.rescan_missing_button.clicked.connect(self._rescan_missing_folders)
+        self.file_watch_checkbox.toggled.connect(self._set_file_watch_enabled)
+        self.show_missing_files_button.clicked.connect(self._show_missing_files_dialog)
         self.clean_missing_index_button.clicked.connect(self._clean_missing_index)
+        self.detect_duplicates_button.clicked.connect(self._detect_duplicates)
         self.clean_orphan_thumbnails_button.clicked.connect(self._clean_orphan_thumbnails)
         self.rebuild_selected_thumbnails_button.clicked.connect(self._batch_rebuild_thumbnails)
         self.remove_selected_index_button.clicked.connect(self._batch_remove_from_library)
@@ -1422,6 +1671,7 @@ class MainWindow(QMainWindow):
         self.restore_database_button.clicked.connect(self._restore_database_from_file)
         self.run_self_check_button.clicked.connect(self._run_self_check_from_settings)
         self.show_error_log_button.clicked.connect(self._show_error_log_window)
+        self.show_operation_history_button.clicked.connect(self._show_operation_history)
         self.refresh_path_candidates_button.clicked.connect(self._refresh_path_remap_candidates)
         self.choose_remap_new_path_button.clicked.connect(self._choose_remap_new_path)
         self.apply_path_remap_button.clicked.connect(self._apply_path_remap)
@@ -1431,6 +1681,8 @@ class MainWindow(QMainWindow):
         self.apply_view_button.clicked.connect(self._apply_selected_saved_view)
         self.rename_view_button.clicked.connect(self._rename_selected_saved_view)
         self.delete_view_button.clicked.connect(self._delete_selected_saved_view)
+        self.file_watcher.directoryChanged.connect(self._handle_watched_path_changed)
+        self.file_watcher.fileChanged.connect(self._handle_watched_path_changed)
 
     def _minimize_window(self) -> None:
         self.showMinimized()
@@ -1448,6 +1700,10 @@ class MainWindow(QMainWindow):
         self._load_llm_service_controls(service)
         self.llm_temperature_spin.setValue(self._llm_temperature())
         self._set_combo_to_data(self.language_combo, self.current_language)
+        if hasattr(self, "file_watch_checkbox"):
+            self.file_watch_checkbox.blockSignals(True)
+            self.file_watch_checkbox.setChecked(self.file_watch_enabled)
+            self.file_watch_checkbox.blockSignals(False)
         if hasattr(self, "path_remap_old_combo"):
             self._refresh_path_remap_candidates()
 
@@ -1730,13 +1986,16 @@ class MainWindow(QMainWindow):
         self._refresh_inspiration_history()
         self._reload_images()
         self._refresh_embedding_stats()
+        self._refresh_file_watcher()
 
     def _set_maintenance_controls_enabled(self, enabled: bool) -> None:
         for attr in [
             "rescan_all_button",
             "rescan_new_button",
             "rescan_missing_button",
+            "show_missing_files_button",
             "clean_missing_index_button",
+            "detect_duplicates_button",
             "clean_orphan_thumbnails_button",
             "run_performance_check_button",
             "restore_database_button",
@@ -1944,7 +2203,10 @@ class MainWindow(QMainWindow):
             self.rescan_all_button.setText("Scan All")
             self.rescan_new_button.setText("Scan New")
             self.rescan_missing_button.setText("Scan Missing")
+            self.file_watch_checkbox.setText("Watch local file changes")
+            self.show_missing_files_button.setText("Repair Missing")
             self.clean_missing_index_button.setText("Clean Missing")
+            self.detect_duplicates_button.setText("Find Duplicates")
             self.clean_orphan_thumbnails_button.setText("Clean Thumbs")
             self.rebuild_selected_thumbnails_button.setText("Rebuild Selected")
             self.remove_selected_index_button.setText("Remove Selected")
@@ -1956,6 +2218,7 @@ class MainWindow(QMainWindow):
             self.restore_database_button.setText("Restore DB")
             self.run_self_check_button.setText("Startup Check")
             self.show_error_log_button.setText("Error Log")
+            self.show_operation_history_button.setText("Operation History")
             self.path_remap_new_input.setPlaceholderText("Choose the new root folder")
             self.refresh_path_candidates_button.setText("Refresh")
             self.choose_remap_new_path_button.setText("Choose")
@@ -2016,7 +2279,10 @@ class MainWindow(QMainWindow):
             self.rescan_all_button.setText("扫描全部")
             self.rescan_new_button.setText("扫描新增")
             self.rescan_missing_button.setText("扫描缺失")
+            self.file_watch_checkbox.setText("自动监听文件变化")
+            self.show_missing_files_button.setText("查看/修复丢失")
             self.clean_missing_index_button.setText("清理丢失")
+            self.detect_duplicates_button.setText("检测重复")
             self.clean_orphan_thumbnails_button.setText("清理缩略图")
             self.rebuild_selected_thumbnails_button.setText("重建选中")
             self.remove_selected_index_button.setText("移除选中")
@@ -2028,6 +2294,7 @@ class MainWindow(QMainWindow):
             self.restore_database_button.setText("恢复数据库")
             self.run_self_check_button.setText("启动自检")
             self.show_error_log_button.setText("错误日志")
+            self.show_operation_history_button.setText("操作历史")
             self.path_remap_new_input.setPlaceholderText("选择移动后的新根目录")
             self.refresh_path_candidates_button.setText("刷新")
             self.choose_remap_new_path_button.setText("选择")
@@ -2268,6 +2535,12 @@ class MainWindow(QMainWindow):
         if not images:
             self.statusBar().showMessage("没有选中图片")
             return
+        if len(images) > 1 and not self._confirm_batch_operation(
+            "导出图片",
+            "复制导出选中图片",
+            images,
+        ):
+            return
         target_dir = QFileDialog.getExistingDirectory(self, "选择图片导出位置")
         if not target_dir:
             return
@@ -2298,6 +2571,7 @@ class MainWindow(QMainWindow):
             f"跳过缺失 {result.skipped_missing}，失败 {result.failed}，"
             f"目录 {result.directories}。位置：{result.target_dir}"
         )
+        self._record_operation_history(message)
         self.settings_status_label.setText(message)
         self.statusBar().showMessage(message)
 
@@ -4475,7 +4749,7 @@ class MainWindow(QMainWindow):
         self._refresh_filter_chain_ui()
         if self.search_filters:
             if self.search_button.isEnabled():
-                self._execute_search_chain()
+                self._execute_search_chain(operation_mode="recompute")
             return
 
         if self.current_result_mode == "color":
@@ -4546,6 +4820,16 @@ class MainWindow(QMainWindow):
             )
             return
 
+        if self.current_result_mode == "duplicate_group":
+            images = self._apply_result_management_filters(
+                self._apply_sidebar_filters(self.current_duplicate_images)
+            )
+            images = self._sort_images(images)
+            self.load_more_button.setEnabled(False)
+            self.grid_view.set_images(images)
+            self._set_result_status(f"重复候选组：{len(images)} 张{self._result_management_status_suffix()}")
+            return
+
         self._reload_images()
 
     def _refresh_visible_results_after_result_management_change(self) -> None:
@@ -4598,6 +4882,16 @@ class MainWindow(QMainWindow):
             self._set_result_status(
                 f"灵感暂存：{name} ｜ {len(images)} 张{suffix}{self._result_management_status_suffix()}"
             )
+            return
+
+        if self.current_result_mode == "duplicate_group":
+            images = self._apply_result_management_filters(
+                self._apply_sidebar_filters(self.current_duplicate_images)
+            )
+            images = self._sort_images(images)
+            self.load_more_button.setEnabled(False)
+            self.grid_view.set_images(images)
+            self._set_result_status(f"重复候选组：{len(images)} 张{self._result_management_status_suffix()}")
             return
 
         if self.current_result_mode == "keyword":
@@ -4745,6 +5039,12 @@ class MainWindow(QMainWindow):
         if not images:
             self.statusBar().showMessage("没有选中图片")
             return
+        if len(images) > 1 and not self._confirm_batch_operation(
+            "保存为灵感暂存",
+            "把选中图片保存为一个灵感暂存项目",
+            images,
+        ):
+            return
         default_name = self._suggest_temporary_project_name(images)
         name, ok = QInputDialog.getText(
             self,
@@ -4774,6 +5074,7 @@ class MainWindow(QMainWindow):
         self._refresh_temporary_projects(select_project_id=project_id)
         project = self.store.get_temporary_project(project_id)
         project_name = project.name if project is not None else clean_name
+        self._record_operation_history(f"新建灵感暂存“{project_name}”：{len(images)} 张")
         self.statusBar().showMessage(f"已暂存 {len(images)} 张到“{project_name}”")
         self._suggest_temporary_project_details(
             project_id=project_id,
@@ -4785,6 +5086,12 @@ class MainWindow(QMainWindow):
         images = self.grid_view.images()
         if not images:
             self.statusBar().showMessage("当前没有可暂存的结果")
+            return
+        if not self._confirm_batch_operation(
+            "暂存当前结果集",
+            "把当前可见结果保存为灵感暂存项目",
+            images,
+        ):
             return
         default_name = self._suggest_current_result_set_name(images)
         name, ok = QInputDialog.getText(
@@ -4813,6 +5120,7 @@ class MainWindow(QMainWindow):
                 intent_queries=intent_queries,
             )
         self._refresh_temporary_projects(select_project_id=project_id)
+        self._record_operation_history(f"暂存当前结果集“{clean_name}”：{len(images)} 张")
         self.statusBar().showMessage(f"已暂存当前结果集 {len(images)} 张到“{clean_name}”")
 
     def _suggest_current_result_set_name(self, images: list[ImageItem]) -> str:
@@ -4838,6 +5146,7 @@ class MainWindow(QMainWindow):
         self.result_excluded_image_ids.update(image.id for image in images)
         added = len(self.result_excluded_image_ids) - before
         self._refresh_visible_results_after_result_management_change()
+        self._record_operation_history(f"从当前结果排除 {added} 张")
         self.statusBar().showMessage(f"已从当前结果排除 {added} 张")
 
     def _exclude_collection_from_results(self, collection_id: int) -> None:
@@ -4869,6 +5178,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"已从当前结果排除文件夹：{label}（新增 {added} 个，影响 {affected} 张）"
         )
+        self._record_operation_history(f"从当前结果排除文件夹“{label}”，影响 {affected} 张")
 
     def _remove_result_collection_exclusion(self, collection_id: int) -> None:
         self.result_excluded_collection_ids.discard(collection_id)
@@ -4896,6 +5206,12 @@ class MainWindow(QMainWindow):
             self._refresh_temporary_projects()
             self.statusBar().showMessage("该灵感暂存已不存在")
             return
+        if len(images) > 1 and not self._confirm_batch_operation(
+            "加入灵感暂存",
+            f"加入已有灵感暂存“{project.name}”",
+            images,
+        ):
+            return
         intent_labels, intent_queries = self._temporary_project_intents_for_images(images)
         self.store.add_images_to_temporary_project(
             project_id,
@@ -4906,6 +5222,7 @@ class MainWindow(QMainWindow):
         self._refresh_temporary_projects()
         if self.current_result_mode == "temp_project" and self.current_temp_project_id == project_id:
             self._load_temporary_project(project_id)
+        self._record_operation_history(f"加入 {len(images)} 张到灵感暂存“{project.name}”")
         self.statusBar().showMessage(f"已加入 {len(images)} 张到“{project.name}”")
 
     def _remove_selection_from_current_temporary_project(self) -> None:
@@ -4919,6 +5236,13 @@ class MainWindow(QMainWindow):
         project_id = self.current_temp_project_id
         project = self.store.get_temporary_project(project_id)
         project_name = project.name if project is not None else "灵感暂存"
+        if not self._confirm_batch_operation(
+            "从灵感暂存移除",
+            f"从“{project_name}”移除选中图片，不删除源文件",
+            images,
+            destructive=True,
+        ):
+            return
         removed = self.store.remove_images_from_temporary_project(
             project_id,
             [image.id for image in images],
@@ -4928,6 +5252,7 @@ class MainWindow(QMainWindow):
             self._load_temporary_project(project_id)
         else:
             self._reload_images()
+        self._record_operation_history(f"从灵感暂存“{project_name}”移除 {removed} 张")
         self.statusBar().showMessage(f"已从“{project_name}”移除 {removed} 张")
 
     def _group_selected_images_with_ai(self) -> None:
@@ -5339,6 +5664,8 @@ class MainWindow(QMainWindow):
         command = action.data()
         if command == "preview":
             self._open_image_preview(context_image)
+        elif command == "compare_selection":
+            self._compare_selected_images()
         elif command == "find_similar":
             self._find_similar_to_image(context_image)
         elif command == "open":
@@ -5396,9 +5723,11 @@ class MainWindow(QMainWindow):
             return action
 
         add_action(menu, "preview", "快速预览")
+        add_action(menu, "compare_selection", "对比查看")
         add_action(menu, "find_similar", "查找相似图片")
         has_single_context = context_image is not None and len(selected_images) <= 1
         actions["preview"].setEnabled(has_single_context)
+        actions["compare_selection"].setEnabled(len(selected_images) >= 2)
         actions["find_similar"].setEnabled(
             has_single_context
             and self._similar_image_blocking_reason(context_image, check_vector=False) is None
@@ -6561,12 +6890,19 @@ class MainWindow(QMainWindow):
         if not images:
             self.statusBar().showMessage("没有选中图片")
             return
+        if len(images) > 1 and not self._confirm_batch_operation(
+            "添加到文件夹",
+            f"添加到文件夹“{collection_name}”",
+            images,
+        ):
+            return
         inserted = self.store.assign_images_to_collection(
             [image.id for image in images],
             collection_id,
         )
         self._refresh_collections(select_collection_id=collection_id)
         self._refresh_current_results_for_filters()
+        self._record_operation_history(f"添加 {inserted} 张到文件夹“{collection_name}”")
         self.statusBar().showMessage(f"已添加 {inserted} 张到文件夹“{collection_name}”")
 
     def _add_selection_to_collection_dialog(self) -> None:
@@ -6624,6 +6960,12 @@ class MainWindow(QMainWindow):
             return
         target_collection_id = choices[labels.index(selected_label)][1]
         target_name = self._collection_name(target_collection_id) or selected_label
+        if not self._confirm_batch_operation(
+            "移动到文件夹",
+            f"从当前文件夹移动到“{target_name}”",
+            images,
+        ):
+            return
         inserted, removed_links, deleted_images, thumbnail_paths = self.store.move_images_to_collection(
             [image.id for image in images],
             source_collection_id=source_collection_id,
@@ -6636,6 +6978,9 @@ class MainWindow(QMainWindow):
         self._refresh_current_results_for_filters()
         self._refresh_embedding_stats()
         self._refresh_ai_vision_stats()
+        self._record_operation_history(
+            f"移动 {len(images)} 张到“{target_name}”：新增关联 {inserted}，移出关联 {removed_links}"
+        )
         self.statusBar().showMessage(
             f"已移动到“{target_name}”：新增关联 {inserted}，移出关联 {removed_links}"
         )
@@ -6650,15 +6995,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("请先选中一个 Eidory 文件夹")
             return
         collection_name = self._collection_name(collection_id) or "当前文件夹"
-        answer = QMessageBox.question(
-            self,
+        if not self._confirm_batch_operation(
             "从当前文件夹移出",
-            f"从“{collection_name}”及其子文件夹移出 {len(images)} 个项目。"
-            "不会删除硬盘源文件；如果项目不属于其他 Eidory 文件夹，会从图库索引中移除。继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+            f"从“{collection_name}”及其子文件夹移出。不会删除源文件；孤立项目会从图库索引移除",
+            images,
+            destructive=True,
+        ):
             return
         removed_links, deleted_images, thumbnail_paths = self.store.remove_images_from_collection_subtree(
             [image.id for image in images],
@@ -6671,6 +7013,9 @@ class MainWindow(QMainWindow):
         self._refresh_current_results_for_filters()
         self._refresh_embedding_stats()
         self._refresh_ai_vision_stats()
+        self._record_operation_history(
+            f"从“{collection_name}”移出关联 {removed_links} 个；移除孤立索引 {deleted_images} 个"
+        )
         self.statusBar().showMessage(
             f"已移出关联 {removed_links} 个；从图库移除索引 {deleted_images} 个，源文件未删除"
         )
@@ -6819,13 +7164,21 @@ class MainWindow(QMainWindow):
         )
 
     def _batch_set_favorite(self, is_favorite: bool) -> None:
-        image_ids = [image.id for image in self._selected_grid_images()]
+        images = self._selected_grid_images()
+        image_ids = [image.id for image in images]
         if not image_ids:
             self.statusBar().showMessage("没有选中图片")
+            return
+        if len(images) > 1 and not self._confirm_batch_operation(
+            "批量收藏",
+            "收藏选中图片" if is_favorite else "取消收藏选中图片",
+            images,
+        ):
             return
         count = self.store.update_favorites(image_ids, is_favorite)
         self._refresh_current_results_for_filters()
         action = "收藏" if is_favorite else "取消收藏"
+        self._record_operation_history(f"{action} {count} 张")
         self.statusBar().showMessage(f"已{action} {count} 张")
 
     def _tag_panel_add_tags(self) -> None:
@@ -6837,9 +7190,16 @@ class MainWindow(QMainWindow):
         if not tags:
             self.statusBar().showMessage("没有输入标签")
             return
+        if len(images) > 1 and not self._confirm_batch_operation(
+            "批量添加标签",
+            f"添加标签：{', '.join(tags)}",
+            images,
+        ):
+            return
         inserted = self.store.add_tags_to_images([image.id for image in images], tags)
         self.tag_panel_input.clear()
         self._refresh_after_tag_assignment(images)
+        self._record_operation_history(f"添加标签 {tags} 到 {len(images)} 张，新增关联 {inserted}")
         self.statusBar().showMessage(f"已添加 {inserted} 个标签关联")
 
     def _tag_panel_remove_selected_tag(self) -> None:
@@ -6851,11 +7211,18 @@ class MainWindow(QMainWindow):
         if not tag_name:
             self.statusBar().showMessage("没有可移除的标签")
             return
+        if len(images) > 1 and not self._confirm_batch_operation(
+            "批量移除标签",
+            f"移除标签：{tag_name}",
+            images,
+        ):
+            return
         removed = self.store.remove_tags_from_images(
             [image.id for image in images],
             [str(tag_name)],
         )
         self._refresh_after_tag_assignment(images)
+        self._record_operation_history(f"移除标签 {tag_name}：{removed} 个关联")
         self.statusBar().showMessage(f"已移除 {removed} 个标签关联：{tag_name}")
 
     def _tag_panel_clear_tags(self) -> None:
@@ -6874,6 +7241,7 @@ class MainWindow(QMainWindow):
             return
         removed = self.store.clear_tags_for_images([image.id for image in images])
         self._refresh_after_tag_assignment(images)
+        self._record_operation_history(f"清除 {len(images)} 张图片标签，移除关联 {removed}")
         self.statusBar().showMessage(f"已清除 {removed} 个标签关联")
 
     def _refresh_after_tag_assignment(self, previous_selection: list[ImageItem]) -> None:
@@ -6898,6 +7266,12 @@ class MainWindow(QMainWindow):
         if not tags:
             self.statusBar().showMessage("没有输入标签")
             return
+        if not self._confirm_batch_operation(
+            "批量添加标签",
+            f"添加标签：{', '.join(tags)}",
+            images,
+        ):
+            return
         inserted = self.store.add_tags_to_images([image.id for image in images], tags)
         self.batch_tags_input.clear()
         self._refresh_tags()
@@ -6905,6 +7279,7 @@ class MainWindow(QMainWindow):
         refreshed = self.grid_view.selected_images()
         if len(refreshed) > 1:
             self._show_multi_selection_details(refreshed)
+        self._record_operation_history(f"添加标签 {tags} 到 {len(images)} 张，新增关联 {inserted}")
         self.statusBar().showMessage(f"已添加 {inserted} 个标签关联")
 
     def _batch_remove_selected_tag(self) -> None:
@@ -6916,6 +7291,12 @@ class MainWindow(QMainWindow):
         if not tag_name:
             self.statusBar().showMessage("没有可移除的标签")
             return
+        if not self._confirm_batch_operation(
+            "批量移除标签",
+            f"移除标签：{tag_name}",
+            images,
+        ):
+            return
         removed = self.store.remove_tags_from_images(
             [image.id for image in images],
             [str(tag_name)],
@@ -6925,6 +7306,7 @@ class MainWindow(QMainWindow):
         refreshed = self.grid_view.selected_images()
         if len(refreshed) > 1:
             self._show_multi_selection_details(refreshed)
+        self._record_operation_history(f"移除标签 {tag_name}：{removed} 个关联")
         self.statusBar().showMessage(f"已移除 {removed} 个标签关联：{tag_name}")
 
     def _batch_add_tags(self) -> None:
@@ -6943,9 +7325,16 @@ class MainWindow(QMainWindow):
         if not tags:
             self.statusBar().showMessage("没有输入标签")
             return
+        if not self._confirm_batch_operation(
+            "批量添加标签",
+            f"添加标签：{', '.join(tags)}",
+            images,
+        ):
+            return
         inserted = self.store.add_tags_to_images([image.id for image in images], tags)
         self._refresh_tags()
         self._refresh_current_results_for_filters()
+        self._record_operation_history(f"添加标签 {tags} 到 {len(images)} 张，新增关联 {inserted}")
         self.statusBar().showMessage(f"已添加 {inserted} 个标签关联")
 
     def _batch_clear_tags(self) -> None:
@@ -6965,7 +7354,54 @@ class MainWindow(QMainWindow):
         removed = self.store.clear_tags_for_images([image.id for image in images])
         self._refresh_tags()
         self._refresh_current_results_for_filters()
+        self._record_operation_history(f"清除 {len(images)} 张图片标签，移除关联 {removed}")
         self.statusBar().showMessage(f"已清除 {removed} 个标签关联")
+
+    def _confirm_batch_operation(
+        self,
+        title: str,
+        action_text: str,
+        images: list[ImageItem],
+        *,
+        destructive: bool = False,
+    ) -> bool:
+        if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            return True
+        preview = "\n".join(f"• {image.file_name}" for image in images[:8])
+        if len(images) > 8:
+            preview += f"\n……另有 {len(images) - 8} 个"
+        icon = QMessageBox.Icon.Warning if destructive else QMessageBox.Icon.Information
+        message = QMessageBox(self)
+        message.setIcon(icon)
+        message.setWindowTitle(title)
+        message.setText(f"{action_text}\n\n选择数量：{len(images)}")
+        message.setInformativeText(preview)
+        message.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        message.setDefaultButton(QMessageBox.StandardButton.No)
+        return message.exec() == QMessageBox.StandardButton.Yes
+
+    def _record_operation_history(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.operation_history_messages.append(f"[{timestamp}] {message}")
+        self.operation_history_messages = self.operation_history_messages[-200:]
+
+    def _show_operation_history(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("操作历史")
+        dialog.resize(760, 460)
+        layout = QVBoxLayout(dialog)
+        intro = QLabel("这里记录本次启动后的批量操作。删除/移除类操作仍以 Cmd+Z 撤销为准。")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        output = QTextEdit()
+        output.setReadOnly(True)
+        output.setPlainText("\n".join(reversed(self.operation_history_messages)) or "暂无批量操作。")
+        layout.addWidget(output, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     @staticmethod
     def _parse_tag_input(text: str) -> list[str]:
@@ -6984,19 +7420,18 @@ class MainWindow(QMainWindow):
         if not images:
             self.statusBar().showMessage("没有选中图片")
             return
-        answer = QMessageBox.question(
-            self,
+        if not self._confirm_batch_operation(
             "从图库移除索引",
-            f"只从 Eidory 移除 {len(images)} 张图片的索引记录，不删除源文件。继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+            "只从 Eidory 移除索引记录，不删除源文件",
+            images,
+            destructive=True,
+        ):
             return
         removed = self._remove_images_from_library_with_undo(
             images,
             undo_label=f"移除索引 {len(images)} 个",
         )
+        self._record_operation_history(f"移除索引 {removed} 张，可 Cmd+Z 撤销")
         self.statusBar().showMessage(f"已从图库移除 {removed} 张，源文件未删除。按 Cmd+Z 可撤销")
 
     def _delete_selected_source_files(self) -> None:
@@ -7010,6 +7445,7 @@ class MainWindow(QMainWindow):
                 images,
                 undo_label=f"移除索引 {len(images)} 个",
             )
+            self._record_operation_history(f"移除索引 {removed} 张，可 Cmd+Z 撤销")
             self.statusBar().showMessage(f"已从图库移除 {removed} 张，源文件未删除。按 Cmd+Z 可撤销")
         elif mode == "source":
             self._delete_source_files_with_undo(images)
@@ -7124,6 +7560,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"已删除源文件并移除索引 {len(deleted_ids)} 个；失败 {len(failures)} 个。按 Cmd+Z 可撤销"
             )
+            self._record_operation_history(
+                f"删除源文件并移除索引 {len(deleted_ids)} 个，失败 {len(failures)} 个，可 Cmd+Z 撤销"
+            )
         else:
             self.statusBar().showMessage(f"没有删除源文件；失败 {len(failures)} 个")
 
@@ -7216,6 +7655,7 @@ class MainWindow(QMainWindow):
                 "撤销不完整",
                 f"已恢复索引 {restored} 个；失败 {len(failures)} 个。\n\n" + "\n".join(failures[:6]),
             )
+        self._record_operation_history(f"撤销删除/移除：恢复 {restored} 个项目")
         self.statusBar().showMessage(f"已撤销：恢复 {restored} 个项目")
 
     def _refresh_after_library_removal(self) -> None:
@@ -7230,6 +7670,12 @@ class MainWindow(QMainWindow):
         images = self._selected_grid_images()
         if not images:
             self.statusBar().showMessage("没有选中图片")
+            return
+        if not self._confirm_batch_operation(
+            "重建缩略图",
+            "重新生成选中项目的缩略图",
+            images,
+        ):
             return
         rebuilt = 0
         failed = 0
@@ -7251,9 +7697,335 @@ class MainWindow(QMainWindow):
                 failed += 1
                 self.store.update_thumbnail(image.id, None, "failed")
         self._refresh_current_results_for_filters()
+        self._record_operation_history(f"重建缩略图：成功 {rebuilt}，失败 {failed}")
         self.statusBar().showMessage(
             f"缩略图重建完成：成功 {rebuilt}，失败 {failed}"
         )
+
+    def _set_file_watch_enabled(self, enabled: bool) -> None:
+        self.file_watch_enabled = bool(enabled)
+        self.store.set_setting("ui.file_watch_enabled", "1" if self.file_watch_enabled else "0")
+        self._refresh_file_watcher()
+        state = "已开启" if self.file_watch_enabled else "已关闭"
+        self.statusBar().showMessage(f"自动监听文件变化{state}")
+
+    def _refresh_file_watcher(self) -> None:
+        if not hasattr(self, "file_watcher"):
+            return
+        watched = list(self.file_watcher.directories()) + list(self.file_watcher.files())
+        if watched:
+            self.file_watcher.removePaths(watched)
+        self._watch_path_roots.clear()
+        if not self.file_watch_enabled:
+            return
+        paths_to_watch: list[str] = []
+        for folder in self.store.list_folders():
+            root = self._normalize_folder_path(folder.folder_path)
+            if not os.path.isdir(root):
+                continue
+            for directory in self._watched_directories_for_root(root):
+                if directory in self._watch_path_roots:
+                    continue
+                paths_to_watch.append(directory)
+                self._watch_path_roots[directory] = root
+        if paths_to_watch:
+            self.file_watcher.addPaths(paths_to_watch)
+            self.statusBar().showMessage(f"已监听 {len(paths_to_watch)} 个本地目录")
+
+    @staticmethod
+    def _watched_directories_for_root(root: str, *, max_directories: int = 1200) -> list[str]:
+        directories: list[str] = []
+        for current_root, dirnames, _filenames in os.walk(root, topdown=True, followlinks=False):
+            dirnames[:] = [
+                dirname
+                for dirname in dirnames
+                if not dirname.startswith(".")
+                and not os.path.islink(os.path.join(current_root, dirname))
+            ]
+            directories.append(os.path.abspath(current_root))
+            if len(directories) >= max_directories:
+                dirnames[:] = []
+                break
+        return directories
+
+    def _handle_watched_path_changed(self, changed_path: str) -> None:
+        if not self.file_watch_enabled:
+            return
+        normalized = self._normalize_folder_path(changed_path)
+        root = self._watch_path_roots.get(normalized)
+        if root is None:
+            for watched_path, watched_root in self._watch_path_roots.items():
+                if self._path_is_in_folder(normalized, watched_path):
+                    root = watched_root
+                    break
+        if root is None:
+            return
+        self._pending_watch_scan_roots.add(root)
+        self.watch_scan_timer.start(1500)
+        self.statusBar().showMessage("检测到本地文件变化，准备增量扫描")
+
+    def _run_pending_watch_scans(self) -> None:
+        roots = sorted(self._pending_watch_scan_roots)
+        self._pending_watch_scan_roots.clear()
+        if not roots:
+            return
+        if not self.file_watch_enabled:
+            return
+        self._set_maintenance_controls_enabled(False)
+
+        def run() -> None:
+            results: list[ScanResult] = []
+            failures: list[str] = []
+            for root in roots:
+                try:
+                    results.append(self.scanner.scan_folder(root))
+                except Exception as exc:
+                    failures.append(f"{root}: {exc}")
+            self.events.put(("watch_scan_done", (roots, results, failures)))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _handle_watch_scan_done(self, payload: object) -> None:
+        roots, results, failures = payload
+        self._set_maintenance_controls_enabled(True)
+        self._refresh_after_scan_database_change()
+        scanned = sum(result.scanned_files for result in results)
+        new_files = sum(result.new_files for result in results)
+        changed_files = sum(result.changed_files for result in results)
+        missing = sum(result.missing_marked for result in results)
+        message = (
+            f"自动扫描完成：目录 {len(roots)}，扫描 {scanned}，"
+            f"新增 {new_files}，变化 {changed_files}，标记丢失 {missing}，失败 {len(failures)}"
+        )
+        if failures:
+            self._record_error("自动监听扫描失败：" + " | ".join(failures[:5]))
+        self.settings_status_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _refresh_after_scan_database_change(
+        self,
+        *,
+        select_collection_id: int | None = None,
+    ) -> None:
+        self._refresh_folders()
+        self._refresh_collections(select_collection_id=select_collection_id)
+        self.store.seed_default_ai_vision_collection_rules()
+        if self._has_visible_result_context() or self.search_filters:
+            self._refresh_current_results_for_filters()
+        else:
+            self._reload_images()
+        self._refresh_embedding_stats()
+        self._refresh_ai_vision_stats()
+        self._refresh_path_remap_candidates()
+        self._refresh_file_watcher()
+
+    def _folder_label_for_image(self, image: ImageItem) -> str:
+        chains = self.store.collection_chains_for_image(image.id)
+        if chains:
+            labels = [" / ".join(collection.name for collection in chain) for chain in chains]
+            return "；".join(labels)
+        parent = Path(image.file_path).parent
+        return parent.name or str(parent)
+
+    def _show_missing_files_dialog(self) -> None:
+        missing_count = self.store.count_missing_images()
+        if missing_count <= 0:
+            QMessageBox.information(self, "缺失文件修复", "当前没有缺失文件。")
+            return
+        images = self.store.list_images(
+            status_filter="missing",
+            include_missing=True,
+            limit=max(1, missing_count),
+            sort_key="name",
+            sort_desc=False,
+        )
+        folder_labels = {image.id: self._folder_label_for_image(image) for image in images}
+        dialog = MissingFilesDialog(images=images, folder_labels=folder_labels, parent=self)
+
+        def refresh_dialog() -> None:
+            refreshed_count = self.store.count_missing_images()
+            refreshed = self.store.list_images(
+                status_filter="missing",
+                include_missing=True,
+                limit=max(1, refreshed_count),
+                sort_key="name",
+                sort_desc=False,
+            )
+            labels = {image.id: self._folder_label_for_image(image) for image in refreshed}
+            dialog.set_images(refreshed, labels)
+
+        def relink_selected() -> None:
+            image_id = dialog.current_image_id()
+            image = self.store.get_image(image_id) if image_id is not None else None
+            if image is None:
+                return
+            file_path, _selected_filter = QFileDialog.getOpenFileName(
+                dialog,
+                "重新指定源文件",
+                str(Path(image.file_path).parent),
+                "Media (*.jpg *.jpeg *.png *.webp *.mp4 *.mov *.m4v);;All Files (*)",
+            )
+            if not file_path:
+                return
+            try:
+                self._repair_missing_image_path(image.id, Path(file_path))
+            except Exception as exc:
+                QMessageBox.warning(dialog, "修复失败", str(exc))
+                return
+            self._record_operation_history(f"重新定位缺失文件：{image.file_name} -> {file_path}")
+            refresh_dialog()
+
+        def remap_selected() -> None:
+            image_id = dialog.current_image_id()
+            image = self.store.get_image(image_id) if image_id is not None else None
+            if image is None:
+                return
+            old_prefix = str(Path(image.file_path).parent)
+            new_prefix = QFileDialog.getExistingDirectory(dialog, "选择移动后的新目录", str(Path.home()))
+            if not new_prefix:
+                return
+            try:
+                counts = self.store.path_prefix_match_counts(old_prefix)
+            except Exception as exc:
+                QMessageBox.warning(dialog, "检查失败", str(exc))
+                return
+            answer = QMessageBox.question(
+                dialog,
+                "批量重定位",
+                (
+                    f"旧目录：{old_prefix}\n新目录：{new_prefix}\n\n"
+                    f"匹配 {counts['images']} 个文件记录，其中 {counts['missing']} 个缺失。继续？"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            result = self.store.remap_path_prefix(old_prefix, new_prefix)
+            self.vector_index.invalidate()
+            self._refresh_after_database_change()
+            refresh_dialog()
+            self._record_operation_history(
+                f"批量路径重定位：{old_prefix} -> {new_prefix}，恢复 {result.get('relinked', 0)}"
+            )
+            self.statusBar().showMessage(
+                f"批量重定位完成：恢复 {result.get('relinked', 0)}，仍丢失 {result.get('still_missing', 0)}"
+            )
+
+        def remove_selected() -> None:
+            image_ids = dialog.selected_image_ids()
+            if not image_ids:
+                return
+            images_to_remove = self.store.images_by_ids(image_ids)
+            if not images_to_remove:
+                return
+            if not self._confirm_batch_operation("移除缺失索引", "从 Eidory 移除缺失文件索引", images_to_remove):
+                return
+            removed = self._remove_images_from_library_with_undo(
+                images_to_remove,
+                undo_label=f"移除缺失索引 {len(images_to_remove)} 个",
+            )
+            refresh_dialog()
+            self._record_operation_history(f"移除缺失索引 {removed} 个，可 Cmd+Z 撤销")
+            self.statusBar().showMessage(f"已移除缺失索引 {removed} 个。按 Cmd+Z 可撤销")
+
+        dialog.relink_button.clicked.connect(relink_selected)
+        dialog.remap_button.clicked.connect(remap_selected)
+        dialog.remove_button.clicked.connect(remove_selected)
+        dialog.exec()
+        self._refresh_after_database_change()
+
+    def _repair_missing_image_path(self, image_id: int, file_path: Path) -> None:
+        path = Path(file_path).expanduser().resolve()
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("请选择一个存在的普通媒体文件。")
+        if not is_supported_media(str(path)):
+            raise ValueError("文件格式不受支持。")
+        stat = path.stat()
+        width, height, duration_ms = self.scanner._read_media_metadata(str(path))
+        self.store.repair_missing_image_path(
+            image_id,
+            file_path=str(path),
+            file_size=stat.st_size,
+            width=width,
+            height=height,
+            modified_time_ns=stat.st_mtime_ns,
+            duration_ms=duration_ms,
+        )
+        try:
+            thumbnail_path = (
+                self.thumbnailer.generate_video(image_id, str(path))
+                if is_supported_video(str(path))
+                else self.thumbnailer.generate(image_id, str(path))
+            )
+            self.store.update_thumbnail(image_id, str(thumbnail_path), "ready")
+        except Exception:
+            self.store.update_thumbnail(image_id, None, "failed")
+        if is_supported_image(str(path)):
+            self.scanner._update_color_feature(image_id, str(path))
+        else:
+            self.store.mark_embedding_not_required(image_id)
+        self.vector_index.invalidate()
+
+    def _detect_duplicates(self) -> None:
+        image_count = self.store.count_images()
+        if image_count <= 1:
+            QMessageBox.information(self, "重复检测", "图库里没有足够的图片可检测。")
+            return
+        self._set_maintenance_controls_enabled(False)
+        self.settings_status_label.setText("正在检测重复/近重复图片...")
+        self.statusBar().showMessage("正在检测重复/近重复图片")
+
+        def run() -> None:
+            try:
+                images = self.store.list_images(
+                    include_missing=False,
+                    limit=max(1, image_count),
+                    sort_key="name",
+                    sort_desc=False,
+                )
+                folder_labels = {image.id: self._folder_label_for_image(image) for image in images}
+                groups = find_duplicate_groups(
+                    images,
+                    folder_label_for_image=folder_labels,
+                    near_distance=8,
+                )
+                self.events.put(("duplicates_done", groups))
+            except Exception as exc:
+                self.events.put(("error", f"重复检测失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _handle_duplicates_done(self, groups: list[DuplicateGroup]) -> None:
+        self._set_maintenance_controls_enabled(True)
+        if not groups:
+            self.settings_status_label.setText("没有发现重复/近重复图片。")
+            self.statusBar().showMessage("没有发现重复/近重复图片")
+            return
+        exact_count = sum(1 for group in groups if group.kind == "exact")
+        near_count = len(groups) - exact_count
+        dialog = DuplicateResultsDialog(groups, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_group_image_ids:
+            images = self.store.images_by_ids(dialog.selected_group_image_ids)
+            self.current_duplicate_images = images
+            self.current_result_mode = "duplicate_group"
+            self._clear_result_management_state()
+            self.search_filters.clear()
+            self.current_offset = len(images)
+            self.load_more_button.setEnabled(False)
+            self.grid_view.set_images(images)
+            self._set_result_status(f"重复候选组：{len(images)} 张")
+            self.search_diagnostics_label.setText("搜索诊断：重复/近重复候选组")
+        message = f"重复检测完成：完全重复 {exact_count} 组，近重复 {near_count} 组"
+        self.settings_status_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _compare_selected_images(self) -> None:
+        images = self._selected_grid_images()
+        if len(images) < 2:
+            self.statusBar().showMessage("至少选择 2 张图片才能对比")
+            return
+        ImageCompareDialog(images, parent=self).exec()
 
     def _delete_thumbnail_files(self, thumbnail_paths: list[str]) -> None:
         thumbnail_root = self.paths.thumbnail_dir.resolve()
@@ -7367,6 +8139,10 @@ class MainWindow(QMainWindow):
                 self._handle_scan_new_done(payload)
             elif kind == "scan_missing_done":
                 self._handle_scan_missing_done(payload)
+            elif kind == "watch_scan_done":
+                self._handle_watch_scan_done(payload)
+            elif kind == "duplicates_done":
+                self._handle_duplicates_done(payload)
             elif kind == "import_done":
                 result, collection_id, collection_name, assigned, preserve_structure = payload
                 self._handle_import_done(
@@ -7515,13 +8291,7 @@ class MainWindow(QMainWindow):
         self.add_folder_button.setEnabled(True)
         self.rescan_button.setEnabled(True)
         self._set_maintenance_controls_enabled(True)
-        self._refresh_folders()
-        self._refresh_collections()
-        self.store.seed_default_ai_vision_collection_rules()
-        self._reload_images()
-        self._refresh_embedding_stats()
-        self._refresh_ai_vision_stats()
-        self._refresh_path_remap_candidates()
+        self._refresh_after_scan_database_change()
         self.statusBar().showMessage(
             f"扫描完成：新增 {result.new_files}，变化 {result.changed_files}，丢失 {result.missing_marked}"
         )
@@ -7530,13 +8300,7 @@ class MainWindow(QMainWindow):
         self.add_folder_button.setEnabled(True)
         self.rescan_button.setEnabled(True)
         self._set_maintenance_controls_enabled(True)
-        self._refresh_folders()
-        self._refresh_collections()
-        self.store.seed_default_ai_vision_collection_rules()
-        self._reload_images()
-        self._refresh_embedding_stats()
-        self._refresh_ai_vision_stats()
-        self._refresh_path_remap_candidates()
+        self._refresh_after_scan_database_change()
         scanned = sum(result.scanned_files for result in results)
         new_files = sum(result.new_files for result in results)
         changed_files = sum(result.changed_files for result in results)
@@ -7552,13 +8316,7 @@ class MainWindow(QMainWindow):
         self.add_folder_button.setEnabled(True)
         self.rescan_button.setEnabled(True)
         self._set_maintenance_controls_enabled(True)
-        self._refresh_folders()
-        self._refresh_collections()
-        self.store.seed_default_ai_vision_collection_rules()
-        self._reload_images()
-        self._refresh_embedding_stats()
-        self._refresh_ai_vision_stats()
-        self._refresh_path_remap_candidates()
+        self._refresh_after_scan_database_change()
         scanned = sum(result.scanned_files for result in results)
         new_files = sum(result.new_files for result in results)
         changed_files = sum(result.changed_files for result in results)
@@ -7573,13 +8331,7 @@ class MainWindow(QMainWindow):
         self.add_folder_button.setEnabled(True)
         self.rescan_button.setEnabled(True)
         self._set_maintenance_controls_enabled(True)
-        self._refresh_folders()
-        self._refresh_collections()
-        self.store.seed_default_ai_vision_collection_rules()
-        self._reload_images()
-        self._refresh_embedding_stats()
-        self._refresh_ai_vision_stats()
-        self._refresh_path_remap_candidates()
+        self._refresh_after_scan_database_change()
         scanned = sum(result.scanned_files for result in results)
         recovered = sum(result.changed_files for result in results)
         missing = sum(result.missing_marked for result in results)
@@ -7606,12 +8358,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         self.add_folder_button.setEnabled(True)
         self.rescan_button.setEnabled(True)
-        self._refresh_folders()
-        self._refresh_collections(select_collection_id=collection_id)
-        self.store.seed_default_ai_vision_collection_rules()
-        self._reload_images()
-        self._refresh_embedding_stats()
-        self._refresh_ai_vision_stats()
+        self._refresh_after_scan_database_change(select_collection_id=collection_id)
         mode = "按目录结构导入" if preserve_structure else "导入"
         self.statusBar().showMessage(
             f"{mode}完成：{collection_name}，扫描 {result.scanned_files}，"
@@ -7642,9 +8389,11 @@ class MainWindow(QMainWindow):
         if clean_imported_ids:
             self._show_imported_images_first(collection_id, clean_imported_ids)
         else:
-            self._reload_images()
-        self._refresh_embedding_stats()
-        self._refresh_ai_vision_stats()
+            self._refresh_after_scan_database_change(select_collection_id=collection_id)
+        if clean_imported_ids:
+            self._refresh_embedding_stats()
+            self._refresh_ai_vision_stats()
+            self._refresh_file_watcher()
         self.statusBar().showMessage(
             f"拖入导入成功：{collection_name}，扫描 {scanned}，"
             f"新增 {new_files}，变化 {changed_files}，加入 {assigned}"
@@ -8758,6 +9507,7 @@ class MainWindow(QMainWindow):
             "search_chain",
             "inspiration",
             "temp_project",
+            "duplicate_group",
             "keyword",
         } or bool(self.search_filters)
 
@@ -8768,6 +9518,7 @@ class MainWindow(QMainWindow):
             "search_chain",
             "inspiration",
             "temp_project",
+            "duplicate_group",
             "keyword",
         }
 
@@ -8789,6 +9540,9 @@ class MainWindow(QMainWindow):
         self.thumbnail_size_label.setText(f"缩略图：{size}")
         self.grid_view.set_thumbnail_size(size)
         self.store.set_setting("ui.thumbnail_size", str(size))
+
+    def _preview_score_threshold(self, value: int) -> None:
+        self.score_threshold_label.setText(self._format_score_threshold_label(value))
 
     def _update_score_threshold(self) -> None:
         self.score_threshold_label.setText(

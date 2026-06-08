@@ -1243,6 +1243,83 @@ class MetadataStore:
             if int(cur.rowcount) == 0:
                 raise ValueError("image not found")
 
+    def repair_missing_image_path(
+        self,
+        image_id: int,
+        *,
+        file_path: str,
+        file_size: int,
+        width: int | None,
+        height: int | None,
+        modified_time_ns: int,
+        duration_ms: int | None = None,
+    ) -> None:
+        normalized = os.path.abspath(os.path.expanduser(file_path))
+        file_name = os.path.basename(normalized)
+        file_ext = Path(file_name).suffix.lower()
+        modified_at = timestamp_ns_to_iso(modified_time_ns)
+        now = utc_now_iso()
+        with self.connect() as conn:
+            current = conn.execute(
+                """
+                SELECT id, file_size, modified_time_ns, is_missing
+                FROM images
+                WHERE id = ?
+                """,
+                (image_id,),
+            ).fetchone()
+            if current is None:
+                raise ValueError("image not found")
+            conflict = conn.execute(
+                """
+                SELECT id
+                FROM images
+                WHERE file_path = ?
+                  AND id != ?
+                """,
+                (normalized, image_id),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("another image already uses this path")
+
+            changed = (
+                int(current["file_size"]) != int(file_size)
+                or int(current["modified_time_ns"]) != int(modified_time_ns)
+                or bool(current["is_missing"])
+            )
+            conn.execute(
+                """
+                UPDATE images
+                SET file_path = ?,
+                    file_name = ?,
+                    file_ext = ?,
+                    file_size = ?,
+                    width = ?,
+                    height = ?,
+                    duration_ms = ?,
+                    modified_at = ?,
+                    modified_time_ns = ?,
+                    last_seen_at = ?,
+                    is_missing = 0
+                WHERE id = ?
+                """,
+                (
+                    normalized,
+                    file_name,
+                    file_ext,
+                    file_size,
+                    width,
+                    height,
+                    duration_ms,
+                    modified_at,
+                    modified_time_ns,
+                    now,
+                    image_id,
+                ),
+            )
+            if changed:
+                self._mark_image_media_stale(conn, image_id, now)
+
     def mark_embedding_not_required(self, image_id: int) -> None:
         with self.connect() as conn:
             conn.execute(

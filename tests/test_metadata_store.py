@@ -83,6 +83,47 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(image.thumbnail_status, "pending")
             self.assertEqual(image.embedding_status, "pending")
 
+    def test_repair_missing_image_path_relinks_single_file_and_marks_media_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            root = Path(tmp) / "library"
+            root.mkdir()
+            new_path = root / "relinked.jpg"
+            new_path.write_bytes(b"new image bytes")
+            stat = new_path.stat()
+
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(root / "missing.jpg"),
+                file_size=1,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            self.assertEqual(store.mark_missing_for_folder(folder_id, []), 1)
+
+            store.repair_missing_image_path(
+                image_id,
+                file_path=str(new_path),
+                file_size=stat.st_size,
+                width=640,
+                height=480,
+                modified_time_ns=stat.st_mtime_ns,
+            )
+
+            image = store.get_image(image_id)
+            self.assertIsNotNone(image)
+            self.assertFalse(image.is_missing)
+            self.assertEqual(image.file_path, str(new_path))
+            self.assertEqual(image.file_name, "relinked.jpg")
+            self.assertEqual((image.width, image.height), (640, 480))
+            self.assertEqual(image.thumbnail_status, "pending")
+            self.assertEqual(image.embedding_status, "pending")
+
     def test_remove_missing_images_from_library_keeps_existing_images(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"

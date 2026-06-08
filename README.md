@@ -17,6 +17,10 @@ model are still changing.
 - Stores metadata in SQLite under `~/Library/Application Support/Eidory/eidory.sqlite3`.
 - Supports nested library folders, manual tags, favorites, notes, and temporary inspiration projects.
 - Searches by keyword, semantic text query, similar image, color, and stacked filters.
+- Watches indexed local folders for new, changed, deleted, renamed, or moved files.
+- Repairs missing files by relinking a single file or remapping a moved folder prefix.
+- Detects exact and near-duplicate image candidates without deleting anything automatically.
+- Supports multi-image comparison for final reference judgment.
 - Uses local embeddings for image semantic search.
 - Uses an LLM provider for AI semantic probes and reference grouping.
 - Exports selected files or the whole logical library folder tree.
@@ -24,7 +28,6 @@ model are still changing.
 ## What It Does Not Do Yet
 
 - Cloud sync
-- Real-time file watching
 - AI auto-tagging
 - Full chat-based recommendation workflow
 - Signed macOS distribution
@@ -70,9 +73,10 @@ right-clicking `dist/Eidory.app` and choosing `Open`.
 1. Open Eidory.
 2. Create or select a library folder in the left sidebar.
 3. Click `导入到当前文件夹` to import images from a disk folder into the selected logical folder.
-4. Click `扫描全部` or `扫描新增` from the settings panel when files changed on disk.
-5. Click `开始索引` if semantic search has not indexed the imported images yet.
-6. Use the search bar with `语义`, `关键词`, `相似图`, or `颜色`.
+4. Keep `自动监听文件变化` enabled in the settings panel for local file changes.
+5. Click `扫描全部`, `扫描新增`, or `扫描缺失` from the settings panel when you need a manual scan.
+6. Click `开始索引` if semantic search has not indexed the imported images yet.
+7. Use the search bar with `语义`, `关键词`, `相似图`, or `颜色`.
 
 Eidory indexes files in place. Importing means “record these files in Eidory and
 assign them to the selected logical folder”; it does not copy the source files.
@@ -94,6 +98,23 @@ Search logic:
 
 The minimum-similarity slider controls how many semantic/color/probe results are
 kept. Lower values are broader; higher values are stricter.
+
+## Library Maintenance
+
+Open the right sidebar `设置` tab for maintenance:
+
+- `查看/修复丢失`: lists missing source files, relinks one file, remaps a moved folder, or removes missing records from Eidory only.
+- `扫描新增`: finds new or changed files without marking deleted files as missing.
+- `扫描缺失`: rescans folders that currently contain missing records.
+- `检测重复`: finds exact duplicate files and near-duplicate image candidates. It shows each candidate's folder so the user decides whether the duplicate is intentional.
+- `操作历史`: shows batch operations from the current app session.
+
+Automatic file watching marks deleted, renamed, or moved files as missing, but it
+does not silently delete records or decide which duplicates should be removed.
+
+Right-click selected images and choose `对比查看` to compare 2-6 images side by
+side. Double-click a single image for the existing large preview with zoom,
+source-file actions, and next/previous navigation.
 
 ## AI Semantic Probes
 

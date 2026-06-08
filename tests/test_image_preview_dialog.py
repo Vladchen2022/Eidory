@@ -109,12 +109,13 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 embedding_dim=2,
             )
             self.assertTrue(dialog.fit_to_window)
+            fit_zoom = dialog._fit_zoom_factor()
             dialog._zoom_by(120)
             self.assertFalse(dialog.fit_to_window)
-            self.assertGreater(dialog.zoom_factor, 1.0)
+            self.assertGreater(dialog.zoom_factor, fit_zoom)
             dialog._fit_image_to_window()
             self.assertTrue(dialog.fit_to_window)
-            self.assertEqual(dialog.zoom_factor, 1.0)
+            self.assertEqual(dialog.zoom_factor, dialog._fit_zoom_factor())
             dialog._actual_size_image()
             self.assertFalse(dialog.fit_to_window)
             self.assertEqual(dialog.zoom_factor, 1.0)
@@ -126,7 +127,130 @@ class ImagePreviewDialogTest(unittest.TestCase):
             self.assertFalse(dialog.fit_to_window)
             dialog._handle_space_pressed()
             self.assertTrue(dialog.fit_to_window)
-            self.assertEqual(dialog.zoom_factor, 1.0)
+            self.assertEqual(dialog.zoom_factor, dialog._fit_zoom_factor())
+            dialog.close()
+
+    def test_preview_first_wheel_zoom_starts_from_fit_scale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "large.jpg"
+            Image.new("RGB", (2400, 1600), color="green").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=2400,
+                height=1600,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            fit_zoom = dialog._fit_zoom_factor()
+            dialog._zoom_by(120)
+
+            self.assertFalse(dialog.fit_to_window)
+            self.assertGreater(dialog.zoom_factor, fit_zoom)
+            self.assertLess(dialog.zoom_factor, 1.0)
+            dialog.close()
+
+    def test_preview_wheel_zoom_reuses_loaded_pixmap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (1600, 1000), color="green").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=1600,
+                height=1000,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+
+            with patch.object(
+                ImagePreviewDialog,
+                "_load_preview_pixmap",
+                wraps=ImagePreviewDialog._load_preview_pixmap,
+            ) as load_preview:
+                dialog = ImagePreviewDialog(
+                    images=[store.get_image(image_id)],
+                    start_index=0,
+                    store=store,
+                    semantic_query=None,
+                    model_name="fake-model",
+                    model_revision="test",
+                    embedding_dim=2,
+                )
+                initial_loads = load_preview.call_count
+                dialog._zoom_by(120)
+
+                self.assertEqual(load_preview.call_count, initial_loads)
+                dialog._render_current_image()
+                self.assertFalse(dialog.fit_to_window)
+                dialog.close()
+
+    def test_preview_navigator_only_shows_when_image_can_pan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "large.jpg"
+            Image.new("RGB", (2400, 1600), color="green").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=2400,
+                height=1600,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            dialog.show()
+            self.app.processEvents()
+
+            self.assertTrue(dialog.fit_to_window)
+            self.assertFalse(dialog.image_view._navigator.isVisible())
+
+            dialog._actual_size_image()
+            self.app.processEvents()
+
+            self.assertFalse(dialog.fit_to_window)
+            self.assertTrue(dialog.image_view._navigator.isVisible())
+            self.assertGreater(dialog.image_view._navigator._visible_rect.width(), 0)
+            self.assertGreater(dialog.image_view._navigator._visible_rect.height(), 0)
+
+            dialog._fit_image_to_window()
+            self.app.processEvents()
+
+            self.assertTrue(dialog.fit_to_window)
+            self.assertFalse(dialog.image_view._navigator.isVisible())
             dialog.close()
 
     def test_fit_mode_scales_small_pixmap_up_to_preview_bounds(self) -> None:
@@ -195,7 +319,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 Qt.KeyboardModifier.NoModifier,
             )
 
-            self.assertTrue(dialog.eventFilter(dialog.image_label, event))
+            self.assertTrue(dialog.eventFilter(dialog.image_view.viewport(), event))
             self.assertFalse(dialog.isVisible())
 
     def test_preview_double_click_closes_video_surface(self) -> None:

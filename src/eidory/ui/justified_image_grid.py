@@ -4,7 +4,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QRect, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDrag, QPainter, QPixmap
+from PySide6.QtGui import QColor, QDrag, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication
 
 from eidory.core.media_types import is_supported_video
@@ -170,14 +170,19 @@ class JustifiedImageGridView(QAbstractScrollArea):
                 painter.drawPixmap(draw_rect, pixmap)
             self._draw_badges(painter, draw_rect, image)
             if index in self._selected_indexes:
-                painter.fillRect(draw_rect, QColor(79, 124, 255, 55))
-                pen = painter.pen()
-                painter.setPen(QColor("#4f7cff"))
-                painter.drawRect(draw_rect.adjusted(0, 0, -1, -1))
-                painter.setPen(pen)
+                old_pen = painter.pen()
+                painter.fillRect(draw_rect, QColor(79, 124, 255, 92))
+                outer_pen = QPen(QColor("#78a3ff"), 3)
+                inner_pen = QPen(QColor("#d7e3ff"), 1)
+                painter.setPen(outer_pen)
+                painter.drawRect(draw_rect.adjusted(1, 1, -2, -2))
+                painter.setPen(inner_pen)
+                painter.drawRect(draw_rect.adjusted(4, 4, -5, -5))
+                painter.setPen(old_pen)
             if index == self._selected_index and index not in self._selected_indexes:
                 pen = painter.pen()
-                painter.setPen(QColor("#2f80ed"))
+                focus_pen = QPen(QColor("#78a3ff"), 2)
+                painter.setPen(focus_pen)
                 painter.drawRect(draw_rect.adjusted(0, 0, -1, -1))
                 painter.setPen(pen)
 

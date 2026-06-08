@@ -78,6 +78,90 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(window.advanced_search_widget.isHidden())
             window.close()
 
+    def test_search_operation_defaults_to_replace_until_results_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            self.assertTrue(window.search_replace_results_button.isChecked())
+            self.assertFalse(window.search_within_results_button.isEnabled())
+            self.assertFalse(window.search_merge_results_button.isEnabled())
+
+            window.search_within_results_button.setChecked(True)
+            self.assertEqual(window._selected_search_operation_mode(), "replace")
+
+            window.current_result_mode = "keyword"
+            window._refresh_search_operation_controls()
+            self.assertTrue(window.search_within_results_button.isEnabled())
+            self.assertTrue(window.search_merge_results_button.isEnabled())
+            window.close()
+
+    def test_empty_side_panels_explain_next_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            self.assertIn("先在图片墙选择", window.tag_panel_selection_label.text())
+            self.assertIn("顶栏“标签”用于筛选", window.tag_panel_selection_label.text())
+            self.assertIn("选择图片后", window.collection_detail_help_label.text())
+            self.assertIn("AI 标签", window.collection_detail_help_label.text())
+            self.assertEqual(window.grid_view.accessibleName(), "Image wall")
+            self.assertEqual(window.search_input.accessibleName(), "Search text")
+            window.close()
+
+    def test_result_status_uses_unified_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "image.jpg"),
+                file_size=100,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            status = window.result_state_label.text()
+            self.assertIn("总数 1", status)
+            self.assertIn("当前范围 1", status)
+            self.assertIn("已加载 1", status)
+            self.assertIn("缺失 0", status)
+            self.assertIn("结果 -", status)
+            window.close()
+
     def test_main_window_has_minimize_shortcut(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(

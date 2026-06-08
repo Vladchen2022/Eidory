@@ -281,6 +281,7 @@ class MainWindow(QMainWindow):
         self._configure_native_titlebar()
         self.setStatusBar(QStatusBar())
         self._build_ui()
+        self._configure_accessibility_labels()
         self._apply_runtime_language_settings()
         self._connect_signals()
         self._refresh_folders()
@@ -290,6 +291,7 @@ class MainWindow(QMainWindow):
         self._refresh_tags()
         self._refresh_saved_views()
         self._reload_images()
+        self._refresh_search_operation_controls()
         self._refresh_embedding_stats()
         self._refresh_ai_vision_stats()
         QTimer.singleShot(1200, self._run_startup_self_check)
@@ -600,7 +602,7 @@ class MainWindow(QMainWindow):
         self.search_within_results_button.setCheckable(True)
         self.search_merge_results_button.setCheckable(True)
         self.search_replace_results_button.setCheckable(True)
-        self.search_within_results_button.setChecked(True)
+        self.search_replace_results_button.setChecked(True)
         self.search_within_results_button.setToolTip("第二轮搜索时，只在当前结果中继续筛选")
         self.search_merge_results_button.setToolTip("第二轮搜索时，重新搜索当前图库/文件夹范围，并与当前结果合并")
         self.search_replace_results_button.setToolTip("清空当前搜索条件，用这次搜索替换当前结果")
@@ -740,6 +742,7 @@ class MainWindow(QMainWindow):
         self.search_diagnostics_label.setWordWrap(False)
         self.search_diagnostics_label.setFixedHeight(20)
         self.search_diagnostics_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.search_diagnostics_label.hide()
 
         self.grid_view = JustifiedImageGridView(
             thumbnail_size=self.initial_thumbnail_size,
@@ -772,8 +775,8 @@ class MainWindow(QMainWindow):
         compact_status_row = QHBoxLayout()
         compact_status_row.setContentsMargins(0, 0, 0, 0)
         compact_status_row.setSpacing(12)
-        compact_status_row.addWidget(self.result_state_label, 2)
-        compact_status_row.addWidget(self.search_diagnostics_label, 3)
+        compact_status_row.addWidget(self.result_state_label, 1)
+        compact_status_row.addWidget(self.search_diagnostics_label)
 
         layout.addLayout(search_row)
         layout.addWidget(self.advanced_search_widget)
@@ -890,7 +893,7 @@ class MainWindow(QMainWindow):
         batch_tags_layout.addLayout(batch_add_row)
         batch_tags_layout.addLayout(batch_remove_row)
 
-        self.tag_panel_selection_label = QLabel("未选择图片")
+        self.tag_panel_selection_label = QLabel("先在图片墙选择 1 张或多张图片。")
         self.tag_panel_selection_label.setWordWrap(True)
         self.tag_panel_input = QLineEdit()
         self.tag_panel_input.setPlaceholderText("给选中图片添加标签，逗号分隔")
@@ -1036,12 +1039,17 @@ class MainWindow(QMainWindow):
         self.collection_detail_import_dir_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
+        self.collection_detail_help_label = QLabel(
+            "当前没有选中图片。选择图片后，这里会显示路径、标签、备注、AI 标签和删除/移除操作。"
+        )
+        self.collection_detail_help_label.setWordWrap(True)
         collection_form.addRow("文件夹", self.collection_detail_name_label)
         collection_form.addRow("层级", self.collection_detail_path_label)
         collection_form.addRow("图片/视频", self.collection_detail_count_label)
         collection_form.addRow("保存位置", self.collection_detail_import_dir_label)
         self.open_collection_import_dir_button = QPushButton("打开保存位置")
         collection_detail_layout.addLayout(collection_form)
+        collection_detail_layout.addWidget(self.collection_detail_help_label)
         collection_detail_layout.addWidget(self.open_collection_import_dir_button)
         collection_detail_layout.addStretch(1)
         self.collection_detail_widget.hide()
@@ -1848,6 +1856,41 @@ class MainWindow(QMainWindow):
                 handle.write(entry + "\n")
         except Exception:
             pass
+
+    def _configure_accessibility_labels(self) -> None:
+        pairs = [
+            (self, "Eidory main window", "Local image library manager"),
+            (self.search_input, "Search text", "File name, tags, notes, or semantic search text"),
+            (self.reverse_exclusion_button, "Reverse exclusion toggle", "Use selected filter buttons as exclusion filters"),
+            (self.color_mode_button, "Color filter", "Pick a color and filter images by dominant color similarity"),
+            (self.keyword_mode_button, "Keyword search mode", "Search file names, tags and notes"),
+            (self.semantic_mode_button, "Semantic search mode", "Search images by semantic embedding"),
+            (self.collection_filter_button, "Folder filter", "Filter or exclude selected folders"),
+            (self.tag_filter_button, "Tag filter", "Filter or exclude selected user tags"),
+            (self.similar_image_button, "Similar image search", "Search images similar to the selected image"),
+            (self.search_button, "Run search", "Run the selected search"),
+            (self.clear_search_button, "Clear search", "Clear current filters and search state"),
+            (self.advanced_search_toggle_button, "Search and sort panel", "Show or hide advanced search controls"),
+            (self.search_replace_results_button, "Replace results", "Search the current scope from scratch"),
+            (self.search_within_results_button, "Search within results", "Narrow the current visible result set"),
+            (self.search_merge_results_button, "Merge results", "Union a new search with current results"),
+            (self.result_state_label, "Result status", "Unified library and search result status"),
+            (self.grid_view, "Image wall", "Selectable image and video result grid"),
+            (self.collection_tree, "Library folders", "Nested Eidory folder tree"),
+            (self.temp_project_list, "Inspiration stash", "Saved temporary reference groups"),
+            (self.right_tab_widget, "Right side panel", "Details, AI, tag, index and settings pages"),
+            (self.preview_label, "Selected item preview", "Preview of selected image or folder state"),
+            (self.tag_panel_selection_label, "Tag page selection status", "Shows which selected images can be tagged"),
+            (self.tag_panel_input, "Add tags to selection", "Comma-separated tags to add to selected images"),
+            (self.tag_list, "Tag management list", "Existing user tags for filtering and management"),
+            (self.settings_status_label, "Settings status", "Settings, self-check and error status output"),
+        ]
+        for widget, name, description in pairs:
+            try:
+                widget.setAccessibleName(name)
+                widget.setAccessibleDescription(description)
+            except RuntimeError:
+                continue
 
     def _apply_runtime_language_settings(self) -> None:
         if self.current_language == "en":
@@ -3043,11 +3086,22 @@ class MainWindow(QMainWindow):
         return SearchFilter("keyword", query)
 
     def _selected_search_operation_mode(self) -> str:
+        if not self._has_visible_result_context():
+            return "replace"
         if self.search_merge_results_button.isChecked():
             return "merge"
         if self.search_replace_results_button.isChecked():
             return "replace"
         return "refine"
+
+    def _refresh_search_operation_controls(self) -> None:
+        if not hasattr(self, "search_within_results_button"):
+            return
+        has_results = self._has_visible_result_context()
+        self.search_within_results_button.setEnabled(has_results)
+        self.search_merge_results_button.setEnabled(has_results)
+        if not has_results:
+            self.search_replace_results_button.setChecked(True)
 
     def _start_search_with_filter(self, search_filter: SearchFilter) -> None:
         operation_mode = self._selected_search_operation_mode()
@@ -4553,9 +4607,51 @@ class MainWindow(QMainWindow):
         self._reload_images()
 
     def _set_result_status(self, message: str) -> None:
-        self.result_state_label.setText(message)
+        display_message = self._format_unified_result_status(message)
+        self.result_state_label.setText(display_message)
         self.statusBar().showMessage(message)
         self._refresh_result_management_buttons()
+        self._refresh_search_operation_controls()
+
+    def _format_unified_result_status(self, context: str) -> str:
+        try:
+            total = self.store.count_images()
+            missing = self.store.count_missing_images()
+            scope_count = self._current_scope_count_for_status(total=total, missing=missing)
+        except Exception:
+            total = 0
+            missing = 0
+            scope_count = 0
+        loaded = self.grid_view.rowCount() if hasattr(self, "grid_view") else 0
+        result_count = loaded if self._has_visible_result_context() else "-"
+        context_label = self._compact_status_context(context)
+        parts = [
+            f"总数 {total}",
+            f"当前范围 {scope_count}",
+            f"已加载 {loaded}",
+            f"缺失 {missing}",
+            f"结果 {result_count}",
+        ]
+        if context_label:
+            parts.append(context_label)
+        return " ｜ ".join(parts)
+
+    def _current_scope_count_for_status(self, *, total: int, missing: int) -> int:
+        collection_id = self._selected_collection_id()
+        if collection_id is not None:
+            return self.store.collection_image_counts().get(collection_id, 0)
+        return max(0, total - missing)
+
+    @staticmethod
+    def _compact_status_context(context: str) -> str:
+        clean = " ".join(str(context or "").split())
+        if not clean:
+            return ""
+        if clean.startswith("全部图库"):
+            return "全部图库"
+        if clean.startswith("已加载 "):
+            return "全部图库"
+        return clean
 
     def _shuffle_current_grid_images(self) -> None:
         images = self.grid_view.images()
@@ -5690,8 +5786,11 @@ class MainWindow(QMainWindow):
             available = max(0, total - missing)
             self.collection_detail_name_label.setText("全部文件夹")
             self.collection_detail_path_label.setText("全部文件夹")
-            self.collection_detail_count_label.setText(f"{available} 个可用，{missing} 个丢失")
+            self.collection_detail_count_label.setText(f"{available} 个可用 / {missing} 个丢失 / 共 {total} 个")
             self.collection_detail_import_dir_label.setText("-")
+            self.collection_detail_help_label.setText(
+                "当前范围是全部文件夹。选择左侧文件夹可缩小范围；在图片墙选择图片后，这里会显示路径、标签、备注、AI 标签和删除/移除操作。"
+            )
             self.open_collection_import_dir_button.setEnabled(False)
             self.ai_vision_detail_label.setText("-")
             return
@@ -5702,6 +5801,9 @@ class MainWindow(QMainWindow):
             self.collection_detail_path_label.setText("-")
             self.collection_detail_count_label.setText("-")
             self.collection_detail_import_dir_label.setText("-")
+            self.collection_detail_help_label.setText(
+                "当前没有可显示的文件夹详情。请选择左侧文件夹，或在图片墙选择图片。"
+            )
             self.open_collection_import_dir_button.setEnabled(False)
             self.ai_vision_detail_label.setText("-")
             return
@@ -5712,6 +5814,9 @@ class MainWindow(QMainWindow):
         self.collection_detail_path_label.setText(self._collection_path_text(collection_id))
         self.collection_detail_count_label.setText(f"{counts.get(collection_id, 0)} 个")
         self.collection_detail_import_dir_label.setText(str(import_dir))
+        self.collection_detail_help_label.setText(
+            "当前显示的是所选文件夹范围。可以把图片拖入中间图片墙导入；选择图片后，这里会切换为图片详情。"
+        )
         self.open_collection_import_dir_button.setEnabled(True)
 
     def _show_video_details(self, image: ImageItem) -> None:
@@ -5830,7 +5935,9 @@ class MainWindow(QMainWindow):
         image_ids = [image.id for image in selected]
         count = len(image_ids)
         if count == 0:
-            self.tag_panel_selection_label.setText("未选择图片")
+            self.tag_panel_selection_label.setText(
+                "先在图片墙选择 1 张或多张图片，然后在这里添加、移除或清空标签。顶栏“标签”用于筛选；这里用于编辑标签。"
+            )
             tag_counts: dict[str, int] = {}
         elif count == 1:
             self.tag_panel_selection_label.setText(f"已选择 1 张：{selected[0].file_name}")

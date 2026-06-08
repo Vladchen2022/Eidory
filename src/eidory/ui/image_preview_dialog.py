@@ -5,8 +5,18 @@ from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image, ImageOps
-from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QImage, QKeyEvent, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QImage,
+    QKeyEvent,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -14,12 +24,15 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QDialog,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsTextItem,
+    QGraphicsView,
     QHBoxLayout,
     QLabel,
     QMenu,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QSlider,
     QStackedWidget,
@@ -31,6 +44,390 @@ from eidory.core.image_loader import open_local_image
 from eidory.core.media_types import is_supported_video
 from eidory.core.metadata_store import MetadataStore
 from eidory.models import ImageItem
+
+
+class PreviewNavigator(QWidget):
+    centerRequested = Signal(float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thumbnail = QPixmap()
+        self._source_width = 1
+        self._source_height = 1
+        self._visible_rect = QRectF()
+        self._image_rect = QRectF()
+        self.setAutoFillBackground(False)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.hide()
+
+    def set_state(
+        self,
+        *,
+        thumbnail: QPixmap,
+        source_width: int,
+        source_height: int,
+        visible_rect: QRectF,
+    ) -> None:
+        if thumbnail.isNull() or source_width <= 0 or source_height <= 0:
+            self.hide()
+            return
+        self._thumbnail = thumbnail
+        self._source_width = max(1, source_width)
+        self._source_height = max(1, source_height)
+        self._visible_rect = visible_rect
+        self._image_rect = QRectF(6, 6, thumbnail.width(), thumbnail.height())
+        wanted_width = thumbnail.width() + 12
+        wanted_height = thumbnail.height() + 12
+        if self.width() != wanted_width or self.height() != wanted_height:
+            self.resize(wanted_width, wanted_height)
+        self.show()
+        self.raise_()
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        if self._thumbnail.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        outer = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(QPen(QColor(84, 94, 108, 210), 1))
+        painter.setBrush(QColor(22, 25, 30, 190))
+        painter.drawRoundedRect(outer, 5, 5)
+
+        painter.drawPixmap(self._image_rect.toRect(), self._thumbnail)
+        view_rect = self._mapped_visible_rect()
+        if not view_rect.isEmpty():
+            painter.setPen(QPen(QColor(255, 255, 255, 235), 2))
+            painter.setBrush(QColor(255, 255, 255, 28))
+            painter.drawRoundedRect(view_rect.adjusted(1, 1, -1, -1), 2, 2)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._request_center(event)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._request_center(event)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def _mapped_visible_rect(self) -> QRectF:
+        if self._image_rect.isEmpty():
+            return QRectF()
+        scale_x = self._image_rect.width() / self._source_width
+        scale_y = self._image_rect.height() / self._source_height
+        visible = self._visible_rect.intersected(QRectF(0, 0, self._source_width, self._source_height))
+        return QRectF(
+            self._image_rect.left() + visible.left() * scale_x,
+            self._image_rect.top() + visible.top() * scale_y,
+            visible.width() * scale_x,
+            visible.height() * scale_y,
+        )
+
+    def _request_center(self, event) -> None:
+        position = event.position() if hasattr(event, "position") else event.pos()
+        if self._image_rect.isEmpty() or not self._image_rect.contains(position):
+            return
+        x_ratio = (position.x() - self._image_rect.left()) / self._image_rect.width()
+        y_ratio = (position.y() - self._image_rect.top()) / self._image_rect.height()
+        self.centerRequested.emit(
+            max(0.0, min(1.0, x_ratio)),
+            max(0.0, min(1.0, y_ratio)),
+        )
+
+
+class PreviewImageView(QGraphicsView):
+    zoomChanged = Signal(float, bool)
+    doubleClicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self._pixmap_item = QGraphicsPixmapItem()
+        self._message_item = QGraphicsTextItem()
+        self._scene.addItem(self._pixmap_item)
+        self._scene.addItem(self._message_item)
+        self.setScene(self._scene)
+
+        self._fit_to_window = True
+        self._zoom_factor = 1.0
+        self._original_width = 1
+        self._original_height = 1
+        self._source_width = 1
+        self._source_height = 1
+        self._has_pixmap = False
+        self._navigator_thumb = QPixmap()
+
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setBackgroundBrush(QColor("#2d3138"))
+        self.setStyleSheet("background:#2d3138;color:#d8dee9;")
+        self.setMinimumHeight(420)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontSavePainterState, True)
+        self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True)
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
+        self._pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._message_item.setDefaultTextColor(QColor("#d8dee9"))
+        self._smooth_timer = QTimer(self)
+        self._smooth_timer.setSingleShot(True)
+        self._smooth_timer.setInterval(90)
+        self._smooth_timer.timeout.connect(self._restore_smooth_transform)
+        self._navigator = PreviewNavigator(self.viewport())
+        self._navigator.centerRequested.connect(self._center_on_navigator_ratio)
+        self.horizontalScrollBar().valueChanged.connect(lambda _value: self._update_navigator())
+        self.verticalScrollBar().valueChanged.connect(lambda _value: self._update_navigator())
+        self.set_message("未选择图片")
+
+    @property
+    def fit_to_window(self) -> bool:
+        return self._fit_to_window
+
+    @property
+    def zoom_factor(self) -> float:
+        return self._zoom_factor
+
+    def set_message(self, text: str) -> None:
+        self._smooth_timer.stop()
+        self._has_pixmap = False
+        self._fit_to_window = True
+        self._zoom_factor = 1.0
+        self._navigator_thumb = QPixmap()
+        self._navigator.hide()
+        self._pixmap_item.setPixmap(QPixmap())
+        self._pixmap_item.hide()
+        self._message_item.setPlainText(text)
+        self._message_item.show()
+        self.resetTransform()
+        self._scene.setSceneRect(QRectF(0, 0, max(1, self.viewport().width()), max(1, self.viewport().height())))
+        self._center_message()
+        self._update_drag_mode()
+
+    def set_pixmap(
+        self,
+        pixmap: QPixmap,
+        *,
+        original_width: int | None,
+        original_height: int | None,
+        fit_to_window: bool,
+        zoom_factor: float,
+    ) -> None:
+        if pixmap.isNull():
+            self.set_message("无法预览")
+            return
+        center_ratio = self._current_center_ratio()
+        self._has_pixmap = True
+        self._message_item.hide()
+        self._pixmap_item.show()
+        self._pixmap_item.setPixmap(pixmap)
+        self._source_width = max(1, pixmap.width())
+        self._source_height = max(1, pixmap.height())
+        self._original_width = max(1, int(original_width or pixmap.width()))
+        self._original_height = max(1, int(original_height or pixmap.height()))
+        self._navigator_thumb = pixmap.scaled(
+            170,
+            130,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._scene.setSceneRect(QRectF(0, 0, self._source_width, self._source_height))
+        if fit_to_window:
+            self.fit_image_to_window(emit=False)
+        else:
+            self.set_zoom_factor(zoom_factor, emit=False)
+            self._center_on_ratio(center_ratio)
+        self._update_drag_mode()
+        self._schedule_navigator_update()
+
+    def fit_image_to_window(self, *, emit: bool = True) -> None:
+        if not self._has_pixmap:
+            return
+        self._smooth_timer.stop()
+        self._pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._fit_to_window = True
+        self._zoom_factor = self.fit_zoom_factor()
+        self._apply_zoom_transform(reset=True)
+        self.centerOn(self._pixmap_item)
+        self._update_drag_mode()
+        if emit:
+            self.zoomChanged.emit(self._zoom_factor, self._fit_to_window)
+
+    def set_actual_size(self, *, emit: bool = True) -> None:
+        if not self._has_pixmap:
+            return
+        self._smooth_timer.stop()
+        self._pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._fit_to_window = False
+        self._zoom_factor = 1.0
+        self._apply_zoom_transform(reset=True)
+        self.centerOn(self._pixmap_item)
+        self._update_drag_mode()
+        if emit:
+            self.zoomChanged.emit(self._zoom_factor, self._fit_to_window)
+
+    def set_zoom_factor(self, zoom_factor: float, *, emit: bool = True) -> None:
+        if not self._has_pixmap:
+            return
+        self._fit_to_window = False
+        self._zoom_factor = max(0.1, min(8.0, zoom_factor))
+        self._apply_zoom_transform(reset=True)
+        self._update_drag_mode()
+        if emit:
+            self.zoomChanged.emit(self._zoom_factor, self._fit_to_window)
+
+    def fit_zoom_factor(self) -> float:
+        if not self._has_pixmap:
+            return 1.0
+        viewport_width = max(1, self.viewport().width() - 2)
+        viewport_height = max(1, self.viewport().height() - 2)
+        return max(
+            0.1,
+            min(8.0, min(viewport_width / self._original_width, viewport_height / self._original_height)),
+        )
+
+    def zoom_by(self, wheel_delta: int) -> None:
+        if not self._has_pixmap or wheel_delta == 0:
+            return
+        if self._fit_to_window:
+            self._zoom_factor = self.fit_zoom_factor()
+            self._fit_to_window = False
+        step = 1.15 if wheel_delta > 0 else 1 / 1.15
+        self._zoom_factor = max(0.1, min(8.0, self._zoom_factor * step))
+        self._pixmap_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
+        self._apply_zoom_transform(reset=False)
+        self._update_drag_mode()
+        self._smooth_timer.start()
+        self.zoomChanged.emit(self._zoom_factor, self._fit_to_window)
+
+    def can_pan(self) -> bool:
+        return (
+            self._has_pixmap
+            and not self._fit_to_window
+            and (self.horizontalScrollBar().maximum() > 0 or self.verticalScrollBar().maximum() > 0)
+        )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._message_item.isVisible():
+            self._scene.setSceneRect(QRectF(0, 0, max(1, self.viewport().width()), max(1, self.viewport().height())))
+            self._center_message()
+        elif self._fit_to_window:
+            self.fit_image_to_window()
+        else:
+            self._position_navigator()
+            self._schedule_navigator_update()
+
+    def wheelEvent(self, event) -> None:
+        self.zoom_by(event.angleDelta().y())
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.doubleClicked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def _apply_zoom_transform(self, *, reset: bool) -> None:
+        target_view_scale = self._view_scale_for_zoom(self._zoom_factor)
+        if reset:
+            self.resetTransform()
+            self.scale(target_view_scale, target_view_scale)
+            return
+        current_view_scale = self.transform().m11()
+        if current_view_scale <= 0:
+            self.resetTransform()
+            self.scale(target_view_scale, target_view_scale)
+            return
+        factor = target_view_scale / current_view_scale
+        self.scale(factor, factor)
+
+    def _view_scale_for_zoom(self, zoom_factor: float) -> float:
+        return max(0.001, zoom_factor * self._original_width / self._source_width)
+
+    def _restore_smooth_transform(self) -> None:
+        self._pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._update_navigator()
+        self.viewport().update()
+
+    def _update_drag_mode(self) -> None:
+        can_pan = self.can_pan()
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag if can_pan else QGraphicsView.DragMode.NoDrag)
+        self.viewport().setCursor(Qt.CursorShape.OpenHandCursor if can_pan else Qt.CursorShape.ArrowCursor)
+        self._update_navigator()
+        self._schedule_navigator_update()
+
+    def _center_message(self) -> None:
+        rect = self._scene.sceneRect()
+        text_rect = self._message_item.boundingRect()
+        self._message_item.setPos(
+            rect.center().x() - text_rect.width() / 2,
+            rect.center().y() - text_rect.height() / 2,
+        )
+
+    def _current_center_ratio(self) -> tuple[float, float] | None:
+        if not self._has_pixmap or self._source_width <= 0 or self._source_height <= 0:
+            return None
+        center = self.mapToScene(self.viewport().rect().center())
+        return (
+            max(0.0, min(1.0, center.x() / self._source_width)),
+            max(0.0, min(1.0, center.y() / self._source_height)),
+        )
+
+    def _center_on_ratio(self, center_ratio: tuple[float, float] | None) -> None:
+        if center_ratio is None:
+            self.centerOn(self._pixmap_item)
+            return
+        self.centerOn(
+            center_ratio[0] * self._source_width,
+            center_ratio[1] * self._source_height,
+        )
+
+    def _center_on_navigator_ratio(self, x_ratio: float, y_ratio: float) -> None:
+        if not self._has_pixmap:
+            return
+        self.centerOn(x_ratio * self._source_width, y_ratio * self._source_height)
+        self._update_navigator()
+
+    def _visible_source_rect(self) -> QRectF:
+        if not self._has_pixmap:
+            return QRectF()
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        return visible.intersected(QRectF(0, 0, self._source_width, self._source_height))
+
+    def _position_navigator(self) -> None:
+        if not hasattr(self, "_navigator") or self._navigator.isHidden():
+            return
+        margin = 14
+        self._navigator.move(
+            max(0, self.viewport().width() - self._navigator.width() - margin),
+            max(0, self.viewport().height() - self._navigator.height() - margin),
+        )
+
+    def _update_navigator(self) -> None:
+        if not hasattr(self, "_navigator"):
+            return
+        if not self.can_pan() or self._navigator_thumb.isNull():
+            self._navigator.hide()
+            return
+        self._navigator.set_state(
+            thumbnail=self._navigator_thumb,
+            source_width=self._source_width,
+            source_height=self._source_height,
+            visible_rect=self._visible_source_rect(),
+        )
+        self._position_navigator()
+
+    def _schedule_navigator_update(self) -> None:
+        QTimer.singleShot(0, self._update_navigator)
 
 
 class ImagePreviewDialog(QDialog):
@@ -71,27 +468,24 @@ class ImagePreviewDialog(QDialog):
         self._pan_start_vertical = 0
         self._shortcuts: list[QShortcut] = []
         self._app_event_filter_installed = False
+        self._preview_source_key: tuple[int, str, int, int, bool, bool] | None = None
+        self._preview_source_pixmap = QPixmap()
+        self._zoom_refine_timer = QTimer(self)
+        self._zoom_refine_timer.setSingleShot(True)
+        self._zoom_refine_timer.setInterval(90)
+        self._zoom_refine_timer.timeout.connect(self._render_current_image)
 
         self.setWindowTitle("Eidory 预览")
         self.resize(1200, 820)
         self.setMinimumSize(720, 520)
 
-        self.image_label = QLabel("未选择图片")
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setStyleSheet("background:#2d3138;color:#d8dee9;")
-        self.image_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.image_label.customContextMenuRequested.connect(self._show_image_context_menu)
-        self.image_label.installEventFilter(self)
-
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidget(self.image_label)
-        self.scroll_area.setWidgetResizable(False)
-        self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.scroll_area.setMinimumHeight(420)
-        self.scroll_area.setStyleSheet("background:#2d3138;")
-        self.scroll_area.viewport().installEventFilter(self)
-        self.scroll_area.viewport().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.scroll_area.viewport().customContextMenuRequested.connect(self._show_image_context_menu)
+        self.image_view = PreviewImageView()
+        self.image_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.image_view.viewport().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.image_view.customContextMenuRequested.connect(self._show_image_context_menu)
+        self.image_view.viewport().customContextMenuRequested.connect(self._show_image_context_menu)
+        self.image_view.doubleClicked.connect(self.close)
+        self.image_view.zoomChanged.connect(self._handle_image_zoom_changed)
 
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumHeight(420)
@@ -105,7 +499,7 @@ class ImagePreviewDialog(QDialog):
         self.video_player.setVideoOutput(self.video_widget)
 
         self.preview_stack = QStackedWidget()
-        self.preview_stack.addWidget(self.scroll_area)
+        self.preview_stack.addWidget(self.image_view)
         self.preview_stack.addWidget(self.video_widget)
 
         self.info_label = QLabel("-")
@@ -241,14 +635,6 @@ class ImagePreviewDialog(QDialog):
 
     def eventFilter(self, watched, event) -> bool:
         if (
-            hasattr(self, "scroll_area")
-            and watched == self.scroll_area.viewport()
-            and event.type() == QEvent.Type.Resize
-        ):
-            if self.fit_to_window:
-                self._schedule_fit_to_window()
-            return super().eventFilter(watched, event)
-        if (
             self._is_preview_surface(watched)
             and event.type() == QEvent.Type.MouseButtonDblClick
             and event.button() == Qt.MouseButton.LeftButton
@@ -268,27 +654,6 @@ class ImagePreviewDialog(QDialog):
                         self._handle_space_pressed()
                     event.accept()
                     return True
-        if (
-            (watched == self.scroll_area.viewport() or watched == self.image_label)
-            and event.type() == QEvent.Type.Wheel
-        ):
-            self._zoom_by(event.angleDelta().y())
-            event.accept()
-            return True
-        if watched == self.scroll_area.viewport() or watched == self.image_label:
-            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-                if self._can_pan():
-                    self._start_pan(event)
-                    event.accept()
-                    return True
-            if event.type() == QEvent.Type.MouseMove and self._panning:
-                self._pan_to(event)
-                event.accept()
-                return True
-            if event.type() == QEvent.Type.MouseButtonRelease and self._panning:
-                self._stop_pan()
-                event.accept()
-                return True
         return super().eventFilter(watched, event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
@@ -325,9 +690,8 @@ class ImagePreviewDialog(QDialog):
         image = self.current_image()
         if image is None:
             self.info_label.setText("-")
-            self.image_label.setPixmap(QPixmap())
-            self.image_label.setText("未选择图片")
-            self.image_label.resize(self.scroll_area.viewport().size())
+            self._clear_preview_pixmap_cache()
+            self.image_view.set_message("未选择图片")
             self.video_controls_widget.hide()
             self.fit_button.setEnabled(False)
             self.actual_size_button.setEnabled(False)
@@ -409,36 +773,24 @@ class ImagePreviewDialog(QDialog):
             return
         self._stop_video()
         self.video_controls_widget.hide()
-        self.preview_stack.setCurrentWidget(self.scroll_area)
+        self.preview_stack.setCurrentWidget(self.image_view)
         self.fit_button.setEnabled(True)
         self.actual_size_button.setEnabled(True)
         self.grayscale_button.setEnabled(True)
         self.mirror_button.setEnabled(True)
         self.copy_image_button.setEnabled(True)
         max_width, max_height = self._render_bounds()
-        pixmap = self._load_preview_pixmap(
-            image.file_path,
-            max_width,
-            max_height,
-        )
+        pixmap = self._load_preview_source_pixmap(image, max_width, max_height)
         if pixmap.isNull():
-            fallback = image.thumbnail_path if image.thumbnail_path and Path(image.thumbnail_path).exists() else None
-            pixmap = QPixmap(fallback) if fallback else QPixmap()
-        if pixmap.isNull():
-            self.image_label.setPixmap(QPixmap())
-            self.image_label.setText("无法预览")
-            self.image_label.resize(self.scroll_area.viewport().size())
+            self.image_view.set_message("无法预览")
             return
-        self.image_label.setText("")
-        pixmap = self._apply_preview_transforms(
+        self.image_view.set_pixmap(
             pixmap,
-            grayscale=self.grayscale_preview,
-            mirror_horizontal=self.mirrored_preview,
+            original_width=image.width,
+            original_height=image.height,
+            fit_to_window=self.fit_to_window,
+            zoom_factor=self.zoom_factor,
         )
-        pixmap = self._scale_pixmap_to_bounds(pixmap, max_width, max_height)
-        self.image_label.setPixmap(pixmap)
-        self.image_label.resize(pixmap.size())
-        self._update_pan_cursor()
         self._update_info(image)
 
     def _render_current_video(self, image: ImageItem) -> None:
@@ -468,7 +820,7 @@ class ImagePreviewDialog(QDialog):
         self._update_info(image)
 
     def _render_bounds(self) -> tuple[int, int]:
-        viewport = self.scroll_area.viewport().size()
+        viewport = self.image_view.viewport().size()
         width = max(1, viewport.width() - 2)
         height = max(1, viewport.height() - 2)
         if self.fit_to_window:
@@ -479,14 +831,22 @@ class ImagePreviewDialog(QDialog):
         return max(1, int(width * self.zoom_factor)), max(1, int(height * self.zoom_factor))
 
     @staticmethod
-    def _scale_pixmap_to_bounds(pixmap: QPixmap, max_width: int, max_height: int) -> QPixmap:
+    def _scale_pixmap_to_bounds(
+        pixmap: QPixmap,
+        max_width: int,
+        max_height: int,
+        *,
+        smooth: bool = True,
+    ) -> QPixmap:
         if pixmap.isNull() or max_width <= 0 or max_height <= 0:
             return pixmap
         return pixmap.scaled(
             max_width,
             max_height,
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.SmoothTransformation
+            if smooth
+            else Qt.TransformationMode.FastTransformation,
         )
 
     @staticmethod
@@ -518,26 +878,43 @@ class ImagePreviewDialog(QDialog):
             self._render_current_image()
 
     def _zoom_by(self, wheel_delta: int) -> None:
-        if wheel_delta == 0:
+        image = self.current_image()
+        if image is None or is_supported_video(image.file_path):
             return
-        if self.fit_to_window:
-            self.fit_to_window = False
-            self.zoom_factor = 1.0
-        step = 1.15 if wheel_delta > 0 else 1 / 1.15
-        self.zoom_factor = max(0.1, min(8.0, self.zoom_factor * step))
-        self._render_current_image()
+        self.image_view.zoom_by(wheel_delta)
 
     def _fit_image_to_window(self) -> None:
+        self._zoom_refine_timer.stop()
         self.fit_to_window = True
-        self.zoom_factor = 1.0
         self._stop_pan()
-        self._render_current_image()
+        self.image_view.fit_image_to_window()
+        self.zoom_factor = self.image_view.zoom_factor
+        image = self.current_image()
+        if image is not None:
+            self._update_info(image)
 
     def _actual_size_image(self) -> None:
+        self._zoom_refine_timer.stop()
         self.fit_to_window = False
-        self.zoom_factor = 1.0
         self._stop_pan()
-        self._render_current_image()
+        self.image_view.set_actual_size()
+        self.zoom_factor = self.image_view.zoom_factor
+        image = self.current_image()
+        if image is not None:
+            self._update_info(image)
+
+    def _handle_image_zoom_changed(self, zoom_factor: float, fit_to_window: bool) -> None:
+        self.zoom_factor = zoom_factor
+        self.fit_to_window = fit_to_window
+        image = self.current_image()
+        if image is None or is_supported_video(image.file_path):
+            return
+        self._update_info(image)
+        if not fit_to_window:
+            self._zoom_refine_timer.start()
+
+    def _fit_zoom_factor(self) -> float:
+        return self.image_view.fit_zoom_factor()
 
     def _schedule_fit_to_window(self) -> None:
         QTimer.singleShot(0, self._fit_current_media_to_window)
@@ -555,40 +932,97 @@ class ImagePreviewDialog(QDialog):
             self._fit_image_to_window()
 
     def _can_pan(self) -> bool:
-        horizontal = self.scroll_area.horizontalScrollBar()
-        vertical = self.scroll_area.verticalScrollBar()
-        return not self.fit_to_window and (horizontal.maximum() > 0 or vertical.maximum() > 0)
+        return self.image_view.can_pan()
 
     def _start_pan(self, event) -> None:
-        self._panning = True
-        self._pan_start_pos = self._event_position(event)
-        self._pan_start_horizontal = self.scroll_area.horizontalScrollBar().value()
-        self._pan_start_vertical = self.scroll_area.verticalScrollBar().value()
-        self.scroll_area.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
-        self.image_label.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self._panning = False
 
     def _pan_to(self, event) -> None:
-        delta = self._event_position(event) - self._pan_start_pos
-        self.scroll_area.horizontalScrollBar().setValue(self._pan_start_horizontal - delta.x())
-        self.scroll_area.verticalScrollBar().setValue(self._pan_start_vertical - delta.y())
+        return
 
     def _stop_pan(self) -> None:
         self._panning = False
-        self._update_pan_cursor()
+        self.image_view._update_drag_mode()
 
     def _update_pan_cursor(self) -> None:
-        cursor = Qt.CursorShape.OpenHandCursor if self._can_pan() else Qt.CursorShape.ArrowCursor
-        self.scroll_area.viewport().setCursor(cursor)
-        self.image_label.setCursor(cursor)
+        self.image_view._update_drag_mode()
 
     def _is_preview_surface(self, watched) -> bool:
-        if hasattr(self, "image_label") and watched is self.image_label:
+        if hasattr(self, "image_view") and watched is self.image_view:
             return True
-        if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport():
+        if hasattr(self, "image_view") and watched is self.image_view.viewport():
             return True
         if hasattr(self, "video_widget") and watched is self.video_widget:
             return True
         return False
+
+    def _fit_render_bounds(self) -> tuple[int, int]:
+        viewport = self.image_view.viewport().size()
+        return max(1, viewport.width() - 2), max(1, viewport.height() - 2)
+
+    def _load_preview_source_pixmap(
+        self,
+        image: ImageItem,
+        target_width: int,
+        target_height: int,
+    ) -> QPixmap:
+        key = (
+            image.id,
+            image.file_path,
+            image.file_size,
+            image.modified_time_ns,
+            self.grayscale_preview,
+            self.mirrored_preview,
+        )
+        if key != self._preview_source_key:
+            self._clear_preview_pixmap_cache()
+            self._preview_source_key = key
+
+        if self._preview_source_pixmap.isNull() or self._preview_source_is_too_small(
+            target_width,
+            target_height,
+        ):
+            load_width, load_height = self._source_load_bounds(image, target_width, target_height)
+            pixmap = self._load_preview_pixmap(image.file_path, load_width, load_height)
+            if pixmap.isNull():
+                fallback = (
+                    image.thumbnail_path
+                    if image.thumbnail_path and Path(image.thumbnail_path).exists()
+                    else None
+                )
+                pixmap = QPixmap(fallback) if fallback else QPixmap()
+            pixmap = self._apply_preview_transforms(
+                pixmap,
+                grayscale=self.grayscale_preview,
+                mirror_horizontal=self.mirrored_preview,
+            )
+            self._preview_source_pixmap = pixmap
+        return self._preview_source_pixmap
+
+    def _preview_source_is_too_small(self, target_width: int, target_height: int) -> bool:
+        if self._preview_source_pixmap.isNull():
+            return True
+        return (
+            target_width > int(self._preview_source_pixmap.width() * 0.9)
+            or target_height > int(self._preview_source_pixmap.height() * 0.9)
+        )
+
+    @staticmethod
+    def _source_load_bounds(
+        image: ImageItem,
+        target_width: int,
+        target_height: int,
+    ) -> tuple[int, int]:
+        preload = 1.6
+        wanted_width = max(1, int(target_width * preload))
+        wanted_height = max(1, int(target_height * preload))
+        if image.width and image.height:
+            return min(image.width, wanted_width), min(image.height, wanted_height)
+        return wanted_width, wanted_height
+
+    def _clear_preview_pixmap_cache(self) -> None:
+        self._preview_source_key = None
+        self._preview_source_pixmap = QPixmap()
 
     def _toggle_video_playback(self) -> None:
         image = self.current_image()
@@ -654,7 +1088,7 @@ class ImagePreviewDialog(QDialog):
         if hasattr(sender, "mapToGlobal"):
             global_position = sender.mapToGlobal(position)
         else:
-            global_position = self.scroll_area.viewport().mapToGlobal(position)
+            global_position = self.image_view.viewport().mapToGlobal(position)
         action = menu.exec(global_position)
         if action == fit_action:
             self._fit_image_to_window()
@@ -760,8 +1194,8 @@ class ImagePreviewDialog(QDialog):
         image = self.current_image()
         if image is None or is_supported_video(image.file_path):
             return
-        width = image.width or self.scroll_area.viewport().width()
-        height = image.height or self.scroll_area.viewport().height()
+        width = image.width or self.image_view.viewport().width()
+        height = image.height or self.image_view.viewport().height()
         pixmap = self._load_preview_pixmap(image.file_path, width, height)
         if pixmap.isNull():
             fallback = image.thumbnail_path if image.thumbnail_path and Path(image.thumbnail_path).exists() else None

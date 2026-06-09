@@ -160,6 +160,51 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertIsNotNone(store.get_image(existing_id))
             self.assertEqual(store.count_missing_images(), 0)
 
+    def test_remove_unclassified_active_roots_removes_stale_scan_roots_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+
+            stale_folder_id = store.add_folder(str(Path(tmp) / "old-root"))
+            stale_image_id, _state = store.upsert_image(
+                folder_id=stale_folder_id,
+                file_path=str(Path(tmp) / "old-root" / "orphan.jpg"),
+                file_size=1,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            store.update_thumbnail(stale_image_id, str(Path(tmp) / "thumb_old.webp"), "ready")
+
+            managed_folder_id = store.add_folder(str(Path(tmp) / "managed-root"))
+            managed_image_id, _state = store.upsert_image(
+                folder_id=managed_folder_id,
+                file_path=str(Path(tmp) / "managed-root" / "kept.jpg"),
+                file_size=2,
+                width=30,
+                height=40,
+                created_time_ns=None,
+                modified_time_ns=2,
+            )
+            collection_id = store.create_collection("参考")
+            store.assign_images_to_collection([managed_image_id], collection_id)
+            self.assertEqual(
+                [folder.id for folder in store.list_folders_with_collection_images()],
+                [managed_folder_id],
+            )
+
+            thumbnail_paths, removed_roots, removed_images = store.remove_unclassified_active_roots()
+
+            self.assertEqual(thumbnail_paths, [str(Path(tmp) / "thumb_old.webp")])
+            self.assertEqual(removed_roots, 1)
+            self.assertEqual(removed_images, 1)
+            self.assertIsNone(store.get_folder(stale_folder_id))
+            self.assertIsNone(store.get_image(stale_image_id))
+            self.assertIsNotNone(store.get_folder(managed_folder_id))
+            self.assertIsNotNone(store.get_image(managed_image_id))
+
     def test_search_feedback_is_query_and_model_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"
@@ -822,6 +867,26 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(store.list_folders(include_inactive=True), [])
             self.assertEqual(store.list_tags(), [])
 
+    def test_restore_snapshot_recreates_folder_after_last_image_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            root = Path(tmp) / "library"
+            folder_id = store.add_folder(str(root))
+            image_id = self._insert_image(store, folder_id, root / "first.jpg", 1)
+            snapshot = store.snapshot_images_for_restore([image_id])
+
+            store.remove_images_from_library([image_id])
+            self.assertEqual(store.count_images(), 0)
+            self.assertEqual(store.list_folders(include_inactive=True), [])
+
+            restored = store.restore_images_snapshot(snapshot)
+
+            self.assertEqual(restored, 1)
+            self.assertIsNotNone(store.get_folder(folder_id))
+            self.assertIsNotNone(store.get_image(image_id))
+
     def test_collections_support_tree_moves_assignment_and_filtering(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"
@@ -1144,6 +1209,52 @@ class MetadataStoreTest(unittest.TestCase):
                 prompt_version=AI_VISION_PROMPT_VERSION,
             )
             self.assertEqual(stats["total"], 1)
+
+    def test_virtual_image_filters_find_untagged_un_ai_tagged_and_uncategorized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            root = Path(tmp) / "library"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            collection_id = store.create_collection("参考")
+
+            uncategorized = self._insert_image(store, folder_id, root / "uncategorized.jpg", 1)
+            tagged_ready = self._insert_image(store, folder_id, root / "tagged-ready.jpg", 2)
+            tagged_no_ai = self._insert_image(store, folder_id, root / "tagged-no-ai.jpg", 3)
+            untagged_no_ai = self._insert_image(store, folder_id, root / "untagged-no-ai.jpg", 4)
+            video_id = self._insert_image(store, folder_id, root / "clip.mp4", 5)
+
+            store.add_tags_to_images([tagged_ready, tagged_no_ai], ["已标签"])
+            store.assign_images_to_collection(
+                [tagged_ready, tagged_no_ai, untagged_no_ai],
+                collection_id,
+            )
+            store.upsert_ai_vision_success(
+                image_id=tagged_ready,
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=AI_VISION_PROMPT_VERSION,
+                analysis=self._ai_vision_analysis(),
+                source_modified_time_ns=2,
+            )
+
+            self.assertEqual(
+                {image.id for image in store.list_images(virtual_filter="untagged", limit=50)},
+                {uncategorized, untagged_no_ai, video_id},
+            )
+            self.assertEqual(
+                {image.id for image in store.list_images(virtual_filter="un_ai_tagged", limit=50)},
+                {uncategorized, tagged_no_ai, untagged_no_ai},
+            )
+            self.assertEqual(
+                {image.id for image in store.list_images(virtual_filter="uncategorized", limit=50)},
+                {uncategorized, video_id},
+            )
+
+            self.assertEqual(store.count_images_for_virtual_filter("untagged"), 3)
+            self.assertEqual(store.count_images_for_virtual_filter("un_ai_tagged"), 3)
+            self.assertEqual(store.count_images_for_virtual_filter("uncategorized"), 2)
 
     @staticmethod
     def _ai_vision_analysis() -> AIVisionAnalysis:

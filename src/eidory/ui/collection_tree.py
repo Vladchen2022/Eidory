@@ -11,6 +11,7 @@ class CollectionTreeWidget(QTreeWidget):
     treeReordered = Signal(object)
     imagesDropped = Signal(int, object)
     filesDropped = Signal(int, object)
+    rootFilesDropped = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -29,13 +30,17 @@ class CollectionTreeWidget(QTreeWidget):
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:
-        if event.mimeData().hasFormat(IMAGE_IDS_MIME) or event.mimeData().hasUrls():
+        if event.mimeData().hasFormat(IMAGE_IDS_MIME):
             item = self.itemAt(event.position().toPoint())
             if item is not None and item.data(0, Qt.ItemDataRole.UserRole) is not None:
                 event.setDropAction(Qt.DropAction.CopyAction)
                 event.accept()
             else:
                 event.ignore()
+            return
+        if event.mimeData().hasUrls():
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
             return
         super().dragMoveEvent(event)
 
@@ -60,16 +65,17 @@ class CollectionTreeWidget(QTreeWidget):
 
         if event.mimeData().hasUrls():
             item = self.itemAt(event.position().toPoint())
-            if item is None:
-                event.ignore()
-                return
-            collection_id = item.data(0, Qt.ItemDataRole.UserRole)
-            if collection_id is None:
-                event.ignore()
-                return
             paths = self._local_paths(event.mimeData().urls())
             if paths:
-                self.filesDropped.emit(int(collection_id), paths)
+                collection_id = (
+                    item.data(0, Qt.ItemDataRole.UserRole)
+                    if item is not None
+                    else None
+                )
+                if collection_id is None:
+                    self.rootFilesDropped.emit(paths)
+                else:
+                    self.filesDropped.emit(int(collection_id), paths)
                 event.setDropAction(Qt.DropAction.CopyAction)
                 event.accept()
             else:

@@ -20,7 +20,7 @@ class FakeVideoThumbnailer(Thumbnailer):
 
 
 class ScannerTest(unittest.TestCase):
-    def test_scan_folder_generates_thumbnails_and_marks_missing(self) -> None:
+    def test_scan_folder_generates_thumbnails_and_removes_deleted_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "library"
             hidden = root / ".hidden"
@@ -50,10 +50,35 @@ class ScannerTest(unittest.TestCase):
             result = scanner.scan_folder(str(root))
             self.assertEqual(result.scanned_files, 1)
             self.assertEqual(result.missing_marked, 1)
+            self.assertTrue(result.removed_thumbnail_paths)
 
-            missing = store.list_images(status_filter="missing", limit=10)
-            self.assertEqual(len(missing), 1)
-            self.assertEqual(missing[0].file_name, "a.jpg")
+            self.assertEqual(store.count_missing_images(), 0)
+            self.assertEqual(
+                [image.file_name for image in store.list_images(limit=10)],
+                ["b.png"],
+            )
+
+    def test_scan_missing_root_removes_folder_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            self._make_image(root / "a.jpg", "red")
+
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+            scanner = ImageScanner(store, Thumbnailer(Path(tmp) / "thumbs"))
+
+            scanner.scan_folder(str(root))
+            self.assertEqual(len(store.list_folders()), 1)
+
+            os.remove(root / "a.jpg")
+            root.rmdir()
+            result = scanner.scan_folder(str(root))
+
+            self.assertEqual(result.scanned_files, 0)
+            self.assertEqual(result.missing_marked, 1)
+            self.assertEqual(store.count_images(), 0)
+            self.assertEqual(store.list_folders(include_inactive=True), [])
 
     def test_scan_regenerates_failed_thumbnail_without_file_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -28,6 +28,7 @@ class ScanResult:
     missing_marked: int
     thumbnail_failures: int
     image_ids: tuple[int, ...]
+    removed_thumbnail_paths: tuple[str, ...] = ()
 
 
 ScanProgressCallback = Callable[[int, str, str], None]
@@ -71,7 +72,21 @@ class ImageScanner:
     ) -> ScanResult:
         root = os.path.abspath(os.path.expanduser(folder_path))
         if not os.path.isdir(root):
-            raise FileNotFoundError(f"folder does not exist: {root}")
+            folder = self.store.get_folder_by_path(root)
+            if folder is None:
+                raise FileNotFoundError(f"folder does not exist: {root}")
+            thumbnail_paths, removed = self.store.remove_folder_from_library(folder.id)
+            return ScanResult(
+                folder_id=folder.id,
+                scanned_files=0,
+                new_files=0,
+                changed_files=0,
+                unchanged_files=0,
+                missing_marked=removed,
+                thumbnail_failures=0,
+                image_ids=(),
+                removed_thumbnail_paths=tuple(thumbnail_paths),
+            )
 
         folder_id = self.store.add_folder(root)
         seen_paths: list[str] = []
@@ -121,11 +136,13 @@ class ImageScanner:
             if on_progress is not None:
                 on_progress(image_id, state, file_path)
 
-        missing_marked = (
-            self.store.mark_missing_for_folder(folder_id, seen_paths)
-            if mark_missing
-            else 0
-        )
+        removed_thumbnail_paths: list[str] = []
+        missing_marked = 0
+        if mark_missing:
+            removed_thumbnail_paths, missing_marked = self.store.remove_unseen_images_for_folder(
+                folder_id,
+                seen_paths,
+            )
         self.store.finish_folder_scan(folder_id)
         return ScanResult(
             folder_id=folder_id,
@@ -136,6 +153,7 @@ class ImageScanner:
             missing_marked=missing_marked,
             thumbnail_failures=thumbnail_failures,
             image_ids=tuple(image_ids),
+            removed_thumbnail_paths=tuple(removed_thumbnail_paths),
         )
 
     def import_files(

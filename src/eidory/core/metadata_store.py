@@ -53,6 +53,8 @@ DEFAULT_AI_VISION_COLLECTION_PATHS = (
     ("ML-07 黑白摄影",),
 )
 
+VIRTUAL_IMAGE_FILTERS = {"untagged", "un_ai_tagged", "uncategorized"}
+
 
 def _clean_color_hex(value: object) -> str:
     if not isinstance(value, str):
@@ -311,6 +313,21 @@ class MetadataStore:
         with self.connect() as conn:
             return [self._folder_from_row(row) for row in conn.execute(sql, params)]
 
+    def list_folders_with_collection_images(self) -> list[FolderItem]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT f.*
+                FROM folders f
+                JOIN images i ON i.folder_id = f.id
+                JOIN image_collections ic ON ic.image_id = i.id
+                WHERE f.is_active = 1
+                  AND i.is_missing = 0
+                ORDER BY f.folder_path COLLATE NOCASE
+                """
+            ).fetchall()
+        return [self._folder_from_row(row) for row in rows]
+
     def folder_subtree_counts(self) -> list[tuple[FolderItem, dict[str, int]]]:
         with self.connect() as conn:
             folder_rows = conn.execute(
@@ -357,6 +374,67 @@ class MetadataStore:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM folders WHERE id = ?", (folder_id,)).fetchone()
             return self._folder_from_row(row) if row else None
+
+    def get_folder_by_path(self, folder_path: str) -> FolderItem | None:
+        normalized = self._normalize_folder_prefix(folder_path)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM folders WHERE folder_path = ? AND is_active = 1",
+                (normalized,),
+            ).fetchone()
+            return self._folder_from_row(row) if row else None
+
+    def remove_unclassified_active_roots(self) -> tuple[list[str], int, int]:
+        """Remove stale physical scan roots that no longer map to Eidory folders.
+
+        Imported files are only part of the managed library after they are linked
+        through image_collections. Old active scan roots with no such links can be
+        resurrected by file watching or manual rescans, so they must not remain as
+        active roots.
+        """
+        with self.connect() as conn:
+            folder_rows = conn.execute(
+                """
+                SELECT f.id
+                FROM folders f
+                WHERE f.is_active = 1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM images i
+                      JOIN image_collections ic ON ic.image_id = i.id
+                      WHERE i.folder_id = f.id
+                  )
+                """
+            ).fetchall()
+            folder_ids = [int(row["id"]) for row in folder_rows]
+            if not folder_ids:
+                return [], 0, 0
+
+            placeholders = ",".join("?" for _ in folder_ids)
+            image_rows = conn.execute(
+                f"""
+                SELECT thumbnail_path
+                FROM images
+                WHERE folder_id IN ({placeholders})
+                  AND thumbnail_path IS NOT NULL
+                """,
+                tuple(folder_ids),
+            ).fetchall()
+            count_row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM images
+                WHERE folder_id IN ({placeholders})
+                """,
+                tuple(folder_ids),
+            ).fetchone()
+            thumbnail_paths = [str(row["thumbnail_path"]) for row in image_rows]
+            cur = conn.execute(
+                f"DELETE FROM folders WHERE id IN ({placeholders})",
+                tuple(folder_ids),
+            )
+            self._delete_unused_tags(conn)
+            return thumbnail_paths, int(cur.rowcount), int(count_row["count"])
 
     def path_remap_candidates(self) -> list[str]:
         candidates: set[str] = set()
@@ -885,6 +963,7 @@ class MetadataStore:
 
             conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
             self._delete_unused_tags(conn)
+            self._delete_empty_folders(conn)
             return image_count, deleted_images, thumbnail_paths
 
     def update_collection_tree(
@@ -974,6 +1053,7 @@ class MetadataStore:
             removed_links = int(cur.rowcount)
             deleted_images, thumbnail_paths = self._delete_orphan_images(conn, clean_ids)
             self._delete_unused_tags(conn)
+            self._delete_empty_folders(conn)
             return removed_links, deleted_images, thumbnail_paths
 
     def move_images_to_collection(
@@ -1026,6 +1106,7 @@ class MetadataStore:
 
             deleted_images, thumbnail_paths = self._delete_orphan_images(conn, clean_ids)
             self._delete_unused_tags(conn)
+            self._delete_empty_folders(conn)
             return inserted, removed_links, deleted_images, thumbnail_paths
 
     @staticmethod
@@ -1081,6 +1162,20 @@ class MetadataStore:
             tuple(orphan_ids),
         )
         return int(cur.rowcount), thumbnail_paths
+
+    @staticmethod
+    def _delete_empty_folders(conn: sqlite3.Connection) -> int:
+        cur = conn.execute(
+            """
+            DELETE FROM folders
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM images i
+                WHERE i.folder_id = folders.id
+            )
+            """
+        )
+        return int(cur.rowcount)
 
     def list_images_for_folder_path_prefix(self, folder_path_prefix: str) -> list[ImageItem]:
         with self.connect() as conn:
@@ -1368,6 +1463,45 @@ class MetadataStore:
             conn.execute("DELETE FROM seen_scan_paths")
             return int(cur.rowcount)
 
+    def remove_unseen_images_for_folder(
+        self,
+        folder_id: int,
+        seen_paths: Iterable[str],
+    ) -> tuple[list[str], int]:
+        with self.connect() as conn:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS seen_scan_paths(path TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM seen_scan_paths")
+            conn.executemany(
+                "INSERT OR IGNORE INTO seen_scan_paths(path) VALUES (?)",
+                ((path,) for path in seen_paths),
+            )
+            rows = conn.execute(
+                """
+                SELECT id, thumbnail_path
+                FROM images
+                WHERE folder_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM seen_scan_paths s WHERE s.path = images.file_path
+                  )
+                """,
+                (folder_id,),
+            ).fetchall()
+            image_ids = [int(row["id"]) for row in rows]
+            thumbnail_paths = [
+                str(row["thumbnail_path"])
+                for row in rows
+                if row["thumbnail_path"] is not None
+            ]
+            if image_ids:
+                placeholders = ",".join("?" for _ in image_ids)
+                conn.execute(
+                    f"DELETE FROM images WHERE id IN ({placeholders})",
+                    tuple(image_ids),
+                )
+            conn.execute("DELETE FROM seen_scan_paths")
+            self._delete_unused_tags(conn)
+            return thumbnail_paths, len(image_ids)
+
     def mark_image_missing(self, image_id: int) -> bool:
         now = utc_now_iso()
         with self.connect() as conn:
@@ -1403,6 +1537,7 @@ class MetadataStore:
         status_filter: str | None = None,
         text_query: str | None = None,
         include_missing: bool = False,
+        virtual_filter: str | None = None,
         sort_key: str = "default",
         sort_desc: bool = True,
     ) -> list[ImageItem]:
@@ -1441,6 +1576,14 @@ class MetadataStore:
         if tag_clause:
             clauses.append(tag_clause)
             params.extend(tag_params)
+        virtual_clause, virtual_params = self._virtual_image_filter_clause(
+            "images.id",
+            "images.file_ext",
+            virtual_filter,
+        )
+        if virtual_clause:
+            clauses.append(virtual_clause)
+            params.extend(virtual_params)
         if status_filter == "favorite":
             clauses.append("images.is_favorite = 1")
         elif status_filter == "unindexed":
@@ -1550,6 +1693,52 @@ class MetadataStore:
             list(clean_ids),
         )
 
+    @staticmethod
+    def _virtual_image_filter_clause(
+        image_id_expr: str,
+        file_ext_expr: str,
+        virtual_filter: str | None,
+    ) -> tuple[str | None, list[object]]:
+        if not virtual_filter:
+            return None, []
+        if virtual_filter not in VIRTUAL_IMAGE_FILTERS:
+            raise ValueError(f"unknown virtual image filter: {virtual_filter}")
+        if virtual_filter == "untagged":
+            return (
+                f"""
+                NOT EXISTS (
+                    SELECT 1
+                    FROM image_tags it
+                    WHERE it.image_id = {image_id_expr}
+                )
+                """,
+                [],
+            )
+        if virtual_filter == "un_ai_tagged":
+            image_placeholders = ",".join("?" for _ in SUPPORTED_IMAGE_EXTENSIONS)
+            return (
+                f"""
+                {file_ext_expr} IN ({image_placeholders})
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM ai_vision_tags avt
+                    WHERE avt.image_id = {image_id_expr}
+                      AND avt.status = 'ready'
+                )
+                """,
+                list(sorted(SUPPORTED_IMAGE_EXTENSIONS)),
+            )
+        return (
+            f"""
+            NOT EXISTS (
+                SELECT 1
+                FROM image_collections ic
+                WHERE ic.image_id = {image_id_expr}
+            )
+            """,
+            [],
+        )
+
     def count_images(self) -> int:
         with self.connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM images").fetchone()
@@ -1561,6 +1750,56 @@ class MetadataStore:
                 "SELECT COUNT(*) AS c FROM images WHERE is_missing = 1"
             ).fetchone()
             return int(row["c"])
+
+    def count_images_for_virtual_filter(self, virtual_filter: str) -> int:
+        virtual_clause, virtual_params = self._virtual_image_filter_clause(
+            "images.id",
+            "images.file_ext",
+            virtual_filter,
+        )
+        clauses = ["images.is_missing = 0"]
+        params: list[object] = []
+        if virtual_clause:
+            clauses.append(virtual_clause)
+            params.extend(virtual_params)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS c
+                FROM images
+                WHERE {' AND '.join(clauses)}
+                """,
+                params,
+            ).fetchone()
+        return int(row["c"])
+
+    def virtual_image_filter_counts(self) -> dict[str, int]:
+        return {
+            virtual_filter: self.count_images_for_virtual_filter(virtual_filter)
+            for virtual_filter in VIRTUAL_IMAGE_FILTERS
+        }
+
+    def image_ids_for_virtual_filter(self, virtual_filter: str) -> set[int]:
+        virtual_clause, virtual_params = self._virtual_image_filter_clause(
+            "images.id",
+            "images.file_ext",
+            virtual_filter,
+        )
+        clauses = ["images.is_missing = 0"]
+        params: list[object] = []
+        if virtual_clause:
+            clauses.append(virtual_clause)
+            params.extend(virtual_params)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT images.id
+                FROM images
+                WHERE {' AND '.join(clauses)}
+                """,
+                params,
+            ).fetchall()
+        return {int(row["id"]) for row in rows}
 
     def get_image(self, image_id: int) -> ImageItem | None:
         with self.connect() as conn:
@@ -1588,6 +1827,7 @@ class MetadataStore:
         tag_ids: Sequence[int] | None = None,
         tag_match_mode: str = "any",
         status_filter: str | None = None,
+        virtual_filter: str | None = None,
     ) -> list[ImageItem]:
         if status_filter == "missing":
             return []
@@ -1630,6 +1870,14 @@ class MetadataStore:
         if tag_clause:
             clauses.append(tag_clause)
             params.extend(tag_params)
+        virtual_clause, virtual_params = self._virtual_image_filter_clause(
+            "images.id",
+            "images.file_ext",
+            virtual_filter,
+        )
+        if virtual_clause:
+            clauses.append(virtual_clause)
+            params.extend(virtual_params)
         if status_filter == "favorite":
             clauses.append("images.is_favorite = 1")
         elif status_filter == "unindexed":
@@ -2058,6 +2306,7 @@ class MetadataStore:
             thumbnail_paths = [str(row["thumbnail_path"]) for row in rows]
             conn.execute(f"DELETE FROM images WHERE id IN ({placeholders})", tuple(clean_ids))
             self._delete_unused_tags(conn)
+            self._delete_empty_folders(conn)
             return thumbnail_paths
 
     def snapshot_images_for_restore(self, image_ids: Sequence[int]) -> dict[str, object]:
@@ -2070,6 +2319,20 @@ class MetadataStore:
             return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
 
         with self.connect() as conn:
+            image_rows = rows(
+                conn,
+                f"SELECT * FROM images WHERE id IN ({placeholders})",
+                clean_ids,
+            )
+            folder_ids = sorted({int(row["folder_id"]) for row in image_rows})
+            folder_rows: list[dict[str, object]] = []
+            if folder_ids:
+                folder_placeholders = ",".join("?" for _ in folder_ids)
+                folder_rows = rows(
+                    conn,
+                    f"SELECT * FROM folders WHERE id IN ({folder_placeholders})",
+                    folder_ids,
+                )
             image_tags = rows(
                 conn,
                 f"SELECT * FROM image_tags WHERE image_id IN ({placeholders})",
@@ -2086,11 +2349,8 @@ class MetadataStore:
                 )
             return {
                 "image_ids": clean_ids,
-                "images": rows(
-                    conn,
-                    f"SELECT * FROM images WHERE id IN ({placeholders})",
-                    clean_ids,
-                ),
+                "folders": folder_rows,
+                "images": image_rows,
                 "tags": tag_rows,
                 "image_tags": image_tags,
                 "embeddings": rows(
@@ -2137,7 +2397,7 @@ class MetadataStore:
             if not isinstance(raw_rows, list):
                 return []
             clean_rows = [dict(row) for row in raw_rows if isinstance(row, Mapping)]
-            if table == "tags":
+            if table in {"folders", "tags"}:
                 return clean_rows
             return [row for row in clean_rows if int(row.get(id_key, 0) or 0) in id_set]
 
@@ -2153,6 +2413,7 @@ class MetadataStore:
             )
 
         with self.connect() as conn:
+            insert_rows(conn, "folders", table_rows("folders", id_key="id"))
             insert_rows(conn, "tags", table_rows("tags"))
             image_rows = table_rows("images", id_key="id")
             insert_rows(conn, "images", image_rows)
@@ -2186,6 +2447,7 @@ class MetadataStore:
             thumbnail_paths = [str(row["thumbnail_path"]) for row in rows]
             conn.execute("DELETE FROM images WHERE is_missing = 1")
             self._delete_unused_tags(conn)
+            self._delete_empty_folders(conn)
             return thumbnail_paths, int(count_row["count"])
 
     def folders_with_missing_images(self) -> list[FolderItem]:
@@ -2220,6 +2482,7 @@ class MetadataStore:
             thumbnail_paths = [str(row["thumbnail_path"]) for row in rows]
             conn.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
             self._delete_unused_tags(conn)
+            self._delete_empty_folders(conn)
             return thumbnail_paths, int(count_row["count"])
 
     def remove_images_by_folder_path_prefix(self, folder_path_prefix: str) -> tuple[list[str], int]:
@@ -2240,6 +2503,7 @@ class MetadataStore:
                 (like,),
             )
             self._delete_unused_tags(conn)
+            self._delete_empty_folders(conn)
             return thumbnail_paths, int(cur.rowcount)
 
     def upsert_search_feedback(
@@ -3297,6 +3561,7 @@ class MetadataStore:
         tag_ids: Sequence[int] | None = None,
         tag_match_mode: str = "any",
         status_filter: str | None = None,
+        virtual_filter: str | None = None,
     ) -> list[int]:
         if status_filter in {"missing", "unindexed"}:
             return []
@@ -3345,6 +3610,14 @@ class MetadataStore:
         if tag_clause:
             clauses.append(tag_clause)
             params.extend(tag_params)
+        virtual_clause, virtual_params = self._virtual_image_filter_clause(
+            "i.id",
+            "i.file_ext",
+            virtual_filter,
+        )
+        if virtual_clause:
+            clauses.append(virtual_clause)
+            params.extend(virtual_params)
         if status_filter == "favorite":
             clauses.append("i.is_favorite = 1")
 

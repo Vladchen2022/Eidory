@@ -126,8 +126,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
             dialog._zoom_by(120)
             self.assertFalse(dialog.fit_to_window)
             dialog._handle_space_pressed()
-            self.assertTrue(dialog.fit_to_window)
-            self.assertEqual(dialog.zoom_factor, dialog._fit_zoom_factor())
+            self.assertFalse(dialog.isVisible())
             dialog.close()
 
     def test_preview_first_wheel_zoom_starts_from_fit_scale(self) -> None:
@@ -280,7 +279,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
         self.assertEqual(right.green(), right.blue())
         self.assertLess(left.red(), right.red())
 
-    def test_preview_double_click_closes_image_surface(self) -> None:
+    def test_preview_double_click_fits_image_surface(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             image_path = root / "image.jpg"
@@ -308,6 +307,8 @@ class ImagePreviewDialogTest(unittest.TestCase):
             )
             dialog.show()
             self.app.processEvents()
+            dialog._actual_size_image()
+            self.assertFalse(dialog.fit_to_window)
 
             event = QMouseEvent(
                 QEvent.Type.MouseButtonDblClick,
@@ -320,7 +321,10 @@ class ImagePreviewDialogTest(unittest.TestCase):
             )
 
             self.assertTrue(dialog.eventFilter(dialog.image_view.viewport(), event))
-            self.assertFalse(dialog.isVisible())
+            self.assertTrue(dialog.isVisible())
+            self.assertTrue(dialog.fit_to_window)
+            self.assertEqual(dialog.zoom_factor, dialog._fit_zoom_factor())
+            dialog.close()
 
     def test_preview_double_click_closes_video_surface(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -372,6 +376,12 @@ class ImagePreviewDialogTest(unittest.TestCase):
             Qt.KeyboardModifier.MetaModifier,
         )
         self.assertTrue(ImagePreviewDialog._is_close_shortcut(event))
+        esc_event = QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_Escape,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        self.assertTrue(ImagePreviewDialog._is_close_shortcut(esc_event))
 
     def test_preview_event_filter_closes_from_child_cmd_w(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -11,14 +11,16 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence
-from PySide6.QtWidgets import QApplication, QListWidgetItem, QMessageBox, QPushButton, QTreeWidget, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QListWidgetItem, QMessageBox, QPushButton, QTextEdit, QTreeWidget, QTreeWidgetItem
 
 from eidory.config import AppPaths
 from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
+from eidory.core.embedding_worker import EmbeddingProgress
 from eidory.core.inspiration import InspirationMatch, InspirationTerm
 from eidory.core.llm_provider import GroupNameSuggestion, ProjectSuggestion, SearchPlanFilter
 from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
 from eidory.core.reference_grouping import ReferenceGroup
+from eidory.core.scanner import ScanResult
 from eidory.core.search_filters import (
     SearchFilter,
     last_score_filter_kind,
@@ -26,7 +28,14 @@ from eidory.core.search_filters import (
     search_filter_to_payload,
 )
 from eidory.models import ImageItem
-from eidory.ui.main_window import EqualWidthTabBar, MainWindow, TOOL_BUTTON_MIN_WIDTH
+from eidory.ui.main_window import (
+    EqualWidthTabBar,
+    LEFT_SIDEBAR_WIDTH,
+    MainWindow,
+    RIGHT_SIDEBAR_WIDTH,
+    SIDEBAR_COUNT_COLUMN_WIDTH,
+    TOOL_BUTTON_MIN_WIDTH,
+)
 
 
 class MainWindowContextMenuTest(unittest.TestCase):
@@ -76,6 +85,48 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.advanced_search_toggle_button.click()
             self.app.processEvents()
             self.assertTrue(window.advanced_search_widget.isHidden())
+            window.close()
+
+    def test_sidebars_have_fixed_visible_widths_and_can_collapse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.resize(1500, 900)
+            window.show()
+            self.app.processEvents()
+
+            self.assertEqual(window.root_splitter.widget(0).maximumWidth(), LEFT_SIDEBAR_WIDTH)
+            self.assertEqual(window.root_splitter.widget(2).maximumWidth(), RIGHT_SIDEBAR_WIDTH)
+            self.assertGreaterEqual(window.root_splitter.sizes()[0], 300)
+            self.assertEqual(window.collection_tree.columnWidth(1), SIDEBAR_COUNT_COLUMN_WIDTH)
+            self.assertGreaterEqual(window.collection_tree.columnWidth(0), 210)
+
+            window.resize(2200, 1000)
+            self.app.processEvents()
+            window._enforce_fixed_sidebar_widths()
+            self.assertEqual(window.root_splitter.sizes()[0], LEFT_SIDEBAR_WIDTH)
+            self.assertGreaterEqual(window.collection_tree.columnWidth(0), 230)
+
+            window.root_splitter.setSizes([360, 700, 640])
+            window._enforce_fixed_sidebar_widths()
+            left, _center, right = window.root_splitter.sizes()
+            self.assertEqual(left, LEFT_SIDEBAR_WIDTH)
+            self.assertEqual(right, RIGHT_SIDEBAR_WIDTH)
+
+            window.root_splitter.setSizes([10, 1200, 20])
+            window._enforce_fixed_sidebar_widths(10, 1)
+            window._enforce_fixed_sidebar_widths(sum(window.root_splitter.sizes()) - 20, 2)
+            left, _center, right = window.root_splitter.sizes()
+            self.assertEqual(left, 0)
+            self.assertEqual(right, 0)
             window.close()
 
     def test_search_operation_defaults_to_replace_until_results_exist(self) -> None:
@@ -574,7 +625,11 @@ class MainWindowContextMenuTest(unittest.TestCase):
             )
             self.app.processEvents()
 
-            window.tag_panel_input.setText("参考, 机械")
+            self.assertIsInstance(window.tag_panel_input, QTextEdit)
+            self.assertGreaterEqual(window.tag_panel_input.minimumHeight(), 140)
+            self.assertIn("每行一个", window.tag_panel_input.placeholderText())
+
+            window.tag_panel_input.setPlainText("参考\n机械")
             window._tag_panel_add_tags()
             self.app.processEvents()
 
@@ -588,6 +643,12 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(tag_names, {"参考", "机械"})
             self.assertGreaterEqual(window.tag_list.count(), 3)
             window.close()
+
+    def test_sidebar_tag_page_uses_newline_only_tag_parsing(self) -> None:
+        self.assertEqual(
+            MainWindow._parse_tag_panel_input(" 参考, 机械\n夜晚\n\n夜晚 "),
+            ["参考, 机械", "夜晚"],
+        )
 
     def test_color_filter_uses_relative_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1008,6 +1069,102 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual({image.id for image in result.images}, set(image_ids[:2]))
             self.assertEqual(search_filter_from_payload(search_filter_to_payload(search_filter)), search_filter)
             self.assertIn("创作参考 / 室内", window._filter_label(search_filter))
+            window.close()
+
+    def test_virtual_collection_filters_are_separate_and_selectable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            untagged_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "untagged.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            tagged_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "tagged.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=2,
+            )
+            store.add_tags_to_images([tagged_id], ["已标签"])
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            top_labels = [
+                window.collection_tree.topLevelItem(index).text(0)
+                for index in range(window.collection_tree.topLevelItemCount())
+            ]
+            self.assertNotIn("未标签", top_labels)
+            self.assertNotIn("未AI标签", top_labels)
+            self.assertNotIn("未分类", top_labels)
+            virtual_labels = [
+                window.virtual_collection_tree.topLevelItem(index).text(0)
+                for index in range(window.virtual_collection_tree.topLevelItemCount())
+            ]
+            self.assertEqual(virtual_labels, ["未标签", "未AI标签", "未分类"])
+
+            untagged_item = window.virtual_collection_tree.topLevelItem(
+                virtual_labels.index("未标签")
+            )
+            window.virtual_collection_tree.setCurrentItem(untagged_item)
+            self.app.processEvents()
+
+            self.assertEqual(window._selected_virtual_filter(), "untagged")
+            self.assertIsNone(window.collection_tree.currentItem())
+            self.assertEqual({image.id for image in window.grid_view.images()}, {untagged_id})
+            window.close()
+
+    def test_startup_removes_previously_scanned_active_roots_missing_on_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            missing_root = Path(tmp) / "deleted-root"
+            folder_id = store.add_folder(str(missing_root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(missing_root / "stale.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            store.update_thumbnail(image_id, str(paths.thumbnail_dir / "thumb_stale.webp"), "ready")
+            collection_id = store.create_collection("失效目录")
+            store.assign_images_to_collection([image_id], collection_id)
+            store.finish_folder_scan(folder_id)
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            self.assertIsNone(store.get_folder(folder_id))
+            self.assertIsNone(store.get_image(image_id))
+            self.assertEqual(store.list_collections_with_counts()[0][1], 0)
             window.close()
 
     def test_refine_search_can_append_same_filter_kind(self) -> None:
@@ -1500,6 +1657,128 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(actions["import_tree"].isEnabled())
             self.assertFalse(actions["import_flat"].isEnabled())
 
+    def test_collection_blank_area_can_import_folder_tree_to_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            _menu, actions = window._build_collection_context_menu(None)
+
+            window.close()
+            self.assertTrue(actions["import_tree"].isEnabled())
+            self.assertFalse(actions["import_flat"].isEnabled())
+
+    def test_folder_tree_import_preserves_disk_directory_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            disk_root = Path(tmp) / "精选练习素材 CC0 Eidory"
+            child = disk_root / "ML-04 简单小景"
+            nested = child / "子目录"
+            nested.mkdir(parents=True)
+            first_path = child / "a.jpg"
+            second_path = nested / "b.jpg"
+            first_path.write_bytes(b"fake image")
+            second_path.write_bytes(b"fake image")
+            folder_id = store.add_folder(str(disk_root))
+            first_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(first_path),
+                file_size=10,
+                width=100,
+                height=80,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            second_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(second_path),
+                file_size=10,
+                width=100,
+                height=80,
+                created_time_ns=None,
+                modified_time_ns=2,
+            )
+            result = ScanResult(
+                folder_id=folder_id,
+                scanned_files=2,
+                new_files=2,
+                changed_files=0,
+                unchanged_files=0,
+                missing_marked=0,
+                thumbnail_failures=0,
+                image_ids=(first_id, second_id),
+            )
+
+            assigned = window._assign_import_result(
+                result=result,
+                folder_path=str(disk_root),
+                collection_id=None,
+                preserve_structure=True,
+            )
+
+            window.close()
+            self.assertEqual(assigned, 2)
+            self.assertEqual(
+                store.collection_paths_for_image(first_id),
+                ["精选练习素材 CC0 Eidory / ML-04 简单小景"],
+            )
+            self.assertEqual(
+                store.collection_paths_for_image(second_id),
+                ["精选练习素材 CC0 Eidory / ML-04 简单小景 / 子目录"],
+            )
+
+    def test_local_import_path_split_separates_files_and_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            folder = Path(tmp) / "ML-05 复杂场景"
+            folder.mkdir()
+            image = Path(tmp) / "a.jpg"
+            image.write_bytes(b"fake image")
+            text = Path(tmp) / "notes.txt"
+            text.write_text("ignore", encoding="utf-8")
+
+            file_paths, folder_paths = window._split_local_import_paths(
+                [str(folder), str(image), str(text), str(folder)]
+            )
+
+            window.close()
+            self.assertEqual(file_paths, [str(image)])
+            self.assertEqual(folder_paths, [str(folder)])
+
     def test_video_selection_uses_embedded_video_preview(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -1568,8 +1847,10 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 EqualWidthTabBar.MIN_TAB_WIDTH,
             )
             self.assertEqual(window.search_row.spacing(), 0)
+            self.assertEqual(window.right_tab_widget.parentWidget().minimumWidth(), 0)
+            self.assertEqual(window.right_tab_widget.parentWidget().maximumWidth(), RIGHT_SIDEBAR_WIDTH)
             self.assertGreaterEqual(
-                window.right_tab_widget.parentWidget().minimumWidth(),
+                window.right_tab_widget.tabBar().minimumWidth(),
                 EqualWidthTabBar.minimum_width_for_tab_count(window.right_tab_widget.count()),
             )
             for button in [
@@ -2546,8 +2827,72 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 window._shuffle_current_grid_images()
 
             self.assertEqual([image.id for image in window.grid_view.images()], [3, 2, 1])
+            self.assertEqual(window.manual_result_order_ids, [3, 2, 1])
             self.assertEqual(window.grid_view.selected_image_ids(), [2])
             self.assertEqual(window.grid_view._badges_by_image_id, {2: ["机械"], 3: ["室内"]})
+
+            window.current_result_mode = "search_chain"
+            window.search_filters = [SearchFilter("keyword", "x")]
+            window.current_chain_images = list(images)
+            window.current_chain_filtered_images = list(images)
+            window._refresh_visible_results_after_result_management_change()
+
+            self.assertEqual([image.id for image in window.grid_view.images()], [3, 2, 1])
+            window.close()
+
+    def test_background_embedding_progress_does_not_reset_current_grid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window.current_result_mode = "library"
+            window.grid_view.set_images([self._image(1), self._image(2)])
+
+            with patch.object(window, "_reload_images") as reload_images:
+                window._handle_embedding_progress(EmbeddingProgress(None, None, "idle", "idle"))
+                for _index in range(25):
+                    window._handle_embedding_progress(EmbeddingProgress(1, "1.jpg", "ready", "ready"))
+
+            reload_images.assert_not_called()
+            self.assertEqual([image.id for image in window.grid_view.images()], [1, 2])
+            window.close()
+
+    def test_preserve_current_view_scan_refresh_does_not_reset_grid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window.current_result_mode = "search_chain"
+            window.search_filters = [SearchFilter("semantic", "水")]
+            window.grid_view.set_images([self._image(1), self._image(2)])
+
+            with (
+                patch.object(window, "_reload_images") as reload_images,
+                patch.object(window, "_refresh_current_results_for_filters") as refresh_results,
+            ):
+                window._refresh_after_scan_database_change(preserve_current_view=True)
+
+            reload_images.assert_not_called()
+            refresh_results.assert_not_called()
+            self.assertEqual([image.id for image in window.grid_view.images()], [1, 2])
             window.close()
 
     @staticmethod

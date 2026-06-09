@@ -65,6 +65,7 @@ class SearchService:
         tag_ids: list[int] | None = None,
         tag_match_mode: str = "any",
         status_filter: str | None = None,
+        virtual_filter: str | None = None,
         allowed_image_ids: set[int] | None = None,
     ) -> SemanticSearchResult:
         if not query.strip():
@@ -76,6 +77,7 @@ class SearchService:
                 tag_ids=tag_ids,
                 tag_match_mode=tag_match_mode,
                 status_filter=status_filter,
+                virtual_filter=virtual_filter,
                 limit=500,
             )
             if allowed_image_ids is not None:
@@ -97,6 +99,7 @@ class SearchService:
             tag_ids=tag_ids,
             tag_match_mode=tag_match_mode,
             status_filter=status_filter,
+            virtual_filter=virtual_filter,
         )
         if allowed_image_ids is not None:
             candidate_ids = [image_id for image_id in candidate_ids if image_id in allowed_image_ids]
@@ -133,6 +136,7 @@ class SearchService:
         tag_ids: list[int] | None = None,
         tag_match_mode: str = "any",
         status_filter: str | None = None,
+        virtual_filter: str | None = None,
         allowed_image_ids: set[int] | None = None,
     ) -> SemanticSearchResult:
         query_vector = self.store.embedding_vector_for_image(
@@ -155,6 +159,7 @@ class SearchService:
             tag_ids=tag_ids,
             tag_match_mode=tag_match_mode,
             status_filter=status_filter,
+            virtual_filter=virtual_filter,
         )
         candidate_ids = [candidate_id for candidate_id in candidate_ids if candidate_id != image_id]
         if allowed_image_ids is not None:
@@ -192,6 +197,7 @@ class SearchService:
         tag_ids: list[int] | None = None,
         tag_match_mode: str = "any",
         status_filter: str | None = None,
+        virtual_filter: str | None = None,
         allowed_image_ids: set[int] | None = None,
         limit: int = 5_000,
     ) -> ColorSearchResult:
@@ -203,6 +209,7 @@ class SearchService:
             tag_ids=tag_ids,
             tag_match_mode=tag_match_mode,
             status_filter=status_filter,
+            virtual_filter=virtual_filter,
         )
         if allowed_image_ids is not None:
             candidates = [image for image in candidates if image.id in allowed_image_ids]

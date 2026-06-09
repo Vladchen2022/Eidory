@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -140,6 +141,13 @@ DEFAULT_LLM_ENDPOINTS = {
     "openai_compatible": "http://localhost:1234/v1",
 }
 
+COLLECTION_VIRTUAL_FILTER_ROLE = Qt.ItemDataRole.UserRole + 3
+VIRTUAL_COLLECTION_FILTERS = (
+    ("untagged", "未标签", "没有用户手动标签的图片/视频。"),
+    ("un_ai_tagged", "未AI标签", "还没有可用 AI 场景视觉标签的图片。"),
+    ("uncategorized", "未分类", "没有放入任何 Eidory 文件夹的图片/视频。"),
+)
+
 
 class EqualWidthTabBar(QTabBar):
     BUTTON_MATCH_HEIGHT = 26
@@ -168,6 +176,10 @@ class EqualWidthTabBar(QTabBar):
 
 
 TOOL_BUTTON_MIN_WIDTH = EqualWidthTabBar.MIN_TAB_WIDTH
+LEFT_SIDEBAR_WIDTH = 330
+RIGHT_SIDEBAR_WIDTH = 386
+SIDEBAR_COLLAPSE_THRESHOLD = 48
+SIDEBAR_COUNT_COLUMN_WIDTH = 74
 
 
 class MissingFilesDialog(QDialog):
@@ -485,6 +497,7 @@ class MainWindow(QMainWindow):
         self.current_chain_base_label: str | None = None
         self.current_chain_operation_mode = "replace"
         self.current_duplicate_images: list[ImageItem] = []
+        self.manual_result_order_ids: list[int] | None = None
         self.result_excluded_image_ids: set[int] = set()
         self.result_excluded_collection_ids: set[int] = set()
         self.result_excluded_collection_image_ids: set[int] = set()
@@ -492,7 +505,6 @@ class MainWindow(QMainWindow):
         self.result_exclusion_filter_matches: dict[SearchFilter, list[ImageItem]] = {}
         self.semantic_search_revision = 0
         self.selected_image: ImageItem | None = None
-        self.embedding_refresh_counter = 0
         self._applying_view_payload = False
         self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
         self.error_log_messages: list[str] = []
@@ -514,6 +526,7 @@ class MainWindow(QMainWindow):
         self._configure_accessibility_labels()
         self._apply_runtime_language_settings()
         self._connect_signals()
+        startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
         self._refresh_folders()
         self._refresh_collections()
         self.store.seed_default_ai_vision_collection_rules()
@@ -525,6 +538,13 @@ class MainWindow(QMainWindow):
         self._refresh_embedding_stats()
         self._refresh_ai_vision_stats()
         self._refresh_file_watcher()
+        if startup_removed_images:
+            message = (
+                f"启动清理：移除 {startup_removed_roots} 个已不存在导入目录，"
+                f"{startup_removed_images} 张失效索引"
+            )
+            self._record_operation_history(message)
+            self.statusBar().showMessage(message)
         QTimer.singleShot(1200, self._run_startup_self_check)
 
         self.poll_timer = QTimer(self)
@@ -670,17 +690,58 @@ class MainWindow(QMainWindow):
         self.root_splitter.addWidget(self._build_sidebar())
         self.root_splitter.addWidget(self._build_library_panel())
         self.root_splitter.addWidget(self._build_detail_panel())
-        self.root_splitter.setSizes(
-            self._setting_int_list("ui.root_splitter_sizes", [220, 944, 216], 3)
-        )
+        self.root_splitter.setCollapsible(0, True)
+        self.root_splitter.setCollapsible(1, False)
+        self.root_splitter.setCollapsible(2, True)
+        self.root_splitter.setStretchFactor(0, 0)
+        self.root_splitter.setStretchFactor(1, 1)
+        self.root_splitter.setStretchFactor(2, 0)
+        self._enforcing_sidebar_widths = False
+        self.root_splitter.splitterMoved.connect(self._enforce_fixed_sidebar_widths)
+        self.root_splitter.setSizes(self._initial_root_splitter_sizes())
+        QTimer.singleShot(0, self._enforce_fixed_sidebar_widths)
         self.central_layout.addWidget(self.root_splitter)
         self.setCentralWidget(self.central_shell)
 
+    def _initial_root_splitter_sizes(self) -> list[int]:
+        saved = self._setting_int_list("ui.root_splitter_sizes", [LEFT_SIDEBAR_WIDTH, 944, RIGHT_SIDEBAR_WIDTH], 3)
+        left = 0 if saved[0] <= SIDEBAR_COLLAPSE_THRESHOLD else LEFT_SIDEBAR_WIDTH
+        right = 0 if saved[2] <= SIDEBAR_COLLAPSE_THRESHOLD else RIGHT_SIDEBAR_WIDTH
+        center = max(640, saved[1])
+        return [left, center, right]
+
+    def _enforce_fixed_sidebar_widths(self, _pos: int | None = None, _index: int | None = None) -> None:
+        if getattr(self, "_enforcing_sidebar_widths", False):
+            return
+        if not hasattr(self, "root_splitter"):
+            return
+        sizes = self.root_splitter.sizes()
+        if len(sizes) != 3:
+            return
+        total = max(1, sum(sizes))
+        collapse_left = sizes[0] <= SIDEBAR_COLLAPSE_THRESHOLD
+        collapse_right = sizes[2] <= SIDEBAR_COLLAPSE_THRESHOLD
+        if _index == 1 and _pos is not None:
+            collapse_left = _pos <= SIDEBAR_COLLAPSE_THRESHOLD
+        if _index == 2 and _pos is not None:
+            collapse_right = (total - _pos) <= SIDEBAR_COLLAPSE_THRESHOLD
+        left = 0 if collapse_left else LEFT_SIDEBAR_WIDTH
+        right = 0 if collapse_right else RIGHT_SIDEBAR_WIDTH
+        center = max(1, total - left - right)
+        self._enforcing_sidebar_widths = True
+        try:
+            self.root_splitter.setSizes([left, center, right])
+        finally:
+            self._enforcing_sidebar_widths = False
+
     def _build_sidebar(self) -> QWidget:
         panel = QWidget()
+        panel.setMinimumWidth(0)
+        panel.setMaximumWidth(LEFT_SIDEBAR_WIDTH)
         layout = QVBoxLayout(panel)
 
-        self.add_folder_button = QPushButton("导入到当前文件夹")
+        self.add_folder_button = QPushButton("导入图片")
+        self.import_folder_tree_button = QPushButton("导入文件夹")
         self.rescan_button = QPushButton("重新扫描")
         self.rescan_button.hide()
         self.folder_tree = QTreeWidget()
@@ -688,7 +749,7 @@ class MainWindow(QMainWindow):
         self.folder_tree.setHeaderLabels(["文件夹", "张"])
         self.folder_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.folder_tree.setIndentation(14)
-        self.folder_tree.setColumnWidth(0, 170)
+        self._configure_sidebar_count_tree(self.folder_tree)
         self.folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         self.add_collection_button = QPushButton("新建文件夹")
@@ -697,8 +758,23 @@ class MainWindow(QMainWindow):
         self.collection_tree.setHeaderLabels(["文件夹", "张"])
         self.collection_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.collection_tree.setIndentation(14)
-        self.collection_tree.setColumnWidth(0, 170)
+        self._configure_sidebar_count_tree(self.collection_tree)
         self.collection_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+        self.virtual_collection_tree = QTreeWidget()
+        self.virtual_collection_tree.setColumnCount(2)
+        self.virtual_collection_tree.setHeaderLabels(["图库状态", "张"])
+        self.virtual_collection_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.virtual_collection_tree.setRootIsDecorated(False)
+        self.virtual_collection_tree.setIndentation(0)
+        self._configure_sidebar_count_tree(self.virtual_collection_tree)
+        self.virtual_collection_tree.setMinimumHeight(96)
+        self.virtual_collection_tree.setMaximumHeight(120)
+        self.virtual_collection_tree.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.virtual_collection_tree.setToolTip("按图库维护状态生成的虚拟筛选，不是实际文件夹。")
 
         self.temp_project_list = QListWidget()
         self.temp_project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -752,10 +828,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("文件夹"))
         layout.addWidget(self.add_collection_button)
         layout.addWidget(self.add_folder_button)
+        layout.addWidget(self.import_folder_tree_button)
         layout.addWidget(self.collection_tree, 3)
+        layout.addWidget(self.virtual_collection_tree)
         layout.addWidget(QLabel("灵感暂存"))
         layout.addWidget(self.temp_project_list, 1)
         return panel
+
+    @staticmethod
+    def _configure_sidebar_count_tree(tree: QTreeWidget) -> None:
+        header = tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        tree.setColumnWidth(1, SIDEBAR_COUNT_COLUMN_WIDTH)
 
     def _build_library_panel(self) -> QWidget:
         panel = QWidget()
@@ -1022,7 +1108,8 @@ class MainWindow(QMainWindow):
 
     def _build_detail_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setMinimumWidth(220)
+        panel.setMinimumWidth(0)
+        panel.setMaximumWidth(RIGHT_SIDEBAR_WIDTH)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -1127,9 +1214,13 @@ class MainWindow(QMainWindow):
 
         self.tag_panel_selection_label = QLabel("先在图片墙选择 1 张或多张图片。")
         self.tag_panel_selection_label.setWordWrap(True)
-        self.tag_panel_input = QLineEdit()
-        self.tag_panel_input.setPlaceholderText("给选中图片添加标签，逗号分隔")
-        self.tag_panel_input.setCompleter(self._make_tag_completer())
+        self.tag_panel_input = QTextEdit()
+        self.tag_panel_input.setPlaceholderText("给选中图片添加标签，每行一个")
+        self.tag_panel_input.setAcceptRichText(False)
+        self.tag_panel_input.setTabChangesFocus(True)
+        self.tag_panel_input.setMinimumHeight(150)
+        self.tag_panel_input.setMaximumHeight(180)
+        self.tag_panel_input.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.tag_panel_add_button = QPushButton("添加到选中")
         self.tag_panel_remove_combo = QComboBox()
         self.tag_panel_remove_button = QPushButton("移除标签")
@@ -1329,7 +1420,8 @@ class MainWindow(QMainWindow):
         filter_layout.addWidget(self.tag_panel_selection_label)
         tag_panel_add_row = QHBoxLayout()
         tag_panel_add_row.setContentsMargins(0, 0, 0, 0)
-        tag_panel_add_row.addWidget(self.tag_panel_input, 1)
+        filter_layout.addWidget(self.tag_panel_input)
+        tag_panel_add_row.addStretch(1)
         tag_panel_add_row.addWidget(self.tag_panel_add_button)
         filter_layout.addLayout(tag_panel_add_row)
         tag_panel_remove_row = QHBoxLayout()
@@ -1541,8 +1633,6 @@ class MainWindow(QMainWindow):
         tab_bar.setMinimumWidth(
             EqualWidthTabBar.minimum_width_for_tab_count(self.right_tab_widget.count())
         )
-        left_margin, _top_margin, right_margin, _bottom_margin = layout.getContentsMargins()
-        panel.setMinimumWidth(tab_bar.minimumWidth() + left_margin + right_margin)
         self.right_tab_widget.setCurrentIndex(
             self._setting_int("ui.right_tab_index", 0, 0, self.right_tab_widget.count() - 1)
         )
@@ -1553,6 +1643,7 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.add_folder_button.clicked.connect(self._choose_folder)
+        self.import_folder_tree_button.clicked.connect(self._choose_folder_tree_import)
         self.rescan_button.clicked.connect(self._rescan_selected_folder)
         self.add_collection_button.clicked.connect(self._create_collection_from_button)
         self.shuffle_results_button.clicked.connect(self._shuffle_current_grid_images)
@@ -1648,6 +1739,10 @@ class MainWindow(QMainWindow):
         self.collection_tree.treeReordered.connect(self._save_collection_tree_order)
         self.collection_tree.imagesDropped.connect(self._assign_dropped_images_to_collection)
         self.collection_tree.filesDropped.connect(self._import_dropped_files_to_collection)
+        self.collection_tree.rootFilesDropped.connect(self._import_dropped_files_to_root)
+        self.virtual_collection_tree.itemSelectionChanged.connect(
+            self._on_virtual_collection_selection_changed
+        )
         self.status_filter_combo.currentIndexChanged.connect(self._refresh_current_results_for_filters)
         self.status_filter_combo.currentIndexChanged.connect(self._save_status_filter)
         self.tag_list.itemSelectionChanged.connect(self._refresh_tag_action_buttons)
@@ -2140,7 +2235,7 @@ class MainWindow(QMainWindow):
             (self.right_tab_widget, "Right side panel", "Details, AI, tag, index and settings pages"),
             (self.preview_label, "Selected item preview", "Preview of selected image or folder state"),
             (self.tag_panel_selection_label, "Tag page selection status", "Shows which selected images can be tagged"),
-            (self.tag_panel_input, "Add tags to selection", "Comma-separated tags to add to selected images"),
+            (self.tag_panel_input, "Add tags to selection", "One tag per line to add to selected images"),
             (self.tag_list, "Tag management list", "Existing user tags for filtering and management"),
             (self.settings_status_label, "Settings status", "Settings, self-check and error status output"),
         ]
@@ -2154,7 +2249,8 @@ class MainWindow(QMainWindow):
     def _apply_runtime_language_settings(self) -> None:
         if self.current_language == "en":
             self.add_collection_button.setText("New Folder")
-            self.add_folder_button.setText("Import Here")
+            self.add_folder_button.setText("Import Images")
+            self.import_folder_tree_button.setText("Import Folder")
             self.search_input.setPlaceholderText("File name, tags, notes, or semantic search text")
             self.keyword_mode_button.setText("Keyword")
             self.semantic_mode_button.setText("Semantic")
@@ -2180,7 +2276,7 @@ class MainWindow(QMainWindow):
             self.save_detail_button.setText("Save Details")
             self.delete_source_button.setText("Delete / Remove")
             self.delete_source_button.setToolTip("Delete source files, or only remove them from Eidory")
-            self.tag_panel_input.setPlaceholderText("Add tags to selected items, separated by commas")
+            self.tag_panel_input.setPlaceholderText("Add tags to selected items, one per line")
             self.tag_panel_add_button.setText("Add to Selected")
             self.tag_panel_remove_button.setText("Remove Tag")
             self.tag_panel_clear_button.setText("Clear Tags")
@@ -2230,7 +2326,8 @@ class MainWindow(QMainWindow):
             self.right_tab_widget.setTabText(4, "Settings")
         else:
             self.add_collection_button.setText("新建文件夹")
-            self.add_folder_button.setText("导入到当前文件夹")
+            self.add_folder_button.setText("导入图片")
+            self.import_folder_tree_button.setText("导入文件夹")
             self.search_input.setPlaceholderText("文件名、标签、备注，或语义搜索文本")
             self.keyword_mode_button.setText("关键词")
             self.semantic_mode_button.setText("语义")
@@ -2256,7 +2353,7 @@ class MainWindow(QMainWindow):
             self.save_detail_button.setText("保存详情")
             self.delete_source_button.setText("删除/移除图片")
             self.delete_source_button.setToolTip("选择删除源文件，或只从 Eidory 移除索引")
-            self.tag_panel_input.setPlaceholderText("给选中图片添加标签，逗号分隔")
+            self.tag_panel_input.setPlaceholderText("给选中图片添加标签，每行一个")
             self.tag_panel_add_button.setText("添加到选中")
             self.tag_panel_remove_button.setText("移除标签")
             self.tag_panel_clear_button.setText("清空标签")
@@ -2312,9 +2409,20 @@ class MainWindow(QMainWindow):
         if collection_id is None:
             self.statusBar().showMessage("请先选择或新建一个 Eidory 文件夹")
             return
+        filters = "Media Files (*.jpg *.jpeg *.png *.webp *.mp4 *.mov *.m4v *.avi *.mkv *.webm)"
+        files, _selected_filter = QFileDialog.getOpenFileNames(
+            self,
+            "选择要导入的图片或视频",
+            str(Path.home()),
+            filters,
+        )
+        if files:
+            self._start_file_import(files, collection_id)
+
+    def _choose_folder_tree_import(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "选择要导入的磁盘文件夹")
         if folder:
-            self._start_import(folder, collection_id, preserve_structure=False)
+            self._start_folder_tree_import([folder], parent_collection_id=None)
 
     def _rescan_selected_folder(self) -> None:
         item = self.folder_tree.currentItem()
@@ -2326,8 +2434,7 @@ class MainWindow(QMainWindow):
 
     def _start_scan(self, folder_path: str) -> None:
         self.statusBar().showMessage(f"扫描中：{folder_path}")
-        self.add_folder_button.setEnabled(False)
-        self.rescan_button.setEnabled(False)
+        self._set_import_controls_enabled(False)
 
         def run() -> None:
             try:
@@ -2339,13 +2446,12 @@ class MainWindow(QMainWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def _rescan_all_folders(self) -> None:
-        folders = self.store.list_folders()
+        folders = self.store.list_folders_with_collection_images()
         if not folders:
             self.statusBar().showMessage("没有可重新扫描的导入目录")
             return
         self.statusBar().showMessage(f"重新扫描全部导入目录：{len(folders)} 个")
-        self.add_folder_button.setEnabled(False)
-        self.rescan_button.setEnabled(False)
+        self._set_import_controls_enabled(False)
         self._set_maintenance_controls_enabled(False)
         self.settings_status_label.setText(f"正在重新扫描全部导入目录：{len(folders)} 个")
 
@@ -2361,15 +2467,14 @@ class MainWindow(QMainWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def _rescan_new_or_changed_folders(self) -> None:
-        folders = self.store.list_folders()
+        folders = self.store.list_folders_with_collection_images()
         if not folders:
             self.statusBar().showMessage("没有可扫描的导入目录")
             return
         self.statusBar().showMessage(f"扫描新增/变化：{len(folders)} 个目录")
-        self.add_folder_button.setEnabled(False)
-        self.rescan_button.setEnabled(False)
+        self._set_import_controls_enabled(False)
         self._set_maintenance_controls_enabled(False)
-        self.settings_status_label.setText("正在扫描新增/变化；不会标记丢失文件。")
+        self.settings_status_label.setText("正在扫描新增/变化；不会处理已删除文件。")
 
         def run() -> None:
             results: list[ScanResult] = []
@@ -2388,8 +2493,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("没有包含丢失文件的导入目录")
             return
         self.statusBar().showMessage(f"扫描缺失所在目录：{len(folders)} 个")
-        self.add_folder_button.setEnabled(False)
-        self.rescan_button.setEnabled(False)
+        self._set_import_controls_enabled(False)
         self._set_maintenance_controls_enabled(False)
         self.settings_status_label.setText(f"正在重新扫描 {len(folders)} 个包含丢失文件的目录...")
 
@@ -2561,6 +2665,11 @@ class MainWindow(QMainWindow):
         self.export_library_button.setEnabled(enabled)
         self.export_selection_button.setEnabled(enabled and bool(self._selected_grid_images()))
 
+    def _set_import_controls_enabled(self, enabled: bool) -> None:
+        self.add_folder_button.setEnabled(enabled)
+        self.import_folder_tree_button.setEnabled(enabled)
+        self.rescan_button.setEnabled(enabled)
+
     def _handle_export_done(self, payload: object) -> None:
         label, result = payload
         if not isinstance(result, ExportResult):
@@ -2587,8 +2696,7 @@ class MainWindow(QMainWindow):
             self.events.put(("error", "请先选择一个 Eidory 文件夹"))
             return
         self.statusBar().showMessage(f"导入中：{folder_path}")
-        self.add_folder_button.setEnabled(False)
-        self.rescan_button.setEnabled(False)
+        self._set_import_controls_enabled(False)
 
         def run() -> None:
             try:
@@ -2607,6 +2715,165 @@ class MainWindow(QMainWindow):
                 self.events.put(("error", f"导入失败：{exc}"))
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _start_file_import(self, file_paths: list[str], collection_id: int) -> None:
+        supported_files = [
+            os.path.abspath(os.path.expanduser(path))
+            for path in file_paths
+            if os.path.isfile(os.path.abspath(os.path.expanduser(path)))
+            and is_supported_media(os.path.abspath(os.path.expanduser(path)))
+        ]
+        if not supported_files:
+            self.statusBar().showMessage("没有可导入的受支持图片或视频")
+            return
+        collection_name = self._collection_name(collection_id) or "当前文件夹"
+        self.statusBar().showMessage(f"导入图片到“{collection_name}”")
+        self._set_import_controls_enabled(False)
+
+        def run() -> None:
+            try:
+                result = self.scanner.import_files(supported_files)
+                assigned = self.store.assign_images_to_collection(
+                    list(result.image_ids),
+                    collection_id,
+                )
+                self.events.put((
+                    "drop_import_done",
+                    (
+                        collection_id,
+                        collection_name,
+                        result.scanned_files,
+                        result.new_files,
+                        result.changed_files,
+                        assigned,
+                        list(result.image_ids),
+                    ),
+                ))
+            except Exception as exc:
+                self.events.put(("error", f"导入图片失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _start_folder_tree_import(
+        self,
+        folder_paths: list[str],
+        *,
+        parent_collection_id: int | None,
+    ) -> None:
+        folders = self._valid_import_folders(folder_paths)
+        if not folders:
+            self.statusBar().showMessage("没有可导入的磁盘文件夹")
+            return
+        parent_name = (
+            self._collection_name(parent_collection_id)
+            if parent_collection_id is not None
+            else "根层级"
+        ) or "文件夹"
+        self.statusBar().showMessage(f"导入文件夹树到“{parent_name}”：{len(folders)} 个")
+        self._set_import_controls_enabled(False)
+
+        def run() -> None:
+            try:
+                results: list[ScanResult] = []
+                assigned_total = 0
+                imported_image_ids: list[int] = []
+                for folder in folders:
+                    result = self.scanner.scan_folder(folder)
+                    results.append(result)
+                    imported_image_ids.extend(result.image_ids)
+                    assigned_total += self._assign_import_result(
+                        result=result,
+                        folder_path=folder,
+                        collection_id=parent_collection_id,
+                        preserve_structure=True,
+                    )
+                self.events.put((
+                    "folder_tree_import_done",
+                    (
+                        results,
+                        parent_collection_id,
+                        parent_name,
+                        assigned_total,
+                        imported_image_ids,
+                        folders,
+                    ),
+                ))
+            except Exception as exc:
+                self.events.put(("error", f"导入文件夹失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _start_local_paths_import(
+        self,
+        *,
+        file_paths: list[str],
+        folder_paths: list[str],
+        parent_collection_id: int | None,
+    ) -> None:
+        target_name = (
+            self._collection_name(parent_collection_id)
+            if parent_collection_id is not None
+            else "根层级"
+        ) or "文件夹"
+        self.statusBar().showMessage(f"导入拖入内容到“{target_name}”")
+        self._set_import_controls_enabled(False)
+
+        def run() -> None:
+            try:
+                results: list[ScanResult] = []
+                assigned_total = 0
+                imported_image_ids: list[int] = []
+                if file_paths:
+                    if parent_collection_id is None:
+                        raise ValueError("拖入图片必须先选择或拖到一个 Eidory 文件夹")
+                    file_result = self.scanner.import_files(file_paths)
+                    results.append(file_result)
+                    imported_image_ids.extend(file_result.image_ids)
+                    assigned_total += self.store.assign_images_to_collection(
+                        list(file_result.image_ids),
+                        parent_collection_id,
+                    )
+                for folder in folder_paths:
+                    folder_result = self.scanner.scan_folder(folder)
+                    results.append(folder_result)
+                    imported_image_ids.extend(folder_result.image_ids)
+                    assigned_total += self._assign_import_result(
+                        result=folder_result,
+                        folder_path=folder,
+                        collection_id=parent_collection_id,
+                        preserve_structure=True,
+                    )
+                self.events.put((
+                    "local_paths_import_done",
+                    (
+                        results,
+                        parent_collection_id,
+                        target_name,
+                        assigned_total,
+                        imported_image_ids,
+                        file_paths,
+                        folder_paths,
+                    ),
+                ))
+            except Exception as exc:
+                self.events.put(("error", f"拖入导入失败：{exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _valid_import_folders(folder_paths: list[str]) -> list[str]:
+        folders: list[str] = []
+        seen: set[str] = set()
+        for raw_path in folder_paths:
+            path = Path(os.path.abspath(os.path.expanduser(str(raw_path))))
+            if not path.is_dir() or path.is_symlink() or path.name.startswith("."):
+                continue
+            normalized = str(path)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            folders.append(normalized)
+        return folders
 
     def _assign_import_result(
         self,
@@ -3041,9 +3308,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("没有可搜索的语义探针")
             return
         self.semantic_search_revision += 1
+        self._clear_manual_result_order()
         revision = self.semantic_search_revision
         folder_path_prefix = self._selected_folder_path_prefix()
         collection_id = self._selected_collection_id()
+        virtual_filter = self._selected_virtual_filter()
         tag_ids: list[int] = []
         tag_match_mode = "any"
         status_filter = self._selected_status_filter()
@@ -3079,6 +3348,7 @@ class MainWindow(QMainWindow):
                         term.query,
                         folder_path_prefix=folder_path_prefix,
                         collection_id=collection_id,
+                        virtual_filter=virtual_filter,
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
@@ -3529,12 +3799,15 @@ class MainWindow(QMainWindow):
         if not self.search_filters:
             self._reload_images()
             return
+        if operation_mode != "recompute":
+            self._clear_manual_result_order()
 
         self.semantic_search_revision += 1
         revision = self.semantic_search_revision
         filters = tuple(self.search_filters)
         folder_path_prefix = self._selected_folder_path_prefix()
         collection_id = self._selected_collection_id()
+        virtual_filter = self._selected_virtual_filter()
         tag_ids: list[int] = []
         tag_match_mode = "any"
         status_filter = self._selected_status_filter()
@@ -3562,6 +3835,7 @@ class MainWindow(QMainWindow):
                     filters=filters,
                     folder_path_prefix=folder_path_prefix,
                     collection_id=collection_id,
+                    virtual_filter=virtual_filter,
                     tag_ids=tag_ids,
                     tag_match_mode=tag_match_mode,
                     status_filter=status_filter,
@@ -3618,6 +3892,7 @@ class MainWindow(QMainWindow):
         tag_ids: list[int],
         tag_match_mode: str,
         status_filter: str | None,
+        virtual_filter: str | None = None,
         base_image_ids: set[int] | None = None,
         merge_base_images: list[ImageItem] | None = None,
     ) -> SearchChainResult:
@@ -3641,6 +3916,7 @@ class MainWindow(QMainWindow):
                     str(search_filter.value),
                     folder_path_prefix=folder_path_prefix,
                     collection_id=collection_id,
+                    virtual_filter=virtual_filter,
                     tag_ids=tag_ids,
                     tag_match_mode=tag_match_mode,
                     status_filter=status_filter,
@@ -3654,6 +3930,7 @@ class MainWindow(QMainWindow):
                     int(search_filter.value),
                     folder_path_prefix=folder_path_prefix,
                     collection_id=collection_id,
+                    virtual_filter=virtual_filter,
                     tag_ids=tag_ids,
                     tag_match_mode=tag_match_mode,
                     status_filter=status_filter,
@@ -3667,6 +3944,7 @@ class MainWindow(QMainWindow):
                     search_filter.value,  # type: ignore[arg-type]
                     folder_path_prefix=folder_path_prefix,
                     collection_id=collection_id,
+                    virtual_filter=virtual_filter,
                     tag_ids=tag_ids,
                     tag_match_mode=tag_match_mode,
                     status_filter=status_filter,
@@ -3686,6 +3964,7 @@ class MainWindow(QMainWindow):
                         tag_match_mode=tag_match_mode,
                         folder_path_prefix=folder_path_prefix,
                         collection_id=collection_id,
+                        virtual_filter=virtual_filter,
                         limit=5_000,
                     )
                 else:
@@ -3699,6 +3978,7 @@ class MainWindow(QMainWindow):
                     images = self._list_chain_base_images(
                         folder_path_prefix=folder_path_prefix,
                         collection_id=collection_id,
+                        virtual_filter=virtual_filter,
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
@@ -3713,6 +3993,7 @@ class MainWindow(QMainWindow):
                     images = self._list_chain_base_images(
                         folder_path_prefix=folder_path_prefix,
                         collection_id=collection_id,
+                        virtual_filter=virtual_filter,
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
@@ -3727,6 +4008,7 @@ class MainWindow(QMainWindow):
                     images = self._list_chain_base_images(
                         folder_path_prefix=folder_path_prefix,
                         collection_id=collection_id,
+                        virtual_filter=virtual_filter,
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
@@ -3741,6 +4023,7 @@ class MainWindow(QMainWindow):
                     images = self._list_chain_base_images(
                         folder_path_prefix=folder_path_prefix,
                         collection_id=collection_id,
+                        virtual_filter=virtual_filter,
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
@@ -3758,6 +4041,7 @@ class MainWindow(QMainWindow):
                     images = self._list_chain_base_images(
                         folder_path_prefix=folder_path_prefix,
                         collection_id=collection_id,
+                        virtual_filter=virtual_filter,
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
@@ -3774,6 +4058,7 @@ class MainWindow(QMainWindow):
                     images = self._list_chain_base_images(
                         folder_path_prefix=folder_path_prefix,
                         collection_id=collection_id,
+                        virtual_filter=virtual_filter,
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
@@ -3821,6 +4106,7 @@ class MainWindow(QMainWindow):
         *,
         folder_path_prefix: str | None,
         collection_id: int | None,
+        virtual_filter: str | None,
         tag_ids: list[int],
         tag_match_mode: str,
         status_filter: str | None,
@@ -3831,6 +4117,7 @@ class MainWindow(QMainWindow):
             tag_match_mode=tag_match_mode,
             folder_path_prefix=folder_path_prefix,
             collection_id=collection_id,
+            virtual_filter=virtual_filter,
             limit=50_000,
         )
 
@@ -4377,8 +4664,11 @@ class MainWindow(QMainWindow):
 
     def _context_filter_actions(self) -> list[tuple[str, object]]:
         actions: list[tuple[str, object]] = []
+        virtual_filter = self._selected_virtual_filter()
         collection_id = self._selected_collection_id()
-        if collection_id is not None:
+        if virtual_filter is not None:
+            actions.append((f"聚类：{self._virtual_filter_label(virtual_filter)}", self._clear_collection_filter))
+        elif collection_id is not None:
             collection_name = self._collection_name(collection_id) or "当前文件夹"
             actions.append((f"文件夹：{collection_name}", self._clear_collection_filter))
 
@@ -4405,6 +4695,11 @@ class MainWindow(QMainWindow):
         self._refresh_visible_results_after_result_management_change()
 
     def _clear_collection_filter(self) -> None:
+        if hasattr(self, "virtual_collection_tree"):
+            self.virtual_collection_tree.blockSignals(True)
+            self.virtual_collection_tree.clearSelection()
+            self.virtual_collection_tree.setCurrentItem(None)
+            self.virtual_collection_tree.blockSignals(False)
         item = self.collection_tree.topLevelItem(0)
         if item is not None:
             self.collection_tree.setCurrentItem(item)
@@ -4631,6 +4926,7 @@ class MainWindow(QMainWindow):
 
     def _reload_images(self) -> None:
         self.current_offset = 0
+        self._clear_manual_result_order()
         self._clear_result_management_state()
         self._clear_temporary_project_selection()
         self.search_filters.clear()
@@ -4667,6 +4963,7 @@ class MainWindow(QMainWindow):
             tag_match_mode="any",
             folder_path_prefix=self._selected_folder_path_prefix(),
             collection_id=self._selected_collection_id(),
+            virtual_filter=self._selected_virtual_filter(),
             limit=self.page_size,
             offset=0,
             sort_key=self._database_sort_key(),
@@ -4703,6 +5000,7 @@ class MainWindow(QMainWindow):
             tag_match_mode="any",
             folder_path_prefix=self._selected_folder_path_prefix(),
             collection_id=self._selected_collection_id(),
+            virtual_filter=self._selected_virtual_filter(),
             limit=self.page_size,
             offset=self.current_offset,
             sort_key=self._database_sort_key(),
@@ -4782,6 +5080,7 @@ class MainWindow(QMainWindow):
                 tag_match_mode="any",
                 folder_path_prefix=self._selected_folder_path_prefix(),
                 collection_id=self._selected_collection_id(),
+                virtual_filter=self._selected_virtual_filter(),
                 limit=self.page_size,
                 offset=0,
                 sort_key=self._database_sort_key(),
@@ -4953,6 +5252,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("当前没有足够的图片可打乱")
             return
         random.shuffle(images)
+        self._set_manual_result_order(images)
         self.grid_view.set_images(
             images,
             badges_by_image_id=self._current_grid_badges_by_image_id(),
@@ -5956,13 +6256,14 @@ class MainWindow(QMainWindow):
             self._assign_selected_images_to_collection(int(collection_id), str(collection_name))
         elif action == actions["import_flat"] and has_collection:
             self._choose_import_folder_for_collection(int(collection_id), preserve_structure=False)
-        elif action == actions["import_tree"] and item is not None:
+        elif action == actions["import_tree"]:
             parent_id = int(collection_id) if collection_id is not None else None
             self._choose_import_folder_for_collection(parent_id, preserve_structure=True)
 
     def _build_collection_context_menu(self, item: QTreeWidgetItem | None) -> tuple[QMenu, dict[str, object]]:
         collection_id = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
         has_collection = collection_id is not None
+        is_virtual = item is not None and item.data(0, COLLECTION_VIRTUAL_FILTER_ROLE) is not None
         menu = QMenu(self)
         actions = {
             "new_root": menu.addAction("新建文件夹"),
@@ -5970,12 +6271,12 @@ class MainWindow(QMainWindow):
             "rename": menu.addAction("重命名"),
             "delete": menu.addAction("删除文件夹"),
             "add_selected": menu.addAction("把选中图片加入此文件夹"),
-            "import_flat": menu.addAction("导入磁盘文件夹到此文件夹"),
-            "import_tree": menu.addAction("按磁盘目录生成子文件夹导入"),
+            "import_flat": menu.addAction("导入图片"),
+            "import_tree": menu.addAction("导入文件夹"),
         }
         for key in ["new_child", "rename", "delete", "add_selected", "import_flat"]:
             actions[key].setEnabled(has_collection)
-        actions["import_tree"].setEnabled(item is not None)
+        actions["import_tree"].setEnabled(not is_virtual)
         return menu, actions
 
     def _on_grid_image_selected(self, image: ImageItem | None) -> None:
@@ -5995,9 +6296,27 @@ class MainWindow(QMainWindow):
         self._refresh_temp_project_save_button()
 
     def _on_collection_selection_changed(self) -> None:
+        if hasattr(self, "virtual_collection_tree"):
+            self.virtual_collection_tree.blockSignals(True)
+            self.virtual_collection_tree.clearSelection()
+            self.virtual_collection_tree.setCurrentItem(None)
+            self.virtual_collection_tree.blockSignals(False)
         self.selected_image = None
         self._refresh_current_results_for_filters()
         self._show_collection_details(self._selected_collection_id())
+        self._refresh_tag_panel_assignment([])
+        self._refresh_temp_project_save_button()
+
+    def _on_virtual_collection_selection_changed(self) -> None:
+        if self._selected_virtual_filter() is None:
+            return
+        self.collection_tree.blockSignals(True)
+        self.collection_tree.clearSelection()
+        self.collection_tree.setCurrentItem(None)
+        self.collection_tree.blockSignals(False)
+        self.selected_image = None
+        self._refresh_current_results_for_filters()
+        self._show_collection_details(None)
         self._refresh_tag_panel_assignment([])
         self._refresh_temp_project_save_button()
 
@@ -6108,6 +6427,21 @@ class MainWindow(QMainWindow):
         self._refresh_feedback_buttons(None)
         self._set_detail_controls_enabled(False)
         self._set_batch_tag_controls_visible(False)
+
+        virtual_filter = self._selected_virtual_filter() if collection_id is None else None
+        if virtual_filter is not None:
+            label = self._virtual_filter_label(virtual_filter)
+            count = self.store.count_images_for_virtual_filter(virtual_filter)
+            self.collection_detail_name_label.setText(label)
+            self.collection_detail_path_label.setText(f"聚类 / {label}")
+            self.collection_detail_count_label.setText(f"{count} 个")
+            self.collection_detail_import_dir_label.setText("-")
+            self.collection_detail_help_label.setText(
+                f"{self._virtual_filter_help(virtual_filter)}选择图片后，这里会切换为图片详情。"
+            )
+            self.open_collection_import_dir_button.setEnabled(False)
+            self.ai_vision_detail_label.setText("-")
+            return
 
         if collection_id is None:
             total = self.store.count_images()
@@ -6369,6 +6703,8 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if hasattr(self, "root_splitter"):
+            QTimer.singleShot(0, self._enforce_fixed_sidebar_widths)
         if hasattr(self, "path_label"):
             self._fit_path_label_height()
         selected_images = self.grid_view.selected_images()
@@ -6391,6 +6727,7 @@ class MainWindow(QMainWindow):
         self.store.update_favorite(image_id, self.favorite_checkbox.isChecked())
         self.store.set_image_tags(image_id, tags)
         self._refresh_tags()
+        self._refresh_virtual_collection_counts()
         self._refresh_current_results_for_filters()
         refreshed = self.store.get_image(image_id)
         self.selected_image = refreshed
@@ -6451,6 +6788,7 @@ class MainWindow(QMainWindow):
         removed = self.store.clear_tags_for_images([image.id])
         self.tags_input.clear()
         self._refresh_tags()
+        self._refresh_virtual_collection_counts()
         self._refresh_current_results_for_filters()
         refreshed = self.store.get_image(image.id)
         self.selected_image = refreshed
@@ -6553,75 +6891,102 @@ class MainWindow(QMainWindow):
         collection_id: int,
         paths: list[str],
     ) -> None:
-        if not self._confirm_drop_import(collection_id, {"local_paths": list(paths)}):
+        file_paths, folder_paths = self._split_local_import_paths(paths)
+        if not file_paths and not folder_paths:
+            self.statusBar().showMessage("拖入内容里没有可导入的图片、视频或文件夹")
             return
-        collection_name = self._collection_name(collection_id) or "文件夹"
-        self.statusBar().showMessage(f"导入拖入的文件到“{collection_name}”")
-        self.add_folder_button.setEnabled(False)
-        self.rescan_button.setEnabled(False)
+        if not self._confirm_local_paths_import(
+            parent_collection_id=collection_id,
+            file_paths=file_paths,
+            folder_paths=folder_paths,
+        ):
+            return
+        self._start_local_paths_import(
+            file_paths=file_paths,
+            folder_paths=folder_paths,
+            parent_collection_id=collection_id,
+        )
 
-        def run() -> None:
-            try:
-                file_paths: list[str] = []
-                folder_paths: list[str] = []
-                for path in paths:
-                    expanded = os.path.abspath(os.path.expanduser(path))
-                    if os.path.isdir(expanded):
-                        folder_paths.append(expanded)
-                    elif os.path.isfile(expanded):
-                        file_paths.append(expanded)
-
-                total_scanned = 0
-                total_new = 0
-                total_changed = 0
-                total_assigned = 0
-                imported_image_ids: list[int] = []
-                if file_paths:
-                    result = self.scanner.import_files(file_paths)
-                    imported_image_ids.extend(result.image_ids)
-                    total_scanned += result.scanned_files
-                    total_new += result.new_files
-                    total_changed += result.changed_files
-                    total_assigned += self.store.assign_images_to_collection(
-                        list(result.image_ids),
-                        collection_id,
-                    )
-                for folder_path in folder_paths:
-                    result = self.scanner.scan_folder(folder_path)
-                    imported_image_ids.extend(result.image_ids)
-                    total_scanned += result.scanned_files
-                    total_new += result.new_files
-                    total_changed += result.changed_files
-                    total_assigned += self.store.assign_images_to_collection(
-                        list(result.image_ids),
-                        collection_id,
-                    )
-                self.events.put((
-                    "drop_import_done",
-                    (
-                        collection_id,
-                        collection_name,
-                        total_scanned,
-                        total_new,
-                        total_changed,
-                        total_assigned,
-                        imported_image_ids,
-                    ),
-                ))
-            except Exception as exc:
-                self.events.put(("error", f"拖入导入失败：{exc}"))
-
-        threading.Thread(target=run, daemon=True).start()
+    def _import_dropped_files_to_root(self, paths: list[str]) -> None:
+        file_paths, folder_paths = self._split_local_import_paths(paths)
+        if file_paths:
+            self.statusBar().showMessage("拖入图片必须拖到具体 Eidory 文件夹；拖入文件夹可放到根层级")
+            return
+        if not folder_paths:
+            self.statusBar().showMessage("拖入内容里没有可导入的文件夹")
+            return
+        if not self._confirm_local_paths_import(
+            parent_collection_id=None,
+            file_paths=[],
+            folder_paths=folder_paths,
+        ):
+            return
+        self._start_local_paths_import(
+            file_paths=[],
+            folder_paths=folder_paths,
+            parent_collection_id=None,
+        )
 
     def _import_dropped_files_to_selected_collection(self, paths: list[str]) -> None:
         collection_id = self._selected_collection_id()
         if collection_id is None:
-            self.statusBar().showMessage("请先选择一个 Eidory 文件夹，再拖入硬盘图片")
+            file_paths, folder_paths = self._split_local_import_paths(paths)
+            if file_paths:
+                self.statusBar().showMessage("拖入图片必须先选择一个 Eidory 文件夹")
+                return
+            if not folder_paths:
+                self.statusBar().showMessage("拖入内容里没有可导入的文件夹")
+                return
+            if not self._confirm_local_paths_import(
+                parent_collection_id=None,
+                file_paths=[],
+                folder_paths=folder_paths,
+            ):
+                return
+            self._start_local_paths_import(
+                file_paths=[],
+                folder_paths=folder_paths,
+                parent_collection_id=None,
+            )
             return
         self._import_dropped_files_to_collection(collection_id, paths)
 
     def _import_drop_payload_to_selected_collection(self, payload: dict[str, object]) -> None:
         collection_id = self._selected_collection_id()
+        raw_paths = payload.get("local_paths", [])
+        if isinstance(raw_paths, list) and raw_paths:
+            file_paths, folder_paths = self._split_local_import_paths([str(path) for path in raw_paths])
+            if not file_paths and not folder_paths:
+                self.statusBar().showMessage("拖入内容里没有可导入的图片、视频或文件夹")
+                return
+            if collection_id is None:
+                if file_paths:
+                    self.statusBar().showMessage("拖入图片必须先选择一个 Eidory 文件夹")
+                    return
+                if folder_paths and self._confirm_local_paths_import(
+                    parent_collection_id=None,
+                    file_paths=[],
+                    folder_paths=folder_paths,
+                ):
+                    self._start_local_paths_import(
+                        file_paths=[],
+                        folder_paths=folder_paths,
+                        parent_collection_id=None,
+                    )
+                return
+            if file_paths or folder_paths:
+                if not self._confirm_local_paths_import(
+                    parent_collection_id=collection_id,
+                    file_paths=file_paths,
+                    folder_paths=folder_paths,
+                ):
+                    return
+                self._start_local_paths_import(
+                    file_paths=file_paths,
+                    folder_paths=folder_paths,
+                    parent_collection_id=collection_id,
+                )
+                return
         if collection_id is None:
             self.statusBar().showMessage("请选择左侧具体文件夹后再拖入图片")
             return
@@ -6645,8 +7010,7 @@ class MainWindow(QMainWindow):
                 prepared_payload["image_png_bytes"] = image_bytes
 
         self.statusBar().showMessage(f"保存拖入图片到“{collection_name}”")
-        self.add_folder_button.setEnabled(False)
-        self.rescan_button.setEnabled(False)
+        self._set_import_controls_enabled(False)
 
         def run() -> None:
             try:
@@ -6674,6 +7038,62 @@ class MainWindow(QMainWindow):
                 self.events.put(("error", f"拖入保存失败：{exc}"))
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _split_local_import_paths(self, paths: list[str]) -> tuple[list[str], list[str]]:
+        file_paths: list[str] = []
+        folder_paths: list[str] = []
+        seen_files: set[str] = set()
+        seen_folders: set[str] = set()
+        for path in paths:
+            expanded = os.path.abspath(os.path.expanduser(str(path)))
+            if os.path.isdir(expanded):
+                folder = Path(expanded)
+                if folder.is_symlink() or folder.name.startswith(".") or expanded in seen_folders:
+                    continue
+                seen_folders.add(expanded)
+                folder_paths.append(expanded)
+            elif os.path.isfile(expanded) and is_supported_media(expanded):
+                if expanded in seen_files:
+                    continue
+                seen_files.add(expanded)
+                file_paths.append(expanded)
+        return file_paths, folder_paths
+
+    def _confirm_local_paths_import(
+        self,
+        *,
+        parent_collection_id: int | None,
+        file_paths: list[str],
+        folder_paths: list[str],
+    ) -> bool:
+        if file_paths and parent_collection_id is None:
+            self.statusBar().showMessage("拖入图片必须指定一个 Eidory 文件夹")
+            return False
+        target_name = (
+            self._collection_path_text(parent_collection_id)
+            if parent_collection_id is not None
+            else "根层级"
+        )
+        lines = [f"目标：{target_name}"]
+        if file_paths:
+            target_dir = self._collection_import_directory(parent_collection_id)  # type: ignore[arg-type]
+            lines.append(f"图片/视频：{len(file_paths)} 个，会复制到：{target_dir}")
+        if folder_paths:
+            lines.append(f"磁盘文件夹：{len(folder_paths)} 个，会按原目录树原地索引，不复制、不移动源文件。")
+            preview_names = [Path(path).name for path in folder_paths[:6]]
+            if preview_names:
+                lines.append("文件夹：" + "、".join(preview_names))
+            if len(folder_paths) > 6:
+                lines.append(f"另有 {len(folder_paths) - 6} 个文件夹。")
+        message = "\n".join(lines) + "\n\n继续导入？"
+        answer = QMessageBox.question(
+            self,
+            "确认导入",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def _confirm_drop_import(self, collection_id: int, payload: dict[str, object]) -> bool:
         local_paths = payload.get("local_paths", [])
@@ -7026,10 +7446,23 @@ class MainWindow(QMainWindow):
         *,
         preserve_structure: bool,
     ) -> None:
-        title = "选择要按目录结构导入的磁盘文件夹" if preserve_structure else "选择要导入的磁盘文件夹"
-        folder = QFileDialog.getExistingDirectory(self, title)
-        if folder:
-            self._start_import(folder, collection_id, preserve_structure=preserve_structure)
+        if preserve_structure:
+            folder = QFileDialog.getExistingDirectory(self, "选择要导入的磁盘文件夹")
+            if folder:
+                self._start_folder_tree_import([folder], parent_collection_id=collection_id)
+            return
+        if collection_id is None:
+            self.statusBar().showMessage("导入图片必须先选择一个 Eidory 文件夹")
+            return
+        filters = "Media Files (*.jpg *.jpeg *.png *.webp *.mp4 *.mov *.m4v *.avi *.mkv *.webm)"
+        files, _selected_filter = QFileDialog.getOpenFileNames(
+            self,
+            "选择要导入的图片或视频",
+            str(Path.home()),
+            filters,
+        )
+        if files:
+            self._start_file_import(files, collection_id)
 
     def _create_collections_from_disk_folder(self, folder_path: str) -> None:
         base = self._normalize_folder_path(folder_path)
@@ -7121,6 +7554,7 @@ class MainWindow(QMainWindow):
             return
         removed = self.store.delete_tag(tag_id)
         self._refresh_tags()
+        self._refresh_virtual_collection_counts()
         self._refresh_current_results_for_filters()
         self.statusBar().showMessage(f"已删除标签“{tag_name}”，移除 {removed} 个关联")
 
@@ -7186,7 +7620,7 @@ class MainWindow(QMainWindow):
         if not images:
             self.statusBar().showMessage("没有选中图片")
             return
-        tags = self._parse_tag_input(self.tag_panel_input.text())
+        tags = self._parse_tag_panel_input(self.tag_panel_input.toPlainText())
         if not tags:
             self.statusBar().showMessage("没有输入标签")
             return
@@ -7246,6 +7680,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_after_tag_assignment(self, previous_selection: list[ImageItem]) -> None:
         self._refresh_tags()
+        self._refresh_virtual_collection_counts()
         self._refresh_current_results_for_filters()
         refreshed = self.grid_view.selected_images() or self.store.images_by_ids(
             [image.id for image in previous_selection]
@@ -7275,6 +7710,7 @@ class MainWindow(QMainWindow):
         inserted = self.store.add_tags_to_images([image.id for image in images], tags)
         self.batch_tags_input.clear()
         self._refresh_tags()
+        self._refresh_virtual_collection_counts()
         self._refresh_current_results_for_filters()
         refreshed = self.grid_view.selected_images()
         if len(refreshed) > 1:
@@ -7302,6 +7738,7 @@ class MainWindow(QMainWindow):
             [str(tag_name)],
         )
         self._refresh_tags()
+        self._refresh_virtual_collection_counts()
         self._refresh_current_results_for_filters()
         refreshed = self.grid_view.selected_images()
         if len(refreshed) > 1:
@@ -7333,6 +7770,7 @@ class MainWindow(QMainWindow):
             return
         inserted = self.store.add_tags_to_images([image.id for image in images], tags)
         self._refresh_tags()
+        self._refresh_virtual_collection_counts()
         self._refresh_current_results_for_filters()
         self._record_operation_history(f"添加标签 {tags} 到 {len(images)} 张，新增关联 {inserted}")
         self.statusBar().showMessage(f"已添加 {inserted} 个标签关联")
@@ -7353,6 +7791,7 @@ class MainWindow(QMainWindow):
             return
         removed = self.store.clear_tags_for_images([image.id for image in images])
         self._refresh_tags()
+        self._refresh_virtual_collection_counts()
         self._refresh_current_results_for_filters()
         self._record_operation_history(f"清除 {len(images)} 张图片标签，移除关联 {removed}")
         self.statusBar().showMessage(f"已清除 {removed} 个标签关联")
@@ -7409,6 +7848,18 @@ class MainWindow(QMainWindow):
         tags: list[str] = []
         for part in re.split(r"[,，\n]", text):
             tag = part.strip()
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            tags.append(tag)
+        return tags
+
+    @staticmethod
+    def _parse_tag_panel_input(text: str) -> list[str]:
+        seen: set[str] = set()
+        tags: list[str] = []
+        for line in text.splitlines():
+            tag = line.strip()
             if not tag or tag in seen:
                 continue
             seen.add(tag)
@@ -7716,10 +8167,18 @@ class MainWindow(QMainWindow):
         if watched:
             self.file_watcher.removePaths(watched)
         self._watch_path_roots.clear()
+        removed_roots, removed_images = self._cleanup_missing_active_scan_roots()
+        if removed_images:
+            message = (
+                f"已移除 {removed_roots} 个已不存在导入目录，"
+                f"{removed_images} 张失效索引"
+            )
+            self._record_operation_history(message)
+            self.statusBar().showMessage(message)
         if not self.file_watch_enabled:
             return
         paths_to_watch: list[str] = []
-        for folder in self.store.list_folders():
+        for folder in self.store.list_folders_with_collection_images():
             root = self._normalize_folder_path(folder.folder_path)
             if not os.path.isdir(root):
                 continue
@@ -7788,14 +8247,15 @@ class MainWindow(QMainWindow):
     def _handle_watch_scan_done(self, payload: object) -> None:
         roots, results, failures = payload
         self._set_maintenance_controls_enabled(True)
-        self._refresh_after_scan_database_change()
+        self._delete_scan_removed_thumbnails(results)
+        self._refresh_after_scan_database_change(preserve_current_view=True)
         scanned = sum(result.scanned_files for result in results)
         new_files = sum(result.new_files for result in results)
         changed_files = sum(result.changed_files for result in results)
-        missing = sum(result.missing_marked for result in results)
+        removed = sum(result.missing_marked for result in results)
         message = (
             f"自动扫描完成：目录 {len(roots)}，扫描 {scanned}，"
-            f"新增 {new_files}，变化 {changed_files}，标记丢失 {missing}，失败 {len(failures)}"
+            f"新增 {new_files}，变化 {changed_files}，移除索引 {removed}，失败 {len(failures)}"
         )
         if failures:
             self._record_error("自动监听扫描失败：" + " | ".join(failures[:5]))
@@ -7806,11 +8266,14 @@ class MainWindow(QMainWindow):
         self,
         *,
         select_collection_id: int | None = None,
+        preserve_current_view: bool = False,
     ) -> None:
         self._refresh_folders()
         self._refresh_collections(select_collection_id=select_collection_id)
         self.store.seed_default_ai_vision_collection_rules()
-        if self._has_visible_result_context() or self.search_filters:
+        if preserve_current_view:
+            self._refresh_filter_chain_ui()
+        elif self._has_visible_result_context() or self.search_filters:
             self._refresh_current_results_for_filters()
         else:
             self._reload_images()
@@ -8038,6 +8501,40 @@ class MainWindow(QMainWindow):
             except Exception:
                 continue
 
+    def _delete_scan_removed_thumbnails(self, results: list[ScanResult]) -> None:
+        thumbnail_paths = [
+            thumbnail_path
+            for result in results
+            for thumbnail_path in result.removed_thumbnail_paths
+        ]
+        self._delete_thumbnail_files(thumbnail_paths)
+
+    def _cleanup_unclassified_active_roots(self) -> tuple[int, int]:
+        thumbnail_paths, removed_roots, removed_images = self.store.remove_unclassified_active_roots()
+        if removed_images:
+            self._delete_thumbnail_files(thumbnail_paths)
+            self.vector_index.invalidate()
+        return removed_roots, removed_images
+
+    def _cleanup_missing_active_scan_roots(self) -> tuple[int, int]:
+        removed_roots = 0
+        removed_images = 0
+        thumbnail_paths: list[str] = []
+        for folder in self.store.list_folders_with_collection_images():
+            if not folder.last_scanned_at:
+                continue
+            root = self._normalize_folder_path(folder.folder_path)
+            if os.path.isdir(root):
+                continue
+            folder_thumbnails, folder_removed = self.store.remove_folder_from_library(folder.id)
+            thumbnail_paths.extend(folder_thumbnails)
+            removed_roots += 1
+            removed_images += folder_removed
+        if removed_images:
+            self._delete_thumbnail_files(thumbnail_paths)
+            self.vector_index.invalidate()
+        return removed_roots, removed_images
+
     def _start_embedding(self) -> None:
         if self.embedding_worker is not None and self.embedding_worker.is_alive():
             self.embedding_worker.resume_work()
@@ -8115,6 +8612,8 @@ class MainWindow(QMainWindow):
 
     def _handle_ai_vision_progress(self, progress: AIVisionProgress) -> None:
         self._refresh_ai_vision_stats()
+        if progress.status in {"ready", "failed", "stale", "pending"}:
+            self._refresh_virtual_collection_counts()
         if progress.image_id is None:
             self.statusBar().showMessage(progress.message)
         else:
@@ -8266,6 +8765,42 @@ class MainWindow(QMainWindow):
                 self._handle_performance_done(payload)
             elif kind == "export_done":
                 self._handle_export_done(payload)
+            elif kind == "folder_tree_import_done":
+                (
+                    results,
+                    parent_collection_id,
+                    parent_name,
+                    assigned,
+                    imported_image_ids,
+                    folder_paths,
+                ) = payload
+                self._handle_folder_tree_import_done(
+                    results=results,
+                    parent_collection_id=parent_collection_id,
+                    parent_name=parent_name,
+                    assigned=assigned,
+                    imported_image_ids=imported_image_ids,
+                    folder_paths=folder_paths,
+                )
+            elif kind == "local_paths_import_done":
+                (
+                    results,
+                    parent_collection_id,
+                    target_name,
+                    assigned,
+                    imported_image_ids,
+                    file_paths,
+                    folder_paths,
+                ) = payload
+                self._handle_local_paths_import_done(
+                    results=results,
+                    parent_collection_id=parent_collection_id,
+                    target_name=target_name,
+                    assigned=assigned,
+                    imported_image_ids=imported_image_ids,
+                    file_paths=file_paths,
+                    folder_paths=folder_paths,
+                )
             elif kind == "embedding":
                 self._handle_embedding_progress(payload)
             elif kind == "ai_vision":
@@ -8276,8 +8811,7 @@ class MainWindow(QMainWindow):
                 self.generate_search_plan_button.setEnabled(True)
                 self.generate_inspiration_button.setEnabled(True)
                 self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
-                self.add_folder_button.setEnabled(True)
-                self.rescan_button.setEnabled(True)
+                self._set_import_controls_enabled(True)
                 if hasattr(self, "start_ai_vision_button"):
                     self.start_ai_vision_button.setEnabled(True)
                     self.pause_ai_vision_button.setEnabled(True)
@@ -8288,56 +8822,56 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Eidory", str(payload))
 
     def _handle_scan_done(self, result: ScanResult) -> None:
-        self.add_folder_button.setEnabled(True)
-        self.rescan_button.setEnabled(True)
+        self._set_import_controls_enabled(True)
         self._set_maintenance_controls_enabled(True)
+        self._delete_scan_removed_thumbnails([result])
         self._refresh_after_scan_database_change()
         self.statusBar().showMessage(
-            f"扫描完成：新增 {result.new_files}，变化 {result.changed_files}，丢失 {result.missing_marked}"
+            f"扫描完成：新增 {result.new_files}，变化 {result.changed_files}，移除索引 {result.missing_marked}"
         )
 
     def _handle_scan_all_done(self, results: list[ScanResult]) -> None:
-        self.add_folder_button.setEnabled(True)
-        self.rescan_button.setEnabled(True)
+        self._set_import_controls_enabled(True)
         self._set_maintenance_controls_enabled(True)
+        self._delete_scan_removed_thumbnails(results)
         self._refresh_after_scan_database_change()
         scanned = sum(result.scanned_files for result in results)
         new_files = sum(result.new_files for result in results)
         changed_files = sum(result.changed_files for result in results)
-        missing = sum(result.missing_marked for result in results)
+        removed = sum(result.missing_marked for result in results)
         message = (
             f"全部重新扫描完成：目录 {len(results)}，扫描 {scanned}，"
-            f"新增 {new_files}，变化 {changed_files}，丢失 {missing}"
+            f"新增 {new_files}，变化 {changed_files}，移除索引 {removed}"
         )
         self.settings_status_label.setText(message)
         self.statusBar().showMessage(message)
 
     def _handle_scan_new_done(self, results: list[ScanResult]) -> None:
-        self.add_folder_button.setEnabled(True)
-        self.rescan_button.setEnabled(True)
+        self._set_import_controls_enabled(True)
         self._set_maintenance_controls_enabled(True)
+        self._delete_scan_removed_thumbnails(results)
         self._refresh_after_scan_database_change()
         scanned = sum(result.scanned_files for result in results)
         new_files = sum(result.new_files for result in results)
         changed_files = sum(result.changed_files for result in results)
         message = (
             f"扫描新增/变化完成：目录 {len(results)}，扫描 {scanned}，"
-            f"新增 {new_files}，变化 {changed_files}，未标记丢失"
+            f"新增 {new_files}，变化 {changed_files}，未处理删除"
         )
         self.settings_status_label.setText(message)
         self.statusBar().showMessage(message)
 
     def _handle_scan_missing_done(self, results: list[ScanResult]) -> None:
-        self.add_folder_button.setEnabled(True)
-        self.rescan_button.setEnabled(True)
+        self._set_import_controls_enabled(True)
         self._set_maintenance_controls_enabled(True)
+        self._delete_scan_removed_thumbnails(results)
         self._refresh_after_scan_database_change()
         scanned = sum(result.scanned_files for result in results)
         recovered = sum(result.changed_files for result in results)
-        missing = sum(result.missing_marked for result in results)
+        removed = sum(result.missing_marked for result in results)
         message = (
             f"扫描缺失所在目录完成：目录 {len(results)}，扫描 {scanned}，"
-            f"恢复/变化 {recovered}，新标记丢失 {missing}"
+            f"恢复/变化 {recovered}，移除索引 {removed}"
         )
         self.settings_status_label.setText(message)
         self.statusBar().showMessage(message)
@@ -8356,14 +8890,80 @@ class MainWindow(QMainWindow):
         assigned: int,
         preserve_structure: bool,
     ) -> None:
-        self.add_folder_button.setEnabled(True)
-        self.rescan_button.setEnabled(True)
+        self._set_import_controls_enabled(True)
         self._refresh_after_scan_database_change(select_collection_id=collection_id)
         mode = "按目录结构导入" if preserve_structure else "导入"
         self.statusBar().showMessage(
             f"{mode}完成：{collection_name}，扫描 {result.scanned_files}，"
             f"新增 {result.new_files}，变化 {result.changed_files}，加入 {assigned}"
         )
+
+    def _handle_folder_tree_import_done(
+        self,
+        *,
+        results: list[ScanResult],
+        parent_collection_id: int | None,
+        parent_name: str,
+        assigned: int,
+        imported_image_ids: list[int],
+        folder_paths: list[str],
+    ) -> None:
+        self._set_import_controls_enabled(True)
+        self._delete_scan_removed_thumbnails(results)
+        self._refresh_after_scan_database_change(select_collection_id=parent_collection_id)
+        self.store.seed_default_ai_vision_collection_rules()
+        clean_imported_ids = [
+            int(image_id)
+            for image_id in imported_image_ids
+            if int(image_id) > 0
+        ]
+        if clean_imported_ids:
+            self._show_imported_images_first(parent_collection_id, clean_imported_ids)
+        scanned = sum(result.scanned_files for result in results)
+        new_files = sum(result.new_files for result in results)
+        changed_files = sum(result.changed_files for result in results)
+        removed = sum(result.missing_marked for result in results)
+        message = (
+            f"导入文件夹完成：目标 {parent_name}，文件夹 {len(folder_paths)}，"
+            f"扫描 {scanned}，新增 {new_files}，变化 {changed_files}，"
+            f"移除索引 {removed}，加入 {assigned}"
+        )
+        self._record_operation_history(message)
+        self.statusBar().showMessage(message)
+
+    def _handle_local_paths_import_done(
+        self,
+        *,
+        results: list[ScanResult],
+        parent_collection_id: int | None,
+        target_name: str,
+        assigned: int,
+        imported_image_ids: list[int],
+        file_paths: list[str],
+        folder_paths: list[str],
+    ) -> None:
+        self._set_import_controls_enabled(True)
+        self._delete_scan_removed_thumbnails(results)
+        self._refresh_after_scan_database_change(select_collection_id=parent_collection_id)
+        self.store.seed_default_ai_vision_collection_rules()
+        clean_imported_ids = [
+            int(image_id)
+            for image_id in imported_image_ids
+            if int(image_id) > 0
+        ]
+        if clean_imported_ids:
+            self._show_imported_images_first(parent_collection_id, clean_imported_ids)
+        scanned = sum(result.scanned_files for result in results)
+        new_files = sum(result.new_files for result in results)
+        changed_files = sum(result.changed_files for result in results)
+        removed = sum(result.missing_marked for result in results)
+        message = (
+            f"拖入导入完成：目标 {target_name}，图片 {len(file_paths)}，"
+            f"文件夹 {len(folder_paths)}，扫描 {scanned}，新增 {new_files}，"
+            f"变化 {changed_files}，移除索引 {removed}，加入 {assigned}"
+        )
+        self._record_operation_history(message)
+        self.statusBar().showMessage(message)
 
     def _handle_drop_import_done(
         self,
@@ -8376,8 +8976,7 @@ class MainWindow(QMainWindow):
         assigned: int,
         imported_image_ids: list[int] | None = None,
     ) -> None:
-        self.add_folder_button.setEnabled(True)
-        self.rescan_button.setEnabled(True)
+        self._set_import_controls_enabled(True)
         self._refresh_folders()
         self._refresh_collections(select_collection_id=collection_id)
         self.store.seed_default_ai_vision_collection_rules()
@@ -8401,7 +9000,7 @@ class MainWindow(QMainWindow):
 
     def _show_imported_images_first(
         self,
-        collection_id: int,
+        collection_id: int | None,
         imported_image_ids: list[int],
     ) -> None:
         imported_images = self.store.images_by_ids(imported_image_ids)
@@ -8418,6 +9017,7 @@ class MainWindow(QMainWindow):
         ]
         images = imported_images + remaining_images
         self.semantic_search_revision += 1
+        self._clear_manual_result_order()
         self._clear_result_management_state()
         self.search_filters.clear()
         self.current_keyword_query = None
@@ -8442,15 +9042,8 @@ class MainWindow(QMainWindow):
         self._refresh_embedding_stats()
         if progress.image_id is None:
             self.statusBar().showMessage(progress.message)
-            if progress.status in {"idle", "stopped"} and self.current_result_mode not in {"semantic", "color", "search_chain", "inspiration"}:
-                self._reload_images()
         else:
             self.statusBar().showMessage(f"{progress.file_name}: {progress.status}")
-        if progress.status in {"ready", "failed"} and self.current_result_mode not in {"semantic", "color", "search_chain", "inspiration"}:
-            self.embedding_refresh_counter += 1
-            if self.embedding_refresh_counter >= 20:
-                self.embedding_refresh_counter = 0
-                self._reload_images()
 
     def _refresh_folders(self) -> None:
         current_prefix = self._selected_folder_path_prefix()
@@ -8508,8 +9101,10 @@ class MainWindow(QMainWindow):
 
     def _refresh_collections(self, select_collection_id: int | None = None) -> None:
         current = select_collection_id
+        current_virtual_filter = None
         if current is None:
             current = self._selected_collection_id()
+            current_virtual_filter = self._selected_virtual_filter()
         expanded_ids = self._expanded_collection_ids(self.collection_tree)
         self.collection_tree.blockSignals(True)
         self.collection_tree.clear()
@@ -8521,7 +9116,7 @@ class MainWindow(QMainWindow):
         self._apply_collection_tree_level_style(all_item, -1)
         all_item.setFlags(all_item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled & ~Qt.ItemFlag.ItemIsDropEnabled)
         self.collection_tree.addTopLevelItem(all_item)
-        if current is None:
+        if current is None and current_virtual_filter is None:
             selected_item = all_item
 
         collections_with_counts = self.store.list_collections_with_counts()
@@ -8549,12 +9144,61 @@ class MainWindow(QMainWindow):
         nonlocal_selected: list[QTreeWidgetItem | None] = [selected_item]
         add_children(None, None, 0)
         selected_item = nonlocal_selected[0]
-        self.collection_tree.setCurrentItem(selected_item or all_item)
+
+        if selected_item is not None or current_virtual_filter is None:
+            self.collection_tree.setCurrentItem(selected_item or all_item)
+        else:
+            self.collection_tree.clearSelection()
+            self.collection_tree.setCurrentItem(None)
         if select_collection_id is not None:
             self._expand_folder_tree_parents(self.collection_tree.currentItem())
         self.collection_tree.blockSignals(False)
+        self._refresh_virtual_collection_filters(select_virtual_filter=current_virtual_filter)
         if hasattr(self, "collection_detail_widget") and self.selected_image is None:
             self._show_collection_details(self._selected_collection_id())
+
+    def _refresh_virtual_collection_filters(self, select_virtual_filter: str | None = None) -> None:
+        if not hasattr(self, "virtual_collection_tree"):
+            return
+        if select_virtual_filter is not None:
+            current_virtual_filter = select_virtual_filter
+        elif self.collection_tree.currentItem() is None:
+            current_virtual_filter = self._selected_virtual_filter()
+        else:
+            current_virtual_filter = None
+        counts = self.store.virtual_image_filter_counts()
+        self.virtual_collection_tree.blockSignals(True)
+        self.virtual_collection_tree.clear()
+        selected_item: QTreeWidgetItem | None = None
+        for virtual_filter, label, help_text in VIRTUAL_COLLECTION_FILTERS:
+            item = QTreeWidgetItem([label, str(counts.get(virtual_filter, 0))])
+            item.setData(0, COLLECTION_VIRTUAL_FILTER_ROLE, virtual_filter)
+            item.setToolTip(0, help_text)
+            item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            for column in range(item.columnCount()):
+                item.setBackground(column, QBrush(QColor("#343b44")))
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled & ~Qt.ItemFlag.ItemIsDropEnabled)
+            self.virtual_collection_tree.addTopLevelItem(item)
+            if current_virtual_filter == virtual_filter:
+                selected_item = item
+        if selected_item is not None:
+            self.virtual_collection_tree.setCurrentItem(selected_item)
+        else:
+            self.virtual_collection_tree.clearSelection()
+            self.virtual_collection_tree.setCurrentItem(None)
+        self.virtual_collection_tree.blockSignals(False)
+
+    def _refresh_virtual_collection_counts(self) -> None:
+        if not hasattr(self, "virtual_collection_tree"):
+            return
+        counts = self.store.virtual_image_filter_counts()
+        for index in range(self.virtual_collection_tree.topLevelItemCount()):
+            item = self.virtual_collection_tree.topLevelItem(index)
+            virtual_filter = item.data(0, COLLECTION_VIRTUAL_FILTER_ROLE)
+            if virtual_filter:
+                item.setText(1, str(counts.get(str(virtual_filter), 0)))
+        if self.selected_image is None and self._selected_virtual_filter() is not None:
+            self._show_collection_details(None)
 
     def _refresh_temporary_projects(self, select_project_id: int | None = None) -> None:
         self.temp_project_list.blockSignals(True)
@@ -8604,6 +9248,7 @@ class MainWindow(QMainWindow):
         images = self.store.images_by_ids(image_ids)
         badges = self.store.temporary_project_image_badges(project_id)
         self.semantic_search_revision += 1
+        self._clear_manual_result_order()
         self._clear_result_management_state()
         self.search_filters.clear()
         self.current_keyword_query = None
@@ -8816,6 +9461,7 @@ class MainWindow(QMainWindow):
         item = QTreeWidgetItem([name, str(count)])
         item.setData(0, Qt.ItemDataRole.UserRole, collection_id)
         item.setData(0, Qt.ItemDataRole.UserRole + 1, name)
+        item.setData(0, COLLECTION_VIRTUAL_FILTER_ROLE, None)
         item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._apply_collection_tree_level_style(item, depth)
         item.setFlags(
@@ -8947,6 +9593,29 @@ class MainWindow(QMainWindow):
             return None
         collection_id = item.data(0, Qt.ItemDataRole.UserRole)
         return int(collection_id) if collection_id is not None else None
+
+    def _selected_virtual_filter(self) -> str | None:
+        if not hasattr(self, "virtual_collection_tree"):
+            return None
+        item = self.virtual_collection_tree.currentItem()
+        if item is None:
+            return None
+        value = item.data(0, COLLECTION_VIRTUAL_FILTER_ROLE)
+        return str(value) if value else None
+
+    @staticmethod
+    def _virtual_filter_label(virtual_filter: str | None) -> str:
+        for key, label, _help_text in VIRTUAL_COLLECTION_FILTERS:
+            if key == virtual_filter:
+                return label
+        return "聚类"
+
+    @staticmethod
+    def _virtual_filter_help(virtual_filter: str | None) -> str:
+        for key, _label, help_text in VIRTUAL_COLLECTION_FILTERS:
+            if key == virtual_filter:
+                return help_text
+        return "当前显示的是虚拟聚类。"
 
     def _collection_by_id(self, collection_id: int):
         for collection in self.store.list_collections():
@@ -9216,6 +9885,7 @@ class MainWindow(QMainWindow):
             "selected_tag_ids": self._selected_tag_ids(),
             "tag_match_mode": self._selected_tag_match_mode(),
             "collection_id": self._selected_collection_id(),
+            "virtual_filter": self._selected_virtual_filter(),
             "search_filters": [
                 self._search_filter_to_payload(search_filter)
                 for search_filter in self.search_filters
@@ -9249,7 +9919,10 @@ class MainWindow(QMainWindow):
         self.semantic_search_revision += 1
         self.search_button.setEnabled(True)
         try:
-            self._apply_collection_from_payload(payload.get("collection_id"))
+            self._apply_collection_from_payload(
+                payload.get("collection_id"),
+                payload.get("virtual_filter"),
+            )
             self._apply_status_from_payload(payload.get("status_filter"))
             self._apply_tags_from_payload(payload.get("selected_tag_ids"))
             self._set_combo_to_data(
@@ -9296,7 +9969,24 @@ class MainWindow(QMainWindow):
         else:
             self._reload_images()
 
-    def _apply_collection_from_payload(self, raw_collection_id: object) -> None:
+    def _apply_collection_from_payload(
+        self,
+        raw_collection_id: object,
+        raw_virtual_filter: object = None,
+    ) -> None:
+        virtual_filter = str(raw_virtual_filter) if raw_virtual_filter else None
+        if virtual_filter in {key for key, _label, _help in VIRTUAL_COLLECTION_FILTERS}:
+            self._refresh_collections()
+            self.collection_tree.blockSignals(True)
+            self.collection_tree.clearSelection()
+            self.collection_tree.setCurrentItem(None)
+            self.collection_tree.blockSignals(False)
+            self._refresh_virtual_collection_filters(select_virtual_filter=virtual_filter)
+            for index in range(self.virtual_collection_tree.topLevelItemCount()):
+                item = self.virtual_collection_tree.topLevelItem(index)
+                if item.data(0, COLLECTION_VIRTUAL_FILTER_ROLE) == virtual_filter:
+                    self.virtual_collection_tree.setCurrentItem(item)
+                    return
         collection_id = None
         try:
             collection_id = int(raw_collection_id) if raw_collection_id is not None else None
@@ -9347,6 +10037,7 @@ class MainWindow(QMainWindow):
         return " / ".join(parts) if parts else "新视图"
 
     def _on_sort_changed(self) -> None:
+        self._clear_manual_result_order()
         self.current_sort_key = str(self.sort_combo.currentData() or "default")
         self.current_sort_desc = self.sort_order_combo.currentData() != "asc"
         self.store.set_setting("ui.sort_key", self.current_sort_key)
@@ -9383,6 +10074,8 @@ class MainWindow(QMainWindow):
         return self.current_sort_key
 
     def _sort_images(self, images: list[ImageItem]) -> list[ImageItem]:
+        if self.manual_result_order_ids:
+            return self._apply_manual_result_order(images)
         sort_key = self.current_sort_key
         if sort_key == "default":
             return list(images)
@@ -9408,6 +10101,27 @@ class MainWindow(QMainWindow):
             reverse=self.current_sort_desc,
         )
         return present + missing
+
+    def _set_manual_result_order(self, images: list[ImageItem]) -> None:
+        self.manual_result_order_ids = [image.id for image in images]
+
+    def _clear_manual_result_order(self) -> None:
+        self.manual_result_order_ids = None
+
+    def _apply_manual_result_order(self, images: list[ImageItem]) -> list[ImageItem]:
+        order = {
+            image_id: index
+            for index, image_id in enumerate(self.manual_result_order_ids or [])
+        }
+        in_order: list[ImageItem] = []
+        new_images: list[ImageItem] = []
+        for image in images:
+            if image.id in order:
+                in_order.append(image)
+            else:
+                new_images.append(image)
+        in_order.sort(key=lambda image: order[image.id])
+        return in_order + new_images
 
     @staticmethod
     def _sort_value(image: ImageItem, sort_key: str):
@@ -9771,6 +10485,12 @@ class MainWindow(QMainWindow):
             if collection_id is not None
             else None
         )
+        virtual_filter = self._selected_virtual_filter()
+        virtual_image_ids = (
+            self.store.image_ids_for_virtual_filter(virtual_filter)
+            if virtual_filter is not None
+            else None
+        )
         status = self._selected_status_filter()
 
         filtered: list[ImageItem] = []
@@ -9778,6 +10498,8 @@ class MainWindow(QMainWindow):
             if folder_path_prefix and not self._path_is_in_folder(image.file_path, folder_path_prefix):
                 continue
             if collection_image_ids is not None and image.id not in collection_image_ids:
+                continue
+            if virtual_image_ids is not None and image.id not in virtual_image_ids:
                 continue
             if status == "favorite" and not image.is_favorite:
                 continue

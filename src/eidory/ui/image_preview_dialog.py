@@ -484,7 +484,7 @@ class ImagePreviewDialog(QDialog):
         self.image_view.viewport().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.image_view.customContextMenuRequested.connect(self._show_image_context_menu)
         self.image_view.viewport().customContextMenuRequested.connect(self._show_image_context_menu)
-        self.image_view.doubleClicked.connect(self.close)
+        self.image_view.doubleClicked.connect(self._fit_image_to_window)
         self.image_view.zoomChanged.connect(self._handle_image_zoom_changed)
 
         self.video_widget = QVideoWidget()
@@ -639,7 +639,11 @@ class ImagePreviewDialog(QDialog):
             and event.type() == QEvent.Type.MouseButtonDblClick
             and event.button() == Qt.MouseButton.LeftButton
         ):
-            self.close()
+            image = self.current_image()
+            if image is not None and not is_supported_video(image.file_path):
+                self._fit_image_to_window()
+            else:
+                self.close()
             event.accept()
             return True
         if event.type() in {QEvent.Type.KeyPress, QEvent.Type.ShortcutOverride}:
@@ -723,7 +727,7 @@ class ImagePreviewDialog(QDialog):
         if is_supported_video(image.file_path):
             self._toggle_video_playback()
             return
-        self._fit_image_to_window()
+        self.close()
 
     def _event_belongs_to_preview(self, watched) -> bool:
         if watched is self:
@@ -736,6 +740,8 @@ class ImagePreviewDialog(QDialog):
     def _is_close_shortcut(event: QKeyEvent) -> bool:
         modifiers = event.modifiers()
         return (
+            event.key() == Qt.Key.Key_Escape
+            or
             event.matches(QKeySequence.StandardKey.Close)
             or (
                 event.key() == Qt.Key.Key_W

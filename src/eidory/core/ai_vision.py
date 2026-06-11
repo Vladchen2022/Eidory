@@ -3,12 +3,13 @@ from __future__ import annotations
 import base64
 import io
 import json
-import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import requests
+
+from eidory.core.image_loader import MAX_AI_VISION_UPLOAD_BYTES, open_local_image
 
 
 AI_VISION_PROMPT_VERSION = "scene-v1"
@@ -466,20 +467,28 @@ def normalize_ai_vision_value(field: str, value: object) -> str:
 
 
 def image_to_data_url(path: Path) -> str:
-    mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
     try:
         from PIL import Image, ImageOps
 
-        with Image.open(path) as image:
+        with open_local_image(path) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
             image.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
-            buffer = io.BytesIO()
-            image.save(buffer, format="JPEG", quality=90, optimize=True)
-            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-            return f"data:image/jpeg;base64,{encoded}"
-    except Exception:
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        return f"data:{mime_type};base64,{encoded}"
+            for quality in (88, 78, 68, 58):
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=quality, optimize=True)
+                payload = buffer.getvalue()
+                if len(payload) <= MAX_AI_VISION_UPLOAD_BYTES or quality == 58:
+                    if len(payload) > MAX_AI_VISION_UPLOAD_BYTES:
+                        raise AIVisionProviderError(
+                            f"AI 视觉缩略图仍过大：{len(payload):,} bytes"
+                        )
+                    encoded = base64.b64encode(payload).decode("ascii")
+                    return f"data:image/jpeg;base64,{encoded}"
+    except AIVisionProviderError:
+        raise
+    except Exception as exc:
+        raise AIVisionProviderError(f"无法生成 AI 视觉缩略图：{path.name}: {exc}") from exc
+    raise AIVisionProviderError(f"无法生成 AI 视觉缩略图：{path.name}")
 
 
 def ai_vision_label(field: str, value: str, *, language: str = "zh") -> str:

@@ -10,7 +10,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QAccessible, QKeySequence
 from PySide6.QtWidgets import QApplication, QListWidgetItem, QMessageBox, QPushButton, QTextEdit, QTreeWidget, QTreeWidgetItem
 
 from eidory.config import AppPaths
@@ -85,6 +85,245 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.advanced_search_toggle_button.click()
             self.app.processEvents()
             self.assertTrue(window.advanced_search_widget.isHidden())
+            window.close()
+
+    def test_main_window_disables_qt_accessibility_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            QAccessible.setActive(True)
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            self.assertFalse(QAccessible.isActive())
+            window.close()
+
+    def test_sqlite_utility_connection_uses_store_busy_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "eidory.sqlite3"
+
+            with MainWindow._connect_sqlite_database(database_path) as conn:
+                busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()
+
+            self.assertEqual(busy_timeout[0], MetadataStore._busy_timeout_ms)
+
+    def test_database_maintenance_blocks_background_tasks_and_file_watcher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            watched_dir = Path(tmp) / "watched"
+            watched_dir.mkdir()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            self.assertTrue(window.file_watcher.addPath(str(watched_dir)))
+            window._pending_watch_scan_roots.add(str(watched_dir))
+            window.watch_scan_timer.start(10_000)
+            ran: list[bool] = []
+
+            with window._database_maintenance("test"):
+                self.assertTrue(window._database_maintenance_active)
+                self.assertFalse(window.watch_scan_timer.isActive())
+                self.assertEqual(window.file_watcher.directories(), [])
+                self.assertFalse(window._start_background_task(lambda: ran.append(True)))
+
+            self.assertEqual(ran, [])
+            window.close()
+
+    def test_database_maintenance_aborts_when_index_workers_do_not_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            entered = False
+
+            with (
+                patch.object(window, "_stop_index_workers_for_maintenance", return_value=False),
+                patch.object(window, "_wait_for_background_tasks") as wait_for_background,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "索引 worker"):
+                    with window._database_maintenance("数据库恢复"):
+                        entered = True
+
+            self.assertFalse(entered)
+            wait_for_background.assert_not_called()
+            self.assertFalse(window._database_maintenance_active)
+            window.close()
+
+    def test_database_maintenance_aborts_when_background_tasks_do_not_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            entered = False
+
+            with (
+                patch.object(window, "_stop_index_workers_for_maintenance", return_value=True),
+                patch.object(window, "_wait_for_background_tasks", return_value=False),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "后台任务"):
+                    with window._database_maintenance("数据库恢复"):
+                        entered = True
+
+            self.assertFalse(entered)
+            self.assertFalse(window._database_maintenance_active)
+            window.close()
+
+    def test_database_backup_maintenance_restarts_previously_running_index_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window.embedding_worker = SimpleNamespace(is_alive=lambda: True)
+            window.ai_vision_worker = SimpleNamespace(is_alive=lambda: True)
+
+            with (
+                patch.object(window, "_stop_index_workers_for_maintenance", return_value=True),
+                patch.object(window, "_wait_for_background_tasks", return_value=True),
+                patch.object(window, "_start_embedding") as start_embedding,
+                patch.object(window, "_start_ai_vision") as start_ai_vision,
+            ):
+                with window._database_maintenance("数据库备份", restart_index_workers=True):
+                    pass
+
+            start_embedding.assert_called_once_with()
+            start_ai_vision.assert_called_once_with()
+            window.embedding_worker = None
+            window.ai_vision_worker = None
+            window.close()
+
+    def test_database_restore_maintenance_does_not_restart_stopped_index_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window.embedding_worker = SimpleNamespace(is_alive=lambda: True)
+            window.ai_vision_worker = SimpleNamespace(is_alive=lambda: True)
+
+            with (
+                patch.object(window, "_stop_index_workers_for_maintenance", return_value=True),
+                patch.object(window, "_wait_for_background_tasks", return_value=True),
+                patch.object(window, "_start_embedding") as start_embedding,
+                patch.object(window, "_start_ai_vision") as start_ai_vision,
+            ):
+                with window._database_maintenance("数据库恢复"):
+                    pass
+
+            start_embedding.assert_not_called()
+            start_ai_vision.assert_not_called()
+            window.embedding_worker = None
+            window.ai_vision_worker = None
+            window.close()
+
+    def test_database_backup_does_not_restart_index_workers_if_stop_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window.embedding_worker = SimpleNamespace(is_alive=lambda: True)
+            window.ai_vision_worker = SimpleNamespace(is_alive=lambda: True)
+
+            with (
+                patch.object(window, "_stop_index_workers_for_maintenance", return_value=False),
+                patch.object(window, "_start_embedding") as start_embedding,
+                patch.object(window, "_start_ai_vision") as start_ai_vision,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "索引 worker"):
+                    with window._database_maintenance("数据库备份", restart_index_workers=True):
+                        pass
+
+            start_embedding.assert_not_called()
+            start_ai_vision.assert_not_called()
+            window.embedding_worker = None
+            window.ai_vision_worker = None
+            window.close()
+
+    def test_background_task_rejection_runs_ui_rollback_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._database_maintenance_active = True
+            calls: list[str] = []
+
+            started = window._start_background_task(
+                lambda: calls.append("ran"),
+                on_rejected=lambda: calls.append("rollback"),
+            )
+
+            self.assertFalse(started)
+            self.assertEqual(calls, ["rollback"])
+            window._database_maintenance_active = False
             window.close()
 
     def test_sidebars_have_fixed_visible_widths_and_can_collapse(self) -> None:

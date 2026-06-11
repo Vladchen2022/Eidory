@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 import sqlite3
 from pathlib import Path
@@ -10,6 +11,53 @@ from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
 
 
 class MetadataStoreTest(unittest.TestCase):
+    def test_connections_use_busy_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+
+            with store.connect() as conn:
+                timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+
+            self.assertGreaterEqual(timeout, 30_000)
+
+    def test_concurrent_upsert_same_path_is_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_path = str(Path(tmp) / "library" / "same.jpg")
+            barrier = threading.Barrier(8)
+            errors: list[BaseException] = []
+            states: list[str] = []
+
+            def worker() -> None:
+                try:
+                    barrier.wait(timeout=3)
+                    _image_id, state = store.upsert_image(
+                        folder_id=folder_id,
+                        file_path=image_path,
+                        file_size=123,
+                        width=10,
+                        height=20,
+                        created_time_ns=None,
+                        modified_time_ns=1_700_000_000_000_000_000,
+                    )
+                    states.append(state)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(store.count_images(), 1)
+            self.assertEqual(states.count("new"), 1)
+            self.assertEqual(states.count("unchanged"), 7)
+
     def test_tags_note_and_favorite_persist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"

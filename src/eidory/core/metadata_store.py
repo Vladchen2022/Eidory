@@ -4,6 +4,7 @@ import os
 import json
 import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
@@ -66,6 +67,9 @@ def _clean_color_hex(value: object) -> str:
 
 
 class MetadataStore:
+    _connection_lock = threading.RLock()
+    _busy_timeout_ms = 30_000
+
     def __init__(self, database_path: Path | str):
         self.database_path = Path(database_path)
 
@@ -274,18 +278,23 @@ class MetadataStore:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.database_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        with self._connection_lock:
+            conn = sqlite3.connect(
+                self.database_path,
+                timeout=self._busy_timeout_ms / 1000,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def add_folder(self, folder_path: str) -> int:
         normalized = os.path.abspath(os.path.expanduser(folder_path))

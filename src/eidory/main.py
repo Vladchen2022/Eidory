@@ -10,6 +10,10 @@ from eidory.core.metadata_store import MetadataStore
 def main() -> int:
     multiprocessing.freeze_support()
 
+    from eidory.ui.accessibility import disable_qt_accessibility
+
+    disable_qt_accessibility()
+
     from PySide6.QtWidgets import QApplication
 
     from eidory.ui.main_window import MainWindow
@@ -21,6 +25,7 @@ def main() -> int:
     store.initialize()
 
     app = QApplication(sys.argv)
+    disable_qt_accessibility()
     app.setApplicationName("Eidory")
     apply_dark_theme(app)
     window = MainWindow(paths=paths, store=store)

@@ -17,8 +17,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Iterator
 
 import numpy as np
 from PySide6.QtCore import QFile, QBuffer, QFileSystemWatcher, QIODevice, QSize, QStringListModel, Qt, QTimer, QUrl
@@ -120,6 +122,7 @@ from eidory.core.search_service import SearchService
 from eidory.core.thumbnailer import Thumbnailer
 from eidory.core.vector_index import VectorIndex
 from eidory.models import ImageItem
+from eidory.ui.accessibility import disable_qt_accessibility
 from eidory.ui.collection_tree import CollectionTreeWidget
 from eidory.ui.image_preview_dialog import ImagePreviewDialog
 from eidory.ui.justified_image_grid import JustifiedImageGridView
@@ -401,6 +404,7 @@ class ImageCompareDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self, *, paths: AppPaths, store: MetadataStore):
         super().__init__()
+        disable_qt_accessibility()
         self.paths = paths
         self.store = store
         self.initial_thumbnail_size = self._setting_int("ui.thumbnail_size", 180, 96, 320)
@@ -511,6 +515,9 @@ class MainWindow(QMainWindow):
         self.operation_history_messages: list[str] = []
         self._last_removal_undo: dict[str, object] | None = None
         self._macos_titlebar_applied = False
+        self._database_maintenance_active = False
+        self._background_threads: set[threading.Thread] = set()
+        self._background_threads_lock = threading.Lock()
         self.file_watch_enabled = self._setting_choice("ui.file_watch_enabled", "1", {"0", "1"}) == "1"
         self.file_watcher = QFileSystemWatcher(self)
         self._watch_path_roots: dict[str, str] = {}
@@ -524,6 +531,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self._build_ui()
         self._configure_accessibility_labels()
+        disable_qt_accessibility(self._record_error)
         self._apply_runtime_language_settings()
         self._connect_signals()
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
@@ -665,10 +673,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._clear_last_removal_undo(cleanup_backups=True)
-        if self.embedding_worker is not None:
-            self.embedding_worker.stop()
-        if self.ai_vision_worker is not None:
-            self.ai_vision_worker.stop()
+        self._database_maintenance_active = True
+        self._stop_file_watcher_for_maintenance()
+        self._stop_index_workers_for_maintenance(timeout_seconds=2.0)
+        self._wait_for_background_tasks(timeout_seconds=2.0)
         if hasattr(self, "video_player"):
             self.video_player.stop()
         if hasattr(self, "root_splitter"):
@@ -680,6 +688,128 @@ class MainWindow(QMainWindow):
         self.store.set_setting("ui.window_width", str(size.width()))
         self.store.set_setting("ui.window_height", str(size.height()))
         super().closeEvent(event)
+
+    def _start_background_task(
+        self,
+        target: Callable[[], None],
+        *,
+        name: str = "background",
+        on_rejected: Callable[[], None] | None = None,
+    ) -> bool:
+        if self._database_maintenance_active:
+            message = "数据库维护中，暂不启动新的后台任务"
+            self._record_error(message)
+            self.statusBar().showMessage(message)
+            if on_rejected is not None:
+                on_rejected()
+            return False
+
+        def run_and_unregister() -> None:
+            thread = threading.current_thread()
+            try:
+                target()
+            finally:
+                with self._background_threads_lock:
+                    self._background_threads.discard(thread)
+
+        thread = threading.Thread(target=run_and_unregister, daemon=True, name=f"Eidory-{name}")
+        with self._background_threads_lock:
+            self._background_threads.add(thread)
+        thread.start()
+        return True
+
+    def _wait_for_background_tasks(self, *, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            with self._background_threads_lock:
+                threads = [thread for thread in self._background_threads if thread.is_alive()]
+            if not threads:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._record_error(f"数据库维护等待后台任务超时：仍有 {len(threads)} 个任务未结束")
+                return False
+            for thread in threads:
+                thread.join(timeout=min(0.25, remaining))
+
+    def _stop_index_workers_for_maintenance(self, *, timeout_seconds: float) -> bool:
+        workers = [
+            ("语义索引", self.embedding_worker),
+            ("AI 视觉识别", self.ai_vision_worker),
+        ]
+        for _label, worker in workers:
+            if worker is not None and worker.is_alive():
+                worker.stop()
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        for label, worker in workers:
+            if worker is None or not worker.is_alive():
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            worker.join(timeout=remaining)
+            if worker.is_alive():
+                self._record_error(f"数据库维护等待{label} worker 停止超时")
+                return False
+        return True
+
+    @contextmanager
+    def _database_maintenance(
+        self,
+        label: str,
+        *,
+        restart_index_workers: bool = False,
+    ) -> Iterator[None]:
+        previous_state = self._database_maintenance_active
+        restart_embedding = (
+            restart_index_workers
+            and self.embedding_worker is not None
+            and self.embedding_worker.is_alive()
+        )
+        restart_ai_vision = (
+            restart_index_workers
+            and self.ai_vision_worker is not None
+            and self.ai_vision_worker.is_alive()
+        )
+        workers_stopped = False
+        self._database_maintenance_active = True
+        self._stop_file_watcher_for_maintenance()
+        try:
+            if not self._stop_index_workers_for_maintenance(timeout_seconds=5.0):
+                raise RuntimeError(f"{label}已中止：索引 worker 未能停止")
+            workers_stopped = True
+            if not self._wait_for_background_tasks(timeout_seconds=10.0):
+                raise RuntimeError(f"{label}已中止：后台任务未能停止")
+            with MetadataStore._connection_lock:
+                yield
+        finally:
+            self._database_maintenance_active = previous_state
+            if not previous_state:
+                self._refresh_file_watcher()
+                if workers_stopped:
+                    self._restart_index_workers_after_maintenance(
+                        restart_embedding=restart_embedding,
+                        restart_ai_vision=restart_ai_vision,
+                    )
+
+    def _stop_file_watcher_for_maintenance(self) -> None:
+        if not hasattr(self, "file_watcher"):
+            return
+        if hasattr(self, "watch_scan_timer"):
+            self.watch_scan_timer.stop()
+        self._pending_watch_scan_roots.clear()
+        watched = list(self.file_watcher.directories()) + list(self.file_watcher.files())
+        if watched:
+            self.file_watcher.removePaths(watched)
+
+    def _restart_index_workers_after_maintenance(
+        self,
+        *,
+        restart_embedding: bool,
+        restart_ai_vision: bool,
+    ) -> None:
+        if restart_embedding:
+            self._start_embedding()
+        if restart_ai_vision:
+            self._start_ai_vision()
 
     def _build_ui(self) -> None:
         self.central_shell = QWidget()
@@ -1890,9 +2020,25 @@ class MainWindow(QMainWindow):
         ok = QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.paths.data_dir)))
         self.statusBar().showMessage("已打开数据目录" if ok else "打开数据目录失败")
 
+    @staticmethod
+    @contextmanager
+    def _connect_sqlite_database(path: str | Path, *, uri: bool = False) -> Iterator[sqlite3.Connection]:
+        with MetadataStore._connection_lock:
+            conn = sqlite3.connect(
+                path,
+                uri=uri,
+                timeout=MetadataStore._busy_timeout_ms / 1000,
+            )
+            conn.execute(f"PRAGMA busy_timeout = {MetadataStore._busy_timeout_ms}")
+            try:
+                yield conn
+            finally:
+                conn.close()
+
     def _backup_database(self) -> None:
         try:
-            backup_path = self._backup_database_to_default_location()
+            with self._database_maintenance("数据库备份", restart_index_workers=True):
+                backup_path = self._backup_database_to_default_location()
         except Exception as exc:
             self._record_error(f"数据库备份失败：{exc}")
             QMessageBox.warning(self, "Eidory", f"数据库备份失败：{exc}")
@@ -1905,8 +2051,8 @@ class MainWindow(QMainWindow):
         backup_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup_path = backup_dir / f"eidory-{timestamp}.sqlite3"
-        with sqlite3.connect(self.paths.database_path) as source:
-            with sqlite3.connect(backup_path) as target:
+        with self._connect_sqlite_database(self.paths.database_path) as source:
+            with self._connect_sqlite_database(backup_path) as target:
                 source.backup(target)
         return backup_path
 
@@ -1939,26 +2085,23 @@ class MainWindow(QMainWindow):
             return
         restore_temp_path: Path | None = None
         try:
-            if self.embedding_worker is not None:
-                self.embedding_worker.stop()
-            if self.ai_vision_worker is not None:
-                self.ai_vision_worker.stop()
-            backup_path = self._backup_database_to_default_location()
-            self.paths.database_path.parent.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            restore_temp_path = self.paths.database_path.with_name(
-                f".eidory-restore-{timestamp}.sqlite3"
-            )
-            source_uri = f"{source_path.resolve().as_uri()}?mode=ro"
-            with sqlite3.connect(source_uri, uri=True) as source:
-                with sqlite3.connect(restore_temp_path) as target:
-                    source.backup(target)
-            shutil.move(str(restore_temp_path), self.paths.database_path)
-            for suffix in ("-wal", "-shm"):
-                self.paths.database_path.with_name(
-                    f"{self.paths.database_path.name}{suffix}"
-                ).unlink(missing_ok=True)
-            self.store.initialize()
+            with self._database_maintenance("数据库恢复"):
+                backup_path = self._backup_database_to_default_location()
+                self.paths.database_path.parent.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                restore_temp_path = self.paths.database_path.with_name(
+                    f".eidory-restore-{timestamp}.sqlite3"
+                )
+                source_uri = f"{source_path.resolve().as_uri()}?mode=ro"
+                with self._connect_sqlite_database(source_uri, uri=True) as source:
+                    with self._connect_sqlite_database(restore_temp_path) as target:
+                        source.backup(target)
+                shutil.move(str(restore_temp_path), self.paths.database_path)
+                for suffix in ("-wal", "-shm"):
+                    self.paths.database_path.with_name(
+                        f"{self.paths.database_path.name}{suffix}"
+                    ).unlink(missing_ok=True)
+                self.store.initialize()
             self._refresh_after_database_change()
         except Exception as exc:
             if restore_temp_path is not None:
@@ -1975,7 +2118,7 @@ class MainWindow(QMainWindow):
             return False, "文件不存在"
         try:
             uri = f"{database_path.resolve().as_uri()}?mode=ro"
-            with sqlite3.connect(uri, uri=True) as conn:
+            with MainWindow._connect_sqlite_database(uri, uri=True) as conn:
                 row = conn.execute("PRAGMA integrity_check").fetchone()
                 if row is None or str(row[0]) != "ok":
                     return False, str(row[0]) if row is not None else "integrity_check 无结果"
@@ -2050,7 +2193,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"路径重映射失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_maintenance_controls_enabled(True),
+        )
 
     def _handle_path_remap_done(self, result: dict[str, int]) -> None:
         self._set_maintenance_controls_enabled(True)
@@ -2117,7 +2263,10 @@ class MainWindow(QMainWindow):
             report = self._build_self_check_report()
             self.events.put(("self_check_done", (report, show_success)))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self.run_self_check_button.setEnabled(True),
+        )
 
     def _build_self_check_report(self) -> list[tuple[str, bool, str]]:
         report: list[tuple[str, bool, str]] = []
@@ -2142,7 +2291,7 @@ class MainWindow(QMainWindow):
 
     def _check_database(self) -> tuple[str, bool, str]:
         try:
-            with sqlite3.connect(self.paths.database_path) as conn:
+            with self._connect_sqlite_database(self.paths.database_path) as conn:
                 row = conn.execute("PRAGMA integrity_check").fetchone()
             status = str(row[0]) if row is not None else "no result"
             return "数据库", status == "ok", status
@@ -2443,7 +2592,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"扫描失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_import_controls_enabled(True),
+        )
 
     def _rescan_all_folders(self) -> None:
         folders = self.store.list_folders_with_collection_images()
@@ -2464,7 +2616,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"重新扫描全部导入目录失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=self._restore_import_and_maintenance_controls,
+        )
 
     def _rescan_new_or_changed_folders(self) -> None:
         folders = self.store.list_folders_with_collection_images()
@@ -2485,7 +2640,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"扫描新增/变化失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=self._restore_import_and_maintenance_controls,
+        )
 
     def _rescan_missing_folders(self) -> None:
         folders = self.store.folders_with_missing_images()
@@ -2506,7 +2664,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"扫描缺失所在目录失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=self._restore_import_and_maintenance_controls,
+        )
 
     def _clean_missing_index(self) -> None:
         missing_count = self.store.count_missing_images()
@@ -2561,7 +2722,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"性能压测失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self.run_performance_check_button.setEnabled(True),
+        )
 
     def _build_performance_report(self) -> str:
         total_started = time.perf_counter()
@@ -2632,7 +2796,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"导出图库失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_export_controls_enabled(True),
+        )
 
     def _export_selected_images(self) -> None:
         images = self._selected_grid_images()
@@ -2659,7 +2826,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"导出选中图片失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_export_controls_enabled(True),
+        )
 
     def _set_export_controls_enabled(self, enabled: bool) -> None:
         self.export_library_button.setEnabled(enabled)
@@ -2669,6 +2839,19 @@ class MainWindow(QMainWindow):
         self.add_folder_button.setEnabled(enabled)
         self.import_folder_tree_button.setEnabled(enabled)
         self.rescan_button.setEnabled(enabled)
+
+    def _restore_import_and_maintenance_controls(self) -> None:
+        self._set_import_controls_enabled(True)
+        self._set_maintenance_controls_enabled(True)
+
+    def _restore_inspiration_generation_controls(self) -> None:
+        self.generate_search_plan_button.setEnabled(True)
+        self.generate_inspiration_button.setEnabled(True)
+        self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
+
+    def _restore_search_task_controls(self) -> None:
+        self.search_button.setEnabled(True)
+        self._restore_inspiration_generation_controls()
 
     def _handle_export_done(self, payload: object) -> None:
         label, result = payload
@@ -2714,7 +2897,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"导入失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_import_controls_enabled(True),
+        )
 
     def _start_file_import(self, file_paths: list[str], collection_id: int) -> None:
         supported_files = [
@@ -2752,7 +2938,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"导入图片失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_import_controls_enabled(True),
+        )
 
     def _start_folder_tree_import(
         self,
@@ -2801,7 +2990,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"导入文件夹失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_import_controls_enabled(True),
+        )
 
     def _start_local_paths_import(
         self,
@@ -2858,7 +3050,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"拖入导入失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_import_controls_enabled(True),
+        )
 
     @staticmethod
     def _valid_import_folders(folder_paths: list[str]) -> list[str]:
@@ -2949,7 +3144,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("inspiration_error", exc))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=self._restore_inspiration_generation_controls,
+        )
 
     def _generate_search_plan_from_panel(self) -> None:
         brief = self.inspiration_brief_input.toPlainText().strip()
@@ -2975,7 +3173,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("search_plan_error", exc))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=self._restore_inspiration_generation_controls,
+        )
 
     def _show_inspiration_proposal(self, proposal) -> None:
         self.current_inspiration_project_id = None
@@ -3361,7 +3562,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"灵感项目搜索失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=self._restore_search_task_controls,
+        )
 
     def _handle_inspiration_filter_changed(self, _item: QListWidgetItem | None = None) -> None:
         self._refresh_inspiration_status()
@@ -3684,7 +3888,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"反向排除失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self.search_button.setEnabled(True),
+        )
 
     def _add_search_filter(
         self,
@@ -3846,7 +4053,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"筛选失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=self._restore_search_task_controls,
+        )
 
     def _search_chain_base_context(self) -> tuple[set[int] | None, str | None]:
         if self.current_result_mode == "temp_project" and self.current_temp_project_id is not None:
@@ -5588,7 +5798,7 @@ class MainWindow(QMainWindow):
                 suggestions = self._fallback_reference_group_suggestions(groups)
             self.events.put(("reference_groups_done", (groups, suggestions, error_message)))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(run)
 
     def _selected_ready_embedding_vectors(self, images: list[ImageItem]) -> dict[int, object]:
         vectors: dict[int, object] = {}
@@ -5779,7 +5989,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("temp_project_suggestion_error", (project_id, exc)))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(run)
 
     def _apply_temporary_project_suggestion(self, payload: object) -> None:
         project_id, can_rename, suggestion = payload
@@ -7037,7 +7247,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"拖入保存失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_import_controls_enabled(True),
+        )
 
     def _split_local_import_paths(self, paths: list[str]) -> tuple[list[str], list[str]]:
         file_paths: list[str] = []
@@ -8167,6 +8380,8 @@ class MainWindow(QMainWindow):
         if watched:
             self.file_watcher.removePaths(watched)
         self._watch_path_roots.clear()
+        if self._database_maintenance_active:
+            return
         removed_roots, removed_images = self._cleanup_missing_active_scan_roots()
         if removed_images:
             message = (
@@ -8208,6 +8423,8 @@ class MainWindow(QMainWindow):
         return directories
 
     def _handle_watched_path_changed(self, changed_path: str) -> None:
+        if self._database_maintenance_active:
+            return
         if not self.file_watch_enabled:
             return
         normalized = self._normalize_folder_path(changed_path)
@@ -8224,6 +8441,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("检测到本地文件变化，准备增量扫描")
 
     def _run_pending_watch_scans(self) -> None:
+        if self._database_maintenance_active:
+            self._pending_watch_scan_roots.clear()
+            return
         roots = sorted(self._pending_watch_scan_roots)
         self._pending_watch_scan_roots.clear()
         if not roots:
@@ -8242,7 +8462,10 @@ class MainWindow(QMainWindow):
                     failures.append(f"{root}: {exc}")
             self.events.put(("watch_scan_done", (roots, results, failures)))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_maintenance_controls_enabled(True),
+        )
 
     def _handle_watch_scan_done(self, payload: object) -> None:
         roots, results, failures = payload
@@ -8457,7 +8680,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.events.put(("error", f"重复检测失败：{exc}"))
 
-        threading.Thread(target=run, daemon=True).start()
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_maintenance_controls_enabled(True),
+        )
 
     def _handle_duplicates_done(self, groups: list[DuplicateGroup]) -> None:
         self._set_maintenance_controls_enabled(True)
@@ -8536,6 +8762,9 @@ class MainWindow(QMainWindow):
         return removed_roots, removed_images
 
     def _start_embedding(self) -> None:
+        if self._database_maintenance_active:
+            self.statusBar().showMessage("数据库维护中，暂不启动语义索引")
+            return
         if self.embedding_worker is not None and self.embedding_worker.is_alive():
             self.embedding_worker.resume_work()
             self._refresh_embedding_stats()
@@ -8564,6 +8793,9 @@ class MainWindow(QMainWindow):
         self._start_embedding()
 
     def _start_ai_vision(self) -> None:
+        if self._database_maintenance_active:
+            self.statusBar().showMessage("数据库维护中，暂不启动 AI 识别")
+            return
         if self.ai_vision_worker is not None and self.ai_vision_worker.is_alive():
             self.ai_vision_worker.resume_work()
             self._refresh_ai_vision_stats()

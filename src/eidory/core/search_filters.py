@@ -14,6 +14,7 @@ SearchFilterValue = str | tuple[int, int, int] | int
 class SearchFilter:
     kind: str
     value: SearchFilterValue
+    score_threshold: int | None = None
 
 
 @dataclass(frozen=True)
@@ -47,7 +48,10 @@ def search_filter_to_payload(search_filter: SearchFilter) -> dict[str, object]:
     value = search_filter.value
     if isinstance(value, tuple):
         value = list(value)
-    return {"kind": search_filter.kind, "value": value}
+    payload: dict[str, object] = {"kind": search_filter.kind, "value": value}
+    if search_filter.score_threshold is not None:
+        payload["score_threshold"] = search_filter.score_threshold
+    return payload
 
 
 def search_filter_from_payload(payload: object) -> SearchFilter | None:
@@ -57,6 +61,7 @@ def search_filter_from_payload(payload: object) -> SearchFilter | None:
     value = payload.get("value")
     if kind not in VALID_FILTER_KINDS:
         return None
+    score_threshold = _score_threshold_from_payload(payload.get("score_threshold"))
     if kind == "similar":
         try:
             image_id = int(value)
@@ -64,13 +69,23 @@ def search_filter_from_payload(payload: object) -> SearchFilter | None:
             return None
         if image_id <= 0:
             return None
-        return SearchFilter("similar", image_id)
+        return SearchFilter("similar", image_id, score_threshold)
     if kind == "color":
         rgb = _rgb_from_payload(value)
-        return SearchFilter("color", rgb) if rgb is not None else None
+        return SearchFilter("color", rgb, score_threshold) if rgb is not None else None
     if not isinstance(value, str):
         return None
-    return SearchFilter(str(kind), value)
+    return SearchFilter(str(kind), value, score_threshold if kind in SCORED_FILTER_KINDS else None)
+
+
+def _score_threshold_from_payload(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        threshold = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(100, threshold))
 
 
 def _rgb_from_payload(value: object) -> tuple[int, int, int] | None:

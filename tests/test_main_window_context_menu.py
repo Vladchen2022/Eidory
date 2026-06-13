@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAccessible, QKeySequence
-from PySide6.QtWidgets import QApplication, QListWidgetItem, QMessageBox, QPushButton, QTextEdit, QTreeWidget, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem, QMessageBox, QPushButton, QTextEdit, QTreeWidget, QTreeWidgetItem
 
 from eidory.config import AppPaths
 from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
@@ -396,6 +396,102 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(window.search_merge_results_button.isEnabled())
             window.close()
 
+    def test_new_filter_kind_prompts_for_search_operation_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window.current_result_mode = "search_chain"
+            window.grid_view.set_images([self._image(1), self._image(2)])
+            window.search_filters = [SearchFilter("color", (240, 152, 196))]
+
+            with (
+                patch.object(window, "_prompt_search_operation_choice", return_value="merge") as prompt,
+                patch.object(window, "_execute_search_chain") as execute_search_chain,
+            ):
+                window._start_search_with_filter(SearchFilter("semantic", "水"))
+
+            prompt.assert_called_once_with(SearchFilter("semantic", "水"))
+            self.assertTrue(window.search_merge_results_button.isChecked())
+            self.assertEqual(window.search_filters, [SearchFilter("semantic", "水")])
+            execute_search_chain.assert_called_once()
+            self.assertEqual(execute_search_chain.call_args.kwargs["operation_mode"], "merge")
+            self.assertIn("operation_context", execute_search_chain.call_args.kwargs)
+            window.close()
+
+    def test_same_filter_kind_does_not_prompt_for_search_operation_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window.current_result_mode = "search_chain"
+            window.grid_view.set_images([self._image(1)])
+            window.search_filters = [SearchFilter("color", (240, 152, 196))]
+
+            with (
+                patch.object(window, "_prompt_search_operation_choice") as prompt,
+                patch.object(window, "_execute_search_chain") as execute_search_chain,
+            ):
+                window._start_search_with_filter(SearchFilter("color", (255, 0, 0)))
+
+            prompt.assert_not_called()
+            self.assertEqual(window.search_filters, [SearchFilter("color", (255, 0, 0))])
+            execute_search_chain.assert_called_once()
+            self.assertEqual(execute_search_chain.call_args.kwargs["operation_mode"], "replace")
+            self.assertIn("operation_context", execute_search_chain.call_args.kwargs)
+            window.close()
+
+    def test_cancel_search_operation_prompt_keeps_current_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window.current_result_mode = "search_chain"
+            window.grid_view.set_images([self._image(1), self._image(2)])
+            original_filters = [SearchFilter("color", (240, 152, 196))]
+            window.search_filters = list(original_filters)
+
+            with (
+                patch.object(window, "_prompt_search_operation_choice", return_value=None) as prompt,
+                patch.object(window, "_execute_search_chain") as execute_search_chain,
+            ):
+                window._start_search_with_filter(SearchFilter("semantic", "水"))
+
+            prompt.assert_called_once_with(SearchFilter("semantic", "水"))
+            self.assertEqual(window.search_filters, original_filters)
+            execute_search_chain.assert_not_called()
+            window.close()
+
     def test_scan_refresh_preserves_active_result_contexts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -574,6 +670,53 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertIsNotNone(refreshed_child)
             self.assertTrue(refreshed_parent.isExpanded())
             self.assertFalse(refreshed_child.isExpanded())
+            window.close()
+
+    def test_collection_filter_dialog_starts_collapsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            parent_id = store.create_collection("一级")
+            child_id = store.create_collection("二级", parent_id)
+            store.create_collection("三级", child_id)
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            inspected = False
+
+            def inspect_dialog(dialog: QDialog) -> QDialog.DialogCode:
+                nonlocal inspected
+                tree = dialog.findChild(QTreeWidget)
+                self.assertIsNotNone(tree)
+                assert tree is not None
+                parent_item = tree.topLevelItem(0)
+                self.assertIsNotNone(parent_item)
+                assert parent_item is not None
+                self.assertFalse(parent_item.isExpanded())
+                child_item = parent_item.child(0)
+                self.assertIsNotNone(child_item)
+                assert child_item is not None
+                self.assertFalse(child_item.isExpanded())
+                inspected = True
+                return QDialog.DialogCode.Rejected
+
+            with patch("eidory.ui.main_window.QDialog.exec", new=inspect_dialog):
+                self.assertIsNone(
+                    window._select_collections_for_search_dialog(
+                        reverse_mode=False,
+                        context_image=None,
+                    )
+                )
+
+            self.assertTrue(inspected)
             window.close()
 
     def test_detail_panel_hides_duplicate_file_action_buttons(self) -> None:
@@ -1199,6 +1342,50 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertIsNone(base_ids)
             self.assertEqual(base_label, "合并当前结果")
             self.assertEqual([image.id for image in merge_base or []], [1, 2])
+            window.close()
+
+    def test_refine_search_uses_unthresholded_source_result_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            source_images = [
+                self._image(1, score=0.95),
+                self._image(2, score=0.70),
+                self._image(3, score=0.40),
+            ]
+            window.current_result_mode = "color"
+            window.current_color_images = list(source_images)
+            window.current_color_filtered_images = [source_images[0]]
+            window.grid_view.set_images([source_images[0]])
+
+            operation_context = window._capture_search_operation_context()
+            base_ids, base_label, merge_base = window._search_operation_context(
+                "refine",
+                operation_context=operation_context,
+            )
+
+            self.assertEqual(base_ids, {1, 2, 3})
+            self.assertEqual(base_label, "在当前结果中")
+            self.assertIsNone(merge_base)
+
+            base_ids, base_label, merge_base = window._search_operation_context(
+                "merge",
+                operation_context=operation_context,
+            )
+            self.assertIsNone(base_ids)
+            self.assertEqual(base_label, "合并当前结果")
+            self.assertEqual([image.id for image in merge_base or []], [1])
             window.close()
 
     def test_merge_search_operation_unions_current_and_new_results(self) -> None:
@@ -2468,6 +2655,174 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.score_threshold_slider.setValue(0)
             self.app.processEvents()
             self.assertEqual([image.id for image in window.grid_view.images()], [5, 6, 7])
+            window.close()
+
+    def test_search_chain_keeps_last_scored_filter_unthresholded_for_later_hard_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            color_images = [
+                self._image(1, score=1.0, file_path="/tmp/bright-sky.jpg"),
+                self._image(2, score=0.35, file_path="/tmp/soft-house.jpg"),
+            ]
+            window.search_service.color_search = lambda *args, **kwargs: SimpleNamespace(
+                images=list(color_images),
+                searchable_count=2,
+                indexed_count=2,
+                candidate_limit=2,
+            )
+
+            result = window._compute_search_chain(
+                filters=(
+                    SearchFilter("color", (240, 152, 196), 100),
+                    SearchFilter("keyword", "house"),
+                ),
+                folder_path_prefix=None,
+                collection_id=None,
+                tag_ids=[],
+                tag_match_mode="any",
+                status_filter=None,
+            )
+
+            window.close()
+            self.assertEqual([image.id for image in result.images], [2])
+
+    def test_search_chain_applies_non_last_scored_filter_before_next_scored_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            captured_allowed_ids: list[set[int] | None] = []
+            color_images = [
+                self._image(1, score=1.0),
+                self._image(2, score=0.55),
+                self._image(3, score=0.20),
+            ]
+            window.search_service.color_search = lambda *args, **kwargs: SimpleNamespace(
+                images=list(color_images),
+                searchable_count=3,
+                indexed_count=3,
+                candidate_limit=3,
+            )
+
+            def semantic_search(*args, **kwargs):
+                captured_allowed_ids.append(kwargs.get("allowed_image_ids"))
+                allowed_ids = kwargs.get("allowed_image_ids") or set()
+                return SimpleNamespace(
+                    images=[self._image(image_id, score=0.8) for image_id in sorted(allowed_ids)],
+                    searchable_count=len(allowed_ids),
+                    candidate_limit=len(allowed_ids),
+                )
+
+            window.search_service.semantic_search = semantic_search
+
+            window._compute_search_chain(
+                filters=(
+                    SearchFilter("color", (240, 152, 196), 50),
+                    SearchFilter("semantic", "房屋", 0),
+                ),
+                folder_path_prefix=None,
+                collection_id=None,
+                tag_ids=[],
+                tag_match_mode="any",
+                status_filter=None,
+            )
+
+            window.close()
+            self.assertEqual(captured_allowed_ids, [{1, 2}])
+
+    def test_selected_search_filter_controls_score_threshold_slider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window.search_filters = [
+                SearchFilter("color", (240, 152, 196), 78),
+                SearchFilter("semantic", "水", 22),
+            ]
+            window.active_filter_index = 0
+            window._refresh_filter_chain_ui()
+            self.assertEqual(window.score_threshold_slider.value(), 78)
+            self.assertIn("颜色相似度", window.score_threshold_label.text())
+
+            window._select_search_filter_chip(1)
+            self.assertEqual(window.score_threshold_slider.value(), 22)
+            self.assertIn("语义相似度", window.score_threshold_label.text())
+
+            window.close()
+
+    def test_score_threshold_updates_recompute_only_for_non_last_scored_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            source_images = [
+                self._image(1, score=0.9),
+                self._image(2, score=0.4),
+            ]
+            window.current_result_mode = "search_chain"
+            window.current_chain_images = list(source_images)
+            window.grid_view.set_images(list(source_images))
+            window.search_filters = [
+                SearchFilter("color", (240, 152, 196), 80),
+                SearchFilter("semantic", "水", 100),
+            ]
+            window.active_filter_index = 0
+            with patch.object(window, "_execute_search_chain") as execute_search_chain:
+                window.score_threshold_slider.setValue(30)
+                self.app.processEvents()
+            execute_search_chain.assert_called_once_with(operation_mode="recompute")
+            self.assertEqual(window.search_filters[0].score_threshold, 30)
+
+            window.active_filter_index = 1
+            window._refresh_score_threshold_controls()
+            with patch.object(window, "_execute_search_chain") as execute_search_chain:
+                window.score_threshold_slider.setValue(0)
+                self.app.processEvents()
+            execute_search_chain.assert_not_called()
+            self.assertEqual(window.search_filters[1].score_threshold, 0)
+            self.assertEqual([image.id for image in window.grid_view.images()], [1, 2])
             window.close()
 
     def test_search_chain_refresh_recomputes_without_visible_result_base(self) -> None:

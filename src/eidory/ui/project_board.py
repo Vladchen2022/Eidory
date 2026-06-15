@@ -4,8 +4,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QImage, QPainter, QPen, QPixmap, QTransform
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFontMetrics, QImage, QImageReader, QPainter, QPen, QPixmap, QTransform
 from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPixmapItem,
@@ -24,6 +24,9 @@ MIN_ZOOM = 0.15
 MAX_ZOOM = 16.0
 GRID_SIZE = 36
 PIXMAP_CACHE_LIMIT = 512
+SOURCE_PIXMAP_PROJECT_LIMIT = 80
+MAX_SOURCE_PIXMAP_SIDE = 2200
+MAX_BOARD_THUMBNAIL_SIDE = 900
 DEFAULT_LAYOUT_LEFT = 80.0
 DEFAULT_LAYOUT_TOP = 110.0
 DEFAULT_LAYOUT_ROW_WIDTH = 1600.0
@@ -31,20 +34,30 @@ DEFAULT_LAYOUT_GAP_X = 48.0
 DEFAULT_LAYOUT_GAP_Y = 64.0
 
 
-_BOARD_PIXMAP_CACHE: OrderedDict[tuple[str, int, int], QPixmap] = OrderedDict()
+_BOARD_PIXMAP_CACHE: OrderedDict[tuple[str, int, int, int], QPixmap] = OrderedDict()
 
 
-def _cached_pixmap(path: Path) -> QPixmap:
+def _cached_pixmap(path: Path, *, max_side: int = MAX_SOURCE_PIXMAP_SIDE) -> QPixmap:
     try:
         stat = path.stat()
     except OSError:
         return QPixmap()
-    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    max_side = max(128, int(max_side))
+    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size), max_side)
     cached = _BOARD_PIXMAP_CACHE.get(key)
     if cached is not None:
         _BOARD_PIXMAP_CACHE.move_to_end(key)
         return QPixmap(cached)
-    pixmap = QPixmap(str(path))
+
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.isValid() and max(size.width(), size.height()) > max_side:
+        scaled_size = QSize(size.width(), size.height())
+        scaled_size.scale(max_side, max_side, Qt.AspectRatioMode.KeepAspectRatio)
+        reader.setScaledSize(scaled_size)
+    image = reader.read()
+    pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
     if pixmap.isNull():
         return pixmap
     _BOARD_PIXMAP_CACHE[key] = QPixmap(pixmap)
@@ -315,6 +328,7 @@ class ProjectBoardView(QGraphicsView):
         self._last_pan_pos = QPoint()
         self._view_mode = "fit_all"
         self._last_fit_selection_ids: tuple[int, ...] = ()
+        self._refit_timer_pending = False
         self._scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
 
     def set_images(
@@ -359,9 +373,15 @@ class ProjectBoardView(QGraphicsView):
             default_y = DEFAULT_LAYOUT_TOP
             row_height = 0.0
             row_right = DEFAULT_LAYOUT_LEFT + DEFAULT_LAYOUT_ROW_WIDTH
+            prefer_source_pixmaps = len(images) <= SOURCE_PIXMAP_PROJECT_LIMIT
+            pixmap_max_side = MAX_SOURCE_PIXMAP_SIDE if prefer_source_pixmaps else MAX_BOARD_THUMBNAIL_SIDE
             for index, image in enumerate(images):
                 item_payload = stored_items.get(str(image.id), {})
-                pixmap = self._pixmap_for(image)
+                pixmap = self._pixmap_for(
+                    image,
+                    prefer_source=prefer_source_pixmaps,
+                    max_side=pixmap_max_side,
+                )
                 item_width, item_height = self._default_item_size(pixmap)
                 if default_x > DEFAULT_LAYOUT_LEFT and default_x + item_width > row_right:
                     default_x = DEFAULT_LAYOUT_LEFT
@@ -395,8 +415,7 @@ class ProjectBoardView(QGraphicsView):
             self.setUpdatesEnabled(True)
 
         if images:
-            self.fit_all_images()
-            QTimer.singleShot(0, self.fit_all_images)
+            self._schedule_refit_current_view_mode()
 
     def fit_all_images(self) -> None:
         self._view_mode = "fit_all"
@@ -620,15 +639,17 @@ class ProjectBoardView(QGraphicsView):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self._view_mode in {"fit_all", "fit_selection"}:
-            QTimer.singleShot(0, self._refit_current_view_mode)
+            self._schedule_refit_current_view_mode()
 
     def selected_image_ids(self) -> list[int]:
-        selected_items = set(self._scene.selectedItems())
-        return [
-            image_id
-            for image_id, item in self._image_items.items()
-            if item in selected_items
-        ]
+        image_ids: list[int] = []
+        seen: set[int] = set()
+        for item in self._scene.selectedItems():
+            image_id = self._image_id_for_item(item)
+            if image_id is not None and image_id not in seen:
+                image_ids.append(image_id)
+                seen.add(image_id)
+        return image_ids
 
     def _zoom_by(self, factor: float) -> None:
         next_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
@@ -653,6 +674,16 @@ class ProjectBoardView(QGraphicsView):
                 return
         if self._view_mode == "fit_all":
             self._fit_items_to_view(self._visible_image_items(), margin=80.0)
+
+    def _schedule_refit_current_view_mode(self) -> None:
+        if self._refit_timer_pending:
+            return
+        self._refit_timer_pending = True
+        QTimer.singleShot(0, self._run_scheduled_refit)
+
+    def _run_scheduled_refit(self) -> None:
+        self._refit_timer_pending = False
+        self._refit_current_view_mode()
 
     def _add_image_item(
         self,
@@ -687,13 +718,23 @@ class ProjectBoardView(QGraphicsView):
                 QGraphicsItem.GraphicsItemFlag.ItemIsMovable
                 | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
             )
+        item.setData(0, int(image.id))
         item.setZValue(len(self._image_items) + 1)
         self._scene.addItem(item)
         self._image_items[image.id] = item
 
     def _selected_image_items(self) -> list[QGraphicsItem]:
-        selected = set(self._scene.selectedItems())
-        return [item for item in self._image_items.values() if item in selected]
+        items: list[QGraphicsItem] = []
+        seen: set[int] = set()
+        for item in self._scene.selectedItems():
+            image_id = self._image_id_for_item(item)
+            if image_id is None or image_id in seen:
+                continue
+            image_item = self._image_items.get(image_id)
+            if image_item is not None:
+                items.append(image_item)
+                seen.add(image_id)
+        return items
 
     def _select_image_id(self, image_id: int) -> None:
         for current_id, item in self._image_items.items():
@@ -720,14 +761,15 @@ class ProjectBoardView(QGraphicsView):
 
     def _image_id_at(self, viewport_pos) -> int | None:
         item = self.itemAt(viewport_pos)
-        if item is None:
-            return None
-        for image_id, image_item in self._image_items.items():
-            current: QGraphicsItem | None = item
-            while current is not None:
-                if current is image_item:
-                    return image_id
-                current = current.parentItem()
+        return self._image_id_for_item(item)
+
+    def _image_id_for_item(self, item: QGraphicsItem | None) -> int | None:
+        current: QGraphicsItem | None = item
+        while current is not None:
+            image_id = current.data(0)
+            if image_id is not None:
+                return int(image_id)
+            current = current.parentItem()
         return None
 
     @staticmethod
@@ -739,15 +781,24 @@ class ProjectBoardView(QGraphicsView):
         return rect
 
     @staticmethod
-    def _pixmap_for(image: ImageItem) -> QPixmap:
-        candidates = [image.thumbnail_path, image.file_path]
+    def _pixmap_for(
+        image: ImageItem,
+        *,
+        prefer_source: bool = False,
+        max_side: int = MAX_SOURCE_PIXMAP_SIDE,
+    ) -> QPixmap:
+        candidates = (
+            [image.file_path, image.thumbnail_path]
+            if prefer_source
+            else [image.thumbnail_path, image.file_path]
+        )
         for candidate in candidates:
             if not candidate:
                 continue
             path = Path(candidate)
             if not path.exists():
                 continue
-            pixmap = _cached_pixmap(path)
+            pixmap = _cached_pixmap(path, max_side=max_side)
             if not pixmap.isNull():
                 return pixmap
         return QPixmap()

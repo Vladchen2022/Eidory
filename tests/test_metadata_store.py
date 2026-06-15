@@ -21,6 +21,22 @@ class MetadataStoreTest(unittest.TestCase):
 
             self.assertGreaterEqual(timeout, 30_000)
 
+    def test_connections_use_wal_performance_pragmas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+
+            with store.connect() as conn:
+                journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                synchronous = int(conn.execute("PRAGMA synchronous").fetchone()[0])
+                temp_store = int(conn.execute("PRAGMA temp_store").fetchone()[0])
+                cache_size = int(conn.execute("PRAGMA cache_size").fetchone()[0])
+
+            self.assertEqual(journal_mode, "wal")
+            self.assertEqual(synchronous, 1)
+            self.assertEqual(temp_store, 2)
+            self.assertLess(cache_size, 0)
+
     def test_concurrent_upsert_same_path_is_serialized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MetadataStore(Path(tmp) / "eidory.sqlite3")

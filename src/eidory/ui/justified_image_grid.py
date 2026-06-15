@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QRect, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDrag, QPainter, QPen, QPixmap
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QRect, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QDrag, QImageReader, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication
 
 from eidory.core.media_types import is_supported_video
@@ -26,6 +27,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         super().__init__()
         self._images: list[ImageItem] = []
         self._rects: list[QRect] = []
+        self._row_ranges: list[tuple[int, int, int, int]] = []
+        self._row_tops: list[int] = []
         self._target_height = thumbnail_size
         self._spacing = spacing
         self._selected_index = -1
@@ -40,6 +43,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.viewport().installEventFilter(self)
         self.verticalScrollBar().valueChanged.connect(lambda _value: self.viewport().update())
 
@@ -157,34 +161,44 @@ class JustifiedImageGridView(QAbstractScrollArea):
         painter.fillRect(event.rect(), self.palette().base())
         offset_y = self.verticalScrollBar().value()
         visible = self.viewport().rect()
+        visible_content_top = offset_y + visible.top()
+        visible_content_bottom = offset_y + visible.bottom()
+        first_row = max(0, bisect_right(self._row_tops, visible_content_top) - 1)
 
-        for index, rect in enumerate(self._rects):
-            draw_rect = rect.translated(0, -offset_y)
-            if not draw_rect.intersects(visible):
+        for row_index in range(first_row, len(self._row_ranges)):
+            row_top, row_bottom, row_start, row_end = self._row_ranges[row_index]
+            if row_top > visible_content_bottom:
+                break
+            if row_bottom < visible_content_top:
                 continue
-            image = self._images[index]
-            pixmap = self._pixmap_for(image)
-            if pixmap.isNull():
-                self._draw_placeholder(painter, draw_rect, image)
-            else:
-                painter.drawPixmap(draw_rect, pixmap)
-            self._draw_badges(painter, draw_rect, image)
-            if index in self._selected_indexes:
-                old_pen = painter.pen()
-                painter.fillRect(draw_rect, QColor(79, 124, 255, 92))
-                outer_pen = QPen(QColor("#78a3ff"), 3)
-                inner_pen = QPen(QColor("#d7e3ff"), 1)
-                painter.setPen(outer_pen)
-                painter.drawRect(draw_rect.adjusted(1, 1, -2, -2))
-                painter.setPen(inner_pen)
-                painter.drawRect(draw_rect.adjusted(4, 4, -5, -5))
-                painter.setPen(old_pen)
-            if index == self._selected_index and index not in self._selected_indexes:
-                pen = painter.pen()
-                focus_pen = QPen(QColor("#78a3ff"), 2)
-                painter.setPen(focus_pen)
-                painter.drawRect(draw_rect.adjusted(0, 0, -1, -1))
-                painter.setPen(pen)
+            for index in range(row_start, row_end):
+                rect = self._rects[index]
+                draw_rect = rect.translated(0, -offset_y)
+                if not draw_rect.intersects(visible):
+                    continue
+                image = self._images[index]
+                pixmap = self._pixmap_for(image)
+                if pixmap.isNull():
+                    self._draw_placeholder(painter, draw_rect, image)
+                else:
+                    painter.drawPixmap(draw_rect, pixmap)
+                self._draw_badges(painter, draw_rect, image)
+                if index in self._selected_indexes:
+                    old_pen = painter.pen()
+                    painter.fillRect(draw_rect, QColor(79, 124, 255, 92))
+                    outer_pen = QPen(QColor("#78a3ff"), 3)
+                    inner_pen = QPen(QColor("#d7e3ff"), 1)
+                    painter.setPen(outer_pen)
+                    painter.drawRect(draw_rect.adjusted(1, 1, -2, -2))
+                    painter.setPen(inner_pen)
+                    painter.drawRect(draw_rect.adjusted(4, 4, -5, -5))
+                    painter.setPen(old_pen)
+                if index == self._selected_index and index not in self._selected_indexes:
+                    pen = painter.pen()
+                    focus_pen = QPen(QColor("#78a3ff"), 2)
+                    painter.setPen(focus_pen)
+                    painter.drawRect(draw_rect.adjusted(0, 0, -1, -1))
+                    painter.setPen(pen)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -431,8 +445,16 @@ class JustifiedImageGridView(QAbstractScrollArea):
             bar.setValue(max(0, bottom - self.viewport().height()))
 
     def _index_at(self, point: QPoint) -> int:
-        content_point = QPoint(point.x(), point.y() + self.verticalScrollBar().value())
-        for index, rect in enumerate(self._rects):
+        content_y = point.y() + self.verticalScrollBar().value()
+        row_index = bisect_right(self._row_tops, content_y) - 1
+        if row_index < 0 or row_index >= len(self._row_ranges):
+            return -1
+        row_top, row_bottom, row_start, row_end = self._row_ranges[row_index]
+        if content_y < row_top or content_y >= row_bottom:
+            return -1
+        content_point = QPoint(point.x(), content_y)
+        for index in range(row_start, row_end):
+            rect = self._rects[index]
             if rect.contains(content_point):
                 return index
         return -1
@@ -442,27 +464,40 @@ class JustifiedImageGridView(QAbstractScrollArea):
         available_width = max(1, viewport_width)
         y = 0
         rects: list[QRect] = [QRect() for _ in self._images]
+        row_ranges: list[tuple[int, int, int, int]] = []
         row_indexes: list[int] = []
         row_aspects: list[float] = []
         row_width = 0.0
+
+        def flush_row(*, justify: bool) -> None:
+            nonlocal y, row_indexes, row_aspects
+            if not row_indexes:
+                return
+            row_start = row_indexes[0]
+            row_end = row_indexes[-1] + 1
+            row_top = y
+            y = self._layout_row(rects, row_indexes, row_aspects, y, available_width, justify)
+            row_ranges.append((row_top, y, row_start, row_end))
+            row_indexes = []
+            row_aspects = []
 
         for index, image in enumerate(self._images):
             aspect = self._aspect_ratio(image)
             next_width = self._target_height * aspect
             spacing_width = self._spacing * len(row_indexes)
             if row_indexes and row_width + next_width + spacing_width >= available_width:
-                y = self._layout_row(rects, row_indexes, row_aspects, y, available_width, True)
-                row_indexes = []
-                row_aspects = []
+                flush_row(justify=True)
                 row_width = 0.0
             row_indexes.append(index)
             row_aspects.append(aspect)
             row_width += next_width
 
         if row_indexes:
-            y = self._layout_row(rects, row_indexes, row_aspects, y, available_width, False)
+            flush_row(justify=False)
 
         self._rects = rects
+        self._row_ranges = row_ranges
+        self._row_tops = [row[0] for row in row_ranges]
         content_height = max(0, y - self._spacing)
         bar = self.verticalScrollBar()
         bar.setPageStep(self.viewport().height())
@@ -515,12 +550,24 @@ class JustifiedImageGridView(QAbstractScrollArea):
         if not image.is_missing:
             path = Path(source)
             if path.exists():
-                pixmap = QPixmap(str(path))
+                pixmap = self._load_scaled_pixmap(path)
 
         self._pixmap_cache[source] = pixmap
         if len(self._pixmap_cache) > self._cache_limit:
             self._pixmap_cache.popitem(last=False)
         return pixmap
+
+    def _load_scaled_pixmap(self, path: Path) -> QPixmap:
+        reader = QImageReader(str(path))
+        reader.setAutoTransform(True)
+        max_side = max(256, int(self._target_height * 3))
+        size = reader.size()
+        if size.isValid() and max(size.width(), size.height()) > max_side:
+            scaled_size = QSize(size.width(), size.height())
+            scaled_size.scale(max_side, max_side, Qt.AspectRatioMode.KeepAspectRatio)
+            reader.setScaledSize(scaled_size)
+        image = reader.read()
+        return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
 
     def _draw_placeholder(self, painter: QPainter, rect: QRect, image: ImageItem) -> None:
         painter.fillRect(rect, QColor("#2d3138"))

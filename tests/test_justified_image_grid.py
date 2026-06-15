@@ -7,7 +7,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QMimeData, QUrl
+from PySide6.QtCore import QMimeData, QPoint, QUrl
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from eidory.models import ImageItem
@@ -92,6 +93,45 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
             mime.setUrls([QUrl.fromLocalFile(str(path))])
 
             self.assertFalse(JustifiedImageGridView._supports_external_import_drop(mime))
+
+    def test_hit_testing_uses_row_ranges_after_layout(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        grid.resize(360, 240)
+        grid.show()
+        self.app.processEvents()
+        grid.set_images([
+            self._image(image_id, width=160 + image_id % 5 * 20, height=90)
+            for image_id in range(1, 220)
+        ])
+
+        self.assertGreater(len(grid._row_ranges), 1)
+        for _row_top, _row_bottom, row_start, _row_end in grid._row_ranges[:5]:
+            rect = grid._rects[row_start]
+            point = QPoint(rect.center().x(), rect.center().y() - grid.verticalScrollBar().value())
+            self.assertEqual(grid._index_at(point), row_start)
+
+        grid.verticalScrollBar().setValue(grid.verticalScrollBar().maximum())
+        self.app.processEvents()
+        _row_top, _row_bottom, row_start, _row_end = grid._row_ranges[-1]
+        last_rect = grid._rects[row_start]
+        visible_point = QPoint(
+            last_rect.center().x(),
+            last_rect.center().y() - grid.verticalScrollBar().value(),
+        )
+        self.assertEqual(grid._index_at(visible_point), row_start)
+
+    def test_missing_thumbnail_fallback_is_decoded_at_bounded_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "large.jpg"
+            pixmap = QPixmap(1200, 420)
+            pixmap.fill(QColor("#667788"))
+            self.assertTrue(pixmap.save(str(image_path)))
+
+            grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+            loaded = grid._pixmap_for(self._image(1, file_path=str(image_path), width=1200, height=420))
+
+            self.assertFalse(loaded.isNull())
+            self.assertLessEqual(max(loaded.width(), loaded.height()), 270)
 
     @staticmethod
     def _image(

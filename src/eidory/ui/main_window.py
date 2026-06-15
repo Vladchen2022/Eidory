@@ -31,6 +31,7 @@ from PySide6.QtGui import (
     QDesktopServices,
     QIcon,
     QImage,
+    QImageReader,
     QKeySequence,
     QPainter,
     QPixmap,
@@ -485,6 +486,25 @@ class DuplicateResultsDialog(QDialog):
         self.accept()
 
 
+def _load_scaled_qt_pixmap(image_path: str, max_width: int, max_height: int) -> QPixmap:
+    if max_width <= 0 or max_height <= 0:
+        return QPixmap()
+    path = Path(image_path)
+    if not path.exists():
+        return QPixmap()
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    source_size = reader.size()
+    if source_size.isValid() and (
+        source_size.width() > max_width or source_size.height() > max_height
+    ):
+        scaled_size = QSize(source_size.width(), source_size.height())
+        scaled_size.scale(max_width, max_height, Qt.AspectRatioMode.KeepAspectRatio)
+        reader.setScaledSize(scaled_size)
+    image = reader.read()
+    return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+
+
 class ImageCompareDialog(QDialog):
     def __init__(self, images: list[ImageItem], *, parent: QWidget | None = None):
         super().__init__(parent)
@@ -508,7 +528,7 @@ class ImageCompareDialog(QDialog):
             preview.setStyleSheet("background: #20262e; border: 1px solid #47515d;")
             pixmap = QPixmap()
             if not image.is_missing and Path(image.file_path).exists() and not is_supported_video(image.file_path):
-                pixmap = QPixmap(image.file_path)
+                pixmap = _load_scaled_qt_pixmap(image.file_path, 1040, 1040)
             if not pixmap.isNull():
                 preview.setPixmap(
                     pixmap.scaled(
@@ -2501,7 +2521,7 @@ class MainWindow(QMainWindow):
                 uri=uri,
                 timeout=MetadataStore._busy_timeout_ms / 1000,
             )
-            conn.execute(f"PRAGMA busy_timeout = {MetadataStore._busy_timeout_ms}")
+            MetadataStore.configure_connection(conn, readonly=uri)
             try:
                 yield conn
             finally:
@@ -7540,7 +7560,7 @@ class MainWindow(QMainWindow):
         self.preview_stack.setCurrentWidget(self.preview_label)
         self.play_pause_button.setEnabled(False)
         preview_path = image.thumbnail_path if image.thumbnail_path and Path(image.thumbnail_path).exists() else image.file_path
-        pixmap = QPixmap(preview_path) if not image.is_missing else QPixmap()
+        pixmap = self._load_detail_preview_pixmap(preview_path) if not image.is_missing else QPixmap()
         if pixmap.isNull():
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText("无法预览")
@@ -7553,6 +7573,12 @@ class MainWindow(QMainWindow):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+
+    def _load_detail_preview_pixmap(self, image_path: str) -> QPixmap:
+        target_size = self.preview_label.size()
+        max_width = max(1, target_size.width() * 2)
+        max_height = max(1, target_size.height() * 2)
+        return _load_scaled_qt_pixmap(image_path, max_width, max_height)
 
     def _show_collection_details(self, collection_id: int | None) -> None:
         if not hasattr(self, "collection_detail_widget"):
@@ -11341,7 +11367,6 @@ class MainWindow(QMainWindow):
         self._current_board_image_ids = image_id_tuple
         self.center_result_stack.setCurrentWidget(self.project_board_view)
         self.project_board_view.setFocus(Qt.FocusReason.OtherFocusReason)
-        QTimer.singleShot(0, self.project_board_view.fit_all_images)
         self.load_more_button.hide()
         self.save_project_board_layout_button.setEnabled(True)
         self._set_board_toolbar_visible(True)
@@ -11754,7 +11779,7 @@ class MainWindow(QMainWindow):
             return
         self._show_temporary_project_board(int(project_id))
 
-    def _load_temporary_project(self, project_id: int) -> None:
+    def _load_temporary_project(self, project_id: int, *, update_grid: bool = True) -> None:
         project = self.store.get_temporary_project(project_id)
         if project is None:
             self._refresh_temporary_projects()
@@ -11790,11 +11815,12 @@ class MainWindow(QMainWindow):
         self.current_offset = 0
         self.load_more_button.setEnabled(False)
         self._refresh_filter_chain_ui()
-        self.grid_view.set_images(
-            self._sort_images(images),
-            selected_image_ids=[],
-            badges_by_image_id=badges,
-        )
+        if update_grid:
+            self.grid_view.set_images(
+                self._sort_images(images),
+                selected_image_ids=[],
+                badges_by_image_id=badges,
+            )
         suffix = f" ｜ {project.summary}" if project.summary else ""
         self._set_result_status(f"灵感暂存：{project.name} ｜ {len(images)} 张{suffix}")
         self.search_diagnostics_label.setText("搜索诊断：-")
@@ -11806,7 +11832,7 @@ class MainWindow(QMainWindow):
             self._refresh_temporary_projects()
             self.statusBar().showMessage("该灵感暂存已不存在")
             return
-        self._load_temporary_project(project_id)
+        self._load_temporary_project(project_id, update_grid=False)
         images = list(self.current_temp_project_images)
         image_id_tuple = tuple(image.id for image in images)
         if (
@@ -11831,7 +11857,6 @@ class MainWindow(QMainWindow):
         self._current_board_image_ids = image_id_tuple
         self.center_result_stack.setCurrentWidget(self.project_board_view)
         self.project_board_view.setFocus(Qt.FocusReason.OtherFocusReason)
-        QTimer.singleShot(0, self.project_board_view.fit_all_images)
         self.load_more_button.hide()
         self.save_project_board_layout_button.setEnabled(False)
         self._set_board_toolbar_visible(True)

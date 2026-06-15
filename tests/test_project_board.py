@@ -11,7 +11,7 @@ from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from eidory.models import ImageItem
-from eidory.ui.project_board import ProjectBoardView
+from eidory.ui.project_board import ProjectBoardView, _cached_pixmap
 
 
 class ProjectBoardViewTest(unittest.TestCase):
@@ -98,6 +98,18 @@ class ProjectBoardViewTest(unittest.TestCase):
 
             item = board._image_items[1]
             self.assertEqual(getattr(item, "badge_text"), "世界观 +1")
+
+    def test_cached_pixmap_respects_max_side(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "large.jpg"
+            pixmap = QPixmap(600, 240)
+            pixmap.fill(QColor("#445566"))
+            self.assertTrue(pixmap.save(str(image_path)))
+
+            cached = _cached_pixmap(image_path, max_side=160)
+
+            self.assertFalse(cached.isNull())
+            self.assertLessEqual(max(cached.width(), cached.height()), 160)
 
     @staticmethod
     def _image(

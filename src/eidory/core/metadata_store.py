@@ -71,6 +71,8 @@ def _clean_color_hex(value: object) -> str:
 class MetadataStore:
     _connection_lock = threading.RLock()
     _busy_timeout_ms = 30_000
+    _cache_size_kib = 64 * 1024
+    _mmap_size_bytes = 256 * 1024 * 1024
 
     def __init__(self, database_path: Path | str):
         self.database_path = Path(database_path)
@@ -384,9 +386,7 @@ class MetadataStore:
                 timeout=self._busy_timeout_ms / 1000,
             )
             conn.row_factory = sqlite3.Row
-            conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA journal_mode = WAL")
+            self.configure_connection(conn)
             try:
                 yield conn
                 conn.commit()
@@ -395,6 +395,17 @@ class MetadataStore:
                 raise
             finally:
                 conn.close()
+
+    @classmethod
+    def configure_connection(cls, conn: sqlite3.Connection, *, readonly: bool = False) -> None:
+        conn.execute(f"PRAGMA busy_timeout = {cls._busy_timeout_ms}")
+        conn.execute("PRAGMA foreign_keys = ON")
+        if not readonly:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute(f"PRAGMA cache_size = -{cls._cache_size_kib}")
+        conn.execute(f"PRAGMA mmap_size = {cls._mmap_size_bytes}")
 
     def add_folder(self, folder_path: str) -> int:
         normalized = os.path.abspath(os.path.expanduser(folder_path))

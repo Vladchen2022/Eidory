@@ -50,6 +50,25 @@ class GroupNameSuggestion:
     summary: str
 
 
+@dataclass(frozen=True)
+class CreativeNodeSuggestion:
+    title: str
+    note: str
+    search_query: str
+
+
+@dataclass(frozen=True)
+class CreativeNodeNoteSuggestion:
+    note: str
+    search_query: str
+
+
+@dataclass(frozen=True)
+class CreativeProjectCopySuggestion:
+    copy_text: str
+    nodes: list[CreativeNodeSuggestion]
+
+
 class LLMProviderError(RuntimeError):
     pass
 
@@ -227,6 +246,135 @@ class LMStudioProvider:
             max_tokens=1400,
         )
         return parse_group_name_suggestions(content, expected_count=len(groups), language=language)
+
+    def generate_creative_nodes(
+        self,
+        *,
+        project_brief: str,
+        parent_title: str,
+        parent_note: str = "",
+        language: str = "zh",
+    ) -> tuple[list[CreativeNodeSuggestion], str]:
+        clean_brief = project_brief.strip()
+        clean_title = parent_title.strip()
+        if not clean_brief and not clean_title:
+            raise LLMProviderError("创作主题不能为空")
+        model_name = self.model_name or self._first_available_model()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You split an illustration reference project into useful visual reference nodes. "
+                    "Return strict JSON only."
+                    if language == "en"
+                    else "你负责把插画参考项目拆成可执行的视觉参考节点。只输出严格 JSON。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _build_creative_nodes_prompt(
+                    project_brief=clean_brief,
+                    parent_title=clean_title,
+                    parent_note=parent_note.strip(),
+                    language=language,
+                ),
+            },
+        ]
+        content = self._chat_completion(
+            model_name=model_name,
+            messages=messages,
+            prefer_json=True,
+            response_format=_creative_nodes_response_format(),
+            temperature=0.65,
+            max_tokens=1800,
+        )
+        nodes = parse_creative_node_suggestions(content, language=language)
+        return nodes, model_name
+
+    def generate_creative_node_note(
+        self,
+        *,
+        project_brief: str,
+        node_title: str,
+        current_note: str = "",
+        node_path: str = "",
+        language: str = "zh",
+    ) -> tuple[CreativeNodeNoteSuggestion, str]:
+        clean_title = node_title.strip()
+        clean_brief = project_brief.strip()
+        if not clean_title and not clean_brief:
+            raise LLMProviderError("创作主题不能为空")
+        model_name = self.model_name or self._first_available_model()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You fill one fixed illustration planning node. Do not create child nodes. "
+                    "Return strict JSON only."
+                    if language == "en"
+                    else "你只负责补全一个固定插画规划节点。不要生成子节点。只输出严格 JSON。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _build_creative_node_note_prompt(
+                    project_brief=clean_brief,
+                    node_title=clean_title,
+                    current_note=current_note.strip(),
+                    node_path=node_path.strip(),
+                    language=language,
+                ),
+            },
+        ]
+        content = self._chat_completion(
+            model_name=model_name,
+            messages=messages,
+            prefer_json=True,
+            response_format=_creative_node_note_response_format(),
+            temperature=0.45,
+            max_tokens=900,
+        )
+        return parse_creative_node_note_suggestion(content, language=language), model_name
+
+    def generate_creative_project_copy(
+        self,
+        *,
+        project_brief: str,
+        nodes: list[dict[str, str]],
+        language: str = "zh",
+    ) -> tuple[CreativeProjectCopySuggestion, str]:
+        clean_brief = project_brief.strip()
+        if not clean_brief and not nodes:
+            raise LLMProviderError("创作项目不能为空")
+        model_name = self.model_name or self._first_available_model()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You write concise, visual illustration concept copy from fixed planning nodes. "
+                    "Respect any existing node information. Return strict JSON only."
+                    if language == "en"
+                    else "你负责根据固定创作节点写一段画面感强的插画概念文案。必须尊重已有节点信息。只输出严格 JSON。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _build_creative_project_copy_prompt(
+                    project_brief=clean_brief,
+                    nodes=nodes,
+                    language=language,
+                ),
+            },
+        ]
+        content = self._chat_completion(
+            model_name=model_name,
+            messages=messages,
+            prefer_json=True,
+            response_format=_creative_project_copy_response_format(),
+            temperature=0.75,
+            max_tokens=1800,
+        )
+        return parse_creative_project_copy_suggestion(content, language=language), model_name
 
     def _chat_completion(
         self,
@@ -443,6 +591,94 @@ def parse_group_name_suggestions(
     return suggestions
 
 
+def parse_creative_node_suggestions(
+    content: str,
+    *,
+    language: str = "zh",
+) -> list[CreativeNodeSuggestion]:
+    payload = _load_json_object(content)
+    raw_nodes = payload.get("nodes", [])
+    if not isinstance(raw_nodes, list):
+        raw_nodes = []
+    fallback_prefix = "Reference Node" if language == "en" else "参考节点"
+    suggestions: list[CreativeNodeSuggestion] = []
+    seen_titles: set[str] = set()
+    for index, raw in enumerate(raw_nodes):
+        if not isinstance(raw, dict):
+            continue
+        title = _clean_project_text(raw.get("title"), max_length=48) or f"{fallback_prefix} {index + 1}"
+        if title in seen_titles:
+            continue
+        note = _clean_project_text(raw.get("note"), max_length=260)
+        search_query = _clean_project_text(raw.get("search_query"), max_length=180)
+        if not search_query:
+            search_query = " ".join(part for part in [title, note] if part).strip()[:180]
+        suggestions.append(
+            CreativeNodeSuggestion(
+                title=title,
+                note=note,
+                search_query=search_query,
+            )
+        )
+        seen_titles.add(title)
+        if len(suggestions) >= 8:
+            break
+    if len(suggestions) < 2:
+        raise LLMProviderError("AI 生成的创作节点太少，请补充主题后重试")
+    return suggestions
+
+
+def parse_creative_node_note_suggestion(
+    content: str,
+    *,
+    language: str = "zh",
+) -> CreativeNodeNoteSuggestion:
+    payload = _load_json_object(content)
+    note = _clean_project_text(payload.get("note"), max_length=900)
+    search_query = _clean_project_text(payload.get("search_query"), max_length=240)
+    if not note and not search_query:
+        raise LLMProviderError("AI 没有返回可用的节点说明")
+    if not search_query:
+        search_query = note[:240]
+    if not note:
+        note = search_query
+    return CreativeNodeNoteSuggestion(note=note, search_query=search_query)
+
+
+def parse_creative_project_copy_suggestion(
+    content: str,
+    *,
+    language: str = "zh",
+) -> CreativeProjectCopySuggestion:
+    payload = _load_json_object(content)
+    fallback_copy = "A focused visual reference concept." if language == "en" else "一段围绕当前创作节点展开的视觉参考文案。"
+    copy_text = _clean_project_text(payload.get("copy_text"), max_length=1600) or fallback_copy
+    raw_nodes = payload.get("nodes", [])
+    if not isinstance(raw_nodes, list):
+        raw_nodes = []
+    suggestions: list[CreativeNodeSuggestion] = []
+    seen_titles: set[str] = set()
+    for raw in raw_nodes:
+        if not isinstance(raw, dict):
+            continue
+        title = _clean_project_text(raw.get("title"), max_length=80)
+        if not title or title in seen_titles:
+            continue
+        note = _clean_project_text(raw.get("note"), max_length=900)
+        search_query = _clean_project_text(raw.get("search_query"), max_length=240)
+        if not note and not search_query:
+            continue
+        suggestions.append(
+            CreativeNodeSuggestion(
+                title=title,
+                note=note or search_query,
+                search_query=search_query or note[:240],
+            )
+        )
+        seen_titles.add(title)
+    return CreativeProjectCopySuggestion(copy_text=copy_text, nodes=suggestions)
+
+
 def _clean_project_text(value: object, *, max_length: int) -> str:
     if not isinstance(value, str):
         return ""
@@ -529,6 +765,78 @@ def _group_names_response_format() -> dict[str, object]:
                     },
                 },
                 "required": ["groups"],
+            },
+        },
+    }
+
+
+def _creative_nodes_response_format() -> dict[str, object]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "eidory_creative_nodes",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "note": {"type": "string"},
+                                "search_query": {"type": "string"},
+                            },
+                            "required": ["title", "note", "search_query"],
+                        },
+                    },
+                },
+                "required": ["nodes"],
+            },
+        },
+    }
+
+
+def _creative_node_note_response_format() -> dict[str, object]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "eidory_creative_node_note",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string"},
+                    "search_query": {"type": "string"},
+                },
+                "required": ["note", "search_query"],
+            },
+        },
+    }
+
+
+def _creative_project_copy_response_format() -> dict[str, object]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "eidory_creative_project_copy",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "copy_text": {"type": "string"},
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "note": {"type": "string"},
+                                "search_query": {"type": "string"},
+                            },
+                            "required": ["title", "note", "search_query"],
+                        },
+                    },
+                },
+                "required": ["copy_text", "nodes"],
             },
         },
     }
@@ -850,6 +1158,218 @@ Requirements:
 4. 避免单独输出“孤独”“落魄”“命运”这类不可直接搜图的词。
 5. 每条 query 应适合直接交给中文图文 embedding 搜图。
 6. 不要输出 Markdown，不要解释 JSON 之外的内容。
+""".strip()
+
+
+def _build_creative_nodes_prompt(
+    *,
+    project_brief: str,
+    parent_title: str,
+    parent_note: str,
+    language: str,
+) -> str:
+    note_block = parent_note if parent_note else (
+        "No parent-node detail has been provided." if language == "en" else "该节点暂无补充说明。"
+    )
+    if language == "en":
+        return f"""
+Project brief:
+{project_brief or "-"}
+
+Current node:
+{parent_title or "-"}
+
+Current node detail:
+{note_block}
+
+Split the current node into useful child reference nodes for an illustrator.
+
+Return JSON:
+{{
+  "nodes": [
+    {{
+      "title": "short node title",
+      "note": "what visual reference this node should collect",
+      "search_query": "concrete English semantic image-search phrase"
+    }}
+  ]
+}}
+
+Rules:
+1. Output 4 to 8 child nodes.
+2. Each node must represent a visually useful reference bucket: setting, object, character pose, lighting, material, composition, mood, or detail.
+3. The search_query must be concrete enough for text-image embedding search. Avoid story-only abstractions.
+4. Do not output Markdown or any text outside JSON.
+""".strip()
+    return f"""
+项目主题：
+{project_brief or "-"}
+
+当前节点：
+{parent_title or "-"}
+
+当前节点说明：
+{note_block}
+
+请把当前节点拆成适合插画师收集参考图的子节点。
+
+请输出 JSON：
+{{
+  "nodes": [
+    {{
+      "title": "简短节点名",
+      "note": "这个节点应该收集什么视觉参考",
+      "search_query": "具体的中文语义搜图短语"
+    }}
+  ]
+}}
+
+规则：
+1. 输出 4 到 8 个子节点。
+2. 每个节点必须是对找参考图有用的视觉篮子：环境、物件、角色姿态、光线、材质、构图、气氛或局部细节。
+3. search_query 必须能直接用于图文 embedding 搜图，不要只有剧情或抽象词。
+4. 不要输出 Markdown，不要解释 JSON 之外的内容。
+""".strip()
+
+
+def _build_creative_node_note_prompt(
+    *,
+    project_brief: str,
+    node_title: str,
+    current_note: str,
+    node_path: str,
+    language: str,
+) -> str:
+    current_note_block = current_note if current_note else (
+        "No detail has been provided yet." if language == "en" else "用户尚未填写具体内容。"
+    )
+    node_path_block = node_path if node_path else node_title
+    if language == "en":
+        return f"""
+Project brief:
+{project_brief or "-"}
+
+Current fixed planning node:
+{node_path_block or "-"}
+
+Existing node detail:
+{current_note_block}
+
+Fill this node as an illustrator's reference-planning field.
+
+Return JSON:
+{{"note":"one concise paragraph about what this node should define visually","search_query":"concrete English semantic image-search phrase"}}
+
+Rules:
+1. Do not create or rename nodes.
+2. Keep the note specific to this node only.
+3. The search_query must be concrete enough for text-image embedding search.
+4. Avoid story-only abstractions; describe visible environment, objects, action, lighting, mood, material, or composition.
+5. Do not output Markdown or text outside JSON.
+""".strip()
+    return f"""
+项目主题：
+{project_brief or "-"}
+
+当前固定规划节点：
+{node_path_block or "-"}
+
+现有节点说明：
+{current_note_block}
+
+请把这个节点补成插画师能直接拿来找参考图的规划内容。
+
+输出 JSON：
+{{"note":"一段简洁说明，说明这个节点要明确哪些视觉参考","search_query":"具体的中文语义搜图短语"}}
+
+规则：
+1. 不要创建节点，不要改节点名。
+2. 只补当前节点，不要把其他节点的内容混进来。
+3. search_query 必须能直接用于图文 embedding 搜图。
+4. 避免只有剧情或抽象词，要落到可见环境、物件、动作、光线、气氛、材质或构图。
+5. 不要输出 Markdown，不要解释 JSON 之外的内容。
+""".strip()
+
+
+def _build_creative_project_copy_prompt(
+    *,
+    project_brief: str,
+    nodes: list[dict[str, str]],
+    language: str,
+) -> str:
+    clean_nodes: list[dict[str, str]] = []
+    for node in nodes:
+        clean_nodes.append(
+            {
+                "title": str(node.get("title", "")).strip()[:80],
+                "path": str(node.get("path", "")).strip()[:240],
+                "note": str(node.get("note", "")).strip()[:900],
+                "search_query": str(node.get("search_query", "")).strip()[:240],
+            }
+        )
+    has_any_detail = any(node["note"] or node["search_query"] for node in clean_nodes)
+    nodes_json = json.dumps(clean_nodes, ensure_ascii=False, indent=2)
+    if language == "en":
+        mode_note = (
+            "Some nodes already contain information. Do not contradict, overwrite, or ignore them. "
+            "You may only fill empty nodes when it helps the copy."
+            if has_any_detail
+            else "All nodes are empty. Invent one coherent visual concept and fill every listed node."
+        )
+        return f"""
+Project brief:
+{project_brief or "-"}
+
+Planning nodes JSON:
+{nodes_json}
+
+Task:
+Write a concise visual concept copy for an illustrator. Also return node updates.
+
+Return JSON:
+{{
+  "copy_text": "one vivid paragraph, 100-220 English words",
+  "nodes": [
+    {{"title": "existing node title exactly", "note": "node visual detail", "search_query": "concrete English image-search phrase"}}
+  ]
+}}
+
+Rules:
+1. {mode_note}
+2. Keep node titles exactly the same as the provided titles.
+3. If existing node information exists, the copy must preserve it as hard constraints.
+4. Do not add characters, location, weather, era, or events that conflict with existing node notes.
+5. Do not output Markdown or any text outside JSON.
+""".strip()
+    mode_note = (
+        "部分节点已经有信息。不得推翻、篡改或忽略已有信息；只在不冲突时补全空节点。"
+        if has_any_detail
+        else "所有节点都为空。请随机生成一个统一、可画、画面感强的创作主题，并补全每个节点。"
+    )
+    return f"""
+项目主题：
+{project_brief or "-"}
+
+规划节点 JSON：
+{nodes_json}
+
+任务：
+为插画师写一段画面感强的短文，并返回节点补全。
+
+输出 JSON：
+{{
+  "copy_text": "一段视觉性强的短文，约 180 到 360 个汉字",
+  "nodes": [
+    {{"title": "必须使用已有节点名", "note": "该节点的视觉信息", "search_query": "具体中文语义搜图短语"}}
+  ]
+}}
+
+规则：
+1. {mode_note}
+2. 节点 title 必须和输入中的节点名完全一致。
+3. 如果已有节点信息存在，文案必须把它当作硬约束。
+4. 不要加入与已有节点说明冲突的角色、地点、天气、年代或事件。
+5. 不要输出 Markdown，不要解释 JSON 之外的内容。
 """.strip()
 
 

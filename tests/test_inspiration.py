@@ -7,6 +7,9 @@ from pathlib import Path
 from eidory.core.inspiration import InspirationTerm, mix_inspiration_search_results
 from eidory.core.llm_provider import (
     _terms_from_plain_text,
+    parse_creative_project_copy_suggestion,
+    parse_creative_node_note_suggestion,
+    parse_creative_node_suggestions,
     parse_group_name_suggestions,
     parse_inspiration_proposal,
     parse_project_suggestion,
@@ -98,6 +101,47 @@ class InspirationTest(unittest.TestCase):
 
         self.assertEqual(name, "潮湿机械住处")
         self.assertEqual(summary, "用于寻找落魄工程师住处和机械细节的参考。")
+
+    def test_parse_creative_node_suggestions_normalizes_nodes(self) -> None:
+        suggestions = parse_creative_node_suggestions(
+            """
+{
+  "nodes": [
+    {"title":"凌乱工作台","note":"住处里的维修台、工具和生活痕迹。","search_query":"凌乱工作台 机械零件"},
+    {"title":"凌乱工作台","note":"重复节点应丢弃。","search_query":"重复"},
+    {"title":"特殊摩托车","note":"复古摩托和改装结构。","search_query":""}
+  ]
+}
+            """
+        )
+
+        self.assertEqual([item.title for item in suggestions], ["凌乱工作台", "特殊摩托车"])
+        self.assertEqual(suggestions[1].search_query, "特殊摩托车 复古摩托和改装结构。")
+
+    def test_parse_creative_node_note_suggestion(self) -> None:
+        suggestion = parse_creative_node_note_suggestion(
+            '{"note":"雨夜小巷、潮湿地面和低位霓虹反光。","search_query":"雨夜潮湿小巷 霓虹反光"}'
+        )
+
+        self.assertEqual(suggestion.note, "雨夜小巷、潮湿地面和低位霓虹反光。")
+        self.assertEqual(suggestion.search_query, "雨夜潮湿小巷 霓虹反光")
+
+    def test_parse_creative_project_copy_suggestion(self) -> None:
+        suggestion = parse_creative_project_copy_suggestion(
+            """
+{
+  "copy_text": "狭窄住处里，疲惫的工程师在冷蓝色台灯下拆解摩托引擎。",
+  "nodes": [
+    {"title":"地点","note":"狭窄出租屋和临时工作台。","search_query":"狭窄出租屋 临时工作台"},
+    {"title":"地点","note":"重复应丢弃。","search_query":"重复"}
+  ]
+}
+            """
+        )
+
+        self.assertIn("工程师", suggestion.copy_text)
+        self.assertEqual(len(suggestion.nodes), 1)
+        self.assertEqual(suggestion.nodes[0].title, "地点")
 
     def test_parse_search_plan_proposal_normalizes_filters(self) -> None:
         proposal = parse_search_plan_proposal(

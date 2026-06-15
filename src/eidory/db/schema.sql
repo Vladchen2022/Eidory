@@ -259,6 +259,68 @@ CREATE TABLE IF NOT EXISTS inspiration_terms (
 CREATE INDEX IF NOT EXISTS idx_inspiration_terms_project_order
 ON inspiration_terms(project_id, sort_order);
 
+CREATE TABLE IF NOT EXISTS creative_projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    brief TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT 'zh',
+    provider_name TEXT NOT NULL DEFAULT '',
+    model_name TEXT NOT NULL DEFAULT '',
+    is_pinned INTEGER NOT NULL DEFAULT 0,
+    copy_text TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_creative_projects_updated_at
+ON creative_projects(updated_at);
+
+CREATE TABLE IF NOT EXISTS creative_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    parent_id INTEGER,
+    title TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    search_query TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES creative_projects(id) ON DELETE CASCADE,
+    FOREIGN KEY(parent_id) REFERENCES creative_nodes(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_creative_nodes_project_parent_order
+ON creative_nodes(project_id, parent_id, sort_order, id);
+
+CREATE TABLE IF NOT EXISTS creative_node_images (
+    node_id INTEGER NOT NULL,
+    image_id INTEGER NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    intent_label TEXT,
+    intent_query TEXT,
+    PRIMARY KEY(node_id, image_id),
+    FOREIGN KEY(node_id) REFERENCES creative_nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_creative_node_images_node_order
+ON creative_node_images(node_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS creative_board_layouts (
+    project_id INTEGER PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES creative_projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS creative_node_board_layouts (
+    node_id INTEGER PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(node_id) REFERENCES creative_nodes(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,

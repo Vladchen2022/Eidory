@@ -611,6 +611,103 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(store.temporary_project_image_ids(first_project), [])
             self.assertIsNotNone(store.get_image(image_id))
 
+    def test_creative_projects_persist_nodes_images_and_board_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            first_id = self._insert_image(store, folder_id, Path(tmp) / "library" / "first.jpg", 1)
+            second_id = self._insert_image(store, folder_id, Path(tmp) / "library" / "second.jpg", 2)
+
+            project_id = store.create_creative_project(
+                title="落魄工程师",
+                brief="落魄机械工程师在住处研究摩托车",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="qwen",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            root = store.get_creative_node(root_id)
+            self.assertIsNotNone(root)
+            self.assertIsNone(root.parent_id)
+            self.assertFalse(store.delete_creative_node(root_id))
+
+            workshop_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=root_id,
+                title="凌乱工作台",
+                note="廉价住处里的维修台",
+                search_query="凌乱工作台 机械零件",
+            )
+            vehicle_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=root_id,
+                title="特殊摩托车",
+                search_query="复古摩托车 改装结构",
+            )
+            store.add_images_to_creative_node(
+                workshop_id,
+                [second_id, first_id],
+                intent_label="工作台",
+                intent_query="凌乱工作台 机械零件",
+            )
+            store.add_images_to_creative_node(
+                vehicle_id,
+                [first_id],
+                intent_label="摩托车",
+                intent_query="复古摩托车 改装结构",
+            )
+            store.save_creative_board_layout(project_id, '{"version":1,"items":{"1":{"x":10}}}')
+            store.save_creative_node_board_layout(workshop_id, '{"version":1,"items":{"2":{"x":40}}}')
+
+            reopened = MetadataStore(db_path)
+            reopened.initialize()
+            project = reopened.get_creative_project(project_id)
+            self.assertIsNotNone(project)
+            self.assertEqual(project.title, "落魄工程师")
+            self.assertEqual(project.language, "zh")
+            self.assertFalse(project.is_pinned)
+            self.assertEqual(project.copy_text, "")
+            self.assertEqual(project.node_count, 3)
+            self.assertEqual(project.image_count, 2)
+            self.assertTrue(reopened.set_creative_project_pinned(project_id, True))
+            self.assertTrue(reopened.update_creative_project_copy(project_id, "昏暗住处里，工程师拆解一辆旧摩托车。"))
+            updated_project = reopened.get_creative_project(project_id)
+            self.assertIsNotNone(updated_project)
+            self.assertTrue(updated_project.is_pinned)
+            self.assertEqual(updated_project.copy_text, "昏暗住处里，工程师拆解一辆旧摩托车。")
+            self.assertEqual(
+                [node.title for node in reopened.list_creative_nodes(project_id)],
+                ["落魄工程师", "凌乱工作台", "特殊摩托车"],
+            )
+            self.assertEqual(reopened.creative_node_image_ids(workshop_id), [second_id, first_id])
+            self.assertEqual(
+                reopened.creative_node_image_ids(root_id, include_descendants=True),
+                [second_id, first_id],
+            )
+            self.assertEqual(
+                reopened.creative_node_image_badges(project_id),
+                {first_id: ["工作台", "摩托车"], second_id: ["工作台"]},
+            )
+            self.assertEqual(
+                reopened.get_creative_board_layout(project_id),
+                '{"version":1,"items":{"1":{"x":10}}}',
+            )
+            self.assertEqual(
+                reopened.get_creative_node_board_layout(workshop_id),
+                '{"version":1,"items":{"2":{"x":40}}}',
+            )
+
+            self.assertEqual(reopened.remove_images_from_creative_node_branch(root_id, [second_id]), 1)
+            self.assertEqual(reopened.creative_node_image_ids(workshop_id), [first_id])
+            self.assertEqual(reopened.remove_images_from_creative_node(workshop_id, [first_id]), 1)
+            self.assertEqual(reopened.creative_node_image_ids(workshop_id), [])
+            self.assertTrue(reopened.delete_creative_project(project_id))
+            self.assertIsNotNone(reopened.get_image(first_id))
+            self.assertIsNotNone(reopened.get_image(second_id))
+
     def test_duration_persists_and_images_can_sort_by_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"

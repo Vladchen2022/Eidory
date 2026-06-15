@@ -18,6 +18,8 @@ from eidory.core.media_types import SUPPORTED_IMAGE_EXTENSIONS
 from eidory.core.time_utils import timestamp_ns_to_iso, utc_now_iso
 from eidory.models import (
     CollectionItem,
+    CreativeNodeItem,
+    CreativeProjectItem,
     FolderItem,
     ImageItem,
     InspirationProjectItem,
@@ -214,7 +216,105 @@ class MetadataStore:
             ON inspiration_terms(project_id, sort_order)
             """
         )
+        MetadataStore._ensure_creative_project_schema(conn)
         MetadataStore._ensure_ai_vision_schema(conn)
+
+    @staticmethod
+    def _ensure_creative_project_schema(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS creative_projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                brief TEXT NOT NULL DEFAULT '',
+                language TEXT NOT NULL DEFAULT 'zh',
+                provider_name TEXT NOT NULL DEFAULT '',
+                model_name TEXT NOT NULL DEFAULT '',
+                is_pinned INTEGER NOT NULL DEFAULT 0,
+                copy_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        project_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(creative_projects)").fetchall()
+        }
+        if "is_pinned" not in project_columns:
+            conn.execute("ALTER TABLE creative_projects ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0")
+        if "copy_text" not in project_columns:
+            conn.execute("ALTER TABLE creative_projects ADD COLUMN copy_text TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_creative_projects_updated_at
+            ON creative_projects(updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS creative_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                parent_id INTEGER,
+                title TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                search_query TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES creative_projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(parent_id) REFERENCES creative_nodes(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_creative_nodes_project_parent_order
+            ON creative_nodes(project_id, parent_id, sort_order, id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS creative_node_images (
+                node_id INTEGER NOT NULL,
+                image_id INTEGER NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                intent_label TEXT,
+                intent_query TEXT,
+                PRIMARY KEY(node_id, image_id),
+                FOREIGN KEY(node_id) REFERENCES creative_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_creative_node_images_node_order
+            ON creative_node_images(node_id, sort_order)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS creative_board_layouts (
+                project_id INTEGER PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES creative_projects(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS creative_node_board_layouts (
+                node_id INTEGER PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(node_id) REFERENCES creative_nodes(id) ON DELETE CASCADE
+            )
+            """
+        )
 
     @staticmethod
     def _ensure_ai_vision_schema(conn: sqlite3.Connection) -> None:
@@ -3252,6 +3352,567 @@ class MetadataStore:
         with self.connect() as conn:
             cur = conn.execute("DELETE FROM inspiration_projects WHERE id = ?", (project_id,))
             return int(cur.rowcount) > 0
+
+    def create_creative_project(
+        self,
+        *,
+        title: str,
+        brief: str = "",
+        language: str = "zh",
+        provider_name: str = "",
+        model_name: str = "",
+    ) -> int:
+        clean_title = " ".join(title.strip().split())[:120] or "未命名创作项目"
+        clean_brief = brief.strip()[:1200]
+        clean_language = language if language in {"zh", "en"} else "zh"
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO creative_projects(
+                    title, brief, language, provider_name, model_name, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_title,
+                    clean_brief,
+                    clean_language,
+                    provider_name.strip()[:80],
+                    model_name.strip()[:120],
+                    now,
+                    now,
+                ),
+            )
+            project_id = int(cur.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO creative_nodes(
+                    project_id, parent_id, title, note, search_query, sort_order, created_at, updated_at
+                )
+                VALUES (?, NULL, ?, ?, ?, 0, ?, ?)
+                """,
+                (project_id, clean_title, clean_brief, clean_brief or clean_title, now, now),
+            )
+            return project_id
+
+    def list_creative_projects(self) -> list[CreativeProjectItem]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    p.*,
+                    COUNT(DISTINCT n.id) AS node_count,
+                    COUNT(DISTINCT cni.image_id) AS image_count
+                FROM creative_projects p
+                LEFT JOIN creative_nodes n ON n.project_id = p.id
+                LEFT JOIN creative_node_images cni ON cni.node_id = n.id
+                GROUP BY p.id
+                ORDER BY p.is_pinned DESC, p.updated_at DESC, p.id DESC
+                """
+            ).fetchall()
+        return [self._creative_project_from_row(row) for row in rows]
+
+    def get_creative_project(self, project_id: int) -> CreativeProjectItem | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    p.*,
+                    COUNT(DISTINCT n.id) AS node_count,
+                    COUNT(DISTINCT cni.image_id) AS image_count
+                FROM creative_projects p
+                LEFT JOIN creative_nodes n ON n.project_id = p.id
+                LEFT JOIN creative_node_images cni ON cni.node_id = n.id
+                WHERE p.id = ?
+                GROUP BY p.id
+                """,
+                (project_id,),
+            ).fetchone()
+        return self._creative_project_from_row(row) if row is not None else None
+
+    def delete_creative_project(self, project_id: int) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute("DELETE FROM creative_projects WHERE id = ?", (project_id,))
+            return int(cur.rowcount) > 0
+
+    def set_creative_project_pinned(self, project_id: int, pinned: bool) -> bool:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE creative_projects
+                SET is_pinned = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (1 if pinned else 0, now, project_id),
+            )
+            return int(cur.rowcount) > 0
+
+    def update_creative_project_copy(self, project_id: int, copy_text: str) -> bool:
+        clean_copy = copy_text.strip()[:4000]
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE creative_projects
+                SET copy_text = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (clean_copy, now, project_id),
+            )
+            return int(cur.rowcount) > 0
+
+    def creative_root_node_id(self, project_id: int) -> int | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM creative_nodes
+                WHERE project_id = ? AND parent_id IS NULL
+                ORDER BY sort_order, id
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+        return int(row["id"]) if row is not None else None
+
+    def create_creative_node(
+        self,
+        *,
+        project_id: int,
+        parent_id: int | None,
+        title: str,
+        note: str = "",
+        search_query: str = "",
+    ) -> int:
+        clean_title = " ".join(title.strip().split())[:120] or "未命名节点"
+        clean_note = note.strip()[:1600]
+        clean_query = " ".join((search_query or clean_note or clean_title).strip().split())[:400]
+        now = utc_now_iso()
+        with self.connect() as conn:
+            project = conn.execute(
+                "SELECT id FROM creative_projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                raise ValueError("creative project does not exist")
+            if parent_id is not None:
+                parent = conn.execute(
+                    "SELECT id FROM creative_nodes WHERE id = ? AND project_id = ?",
+                    (parent_id, project_id),
+                ).fetchone()
+                if parent is None:
+                    raise ValueError("parent creative node does not exist")
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order
+                FROM creative_nodes
+                WHERE project_id = ? AND parent_id IS ?
+                """,
+                (project_id, parent_id),
+            ).fetchone()
+            sort_order = int(row["next_order"]) if row is not None else 0
+            cur = conn.execute(
+                """
+                INSERT INTO creative_nodes(
+                    project_id, parent_id, title, note, search_query, sort_order, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (project_id, parent_id, clean_title, clean_note, clean_query, sort_order, now, now),
+            )
+            conn.execute(
+                "UPDATE creative_projects SET updated_at = ? WHERE id = ?",
+                (now, project_id),
+            )
+            return int(cur.lastrowid)
+
+    def update_creative_node(
+        self,
+        node_id: int,
+        *,
+        title: str | None = None,
+        note: str | None = None,
+        search_query: str | None = None,
+    ) -> CreativeNodeItem | None:
+        assignments: list[str] = ["updated_at = ?"]
+        now = utc_now_iso()
+        params: list[object] = [now]
+        if title is not None:
+            clean_title = " ".join(title.strip().split())[:120]
+            if not clean_title:
+                raise ValueError("creative node title must not be empty")
+            assignments.append("title = ?")
+            params.append(clean_title)
+        if note is not None:
+            assignments.append("note = ?")
+            params.append(note.strip()[:1600])
+        if search_query is not None:
+            assignments.append("search_query = ?")
+            params.append(" ".join(search_query.strip().split())[:400])
+        if len(assignments) == 1:
+            return self.get_creative_node(node_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT project_id FROM creative_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            params.append(node_id)
+            conn.execute(
+                f"UPDATE creative_nodes SET {', '.join(assignments)} WHERE id = ?",
+                params,
+            )
+            conn.execute(
+                "UPDATE creative_projects SET updated_at = ? WHERE id = ?",
+                (now, int(row["project_id"])),
+            )
+        return self.get_creative_node(node_id)
+
+    def delete_creative_node(self, node_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT project_id, parent_id FROM creative_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            if row is None or row["parent_id"] is None:
+                return False
+            now = utc_now_iso()
+            cur = conn.execute("DELETE FROM creative_nodes WHERE id = ?", (node_id,))
+            if cur.rowcount:
+                conn.execute(
+                    "UPDATE creative_projects SET updated_at = ? WHERE id = ?",
+                    (now, int(row["project_id"])),
+                )
+            return int(cur.rowcount) > 0
+
+    def get_creative_node(self, node_id: int) -> CreativeNodeItem | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT n.*, COUNT(cni.image_id) AS image_count
+                FROM creative_nodes n
+                LEFT JOIN creative_node_images cni ON cni.node_id = n.id
+                WHERE n.id = ?
+                GROUP BY n.id
+                """,
+                (node_id,),
+            ).fetchone()
+        return self._creative_node_from_row(row) if row is not None else None
+
+    def list_creative_nodes(self, project_id: int) -> list[CreativeNodeItem]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT n.*, COUNT(cni.image_id) AS image_count
+                FROM creative_nodes n
+                LEFT JOIN creative_node_images cni ON cni.node_id = n.id
+                WHERE n.project_id = ?
+                GROUP BY n.id
+                ORDER BY
+                    CASE WHEN n.parent_id IS NULL THEN 0 ELSE 1 END,
+                    n.parent_id,
+                    n.sort_order,
+                    n.id
+                """,
+                (project_id,),
+            ).fetchall()
+        return [self._creative_node_from_row(row) for row in rows]
+
+    def add_images_to_creative_node(
+        self,
+        node_id: int,
+        image_ids: Sequence[int],
+        *,
+        intent_label: str = "",
+        intent_query: str = "",
+    ) -> int:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return 0
+        label = _clean_optional_text(intent_label, max_length=80)
+        query = _clean_optional_text(intent_query, max_length=200)
+        now = utc_now_iso()
+        changed = 0
+        with self.connect() as conn:
+            node = conn.execute(
+                "SELECT project_id FROM creative_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            if node is None:
+                raise ValueError("creative node does not exist")
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(sort_order), -1) AS max_sort_order
+                FROM creative_node_images
+                WHERE node_id = ?
+                """,
+                (node_id,),
+            ).fetchone()
+            next_order = int(row["max_sort_order"]) + 1 if row is not None else 0
+            for offset, image_id in enumerate(clean_ids):
+                cur = conn.execute(
+                    """
+                    INSERT INTO creative_node_images(
+                        node_id, image_id, sort_order, created_at, intent_label, intent_query
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id, image_id) DO UPDATE SET
+                        intent_label = COALESCE(excluded.intent_label, creative_node_images.intent_label),
+                        intent_query = COALESCE(excluded.intent_query, creative_node_images.intent_query)
+                    """,
+                    (node_id, image_id, next_order + offset, now, label, query),
+                )
+                changed += int(cur.rowcount)
+            conn.execute(
+                "UPDATE creative_projects SET updated_at = ? WHERE id = ?",
+                (now, int(node["project_id"])),
+            )
+        return changed
+
+    def remove_images_from_creative_node(self, node_id: int, image_ids: Sequence[int]) -> int:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return 0
+        placeholders = ",".join("?" for _ in clean_ids)
+        now = utc_now_iso()
+        with self.connect() as conn:
+            node = conn.execute(
+                "SELECT project_id FROM creative_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            if node is None:
+                return 0
+            cur = conn.execute(
+                f"""
+                DELETE FROM creative_node_images
+                WHERE node_id = ? AND image_id IN ({placeholders})
+                """,
+                [node_id, *clean_ids],
+            )
+            removed = int(cur.rowcount)
+            if removed:
+                conn.execute(
+                    "UPDATE creative_projects SET updated_at = ? WHERE id = ?",
+                    (now, int(node["project_id"])),
+                )
+            return removed
+
+    def remove_images_from_creative_node_branch(self, node_id: int, image_ids: Sequence[int]) -> int:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return 0
+        node = self.get_creative_node(node_id)
+        if node is None:
+            return 0
+        node_ids = self._creative_descendant_node_ids(node.project_id, node_id)
+        if not node_ids:
+            return 0
+        image_placeholders = ",".join("?" for _ in clean_ids)
+        node_placeholders = ",".join("?" for _ in node_ids)
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                f"""
+                DELETE FROM creative_node_images
+                WHERE node_id IN ({node_placeholders})
+                  AND image_id IN ({image_placeholders})
+                """,
+                [*node_ids, *clean_ids],
+            )
+            removed = int(cur.rowcount)
+            if removed:
+                conn.execute(
+                    "UPDATE creative_projects SET updated_at = ? WHERE id = ?",
+                    (now, node.project_id),
+                )
+            return removed
+
+    def creative_node_image_ids(self, node_id: int, *, include_descendants: bool = False) -> list[int]:
+        node_ids = [node_id]
+        if include_descendants:
+            node = self.get_creative_node(node_id)
+            if node is not None:
+                node_ids = self._creative_descendant_node_ids(node.project_id, node_id)
+        if not node_ids:
+            return []
+        placeholders = ",".join("?" for _ in node_ids)
+        node_order = {node_id: index for index, node_id in enumerate(node_ids)}
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT node_id, image_id, sort_order
+                FROM creative_node_images
+                WHERE node_id IN ({placeholders})
+                """,
+                node_ids,
+            ).fetchall()
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: (
+                node_order.get(int(row["node_id"]), len(node_order)),
+                int(row["sort_order"]),
+                int(row["image_id"]),
+            ),
+        )
+        image_ids: list[int] = []
+        seen: set[int] = set()
+        for row in ordered_rows:
+            image_id = int(row["image_id"])
+            if image_id in seen:
+                continue
+            seen.add(image_id)
+            image_ids.append(image_id)
+        return image_ids
+
+    def creative_node_image_badges(self, project_id: int) -> dict[int, list[str]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT cni.image_id, COALESCE(NULLIF(TRIM(cni.intent_label), ''), n.title) AS badge
+                FROM creative_node_images cni
+                JOIN creative_nodes n ON n.id = cni.node_id
+                WHERE n.project_id = ?
+                ORDER BY n.sort_order, cni.sort_order, cni.image_id
+                """,
+                (project_id,),
+            ).fetchall()
+        badges: dict[int, list[str]] = {}
+        for row in rows:
+            image_id = int(row["image_id"])
+            badge = str(row["badge"] or "").strip()
+            if not badge:
+                continue
+            badges.setdefault(image_id, [])
+            if badge not in badges[image_id]:
+                badges[image_id].append(badge)
+        return badges
+
+    def save_creative_board_layout(self, project_id: int, payload_json: str) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO creative_board_layouts(project_id, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (project_id, payload_json, now),
+            )
+            conn.execute(
+                "UPDATE creative_projects SET updated_at = ? WHERE id = ?",
+                (now, project_id),
+            )
+
+    def get_creative_board_layout(self, project_id: int) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM creative_board_layouts WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        return str(row["payload_json"]) if row is not None else None
+
+    def save_creative_node_board_layout(self, node_id: int, payload_json: str) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT project_id FROM creative_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            if row is None:
+                return
+            conn.execute(
+                """
+                INSERT INTO creative_node_board_layouts(node_id, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (node_id, payload_json, now),
+            )
+            conn.execute(
+                "UPDATE creative_projects SET updated_at = ? WHERE id = ?",
+                (now, int(row["project_id"])),
+            )
+
+    def get_creative_node_board_layout(self, node_id: int) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM creative_node_board_layouts WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+        return str(row["payload_json"]) if row is not None else None
+
+    def _creative_descendant_node_ids(self, project_id: int, node_id: int) -> list[int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, parent_id
+                FROM creative_nodes
+                WHERE project_id = ?
+                ORDER BY sort_order, id
+                """,
+                (project_id,),
+            ).fetchall()
+        children_by_parent: dict[int | None, list[int]] = {}
+        existing_ids: set[int] = set()
+        for row in rows:
+            current_id = int(row["id"])
+            parent_id = row["parent_id"]
+            existing_ids.add(current_id)
+            children_by_parent.setdefault(
+                int(parent_id) if parent_id is not None else None,
+                [],
+            ).append(current_id)
+        if node_id not in existing_ids:
+            return []
+        ordered: list[int] = []
+
+        def visit(current_id: int) -> None:
+            ordered.append(current_id)
+            for child_id in children_by_parent.get(current_id, []):
+                visit(child_id)
+
+        visit(node_id)
+        return ordered
+
+    @staticmethod
+    def _creative_project_from_row(row: sqlite3.Row) -> CreativeProjectItem:
+        return CreativeProjectItem(
+            id=int(row["id"]),
+            title=str(row["title"]),
+            brief=str(row["brief"] or ""),
+            language=str(row["language"] or "zh"),
+            provider_name=str(row["provider_name"] or ""),
+            model_name=str(row["model_name"] or ""),
+            node_count=int(row["node_count"]),
+            image_count=int(row["image_count"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            is_pinned=bool(int(row["is_pinned"] or 0)),
+            copy_text=str(row["copy_text"] or ""),
+        )
+
+    @staticmethod
+    def _creative_node_from_row(row: sqlite3.Row) -> CreativeNodeItem:
+        parent_id = row["parent_id"]
+        return CreativeNodeItem(
+            id=int(row["id"]),
+            project_id=int(row["project_id"]),
+            parent_id=int(parent_id) if parent_id is not None else None,
+            title=str(row["title"]),
+            note=str(row["note"] or ""),
+            search_query=str(row["search_query"] or ""),
+            sort_order=int(row["sort_order"]),
+            image_count=int(row["image_count"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
 
     @staticmethod
     def _inspiration_project_from_row(row: sqlite3.Row) -> InspirationProjectItem:

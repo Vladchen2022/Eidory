@@ -23,8 +23,21 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
 import numpy as np
-from PySide6.QtCore import QFile, QBuffer, QFileSystemWatcher, QIODevice, QSize, QStringListModel, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QImage, QKeySequence, QPixmap, QTextOption
+from PySide6.QtCore import QFile, QBuffer, QFileSystemWatcher, QIODevice, QRect, QSize, QStringListModel, Qt, QTimer, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QIcon,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QPen,
+    QShortcut,
+    QTextOption,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -57,6 +70,9 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStatusBar,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QTabBar,
@@ -76,6 +92,12 @@ from eidory.core.ai_vision import (
     AI_VISION_PROMPT_VERSION,
     AIVisionProvider,
     ai_vision_label,
+)
+from eidory.core.creative_templates import (
+    CREATIVE_TEMPLATES,
+    CreativeTemplateNode,
+    creative_template_by_id,
+    template_search_query,
 )
 from eidory.core.duplicate_detection import DuplicateGroup, find_duplicate_groups
 from eidory.core.ai_vision_worker import AIVisionProgress, AIVisionWorker
@@ -122,11 +144,12 @@ from eidory.core.search_filters import (
 from eidory.core.search_service import SearchService
 from eidory.core.thumbnailer import Thumbnailer
 from eidory.core.vector_index import VectorIndex
-from eidory.models import ImageItem
+from eidory.models import CreativeNodeItem, ImageItem
 from eidory.ui.accessibility import disable_qt_accessibility
 from eidory.ui.collection_tree import CollectionTreeWidget
 from eidory.ui.image_preview_dialog import ImagePreviewDialog
 from eidory.ui.justified_image_grid import JustifiedImageGridView
+from eidory.ui.project_board import ProjectBoardView
 
 
 LLM_SERVICE_OPTIONS = [
@@ -146,6 +169,12 @@ DEFAULT_LLM_ENDPOINTS = {
 }
 
 COLLECTION_VIRTUAL_FILTER_ROLE = Qt.ItemDataRole.UserRole + 3
+PROJECT_LIST_KIND_ROLE = Qt.ItemDataRole.UserRole + 10
+PROJECT_LIST_ID_ROLE = Qt.ItemDataRole.UserRole + 11
+PROJECT_LIST_NAME_ROLE = Qt.ItemDataRole.UserRole + 12
+PROJECT_LIST_COLOR_ROLE = Qt.ItemDataRole.UserRole + 13
+PROJECT_LIST_COUNT_ROLE = Qt.ItemDataRole.UserRole + 14
+PROJECT_LIST_PINNED_ROLE = Qt.ItemDataRole.UserRole + 15
 VIRTUAL_COLLECTION_FILTERS = (
     ("untagged", "未标签", "没有用户手动标签的图片/视频。"),
     ("un_ai_tagged", "未AI标签", "还没有可用 AI 场景视觉标签的图片。"),
@@ -179,11 +208,116 @@ class EqualWidthTabBar(QTabBar):
         return size
 
 
+class ProjectListItemDelegate(QStyledItemDelegate):
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        kind = index.data(PROJECT_LIST_KIND_ROLE)
+        if kind not in {"temporary", "creative"}:
+            super().paint(painter, option, index)
+            return
+
+        painter.save()
+        rect = option.rect.adjusted(2, 1, -2, -1)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        background = QColor("#3c4652")
+        foreground = QColor("#edf3fb")
+        if selected:
+            background = option.palette.highlight().color()
+            foreground = option.palette.highlightedText().color()
+        else:
+            brush = index.data(Qt.ItemDataRole.BackgroundRole)
+            if isinstance(brush, QBrush) and brush.color().isValid():
+                background = brush.color()
+            elif kind == "creative":
+                background = QColor("#26303a")
+            text_brush = index.data(Qt.ItemDataRole.ForegroundRole)
+            if isinstance(text_brush, QBrush) and text_brush.color().isValid():
+                foreground = text_brush.color()
+
+        painter.fillRect(rect, background)
+        painter.setPen(foreground)
+
+        count_value = index.data(PROJECT_LIST_COUNT_ROLE)
+        count_text = "" if count_value is None else str(count_value)
+        count_width = max(34, option.fontMetrics.horizontalAdvance(count_text) + 8)
+        count_rect = QRect(rect.right() - count_width, rect.top(), count_width, rect.height())
+        name_width = max(8, rect.width() - count_width - 14)
+        name_rect = QRect(rect.left() + 6, rect.top(), name_width, rect.height())
+
+        prefix = "◇ " if kind == "temporary" else "◆ "
+        pinned = "⬆ " if bool(index.data(PROJECT_LIST_PINNED_ROLE)) else ""
+        name = str(index.data(PROJECT_LIST_NAME_ROLE) or "")
+        label = option.fontMetrics.elidedText(
+            f"{prefix}{pinned}{name}",
+            Qt.TextElideMode.ElideMiddle,
+            max(1, name_rect.width()),
+        )
+        painter.drawText(name_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+        painter.drawText(count_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, count_text)
+        painter.restore()
+
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:
+        size = super().sizeHint(option, index)
+        size.setHeight(max(20, size.height()))
+        return size
+
+
 TOOL_BUTTON_MIN_WIDTH = EqualWidthTabBar.MIN_TAB_WIDTH
-LEFT_SIDEBAR_WIDTH = 330
+BOARD_ICON_BUTTON_SIZE = QSize(32, 26)
+BOARD_ICON_SIZE = QSize(18, 18)
+LEFT_SIDEBAR_WIDTH = 300
 RIGHT_SIDEBAR_WIDTH = 386
 SIDEBAR_COLLAPSE_THRESHOLD = 48
-SIDEBAR_COUNT_COLUMN_WIDTH = 74
+SIDEBAR_COUNT_COLUMN_WIDTH = 68
+
+
+def _board_control_icon(kind: str) -> QIcon:
+    pixmap = QPixmap(24, 24)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    line_color = QColor("#e4e9f1")
+    fill_color = QColor("#e4e9f1")
+    muted_color = QColor("#8792a0")
+    painter.setPen(QPen(line_color, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    if kind == "pin":
+        painter.drawEllipse(9, 3, 6, 6)
+        painter.drawLine(12, 9, 12, 18)
+        painter.drawLine(8, 12, 16, 12)
+        painter.drawLine(12, 18, 9, 21)
+    elif kind == "focus":
+        painter.drawRoundedRect(4, 5, 16, 14, 2, 2)
+        painter.drawLine(8, 5, 8, 19)
+        painter.drawLine(16, 5, 16, 19)
+        painter.setPen(QPen(line_color, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.drawLine(5, 20, 19, 4)
+    elif kind == "fit":
+        painter.drawLine(5, 9, 5, 5)
+        painter.drawLine(5, 5, 9, 5)
+        painter.drawLine(15, 5, 19, 5)
+        painter.drawLine(19, 5, 19, 9)
+        painter.drawLine(19, 15, 19, 19)
+        painter.drawLine(19, 19, 15, 19)
+        painter.drawLine(9, 19, 5, 19)
+        painter.drawLine(5, 19, 5, 15)
+        painter.setPen(QPen(muted_color, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.drawRect(8, 8, 8, 8)
+    elif kind == "flip":
+        painter.drawLine(12, 4, 12, 20)
+        painter.drawLine(5, 7, 10, 12)
+        painter.drawLine(5, 17, 10, 12)
+        painter.drawLine(19, 7, 14, 12)
+        painter.drawLine(19, 17, 14, 12)
+    elif kind == "grayscale":
+        painter.setBrush(fill_color)
+        painter.drawPie(5, 5, 14, 14, 90 * 16, 180 * 16)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(5, 5, 14, 14)
+        painter.drawLine(12, 5, 12, 19)
+
+    painter.end()
+    return QIcon(pixmap)
 
 
 class MissingFilesDialog(QDialog):
@@ -494,6 +628,23 @@ class MainWindow(QMainWindow):
         self.current_temp_project_id: int | None = None
         self.current_temp_project_images: list[ImageItem] = []
         self.current_temp_project_badges: dict[int, list[str]] = {}
+        self.current_creative_project_id: int | None = None
+        self.current_creative_node_id: int | None = None
+        self._current_board_node_id: int | None = None
+        self._current_board_temp_project_id: int | None = None
+        self._current_board_image_ids: tuple[int, ...] = ()
+        self.current_creative_node_images: list[ImageItem] = []
+        self.current_creative_node_filtered_images: list[ImageItem] = []
+        self.current_creative_node_searchable_count = 0
+        self.current_creative_node_candidate_limit = 0
+        self.current_creative_node_badges: dict[int, list[str]] = {}
+        self._refreshing_creative_projects = False
+        self._creative_node_undo_stack: list[dict[str, object]] = []
+        self._pending_board_import_node_id: int | None = None
+        self._board_focus_mode = False
+        self._board_focus_previous_splitter_sizes: list[int] | None = None
+        self._board_focus_widget_visibility: dict[QWidget, bool] = {}
+        self._board_window_pinned = False
         self.search_filters: list[SearchFilter] = []
         self.active_filter_index: int | None = None
         self.current_chain_images: list[ImageItem] = []
@@ -545,6 +696,7 @@ class MainWindow(QMainWindow):
         self._refresh_collections()
         self.store.seed_default_ai_vision_collection_rules()
         self._refresh_temporary_projects()
+        self._refresh_creative_projects()
         self._refresh_tags()
         self._refresh_saved_views()
         self._reload_images()
@@ -688,7 +840,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "root_splitter"):
             self.store.set_setting(
                 "ui.root_splitter_sizes",
-                ",".join(str(size) for size in self.root_splitter.sizes()),
+                ",".join(str(size) for size in self._root_splitter_sizes_for_settings()),
             )
         size = self.size()
         self.store.set_setting("ui.window_width", str(size.width()))
@@ -846,8 +998,19 @@ class MainWindow(QMainWindow):
         center = max(640, saved[1])
         return [left, center, right]
 
+    def _root_splitter_sizes_for_settings(self) -> list[int]:
+        sizes = self.root_splitter.sizes()
+        if len(sizes) != 3:
+            return [LEFT_SIDEBAR_WIDTH, 944, RIGHT_SIDEBAR_WIDTH]
+        left = 0 if sizes[0] <= SIDEBAR_COLLAPSE_THRESHOLD else LEFT_SIDEBAR_WIDTH
+        right = 0 if sizes[2] <= SIDEBAR_COLLAPSE_THRESHOLD else RIGHT_SIDEBAR_WIDTH
+        center = max(1, sum(sizes) - left - right)
+        return [left, center, right]
+
     def _enforce_fixed_sidebar_widths(self, _pos: int | None = None, _index: int | None = None) -> None:
         if getattr(self, "_enforcing_sidebar_widths", False):
+            return
+        if getattr(self, "_board_focus_mode", False):
             return
         if not hasattr(self, "root_splitter"):
             return
@@ -874,26 +1037,33 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         panel.setMinimumWidth(0)
         panel.setMaximumWidth(LEFT_SIDEBAR_WIDTH)
+        panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(panel)
 
         self.add_folder_button = QPushButton("导入图片")
         self.import_folder_tree_button = QPushButton("导入文件夹")
         self.rescan_button = QPushButton("重新扫描")
+        self.add_folder_button.setMinimumWidth(0)
+        self.import_folder_tree_button.setMinimumWidth(0)
+        self.rescan_button.setMinimumWidth(0)
         self.rescan_button.hide()
         self.folder_tree = QTreeWidget()
         self.folder_tree.setColumnCount(2)
         self.folder_tree.setHeaderLabels(["文件夹", "张"])
         self.folder_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.folder_tree.setIndentation(14)
+        self.folder_tree.setMinimumWidth(0)
         self._configure_sidebar_count_tree(self.folder_tree)
         self.folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         self.add_collection_button = QPushButton("新建文件夹")
+        self.add_collection_button.setMinimumWidth(0)
         self.collection_tree = CollectionTreeWidget()
         self.collection_tree.setColumnCount(2)
         self.collection_tree.setHeaderLabels(["文件夹", "张"])
         self.collection_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.collection_tree.setIndentation(14)
+        self.collection_tree.setMinimumWidth(0)
         self._configure_sidebar_count_tree(self.collection_tree)
         self.collection_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
@@ -903,6 +1073,7 @@ class MainWindow(QMainWindow):
         self.virtual_collection_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.virtual_collection_tree.setRootIsDecorated(False)
         self.virtual_collection_tree.setIndentation(0)
+        self.virtual_collection_tree.setMinimumWidth(0)
         self._configure_sidebar_count_tree(self.virtual_collection_tree)
         self.virtual_collection_tree.setMinimumHeight(96)
         self.virtual_collection_tree.setMaximumHeight(120)
@@ -914,8 +1085,44 @@ class MainWindow(QMainWindow):
 
         self.temp_project_list = QListWidget()
         self.temp_project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.temp_project_list.setMinimumWidth(0)
         self.temp_project_list.setMinimumHeight(130)
-        self.temp_project_list.setToolTip("保存的临时图片组；删除项目不会影响源文件。")
+        self.temp_project_list.setItemDelegate(ProjectListItemDelegate(self.temp_project_list))
+        self.temp_project_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.temp_project_list.setToolTip("统一管理灵感暂存和创作项目；删除项目不会影响源文件。")
+
+        self.creative_project_combo = QComboBox()
+        self.creative_project_combo.setMinimumWidth(0)
+        self.creative_project_combo.setToolTip("选择创作项目；项目只保存图库图片链接，不移动源文件。")
+        self.creative_project_combo.hide()
+        self.creative_project_list = QListWidget()
+        self.creative_project_list.setMinimumHeight(150)
+        self.creative_project_list.setMaximumHeight(190)
+        self.creative_project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.creative_project_list.setToolTip("选择创作项目；项目只保存图库图片链接，不移动源文件。")
+        self.creative_template_combo = QComboBox()
+        for template in CREATIVE_TEMPLATES:
+            self.creative_template_combo.addItem(template.label, template.id)
+        self.creative_new_project_button = QPushButton("按模板新建项目")
+        self.creative_add_child_button = QPushButton("新建子节点")
+        self.creative_delete_node_button = QPushButton("删除节点")
+        for button in [
+            self.creative_new_project_button,
+            self.creative_add_child_button,
+            self.creative_delete_node_button,
+        ]:
+            button.setMinimumWidth(0)
+        self.creative_node_tree = QTreeWidget()
+        self.creative_node_tree.setColumnCount(2)
+        self.creative_node_tree.setHeaderLabels(["创作节点", "图"])
+        self.creative_node_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.creative_node_tree.setIndentation(14)
+        self.creative_node_tree.setMinimumWidth(0)
+        self.creative_node_tree.setMinimumHeight(260)
+        self.creative_node_tree.setMaximumHeight(430)
+        self.creative_node_tree.setToolTip("节点用于组织创作思路和对应参考图。")
+        self._configure_sidebar_count_tree(self.creative_node_tree)
+        self.creative_node_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         self.status_filter_combo = QComboBox()
         for label, value in [
@@ -967,7 +1174,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.import_folder_tree_button)
         layout.addWidget(self.collection_tree, 3)
         layout.addWidget(self.virtual_collection_tree)
-        layout.addWidget(QLabel("灵感暂存"))
+        layout.addWidget(QLabel("项目"))
         layout.addWidget(self.temp_project_list, 1)
         return panel
 
@@ -988,8 +1195,25 @@ class MainWindow(QMainWindow):
         form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
+    @staticmethod
+    def _configure_board_icon_button(
+        button: QPushButton,
+        icon_name: str,
+        accessible_name: str,
+        tooltip: str,
+    ) -> None:
+        button.setText("")
+        button.setIcon(_board_control_icon(icon_name))
+        button.setIconSize(BOARD_ICON_SIZE)
+        button.setFixedSize(BOARD_ICON_BUTTON_SIZE)
+        button.setToolTip(tooltip)
+        button.setAccessibleName(accessible_name)
+        button.setAccessibleDescription(tooltip)
+
     def _build_library_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setMinimumWidth(0)
+        panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(panel)
         layout.setSpacing(4)
 
@@ -1235,14 +1459,90 @@ class MainWindow(QMainWindow):
             thumbnail_size=self.initial_thumbnail_size,
             spacing=4,
         )
+        self.project_board_view = ProjectBoardView()
+        self.center_result_stack = QStackedWidget()
+        self.center_result_stack.addWidget(self.grid_view)
+        self.center_result_stack.addWidget(self.project_board_view)
 
         self.load_more_button = QPushButton("加载更多")
         thumbnail_size_row = QHBoxLayout()
+        self.show_gallery_button = QPushButton("图片墙")
+        self.show_project_board_button = QPushButton("看板")
+        self.save_project_board_layout_button = QPushButton("保存看板")
+        self.board_pin_button = QPushButton()
+        self.board_pin_button.setCheckable(True)
+        self.board_hide_selected_button = QPushButton()
+        self.board_fit_all_button = QPushButton()
+        self.board_flip_button = QPushButton()
+        self.board_grayscale_button = QPushButton()
+        self.board_import_button = QPushButton("导入图片")
+        self.board_show_all_button = QPushButton("显示全部")
+        for board_button in [
+            self.show_gallery_button,
+            self.show_project_board_button,
+            self.save_project_board_layout_button,
+            self.board_import_button,
+            self.board_show_all_button,
+        ]:
+            board_button.setMinimumWidth(TOOL_BUTTON_MIN_WIDTH)
+        self._configure_board_icon_button(
+            self.board_pin_button,
+            "pin",
+            "图钉",
+            "让 Eidory 窗口置顶，避免被其他软件遮挡",
+        )
+        self._configure_board_icon_button(
+            self.board_hide_selected_button,
+            "focus",
+            "隐藏界面",
+            "隐藏左右侧栏和非看板控件；按 Tab 可恢复",
+        )
+        self._configure_board_icon_button(
+            self.board_fit_all_button,
+            "fit",
+            "适应全部",
+            "让所有看板图片适应当前画布窗口",
+        )
+        self._configure_board_icon_button(
+            self.board_flip_button,
+            "flip",
+            "左右翻转",
+            "左右镜像翻转选中的看板图片",
+        )
+        self._configure_board_icon_button(
+            self.board_grayscale_button,
+            "grayscale",
+            "黑白",
+            "把选中的看板图片切换为黑白显示",
+        )
+        for board_action_button in [
+            self.board_pin_button,
+            self.board_hide_selected_button,
+            self.board_fit_all_button,
+            self.board_flip_button,
+            self.board_grayscale_button,
+            self.board_import_button,
+            self.board_show_all_button,
+        ]:
+            board_action_button.hide()
+        self.save_project_board_layout_button.setEnabled(False)
         self.thumbnail_size_label = QLabel(f"缩略图：{self.initial_thumbnail_size}")
         self.thumbnail_size_slider = QSlider(Qt.Orientation.Horizontal)
         self.thumbnail_size_slider.setRange(96, 320)
         self.thumbnail_size_slider.setValue(self.initial_thumbnail_size)
         self.thumbnail_size_slider.setMaximumWidth(220)
+        thumbnail_size_row.addWidget(self.show_gallery_button)
+        thumbnail_size_row.addWidget(self.show_project_board_button)
+        thumbnail_size_row.addWidget(self.save_project_board_layout_button)
+        thumbnail_size_row.addSpacing(16)
+        thumbnail_size_row.addWidget(self.board_pin_button)
+        thumbnail_size_row.addWidget(self.board_hide_selected_button)
+        thumbnail_size_row.addWidget(self.board_fit_all_button)
+        thumbnail_size_row.addWidget(self.board_flip_button)
+        thumbnail_size_row.addWidget(self.board_grayscale_button)
+        thumbnail_size_row.addSpacing(16)
+        thumbnail_size_row.addWidget(self.board_import_button)
+        thumbnail_size_row.addWidget(self.board_show_all_button)
         thumbnail_size_row.addStretch(1)
         thumbnail_size_row.addWidget(self.shuffle_results_button)
         thumbnail_size_row.addSpacing(12)
@@ -1271,7 +1571,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.filter_chain_widget)
         layout.addLayout(threshold_row)
         layout.addLayout(compact_status_row)
-        layout.addWidget(self.grid_view, 1)
+        layout.addWidget(self.center_result_stack, 1)
         layout.addWidget(self.load_more_button)
         layout.addLayout(thumbnail_size_row)
         return panel
@@ -1380,6 +1680,21 @@ class MainWindow(QMainWindow):
         batch_tags_layout.addLayout(batch_add_row)
         batch_tags_layout.addLayout(batch_remove_row)
 
+        self.creative_selection_summary_label = QLabel("-")
+        self.creative_selection_summary_label.setWordWrap(True)
+        self.creative_selection_add_button = QPushButton("存入当前节点")
+        self.creative_selection_remove_button = QPushButton("移出当前节点")
+        self.creative_selection_widget = QWidget()
+        creative_selection_layout = QVBoxLayout(self.creative_selection_widget)
+        creative_selection_layout.setContentsMargins(0, 0, 0, 0)
+        creative_selection_layout.setSpacing(6)
+        creative_selection_actions = QHBoxLayout()
+        creative_selection_actions.setContentsMargins(0, 0, 0, 0)
+        creative_selection_actions.addWidget(self.creative_selection_add_button)
+        creative_selection_actions.addWidget(self.creative_selection_remove_button)
+        creative_selection_layout.addWidget(self.creative_selection_summary_label)
+        creative_selection_layout.addLayout(creative_selection_actions)
+
         self.tag_panel_selection_label = QLabel("先在图片墙选择 1 张或多张图片。")
         self.tag_panel_selection_label.setWordWrap(True)
         self.tag_panel_input = QTextEdit()
@@ -1411,6 +1726,38 @@ class MainWindow(QMainWindow):
         ]:
             hidden_action_button.hide()
 
+        self.creative_node_status_label = QLabel("未选择创作项目。")
+        self.creative_node_status_label.setWordWrap(True)
+        self.creative_node_note_input = QTextEdit()
+        self.creative_node_note_input.setPlaceholderText("当前节点说明")
+        self.creative_node_note_input.setAcceptRichText(False)
+        self.creative_node_note_input.setMinimumHeight(118)
+        self.creative_node_note_input.setMaximumHeight(170)
+        self.creative_node_query_input = QLineEdit()
+        self.creative_node_query_input.setPlaceholderText("当前节点默认语义搜索语句")
+        self.save_creative_node_button = QPushButton("保存节点")
+        self.save_creative_node_button.hide()
+        self.generate_creative_children_button = QPushButton("节点信息AI补全")
+        self.generate_creative_copy_button = QPushButton("生成文案")
+        self.generate_creative_copy_tab_button = QPushButton("生成文案")
+        self.creative_project_copy_input = QTextEdit()
+        self.creative_project_copy_input.setPlaceholderText("生成文案后会显示在这里，也可以手动修改。")
+        self.creative_project_copy_input.setAcceptRichText(False)
+        self.creative_project_copy_input.setMinimumHeight(220)
+        self.search_creative_node_button = QPushButton("搜索当前节点")
+        self.save_selection_to_creative_node_button = QPushButton("存入当前节点")
+        self.open_creative_board_button = QPushButton("看板")
+        for creative_button in [
+            self.save_creative_node_button,
+            self.generate_creative_children_button,
+            self.generate_creative_copy_button,
+            self.generate_creative_copy_tab_button,
+            self.search_creative_node_button,
+            self.save_selection_to_creative_node_button,
+            self.open_creative_board_button,
+        ]:
+            creative_button.setEnabled(False)
+
         self.inspiration_brief_input = QTextEdit()
         self.inspiration_brief_input.setPlaceholderText("用一句话描述画面的创作主题")
         self.inspiration_brief_input.setAcceptRichText(False)
@@ -1440,6 +1787,15 @@ class MainWindow(QMainWindow):
         self.search_inspiration_button.setEnabled(False)
         self.save_temp_project_button = QPushButton("暂存选中图片")
         self.save_temp_project_button.setEnabled(False)
+        self.ai_project_mode_button = QPushButton("创作节点")
+        self.ai_probe_mode_button = QPushButton("语义探针")
+        self.ai_project_mode_button.setCheckable(True)
+        self.ai_probe_mode_button.setCheckable(True)
+        self.ai_workflow_mode_group = QButtonGroup(self)
+        self.ai_workflow_mode_group.setExclusive(True)
+        self.ai_workflow_mode_group.addButton(self.ai_project_mode_button, 0)
+        self.ai_workflow_mode_group.addButton(self.ai_probe_mode_button, 1)
+        self.ai_project_mode_button.setChecked(True)
 
         self.ai_vision_progress_bar = QProgressBar()
         self.ai_vision_progress_bar.setRange(0, 100)
@@ -1471,6 +1827,9 @@ class MainWindow(QMainWindow):
         form.addRow("AI 标签", self.ai_vision_detail_label)
         form.addRow("相似度", self.score_label)
         form.addRow("", self.favorite_checkbox)
+        form.addRow("创作节点", self.creative_selection_widget)
+        form.addRow("批量标签", self.batch_tags_widget)
+        self.creative_selection_widget.hide()
         self.batch_tags_widget.hide()
 
         detail_tab = QWidget()
@@ -1537,21 +1896,83 @@ class MainWindow(QMainWindow):
         inspiration_layout.addWidget(self.inspiration_brief_input)
         inspiration_layout.addWidget(QLabel("补充信息"))
         inspiration_layout.addWidget(self.inspiration_answers_input)
-        inspiration_layout.addWidget(self.inspiration_questions_label)
-        inspiration_layout.addWidget(QLabel("历史探针"))
-        inspiration_layout.addWidget(self.inspiration_history_list)
-        inspiration_layout.addWidget(QLabel("语义探针"))
-        inspiration_layout.addWidget(self.inspiration_term_list, 1)
-        inspiration_layout.addWidget(self.use_ai_scene_tags_checkbox)
-        inspiration_layout.addWidget(QLabel("AI 场景标签"))
-        inspiration_layout.addWidget(self.inspiration_filter_list)
-        inspiration_layout.addWidget(self.inspiration_status_label)
+        ai_mode_row = QHBoxLayout()
+        ai_mode_row.setContentsMargins(0, 0, 0, 0)
+        ai_mode_row.setSpacing(0)
+        ai_mode_row.addWidget(self.ai_project_mode_button)
+        ai_mode_row.addWidget(self.ai_probe_mode_button)
+        inspiration_layout.addLayout(ai_mode_row)
+
+        self.ai_workflow_stack = QStackedWidget()
+        project_mode_widget = QWidget()
+        project_mode_layout = QVBoxLayout(project_mode_widget)
+        project_mode_layout.setContentsMargins(0, 0, 0, 0)
+        project_mode_layout.setSpacing(7)
+        project_mode_layout.addWidget(QLabel("绘画类型模板"))
+        project_mode_layout.addWidget(self.creative_template_combo)
+        project_mode_layout.addSpacing(4)
+        project_mode_layout.addWidget(self.creative_new_project_button)
+        project_mode_layout.addSpacing(8)
+        self.creative_project_list.hide()
+        project_mode_layout.addWidget(self.creative_project_combo)
+
+        self.creative_content_tabs = QTabWidget()
+        self.creative_content_tabs.setObjectName("creativeContentTabs")
+        self.creative_content_tabs.setTabBar(EqualWidthTabBar())
+        node_tab = QWidget()
+        node_tab_layout = QVBoxLayout(node_tab)
+        node_tab_layout.setContentsMargins(0, 0, 0, 0)
+        node_tab_layout.setSpacing(7)
+        node_tab_layout.addWidget(self.creative_node_tree)
+        node_tab_layout.addWidget(self.creative_node_status_label)
+        node_tab_layout.addWidget(QLabel("当前节点说明"))
+        node_tab_layout.addWidget(self.creative_node_note_input)
+        node_tab_layout.addWidget(self.creative_node_query_input)
+        creative_node_button_row = QHBoxLayout()
+        creative_node_button_row.setContentsMargins(0, 0, 0, 0)
+        creative_node_button_row.addWidget(self.generate_creative_children_button)
+        node_tab_layout.addLayout(creative_node_button_row)
+        creative_node_action_row = QHBoxLayout()
+        creative_node_action_row.setContentsMargins(0, 0, 0, 0)
+        creative_node_action_row.addWidget(self.search_creative_node_button)
+        creative_node_action_row.addWidget(self.save_selection_to_creative_node_button)
+        node_tab_layout.addLayout(creative_node_action_row)
+        node_tab_layout.addWidget(self.open_creative_board_button)
+        copy_tab = QWidget()
+        copy_tab_layout = QVBoxLayout(copy_tab)
+        copy_tab_layout.setContentsMargins(0, 0, 0, 0)
+        copy_tab_layout.setSpacing(7)
+        copy_tab_layout.addWidget(QLabel("项目文案"))
+        copy_tab_layout.addWidget(self.creative_project_copy_input, 1)
+        copy_tab_layout.addWidget(self.generate_creative_copy_tab_button)
+        self.creative_content_tabs.addTab(node_tab, "节点树")
+        self.creative_content_tabs.addTab(copy_tab, "文案")
+        project_mode_layout.addWidget(self.creative_content_tabs, 1)
+        project_mode_layout.addStretch(1)
+
+        probe_mode_widget = QWidget()
+        probe_mode_layout = QVBoxLayout(probe_mode_widget)
+        probe_mode_layout.setContentsMargins(0, 0, 0, 0)
+        probe_mode_layout.setSpacing(7)
+        probe_mode_layout.addWidget(self.inspiration_questions_label)
+        probe_mode_layout.addWidget(QLabel("历史探针"))
+        probe_mode_layout.addWidget(self.inspiration_history_list)
+        probe_mode_layout.addWidget(QLabel("语义探针"))
+        probe_mode_layout.addWidget(self.inspiration_term_list, 1)
+        probe_mode_layout.addWidget(self.use_ai_scene_tags_checkbox)
+        probe_mode_layout.addWidget(QLabel("AI 场景标签"))
+        probe_mode_layout.addWidget(self.inspiration_filter_list)
+        probe_mode_layout.addWidget(self.inspiration_status_label)
         inspiration_button_row = QHBoxLayout()
         inspiration_button_row.setContentsMargins(0, 0, 0, 0)
         inspiration_button_row.addWidget(self.generate_inspiration_button)
         inspiration_button_row.addWidget(self.search_inspiration_button)
-        inspiration_layout.addLayout(inspiration_button_row)
-        inspiration_layout.addWidget(self.save_temp_project_button)
+        probe_mode_layout.addLayout(inspiration_button_row)
+        probe_mode_layout.addWidget(self.save_temp_project_button)
+
+        self.ai_workflow_stack.addWidget(project_mode_widget)
+        self.ai_workflow_stack.addWidget(probe_mode_widget)
+        inspiration_layout.addWidget(self.ai_workflow_stack, 1)
 
         filter_tab = QWidget()
         filter_layout = QVBoxLayout(filter_tab)
@@ -1796,6 +2217,14 @@ class MainWindow(QMainWindow):
         self.import_folder_tree_button.clicked.connect(self._choose_folder_tree_import)
         self.rescan_button.clicked.connect(self._rescan_selected_folder)
         self.add_collection_button.clicked.connect(self._create_collection_from_button)
+        self.creative_project_combo.currentIndexChanged.connect(self._on_creative_project_combo_changed)
+        self.creative_project_list.itemSelectionChanged.connect(self._on_creative_project_list_changed)
+        self.creative_project_list.customContextMenuRequested.connect(self._show_creative_project_context_menu)
+        self.creative_node_tree.customContextMenuRequested.connect(self._show_creative_node_context_menu)
+        self.creative_node_tree.itemSelectionChanged.connect(self._on_creative_node_selection_changed)
+        self.creative_new_project_button.clicked.connect(self._create_creative_project_from_current_brief)
+        self.creative_add_child_button.clicked.connect(self._create_manual_creative_child_node)
+        self.creative_delete_node_button.clicked.connect(self._delete_selected_creative_node)
         self.shuffle_results_button.clicked.connect(self._shuffle_current_grid_images)
         self.advanced_search_toggle_button.toggled.connect(self._toggle_advanced_search_tools)
         self.search_button.clicked.connect(self._run_search)
@@ -1815,6 +2244,17 @@ class MainWindow(QMainWindow):
         self.score_threshold_slider.sliderMoved.connect(self._preview_score_threshold)
         self.score_threshold_slider.valueChanged.connect(self._update_score_threshold)
         self.thumbnail_size_slider.valueChanged.connect(self._update_thumbnail_size)
+        self.show_gallery_button.clicked.connect(self._show_gallery_view)
+        self.show_project_board_button.clicked.connect(self._show_current_project_board)
+        self.save_project_board_layout_button.clicked.connect(self._save_current_creative_board_layout)
+        self.board_pin_button.clicked.connect(self._toggle_board_window_pin)
+        self.board_hide_selected_button.clicked.connect(self._toggle_board_focus_mode)
+        self.board_fit_all_button.clicked.connect(self._fit_board_all_images)
+        self.board_flip_button.clicked.connect(self._flip_board_selected_images)
+        self.board_grayscale_button.clicked.connect(self._toggle_board_selected_grayscale)
+        self.board_import_button.clicked.connect(self._import_images_to_current_board)
+        self.board_show_all_button.clicked.connect(self._show_all_board_images)
+        self.project_board_view.removeImagesRequested.connect(self._remove_images_from_current_creative_board)
         self.load_more_button.clicked.connect(self._load_more)
         self.grid_view.selectionChanged.connect(self._on_grid_image_selected)
         self.grid_view.selectionSetChanged.connect(self._on_grid_selection_changed)
@@ -1836,6 +2276,10 @@ class MainWindow(QMainWindow):
         self.minimize_window_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
         self.minimize_window_action.triggered.connect(self._minimize_window)
         self.addAction(self.minimize_window_action)
+        self.board_focus_shortcut = QShortcut(QKeySequence("Tab"), self)
+        self.board_focus_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.board_focus_shortcut.setEnabled(False)
+        self.board_focus_shortcut.activated.connect(self._toggle_board_focus_mode)
         self.open_collection_import_dir_button.clicked.connect(self._open_selected_collection_import_dir)
         self.open_original_button.clicked.connect(self._open_selected_original)
         self.reveal_in_finder_button.clicked.connect(self._reveal_selected_in_finder)
@@ -1845,10 +2289,20 @@ class MainWindow(QMainWindow):
         self.batch_add_tags_button.clicked.connect(self._batch_add_tags_from_panel)
         self.batch_remove_tag_button.clicked.connect(self._batch_remove_selected_tag)
         self.batch_clear_tags_button.clicked.connect(self._batch_clear_tags)
+        self.creative_selection_add_button.clicked.connect(self._save_selection_to_current_creative_node)
+        self.creative_selection_remove_button.clicked.connect(self._remove_selection_from_current_creative_node)
         self.tag_panel_add_button.clicked.connect(self._tag_panel_add_tags)
         self.tag_panel_remove_button.clicked.connect(self._tag_panel_remove_selected_tag)
         self.tag_panel_clear_button.clicked.connect(self._tag_panel_clear_tags)
+        self.ai_workflow_mode_group.idClicked.connect(self._on_ai_workflow_mode_clicked)
         self.generate_inspiration_button.clicked.connect(self._generate_inspiration_terms_from_panel)
+        self.save_creative_node_button.clicked.connect(self._save_current_creative_node_details)
+        self.generate_creative_children_button.clicked.connect(self._generate_creative_children_for_selected_node)
+        self.generate_creative_copy_button.clicked.connect(self._generate_creative_project_copy)
+        self.generate_creative_copy_tab_button.clicked.connect(self._generate_creative_project_copy)
+        self.search_creative_node_button.clicked.connect(self._search_selected_creative_node)
+        self.save_selection_to_creative_node_button.clicked.connect(self._save_selection_to_current_creative_node)
+        self.open_creative_board_button.clicked.connect(self._show_current_creative_board)
         self.search_inspiration_button.clicked.connect(self._save_and_search_inspiration)
         self.inspiration_history_list.itemClicked.connect(self._load_selected_inspiration_history)
         self.inspiration_history_list.customContextMenuRequested.connect(self._show_inspiration_history_context_menu)
@@ -2402,7 +2856,7 @@ class MainWindow(QMainWindow):
             (self.result_state_label, "Result status", "Unified library and search result status"),
             (self.grid_view, "Image wall", "Selectable image and video result grid"),
             (self.collection_tree, "Library folders", "Nested Eidory folder tree"),
-            (self.temp_project_list, "Inspiration stash", "Saved temporary reference groups"),
+            (self.temp_project_list, "Project list", "Saved temporary reference groups and creative projects"),
             (self.right_tab_widget, "Right side panel", "Details, AI, tag, index and settings pages"),
             (self.preview_label, "Selected item preview", "Preview of selected image or folder state"),
             (self.tags_display, "Selected item tags", "Read-only tags for the selected image"),
@@ -2453,11 +2907,57 @@ class MainWindow(QMainWindow):
             self.tag_panel_add_button.setText("Add to Selected")
             self.tag_panel_remove_button.setText("Remove Tag")
             self.tag_panel_clear_button.setText("Clear Tags")
+            self.creative_selection_add_button.setText("Save to Node")
+            self.creative_selection_remove_button.setText("Remove from Node")
             self.inspiration_brief_input.setPlaceholderText("Describe the image concept in one sentence")
             self.inspiration_answers_input.setPlaceholderText("Extra context: era, weather, lighting, mood, optional")
             self.inspiration_questions_label.setText("AI questions: -")
             self.inspiration_status_label.setText("Select up to 7 semantic probes.")
             self.use_ai_scene_tags_checkbox.setText("Generate AI scene tags with probes")
+            self.ai_project_mode_button.setText("Project Nodes")
+            self.ai_probe_mode_button.setText("Semantic Probes")
+            self.creative_new_project_button.setText("Create from Template")
+            self.creative_add_child_button.setText("New Child")
+            self.creative_delete_node_button.setText("Delete Node")
+            self.save_creative_node_button.setText("Save Node")
+            self.generate_creative_children_button.setText("AI Complete Node")
+            self.search_creative_node_button.setText("Search Node")
+            self.save_selection_to_creative_node_button.setText("Save to Node")
+            self.open_creative_board_button.setText("Board")
+            self.creative_content_tabs.setTabText(0, "Node Tree")
+            self.creative_content_tabs.setTabText(1, "Copy")
+            self._configure_board_icon_button(
+                self.board_pin_button,
+                "pin",
+                "Pin board window",
+                "Keep the Eidory window above other apps",
+            )
+            self._configure_board_icon_button(
+                self.board_hide_selected_button,
+                "focus",
+                "Focus board",
+                "Hide sidebars and non-board controls; press Tab to restore",
+            )
+            self._configure_board_icon_button(
+                self.board_fit_all_button,
+                "fit",
+                "Fit all board images",
+                "Fit all board images into the current board viewport",
+            )
+            self._configure_board_icon_button(
+                self.board_flip_button,
+                "flip",
+                "Flip selected board images",
+                "Flip selected board images horizontally",
+            )
+            self._configure_board_icon_button(
+                self.board_grayscale_button,
+                "grayscale",
+                "Toggle grayscale board images",
+                "Toggle grayscale display for selected board images",
+            )
+            self.board_import_button.setText("Import")
+            self.board_show_all_button.setText("Show All")
             self.generate_inspiration_button.setText("Generate Probes")
             self.search_inspiration_button.setText("Save and Search")
             self.save_temp_project_button.setText("Save Selected")
@@ -2531,11 +3031,57 @@ class MainWindow(QMainWindow):
             self.tag_panel_add_button.setText("添加到选中")
             self.tag_panel_remove_button.setText("移除标签")
             self.tag_panel_clear_button.setText("清空标签")
+            self.creative_selection_add_button.setText("存入当前节点")
+            self.creative_selection_remove_button.setText("移出当前节点")
             self.inspiration_brief_input.setPlaceholderText("用一句话描述画面的创作主题")
             self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
             self.inspiration_questions_label.setText("AI 追问：-")
             self.inspiration_status_label.setText("生成后最多选择 7 个语义探针。")
             self.use_ai_scene_tags_checkbox.setText("生成探针时同时生成 AI 场景标签")
+            self.ai_project_mode_button.setText("创作节点")
+            self.ai_probe_mode_button.setText("语义探针")
+            self.creative_new_project_button.setText("按模板新建项目")
+            self.creative_add_child_button.setText("新建子节点")
+            self.creative_delete_node_button.setText("删除节点")
+            self.save_creative_node_button.setText("保存节点")
+            self.generate_creative_children_button.setText("节点信息AI补全")
+            self.search_creative_node_button.setText("搜索当前节点")
+            self.save_selection_to_creative_node_button.setText("存入当前节点")
+            self.open_creative_board_button.setText("看板")
+            self.creative_content_tabs.setTabText(0, "节点树")
+            self.creative_content_tabs.setTabText(1, "文案")
+            self._configure_board_icon_button(
+                self.board_pin_button,
+                "pin",
+                "图钉",
+                "让 Eidory 窗口置顶，避免被其他软件遮挡",
+            )
+            self._configure_board_icon_button(
+                self.board_hide_selected_button,
+                "focus",
+                "隐藏界面",
+                "隐藏左右侧栏和非看板控件；按 Tab 可恢复",
+            )
+            self._configure_board_icon_button(
+                self.board_fit_all_button,
+                "fit",
+                "适应全部",
+                "让所有看板图片适应当前画布窗口",
+            )
+            self._configure_board_icon_button(
+                self.board_flip_button,
+                "flip",
+                "左右翻转",
+                "左右镜像翻转选中的看板图片",
+            )
+            self._configure_board_icon_button(
+                self.board_grayscale_button,
+                "grayscale",
+                "黑白",
+                "把选中的看板图片切换为黑白显示",
+            )
+            self.board_import_button.setText("导入图片")
+            self.board_show_all_button.setText("显示全部")
             self.generate_inspiration_button.setText("生成语义探针")
             self.search_inspiration_button.setText("保存并搜索")
             self.save_temp_project_button.setText("暂存选中图片")
@@ -2890,6 +3436,21 @@ class MainWindow(QMainWindow):
         self.search_button.setEnabled(True)
         self._restore_inspiration_generation_controls()
 
+    def _on_ai_workflow_mode_clicked(self, mode_id: int) -> None:
+        self._set_ai_workflow_mode("probe" if mode_id == 1 else "project")
+
+    def _set_ai_workflow_mode(self, mode: str) -> None:
+        if not hasattr(self, "ai_workflow_stack"):
+            return
+        is_probe = mode == "probe"
+        self.ai_project_mode_button.blockSignals(True)
+        self.ai_probe_mode_button.blockSignals(True)
+        self.ai_project_mode_button.setChecked(not is_probe)
+        self.ai_probe_mode_button.setChecked(is_probe)
+        self.ai_project_mode_button.blockSignals(False)
+        self.ai_probe_mode_button.blockSignals(False)
+        self.ai_workflow_stack.setCurrentIndex(1 if is_probe else 0)
+
     def _toggle_more_maintenance(self, checked: bool) -> None:
         self.more_maintenance_widget.setVisible(checked)
         if self.current_language == "en":
@@ -3153,6 +3714,7 @@ class MainWindow(QMainWindow):
         return assigned
 
     def _run_search(self) -> None:
+        self._show_gallery_view()
         search_filter = self._search_filter_from_controls()
         if search_filter is None:
             return
@@ -3162,6 +3724,7 @@ class MainWindow(QMainWindow):
         self._start_search_with_filter(search_filter)
 
     def _generate_inspiration_terms_from_panel(self) -> None:
+        self._set_ai_workflow_mode("probe")
         brief = self.inspiration_brief_input.toPlainText().strip()
         if not brief:
             self.inspiration_status_label.setText("先输入创作主题。")
@@ -3206,6 +3769,7 @@ class MainWindow(QMainWindow):
         )
 
     def _show_inspiration_proposal(self, proposal) -> None:
+        self._set_ai_workflow_mode("probe")
         self.current_inspiration_project_id = None
         self.inspiration_proposal_terms = list(proposal.terms)
         self.inspiration_plan_filters = []
@@ -3223,6 +3787,7 @@ class MainWindow(QMainWindow):
         self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
 
     def _show_search_plan_proposal(self, proposal) -> None:
+        self._set_ai_workflow_mode("probe")
         self.current_inspiration_project_id = None
         self.inspiration_proposal_terms = list(proposal.terms)
         self.inspiration_plan_filters = list(proposal.filters)
@@ -3339,6 +3904,7 @@ class MainWindow(QMainWindow):
             self._refresh_inspiration_history()
             self.statusBar().showMessage("该 AI 探针历史已不存在")
             return
+        self._set_ai_workflow_mode("probe")
         terms = self.store.inspiration_terms_for_project(project_id)
         self.current_inspiration_project_id = project.id
         self.inspiration_proposal_terms = list(terms)
@@ -3537,6 +4103,7 @@ class MainWindow(QMainWindow):
             return
         self.semantic_search_revision += 1
         self._clear_manual_result_order()
+        self._clear_result_management_state()
         revision = self.semantic_search_revision
         folder_path_prefix = self._selected_folder_path_prefix()
         collection_id = self._selected_collection_id()
@@ -3947,6 +4514,8 @@ class MainWindow(QMainWindow):
             return list(self.current_color_images)
         if self.current_result_mode == "inspiration":
             return list(self.current_inspiration_images)
+        if self.current_result_mode == "creative_node":
+            return list(self.current_creative_node_images)
         if self.current_result_mode == "temp_project":
             return list(self.current_temp_project_images)
         return list(self.grid_view.images())
@@ -4141,6 +4710,8 @@ class MainWindow(QMainWindow):
             return list(self.current_chain_images)
         if self.current_result_mode == "inspiration":
             return list(self.current_inspiration_images)
+        if self.current_result_mode == "creative_node":
+            return list(self.current_creative_node_images)
         if self.current_result_mode == "temp_project":
             return list(self.current_temp_project_images)
         if self.current_result_mode == "semantic":
@@ -4238,6 +4809,11 @@ class MainWindow(QMainWindow):
                 return None, None
             image_ids = {image.id for image in self.current_temp_project_images}
             return image_ids, f"基于灵感暂存：{project.name}"
+        if self.current_result_mode == "creative_node" and self.current_creative_node_id is not None:
+            node = self.store.get_creative_node(self.current_creative_node_id)
+            image_ids = {image.id for image in self.current_creative_node_images}
+            label = f"基于创作节点：{node.title}" if node is not None else "基于创作节点"
+            return image_ids, label
         if self.current_result_mode == "search_chain" and self.current_chain_base_image_ids is not None:
             return set(self.current_chain_base_image_ids), self.current_chain_base_label
         return None, None
@@ -5435,12 +6011,18 @@ class MainWindow(QMainWindow):
         self.current_temp_project_id = None
         self.current_temp_project_images = []
         self.current_temp_project_badges = {}
+        self.current_creative_node_images = []
+        self.current_creative_node_filtered_images = []
+        self.current_creative_node_searchable_count = 0
+        self.current_creative_node_candidate_limit = 0
+        self.current_creative_node_badges = {}
         self.current_chain_images = []
         self.current_chain_filtered_images = []
         self.current_chain_result = SearchChainResult(images=[])
         self.current_chain_base_image_ids = None
         self.current_chain_base_label = None
         self.current_chain_operation_mode = "replace"
+        self._show_gallery_view()
         self.load_more_button.setEnabled(True)
         images = self.store.list_images(
             status_filter=self._selected_status_filter(),
@@ -5475,6 +6057,7 @@ class MainWindow(QMainWindow):
             "search_chain",
             "inspiration",
             "temp_project",
+            "creative_node",
         }:
             return
         self.current_offset += self.page_size
@@ -5518,6 +6101,11 @@ class MainWindow(QMainWindow):
         self.current_inspiration_images = []
         self.current_inspiration_filtered_images = []
         self.current_inspiration_matches = {}
+        self.current_creative_node_images = []
+        self.current_creative_node_filtered_images = []
+        self.current_creative_node_searchable_count = 0
+        self.current_creative_node_candidate_limit = 0
+        self.current_creative_node_badges = {}
         self.current_chain_images = []
         self.current_chain_filtered_images = []
         self.current_chain_result = SearchChainResult(images=[])
@@ -5587,6 +6175,14 @@ class MainWindow(QMainWindow):
             )
             return
 
+        if self.current_result_mode == "creative_node":
+            self._apply_creative_node_result_filters()
+            images = self.current_creative_node_filtered_images
+            self.grid_view.set_images(images, badges_by_image_id=self.current_creative_node_badges)
+            self._set_creative_node_result_status(images)
+            self._update_creative_node_search_diagnostics(images)
+            return
+
         if self.current_result_mode == "temp_project":
             images = self._apply_result_management_filters(
                 self._apply_sidebar_filters(self.current_temp_project_images)
@@ -5649,6 +6245,14 @@ class MainWindow(QMainWindow):
             self.grid_view.set_images(images, badges_by_image_id=self._inspiration_badges_by_image_id())
             self._set_inspiration_result_status(images)
             self._update_inspiration_diagnostics(images)
+            return
+
+        if self.current_result_mode == "creative_node":
+            self._apply_creative_node_result_filters()
+            images = self.current_creative_node_filtered_images
+            self.grid_view.set_images(images, badges_by_image_id=self.current_creative_node_badges)
+            self._set_creative_node_result_status(images)
+            self._update_creative_node_search_diagnostics(images)
             return
 
         if self.current_result_mode == "temp_project":
@@ -5801,6 +6405,10 @@ class MainWindow(QMainWindow):
             return
         count = len(self._selected_grid_images())
         self.save_temp_project_button.setEnabled(count > 0)
+        if hasattr(self, "save_selection_to_creative_node_button"):
+            self.save_selection_to_creative_node_button.setEnabled(
+                count > 0 and self.current_creative_node_id is not None
+            )
         if hasattr(self, "export_selection_button"):
             self.export_selection_button.setEnabled(count > 0)
         if hasattr(self, "rebuild_selected_thumbnails_button"):
@@ -6007,7 +6615,13 @@ class MainWindow(QMainWindow):
         )
         self._refresh_temporary_projects()
         if self.current_result_mode == "temp_project" and self.current_temp_project_id == project_id:
-            self._load_temporary_project(project_id)
+            if (
+                self.center_result_stack.currentWidget() is self.project_board_view
+                and self._current_board_temp_project_id == project_id
+            ):
+                self._show_temporary_project_board(project_id)
+            else:
+                self._load_temporary_project(project_id)
         self._record_operation_history(f"加入 {len(images)} 张到灵感暂存“{project.name}”")
         self.statusBar().showMessage(f"已加入 {len(images)} 张到“{project.name}”")
 
@@ -6358,7 +6972,13 @@ class MainWindow(QMainWindow):
         self._refresh_collections()
         self._refresh_tags()
         if self.current_result_mode == "temp_project" and self.current_temp_project_id is not None:
-            self._load_temporary_project(self.current_temp_project_id)
+            if (
+                self.center_result_stack.currentWidget() is self.project_board_view
+                and self._current_board_temp_project_id == self.current_temp_project_id
+            ):
+                self._show_temporary_project_board(self.current_temp_project_id)
+            else:
+                self._load_temporary_project(self.current_temp_project_id)
         else:
             self._refresh_current_results_for_filters()
         self._refresh_embedding_stats()
@@ -6470,6 +7090,10 @@ class MainWindow(QMainWindow):
             self._batch_clear_tags()
         elif command == "save_temp":
             self._save_selected_images_as_temporary_project()
+        elif command == "save_to_creative_node":
+            self._save_selection_to_current_creative_node()
+        elif command == "remove_from_creative_node":
+            self._remove_selection_from_current_creative_node()
         elif command == "export_selection":
             self._export_selected_images()
         elif command == "delete_source":
@@ -6552,6 +7176,10 @@ class MainWindow(QMainWindow):
         inspiration_menu.addSeparator()
         add_action(inspiration_menu, "group_selection", "AI 分组选中图片")
 
+        creative_menu = menu.addMenu("创作项目")
+        add_action(creative_menu, "save_to_creative_node", "存入当前创作节点")
+        add_action(creative_menu, "remove_from_creative_node", "从当前节点移除")
+
         collection_menu = menu.addMenu("文件夹归类")
         add_action(collection_menu, "add_to_collection", "添加到文件夹")
         add_action(collection_menu, "move_to_collection", "移动到文件夹")
@@ -6586,6 +7214,7 @@ class MainWindow(QMainWindow):
             marker_menu,
             inspiration_menu,
             temp_project_menu,
+            creative_menu,
             collection_menu,
             result_menu,
             exclude_collection_menu,
@@ -6604,6 +7233,8 @@ class MainWindow(QMainWindow):
             "add_tags",
             "clear_tags",
             "save_temp",
+            "save_to_creative_node",
+            "remove_from_creative_node",
             "remove_from_temp",
             "add_to_collection",
             "move_to_collection",
@@ -6613,6 +7244,12 @@ class MainWindow(QMainWindow):
             actions[key].setEnabled(has_selection)
         actions["save_result_set"].setEnabled(has_visible_results and has_result_context)
         actions["group_selection"].setEnabled(len(selected_images) >= 4)
+        actions["save_to_creative_node"].setEnabled(has_selection and self.current_creative_node_id is not None)
+        actions["remove_from_creative_node"].setEnabled(
+            has_selection
+            and self.current_result_mode == "creative_node"
+            and self.current_creative_node_id is not None
+        )
         temp_project_menu.setEnabled(has_selection and bool(temp_project_actions))
         actions["remove_from_temp"].setEnabled(has_selection and self.current_result_mode == "temp_project")
         has_current_collection = self._selected_collection_id() is not None
@@ -6768,7 +7405,10 @@ class MainWindow(QMainWindow):
     def _on_grid_image_selected(self, image: ImageItem | None) -> None:
         self.selected_image = image
         self._show_image_details(image)
-        self._refresh_tag_panel_assignment([image] if image is not None else [])
+        if self.current_result_mode == "creative_node":
+            self._refresh_creative_selection_panel([image] if image is not None else [])
+        else:
+            self._refresh_tag_panel_assignment([image] if image is not None else [])
         self._refresh_temp_project_save_button()
 
     def _on_grid_selection_changed(self, images: list[ImageItem]) -> None:
@@ -6778,7 +7418,10 @@ class MainWindow(QMainWindow):
         elif not images:
             self.selected_image = None
             self._show_collection_details(self._selected_collection_id())
-        self._refresh_tag_panel_assignment(images)
+        if self.current_result_mode == "creative_node":
+            self._refresh_creative_selection_panel(images)
+        else:
+            self._refresh_tag_panel_assignment(images)
         self._refresh_temp_project_save_button()
 
     def _on_collection_selection_changed(self) -> None:
@@ -6846,8 +7489,14 @@ class MainWindow(QMainWindow):
         self._refresh_feedback_buttons(None)
         self._set_detail_controls_enabled(False)
         self.delete_source_button.setEnabled(True)
-        self._set_batch_tag_controls_visible(True)
-        self._refresh_batch_tag_panel(images)
+        if self.current_result_mode == "creative_node":
+            self.tags_display.setPlainText("创作节点结果：使用下方按钮存入或移出当前节点。")
+            self._set_batch_tag_controls_visible(False)
+            self._refresh_creative_selection_panel(images)
+        else:
+            self._set_creative_selection_controls_visible(False)
+            self._set_batch_tag_controls_visible(True)
+            self._refresh_batch_tag_panel(images)
         self.statusBar().showMessage(f"已选择 {count} 张")
 
     def _show_image_details(self, image: ImageItem | None) -> None:
@@ -6857,6 +7506,7 @@ class MainWindow(QMainWindow):
 
         self._set_detail_controls_enabled(True)
         self._set_batch_tag_controls_visible(False)
+        self._set_creative_selection_controls_visible(False)
         self.image_detail_widget.show()
         self.collection_detail_widget.hide()
         self.file_name_input.setText(image.file_name)
@@ -6879,6 +7529,8 @@ class MainWindow(QMainWindow):
         self.tags_display.setPlainText("\n".join(tags) if tags else "无标签")
         self.note_input.setPlainText(image.note or "")
         self._refresh_feedback_buttons(image)
+        if self.current_result_mode == "creative_node":
+            self._refresh_creative_selection_panel([image])
 
         if is_supported_video(image.file_path):
             self._show_video_details(image)
@@ -6912,6 +7564,7 @@ class MainWindow(QMainWindow):
         self._refresh_feedback_buttons(None)
         self._set_detail_controls_enabled(False)
         self._set_batch_tag_controls_visible(False)
+        self._set_creative_selection_controls_visible(False)
 
         virtual_filter = self._selected_virtual_filter() if collection_id is None else None
         if virtual_filter is not None:
@@ -7037,6 +7690,33 @@ class MainWindow(QMainWindow):
             self.batch_tag_summary_label.setText("-")
             self.batch_tags_input.clear()
             self.batch_remove_tag_combo.clear()
+
+    def _set_creative_selection_controls_visible(self, visible: bool) -> None:
+        self.creative_selection_widget.setVisible(visible)
+        label = self.detail_form.labelForField(self.creative_selection_widget)
+        if label is not None:
+            label.setVisible(visible)
+        if not visible:
+            self.creative_selection_summary_label.setText("-")
+            self.creative_selection_add_button.setEnabled(False)
+            self.creative_selection_remove_button.setEnabled(False)
+
+    def _refresh_creative_selection_panel(self, images: list[ImageItem]) -> None:
+        node = self._current_creative_node()
+        if node is None or not images:
+            self._set_creative_selection_controls_visible(False)
+            return
+        selected_ids = [image.id for image in images]
+        node_image_ids = set(self.store.creative_node_image_ids(node.id, include_descendants=False))
+        already_count = sum(1 for image_id in selected_ids if image_id in node_image_ids)
+        can_add = already_count < len(selected_ids)
+        can_remove = already_count > 0
+        self.creative_selection_summary_label.setText(
+            f"当前节点：{node.title}\n已选择 {len(selected_ids)} 张，{already_count} 张已在当前节点。"
+        )
+        self.creative_selection_add_button.setEnabled(can_add)
+        self.creative_selection_remove_button.setEnabled(can_remove)
+        self._set_creative_selection_controls_visible(True)
 
     def _refresh_batch_tag_panel(self, images: list[ImageItem]) -> None:
         image_ids = [image.id for image in images]
@@ -9261,6 +9941,32 @@ class MainWindow(QMainWindow):
                     raw_term_results=raw_term_results,
                     plan_filters=plan_filters,
                 )
+            elif kind == "creative_node_note_done":
+                node_id, suggestion, model_name = payload
+                self._handle_creative_node_note_done(node_id, suggestion, model_name)
+            elif kind == "creative_node_note_error":
+                node_id, exc = payload
+                self._handle_creative_node_note_error(node_id, exc)
+            elif kind == "creative_project_copy_done":
+                project_id, selected_node_id, fill_empty_only, suggestion, model_name = payload
+                self._handle_creative_project_copy_done(
+                    int(project_id),
+                    int(selected_node_id) if selected_node_id is not None else None,
+                    bool(fill_empty_only),
+                    suggestion,
+                    str(model_name),
+                )
+            elif kind == "creative_project_copy_error":
+                project_id, exc = payload
+                self._handle_creative_project_copy_error(int(project_id), exc)
+            elif kind == "creative_node_search_done":
+                revision, node_id, query, result = payload
+                self._handle_creative_node_search_done(revision, node_id, query, result)
+            elif kind == "creative_node_search_error":
+                revision, exc = payload
+                if revision == self.semantic_search_revision:
+                    self.search_creative_node_button.setEnabled(self.current_creative_node_id is not None)
+                    QMessageBox.warning(self, "Eidory", f"创作节点搜索失败：{exc}")
             elif kind == "temp_project_suggestion":
                 self._apply_temporary_project_suggestion(payload)
             elif kind == "temp_project_suggestion_error":
@@ -9494,7 +10200,22 @@ class MainWindow(QMainWindow):
             for image_id in imported_image_ids or []
             if int(image_id) > 0
         ]
-        if clean_imported_ids:
+        pending_node_id = self._pending_board_import_node_id
+        self._pending_board_import_node_id = None
+        imported_to_board = False
+        if pending_node_id is not None and clean_imported_ids:
+            node = self.store.get_creative_node(pending_node_id)
+            if node is not None:
+                self.store.add_images_to_creative_node(
+                    node.id,
+                    clean_imported_ids,
+                    intent_label=node.title,
+                    intent_query=node.search_query or node.title,
+                )
+                imported_to_board = True
+                if self.center_result_stack.currentWidget() is self.project_board_view:
+                    self._show_current_creative_board()
+        if clean_imported_ids and not imported_to_board:
             self._show_imported_images_first(collection_id, clean_imported_ids)
         else:
             self._refresh_after_scan_database_change(select_collection_id=collection_id)
@@ -9710,23 +10431,1296 @@ class MainWindow(QMainWindow):
         if self.selected_image is None and self._selected_virtual_filter() is not None:
             self._show_collection_details(None)
 
+    def _refresh_creative_projects(self, select_project_id: int | None = None) -> None:
+        if not hasattr(self, "creative_project_combo"):
+            return
+        projects = self.store.list_creative_projects()
+        target_id = select_project_id if select_project_id is not None else self.current_creative_project_id
+        if target_id is None and projects:
+            target_id = projects[0].id
+        self._refreshing_creative_projects = True
+        self.creative_project_combo.blockSignals(True)
+        self.creative_project_list.blockSignals(True)
+        self.creative_project_combo.clear()
+        self.creative_project_combo.addItem("未选择创作项目", None)
+        self.creative_project_list.clear()
+        selected_index = 0
+        selected_item: QListWidgetItem | None = None
+        for project in projects:
+            label = f"{'⬆ ' if project.is_pinned else ''}{project.title} ({project.node_count}/{project.image_count})"
+            self.creative_project_combo.addItem(label, project.id)
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, project.id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, project.is_pinned)
+            item.setToolTip(project.brief or project.title)
+            self.creative_project_list.addItem(item)
+            if project.id == target_id:
+                selected_index = self.creative_project_combo.count() - 1
+                selected_item = item
+        self.creative_project_combo.setCurrentIndex(selected_index)
+        if selected_item is not None:
+            self.creative_project_list.setCurrentItem(selected_item)
+        else:
+            self.creative_project_list.clearSelection()
+        self.creative_project_combo.blockSignals(False)
+        self.creative_project_list.blockSignals(False)
+        self._refreshing_creative_projects = False
+        self._refresh_project_sidebar(
+            select_kind="creative" if selected_index > 0 else None,
+            select_id=target_id if selected_index > 0 else None,
+        )
+        self._load_creative_project(target_id if selected_index > 0 else None)
+
+    def _show_creative_project_context_menu(self, pos) -> None:
+        item = self.creative_project_list.itemAt(pos)
+        if item is None:
+            return
+        self.creative_project_list.setCurrentItem(item)
+        project_id = item.data(Qt.ItemDataRole.UserRole)
+        if project_id is None:
+            return
+        project = self.store.get_creative_project(int(project_id))
+        if project is None:
+            return
+        menu = QMenu(self)
+        pin_action = menu.addAction("取消置顶项目" if project.is_pinned else "置顶项目")
+        delete_action = menu.addAction("删除创作项目")
+        chosen = menu.exec(self.creative_project_list.viewport().mapToGlobal(pos))
+        if chosen == pin_action:
+            self.store.set_creative_project_pinned(project.id, not project.is_pinned)
+            self._refresh_creative_projects(select_project_id=project.id)
+            self.statusBar().showMessage("已置顶项目" if not project.is_pinned else "已取消置顶项目")
+        elif chosen == delete_action:
+            self._delete_creative_project(project.id)
+
+    def _delete_creative_project(self, project_id: int) -> None:
+        project = self.store.get_creative_project(project_id)
+        if project is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除创作项目",
+            f"删除创作项目“{project.title}”？\n这只删除项目、节点和图片链接，不会删除图库图片或源文件。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self.store.delete_creative_project(project_id):
+            if self.current_creative_project_id == project_id:
+                self.current_creative_project_id = None
+                self.current_creative_node_id = None
+            self._refresh_creative_projects()
+            self.statusBar().showMessage(f"已删除创作项目：{project.title}")
+
+    def _on_creative_project_combo_changed(self, _index: int) -> None:
+        if self._refreshing_creative_projects:
+            return
+        project_id = self.creative_project_combo.currentData()
+        self._load_creative_project(int(project_id) if project_id is not None else None, show_board=project_id is not None)
+
+    def _on_creative_project_list_changed(self) -> None:
+        if self._refreshing_creative_projects:
+            return
+        item = self.creative_project_list.currentItem()
+        project_id = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        self.creative_project_combo.blockSignals(True)
+        self._set_combo_to_data(self.creative_project_combo, project_id)
+        self.creative_project_combo.blockSignals(False)
+        self._load_creative_project(int(project_id) if project_id is not None else None, show_board=project_id is not None)
+
+    def _load_creative_project(
+        self,
+        project_id: int | None,
+        *,
+        select_node_id: int | None = None,
+        show_board: bool = False,
+    ) -> None:
+        self.current_creative_project_id = project_id
+        if project_id is None:
+            self.current_creative_node_id = None
+            self._current_board_node_id = None
+            self._current_board_image_ids = ()
+            self.creative_node_tree.clear()
+            self.creative_project_copy_input.blockSignals(True)
+            self.creative_project_copy_input.clear()
+            self.creative_project_copy_input.blockSignals(False)
+            self._sync_creative_node_panel()
+            return
+        project = self.store.get_creative_project(project_id)
+        if project is not None:
+            self.creative_project_copy_input.blockSignals(True)
+            self.creative_project_copy_input.setPlainText(project.copy_text)
+            self.creative_project_copy_input.blockSignals(False)
+        if select_node_id is None:
+            select_node_id = self.current_creative_node_id or self.store.creative_root_node_id(project_id)
+        self._refresh_creative_node_tree(select_node_id=select_node_id)
+        self._sync_creative_node_panel()
+        self._refresh_project_sidebar(select_kind="creative", select_id=project_id)
+        if show_board and self.current_creative_node_id is not None:
+            QTimer.singleShot(0, self._show_current_creative_board)
+
+    def _refresh_creative_node_tree(self, select_node_id: int | None = None) -> None:
+        self.creative_node_tree.blockSignals(True)
+        self.creative_node_tree.clear()
+        if self.current_creative_project_id is None:
+            self.creative_node_tree.blockSignals(False)
+            return
+        nodes = self.store.list_creative_nodes(self.current_creative_project_id)
+        items_by_id: dict[int, QTreeWidgetItem] = {}
+        children_by_parent: dict[int | None, list[CreativeNodeItem]] = {}
+        for node in nodes:
+            children_by_parent.setdefault(node.parent_id, []).append(node)
+
+        def add_node(node: CreativeNodeItem, parent_item: QTreeWidgetItem | None) -> None:
+            branch_image_count = len(self.store.creative_node_image_ids(node.id, include_descendants=True))
+            item = QTreeWidgetItem([node.title, str(branch_image_count)])
+            item.setData(0, Qt.ItemDataRole.UserRole, node.id)
+            item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if parent_item is None:
+                self.creative_node_tree.addTopLevelItem(item)
+            else:
+                parent_item.addChild(item)
+            items_by_id[node.id] = item
+            for child in children_by_parent.get(node.id, []):
+                add_node(child, item)
+
+        for root_node in children_by_parent.get(None, []):
+            add_node(root_node, None)
+        self.creative_node_tree.expandAll()
+        if select_node_id in items_by_id:
+            self.creative_node_tree.setCurrentItem(items_by_id[select_node_id])
+            self.current_creative_node_id = select_node_id
+        elif nodes:
+            first = nodes[0]
+            self.current_creative_node_id = first.id
+            self.creative_node_tree.setCurrentItem(items_by_id.get(first.id))
+        else:
+            self.current_creative_node_id = None
+        self.creative_node_tree.blockSignals(False)
+
+    def _on_creative_node_selection_changed(self) -> None:
+        item = self.creative_node_tree.currentItem()
+        node_id = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
+        self.current_creative_node_id = int(node_id) if node_id is not None else None
+        self._sync_creative_node_panel()
+        if self.current_creative_node_id is not None:
+            self._show_current_creative_board()
+
+    def _current_creative_node(self) -> CreativeNodeItem | None:
+        if self.current_creative_node_id is None:
+            return None
+        return self.store.get_creative_node(self.current_creative_node_id)
+
+    def _creative_node_path_text(self, node_id: int) -> str:
+        if self.current_creative_project_id is None:
+            node = self.store.get_creative_node(node_id)
+            return node.title if node is not None else ""
+        nodes = self.store.list_creative_nodes(self.current_creative_project_id)
+        by_id = {node.id: node for node in nodes}
+        parts: list[str] = []
+        current = by_id.get(node_id)
+        visited: set[int] = set()
+        while current is not None and current.id not in visited:
+            visited.add(current.id)
+            parts.append(current.title)
+            current = by_id.get(current.parent_id) if current.parent_id is not None else None
+        return " / ".join(reversed(parts))
+
+    def _sync_creative_node_panel(self) -> None:
+        if not hasattr(self, "creative_node_status_label"):
+            return
+        node = self._current_creative_node()
+        project = (
+            self.store.get_creative_project(self.current_creative_project_id)
+            if self.current_creative_project_id is not None
+            else None
+        )
+        has_node = node is not None and project is not None
+        self.creative_node_note_input.blockSignals(True)
+        self.creative_node_query_input.blockSignals(True)
+        if not has_node:
+            self.creative_node_status_label.setText("未选择创作项目。")
+            self.creative_node_note_input.clear()
+            self.creative_node_query_input.clear()
+        else:
+            assert node is not None and project is not None
+            self.creative_node_status_label.setText(
+                f"项目：{project.title}\n节点：{node.title} ｜ 已存 {node.image_count} 张"
+            )
+            self.creative_node_note_input.setPlainText(node.note)
+            self.creative_node_query_input.setText(node.search_query)
+        self.creative_node_note_input.blockSignals(False)
+        self.creative_node_query_input.blockSignals(False)
+        for button in [
+            self.generate_creative_children_button,
+            self.generate_creative_copy_button,
+            self.generate_creative_copy_tab_button,
+            self.search_creative_node_button,
+            self.open_creative_board_button,
+            self.creative_add_child_button,
+            self.creative_delete_node_button,
+        ]:
+            button.setEnabled(has_node)
+        self.save_selection_to_creative_node_button.setEnabled(
+            has_node and bool(self._selected_grid_images())
+        )
+        if node is not None and node.parent_id is None:
+            self.creative_delete_node_button.setEnabled(False)
+
+    def _create_creative_project_from_current_brief(self) -> None:
+        self._set_ai_workflow_mode("project")
+        brief = self.inspiration_brief_input.toPlainText().strip()
+        default_title = brief[:32].strip() if brief else "新创作项目"
+        title, ok = QInputDialog.getText(self, "新建创作项目", "项目名称", text=default_title)
+        if not ok:
+            return
+        title = title.strip()
+        if not title:
+            self.statusBar().showMessage("项目名称不能为空")
+            return
+        template_id = str(self.creative_template_combo.currentData() or "story")
+        template = creative_template_by_id(template_id)
+        service = self._llm_service_key()
+        project_id = self.store.create_creative_project(
+            title=title,
+            brief=brief,
+            language=self.current_language,
+            provider_name=self._llm_service_label(service),
+            model_name=self._llm_model(service),
+        )
+        root_id = self.store.creative_root_node_id(project_id)
+        if root_id is not None:
+            self._seed_creative_template(
+                project_id=project_id,
+                root_id=root_id,
+                project_brief=brief or title,
+                template_root=template.root,
+            )
+        self._refresh_creative_projects(select_project_id=project_id)
+        self.right_tab_widget.setCurrentIndex(1)
+        self.statusBar().showMessage(f"已新建创作项目：{title} / {template.label}")
+
+    def _seed_creative_template(
+        self,
+        *,
+        project_id: int,
+        root_id: int,
+        project_brief: str,
+        template_root: CreativeTemplateNode,
+    ) -> None:
+        existing_nodes = self.store.list_creative_nodes(project_id)
+        if any(node.parent_id == root_id for node in existing_nodes):
+            return
+        self.store.update_creative_node(
+            root_id,
+            note=project_brief or template_root.note,
+            search_query=project_brief or template_root.title,
+        )
+
+        def add_template_node(parent_id: int, template_node: CreativeTemplateNode) -> int:
+            node_id = self.store.create_creative_node(
+                project_id=project_id,
+                parent_id=parent_id,
+                title=template_node.title,
+                note=template_node.note,
+                search_query=template_search_query(
+                    template_node.title,
+                    template_node.note,
+                    project_brief,
+                ),
+            )
+            for child_template in template_node.children:
+                add_template_node(node_id, child_template)
+            return node_id
+
+        for template_node in template_root.children:
+            add_template_node(root_id, template_node)
+
+    def _create_manual_creative_child_node(self) -> None:
+        parent = self._current_creative_node()
+        if parent is None or self.current_creative_project_id is None:
+            return
+        title, ok = QInputDialog.getText(self, "新建子节点", "节点名称")
+        if not ok or not title.strip():
+            return
+        node_id = self.store.create_creative_node(
+            project_id=self.current_creative_project_id,
+            parent_id=parent.id,
+            title=title.strip(),
+            note="",
+            search_query=title.strip(),
+        )
+        self._push_creative_node_undo({"kind": "created", "node_id": node_id})
+        self._load_creative_project(self.current_creative_project_id, select_node_id=node_id)
+
+    def _delete_selected_creative_node(self) -> None:
+        node = self._current_creative_node()
+        if node is None or node.parent_id is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除节点",
+            f"删除节点“{node.title}”及其子节点？\n这只删除项目链接，不会删除图库图片。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        snapshot = self._creative_node_subtree_snapshot(node.id)
+        parent_id = node.parent_id
+        if self.store.delete_creative_node(node.id):
+            self._push_creative_node_undo({"kind": "deleted", "snapshot": snapshot})
+            self._load_creative_project(node.project_id, select_node_id=parent_id)
+
+    def _show_creative_node_context_menu(self, pos) -> None:
+        item = self.creative_node_tree.itemAt(pos)
+        if item is not None:
+            self.creative_node_tree.setCurrentItem(item)
+        menu = QMenu(self)
+        add_action = menu.addAction("新建子节点")
+        add_action.setEnabled(self._current_creative_node() is not None)
+        delete_action = menu.addAction("删除节点")
+        node = self._current_creative_node()
+        delete_action.setEnabled(node is not None and node.parent_id is not None)
+        undo_action = menu.addAction("撤销节点操作")
+        undo_action.setEnabled(bool(self._creative_node_undo_stack))
+        chosen = menu.exec(self.creative_node_tree.viewport().mapToGlobal(pos))
+        if chosen == add_action:
+            self._create_manual_creative_child_node()
+        elif chosen == delete_action:
+            self._delete_selected_creative_node()
+        elif chosen == undo_action:
+            self._undo_last_creative_node_operation()
+
+    def _push_creative_node_undo(self, payload: dict[str, object]) -> None:
+        self._creative_node_undo_stack.append(payload)
+        if len(self._creative_node_undo_stack) > 12:
+            self._creative_node_undo_stack.pop(0)
+
+    def _creative_node_subtree_snapshot(self, root_node_id: int) -> dict[str, object]:
+        root = self.store.get_creative_node(root_node_id)
+        if root is None:
+            return {"nodes": [], "root_id": root_node_id}
+        nodes = self.store.list_creative_nodes(root.project_id)
+        children_by_parent: dict[int | None, list[CreativeNodeItem]] = {}
+        for node in nodes:
+            children_by_parent.setdefault(node.parent_id, []).append(node)
+        ordered: list[CreativeNodeItem] = []
+
+        def visit(node_id: int) -> None:
+            node = next((candidate for candidate in nodes if candidate.id == node_id), None)
+            if node is None:
+                return
+            ordered.append(node)
+            for child in children_by_parent.get(node.id, []):
+                visit(child.id)
+
+        visit(root_node_id)
+        return {
+            "project_id": root.project_id,
+            "parent_id": root.parent_id,
+            "root_id": root_node_id,
+            "nodes": [
+                {
+                    "id": node.id,
+                    "parent_id": node.parent_id,
+                    "title": node.title,
+                    "note": node.note,
+                    "search_query": node.search_query,
+                    "image_ids": self.store.creative_node_image_ids(node.id),
+                    "layout": self.store.get_creative_node_board_layout(node.id) or "",
+                }
+                for node in ordered
+            ],
+        }
+
+    def _undo_last_creative_node_operation(self) -> None:
+        if not self._creative_node_undo_stack:
+            self.statusBar().showMessage("没有可撤销的节点操作")
+            return
+        payload = self._creative_node_undo_stack.pop()
+        kind = payload.get("kind")
+        if kind == "created":
+            node_id = int(payload.get("node_id", 0) or 0)
+            node = self.store.get_creative_node(node_id)
+            if node is None:
+                self.statusBar().showMessage("节点已不存在，无法撤销")
+                return
+            project_id = node.project_id
+            parent_id = node.parent_id
+            if self.store.delete_creative_node(node_id):
+                self._load_creative_project(project_id, select_node_id=parent_id)
+                self.statusBar().showMessage("已撤销新建节点")
+            return
+        if kind != "deleted":
+            return
+        snapshot = payload.get("snapshot")
+        if not isinstance(snapshot, dict):
+            self.statusBar().showMessage("撤销数据无效")
+            return
+        project_id = int(snapshot.get("project_id", 0) or 0)
+        parent_id = snapshot.get("parent_id")
+        restored_parent_id = int(parent_id) if parent_id is not None else None
+        raw_nodes = snapshot.get("nodes", [])
+        if project_id <= 0 or not isinstance(raw_nodes, list):
+            self.statusBar().showMessage("撤销数据无效")
+            return
+        id_map: dict[int, int] = {}
+        first_new_id: int | None = None
+        for raw_node in raw_nodes:
+            if not isinstance(raw_node, dict):
+                continue
+            old_id = int(raw_node.get("id", 0) or 0)
+            old_parent = raw_node.get("parent_id")
+            new_parent_id = restored_parent_id
+            if old_parent is not None:
+                new_parent_id = id_map.get(int(old_parent), restored_parent_id)
+            new_id = self.store.create_creative_node(
+                project_id=project_id,
+                parent_id=new_parent_id,
+                title=str(raw_node.get("title", "未命名节点")),
+                note=str(raw_node.get("note", "")),
+                search_query=str(raw_node.get("search_query", "")),
+            )
+            id_map[old_id] = new_id
+            first_new_id = first_new_id or new_id
+            image_ids: list[int] = []
+            raw_image_ids = raw_node.get("image_ids", [])
+            if isinstance(raw_image_ids, list):
+                for raw_image_id in raw_image_ids:
+                    try:
+                        image_id = int(raw_image_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if image_id > 0:
+                        image_ids.append(image_id)
+            if image_ids:
+                self.store.add_images_to_creative_node(
+                    new_id,
+                    image_ids,
+                    intent_label=str(raw_node.get("title", "")),
+                    intent_query=str(raw_node.get("search_query", "")),
+                )
+            layout = str(raw_node.get("layout", "") or "")
+            if layout:
+                self.store.save_creative_node_board_layout(new_id, layout)
+        self._load_creative_project(project_id, select_node_id=first_new_id)
+        self.statusBar().showMessage("已撤销删除节点")
+
+    def _save_current_creative_node_details(self) -> None:
+        node = self._current_creative_node()
+        if node is None:
+            return
+        updated = self.store.update_creative_node(
+            node.id,
+            note=self.creative_node_note_input.toPlainText(),
+            search_query=self.creative_node_query_input.text(),
+        )
+        if updated is None:
+            self.statusBar().showMessage("节点不存在")
+            return
+        self._load_creative_project(updated.project_id, select_node_id=updated.id)
+        self.statusBar().showMessage("节点已保存")
+
+    def _generate_creative_children_for_selected_node(self) -> None:
+        self._set_ai_workflow_mode("project")
+        node = self._current_creative_node()
+        project = (
+            self.store.get_creative_project(self.current_creative_project_id)
+            if self.current_creative_project_id is not None
+            else None
+        )
+        if node is None or project is None:
+            self.statusBar().showMessage("先选择创作项目节点")
+            return
+        self.generate_creative_children_button.setEnabled(False)
+        self.creative_node_status_label.setText(f"正在补全“{node.title}”...")
+        provider = self._make_llm_provider()
+        current_note = self.creative_node_note_input.toPlainText() or node.note
+        node_path = self._creative_node_path_text(node.id)
+
+        def run() -> None:
+            try:
+                suggestion, model_name = provider.generate_creative_node_note(
+                    project_brief=project.brief or project.title,
+                    node_title=node.title,
+                    current_note=current_note,
+                    node_path=node_path,
+                    language=self.current_language,
+                )
+                self.events.put(("creative_node_note_done", (node.id, suggestion, model_name)))
+            except Exception as exc:
+                self.events.put(("creative_node_note_error", (node.id, exc)))
+
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self.generate_creative_children_button.setEnabled(True),
+        )
+
+    def _handle_creative_node_note_done(self, node_id: int, suggestion: object, _model_name: str) -> None:
+        node = self.store.get_creative_node(node_id)
+        if node is None:
+            self.statusBar().showMessage("节点已不存在，AI补全结果已丢弃")
+            self._sync_creative_node_panel()
+            return
+        note = str(getattr(suggestion, "note", "")).strip()
+        query = str(getattr(suggestion, "search_query", "")).strip()
+        if not note and not query:
+            self.statusBar().showMessage("AI没有返回可用节点内容")
+            self.generate_creative_children_button.setEnabled(True)
+            return
+        updated = self.store.update_creative_node(
+            node.id,
+            note=note or node.note,
+            search_query=query or node.search_query or node.title,
+        )
+        self._load_creative_project(node.project_id, select_node_id=node.id)
+        self.generate_creative_children_button.setEnabled(True)
+        if updated is not None:
+            self.statusBar().showMessage(f"已补全节点“{updated.title}”")
+
+    def _handle_creative_node_note_error(self, node_id: int, exc: Exception) -> None:
+        if self.current_creative_node_id == node_id:
+            self.generate_creative_children_button.setEnabled(True)
+            self._sync_creative_node_panel()
+        QMessageBox.warning(self, "Eidory", f"AI补全当前节点失败：{exc}")
+
+    def _creative_project_node_payload(self, project_id: int) -> list[dict[str, str]]:
+        nodes = self.store.list_creative_nodes(project_id)
+        by_id = {node.id: node for node in nodes}
+        payload: list[dict[str, str]] = []
+        for node in nodes:
+            parts: list[str] = []
+            current: CreativeNodeItem | None = node
+            visited: set[int] = set()
+            while current is not None and current.id not in visited:
+                visited.add(current.id)
+                parts.append(current.title)
+                current = by_id.get(current.parent_id) if current.parent_id is not None else None
+            payload.append(
+                {
+                    "title": node.title,
+                    "path": " / ".join(reversed(parts)),
+                    "note": node.note,
+                    "search_query": node.search_query,
+                }
+            )
+        return payload
+
+    def _generate_creative_project_copy(self) -> None:
+        self._set_ai_workflow_mode("project")
+        project = (
+            self.store.get_creative_project(self.current_creative_project_id)
+            if self.current_creative_project_id is not None
+            else None
+        )
+        if project is None:
+            self.statusBar().showMessage("先选择创作项目")
+            return
+        nodes_payload = self._creative_project_node_payload(project.id)
+        fill_empty_only = any(
+            str(node.get("note", "")).strip() or str(node.get("search_query", "")).strip()
+            for node in nodes_payload
+        )
+        selected_node_id = self.current_creative_node_id
+        for button in [self.generate_creative_copy_button, self.generate_creative_copy_tab_button]:
+            button.setEnabled(False)
+        self.statusBar().showMessage(f"正在生成项目文案：{project.title}")
+        provider = self._make_llm_provider()
+
+        def run() -> None:
+            try:
+                suggestion, model_name = provider.generate_creative_project_copy(
+                    project_brief=project.brief or project.title,
+                    nodes=nodes_payload,
+                    language=self.current_language,
+                )
+                self.events.put(
+                    (
+                        "creative_project_copy_done",
+                        (project.id, selected_node_id, fill_empty_only, suggestion, model_name),
+                    )
+                )
+            except Exception as exc:
+                self.events.put(("creative_project_copy_error", (project.id, exc)))
+
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_creative_copy_buttons_enabled(True),
+        )
+
+    def _set_creative_copy_buttons_enabled(self, enabled: bool) -> None:
+        has_project = self.current_creative_project_id is not None
+        for button in [self.generate_creative_copy_button, self.generate_creative_copy_tab_button]:
+            button.setEnabled(bool(enabled and has_project))
+
+    def _handle_creative_project_copy_done(
+        self,
+        project_id: int,
+        selected_node_id: int | None,
+        fill_empty_only: bool,
+        suggestion: object,
+        _model_name: str,
+    ) -> None:
+        project = self.store.get_creative_project(project_id)
+        if project is None:
+            self.statusBar().showMessage("项目已不存在，文案结果已丢弃")
+            self._set_creative_copy_buttons_enabled(True)
+            return
+        copy_text = str(getattr(suggestion, "copy_text", "")).strip()
+        if copy_text:
+            self.store.update_creative_project_copy(project_id, copy_text)
+        node_suggestions = getattr(suggestion, "nodes", [])
+        if isinstance(node_suggestions, list):
+            nodes = self.store.list_creative_nodes(project_id)
+            by_title = {node.title: node for node in nodes}
+            for node_suggestion in node_suggestions:
+                title = str(getattr(node_suggestion, "title", "")).strip()
+                node = by_title.get(title)
+                if node is None:
+                    continue
+                if fill_empty_only and (node.note.strip() or node.search_query.strip()):
+                    continue
+                note = str(getattr(node_suggestion, "note", "")).strip()
+                search_query = str(getattr(node_suggestion, "search_query", "")).strip()
+                if note or search_query:
+                    self.store.update_creative_node(
+                        node.id,
+                        note=note or node.note,
+                        search_query=search_query or node.search_query or node.title,
+                    )
+        self._load_creative_project(project_id, select_node_id=selected_node_id)
+        if hasattr(self, "creative_content_tabs"):
+            self.creative_content_tabs.setCurrentIndex(1)
+        self._set_creative_copy_buttons_enabled(True)
+        self.statusBar().showMessage(f"已生成项目文案：{project.title}")
+
+    def _handle_creative_project_copy_error(self, project_id: int, exc: Exception) -> None:
+        if self.current_creative_project_id == project_id:
+            self._set_creative_copy_buttons_enabled(True)
+        QMessageBox.warning(self, "Eidory", f"生成项目文案失败：{exc}")
+
+    def _search_selected_creative_node(self) -> None:
+        node = self._current_creative_node()
+        if node is None:
+            self.statusBar().showMessage("先选择创作项目节点")
+            return
+        note_text = self.creative_node_note_input.toPlainText()
+        query_text = self.creative_node_query_input.text().strip()
+        updated = self.store.update_creative_node(
+            node.id,
+            note=note_text,
+            search_query=query_text,
+        )
+        if updated is not None:
+            node = updated
+        query = query_text or node.search_query or note_text.strip() or node.note or node.title
+        if not query.strip():
+            self.statusBar().showMessage("当前节点没有可搜索内容")
+            return
+        self.semantic_search_revision += 1
+        self._clear_manual_result_order()
+        self._clear_result_management_state()
+        revision = self.semantic_search_revision
+        self.current_result_mode = "creative_node"
+        self.current_creative_node_id = node.id
+        self.current_creative_node_images = []
+        self.current_creative_node_filtered_images = []
+        self.current_creative_node_searchable_count = 0
+        self.current_creative_node_candidate_limit = 0
+        self.current_creative_node_badges = {}
+        self.current_temp_project_id = None
+        self.current_temp_project_images = []
+        self.current_temp_project_badges = {}
+        self.search_filters.clear()
+        self.active_filter_index = None
+        self._refresh_filter_chain_ui()
+        self._show_gallery_view()
+        self.search_creative_node_button.setEnabled(False)
+        self._set_result_status(f"创作节点搜索中：{node.title}")
+
+        def run() -> None:
+            try:
+                result = self.search_service.semantic_search(query)
+                self.events.put(("creative_node_search_done", (revision, node.id, query, result)))
+            except Exception as exc:
+                self.events.put(("creative_node_search_error", (revision, exc)))
+
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self.search_creative_node_button.setEnabled(True),
+        )
+
+    def _handle_creative_node_search_done(self, revision: int, node_id: int, query: str, result) -> None:
+        self.search_creative_node_button.setEnabled(self.current_creative_node_id is not None)
+        if revision != self.semantic_search_revision:
+            return
+        node = self.store.get_creative_node(node_id)
+        if node is None:
+            return
+        self.current_result_mode = "creative_node"
+        self.current_creative_node_id = node_id
+        self.current_creative_node_images = list(result.images)
+        self.current_creative_node_searchable_count = int(result.searchable_count)
+        self.current_creative_node_candidate_limit = int(result.candidate_limit)
+        self.current_creative_node_badges = {
+            image.id: [node.title]
+            for image in self.current_creative_node_images
+        }
+        self._apply_creative_node_result_filters()
+        images = self.current_creative_node_filtered_images
+        self.grid_view.set_images(images, badges_by_image_id=self.current_creative_node_badges)
+        self._set_creative_node_result_status(images, node=node, query=query)
+        self._update_creative_node_search_diagnostics(images)
+        self._refresh_temp_project_save_button()
+
+    def _apply_creative_node_result_filters(self) -> None:
+        images = self.current_creative_node_images
+        threshold = self._semantic_score_threshold(images)
+        if threshold is not None:
+            images = [
+                image
+                for image in images
+                if image.score is not None and image.score >= threshold
+            ]
+        images = self._apply_result_management_filters(images)
+        self.current_creative_node_filtered_images = self._sort_images(images)
+
+    def _set_creative_node_result_status(
+        self,
+        images: list[ImageItem],
+        *,
+        node: CreativeNodeItem | None = None,
+        query: str | None = None,
+    ) -> None:
+        node = node or self._current_creative_node()
+        title = node.title if node is not None else "创作节点"
+        source_count = len(self.current_creative_node_images)
+        suffix = self._result_management_status_suffix()
+        query_text = f" ｜ {query}" if query else ""
+        if len(images) == source_count:
+            self._set_result_status(f"创作节点结果：{title} ｜ {len(images)} 张{query_text}{suffix}")
+        else:
+            self._set_result_status(
+                f"创作节点结果：{title} ｜ {len(images)} / 原始 {source_count}{query_text}{suffix}"
+            )
+
+    def _update_creative_node_search_diagnostics(self, images: list[ImageItem]) -> None:
+        if not images:
+            self.search_diagnostics_label.setText("搜索诊断：-")
+            return
+        scores = [image.score for image in images if image.score is not None]
+        parts = [
+            f"显示 {len(images)}",
+            f"可搜索 {self.current_creative_node_searchable_count}",
+            f"候选上限 {self.current_creative_node_candidate_limit}",
+        ]
+        if scores:
+            parts.extend([
+                f"最高 {max(scores):.3f}",
+                f"最低 {min(scores):.3f}",
+                f"平均 {sum(scores) / len(scores):.3f}",
+            ])
+        self.search_diagnostics_label.setText("搜索诊断：" + "，".join(parts))
+
+    def _save_selection_to_current_creative_node(self) -> None:
+        node = self._current_creative_node()
+        if node is None:
+            self.statusBar().showMessage("先选择创作项目节点")
+            return
+        selected_images = self._selected_grid_images()
+        if not selected_images:
+            self.statusBar().showMessage("先在图片墙选择要存入节点的图片")
+            return
+        query = self.creative_node_query_input.text().strip() or node.search_query or node.title
+        changed = self.store.add_images_to_creative_node(
+            node.id,
+            [image.id for image in selected_images],
+            intent_label=node.title,
+            intent_query=query,
+        )
+        self._refresh_creative_projects(select_project_id=node.project_id)
+        self._refresh_creative_selection_panel(selected_images)
+        self.statusBar().showMessage(f"已存入 {changed} 张到节点“{node.title}”")
+
+    def _remove_selection_from_current_creative_node(self) -> None:
+        node = self._current_creative_node()
+        if node is None:
+            self.statusBar().showMessage("先选择创作项目节点")
+            return
+        selected_images = self._selected_grid_images()
+        if not selected_images:
+            return
+        removed = self.store.remove_images_from_creative_node(
+            node.id,
+            [image.id for image in selected_images],
+        )
+        if removed:
+            self.current_creative_node_images = [
+                image for image in self.current_creative_node_images
+                if image.id not in {selected.id for selected in selected_images}
+            ]
+            self._apply_creative_node_result_filters()
+            images = self.current_creative_node_filtered_images
+            self.grid_view.set_images(images, badges_by_image_id=self.current_creative_node_badges)
+            self._set_creative_node_result_status(images)
+            self._refresh_creative_projects(select_project_id=node.project_id)
+            self._refresh_creative_selection_panel(self._selected_grid_images())
+        self.statusBar().showMessage(f"已从节点移除 {removed} 张")
+
+    def _show_creative_node_saved_images(self, node_id: int) -> None:
+        node = self.store.get_creative_node(node_id)
+        if node is None:
+            return
+        image_ids = self.store.creative_node_image_ids(node.id, include_descendants=True)
+        images = self.store.images_by_ids(image_ids)
+        self.current_result_mode = "creative_node"
+        self.current_creative_node_id = node.id
+        self.current_creative_node_images = images
+        self.current_creative_node_searchable_count = 0
+        self.current_creative_node_candidate_limit = 0
+        self.current_creative_node_badges = self.store.creative_node_image_badges(node.project_id)
+        self.current_temp_project_id = None
+        self.current_temp_project_images = []
+        self.current_temp_project_badges = {}
+        self.search_filters.clear()
+        self.active_filter_index = None
+        self._refresh_filter_chain_ui()
+        self._apply_creative_node_result_filters()
+        filtered = self.current_creative_node_filtered_images
+        self.grid_view.set_images(filtered, badges_by_image_id=self.current_creative_node_badges)
+        self._show_gallery_view()
+        if filtered:
+            self._set_result_status(f"创作节点已存图片：{node.title} ｜ {len(filtered)} 张")
+            self.search_diagnostics_label.setText("搜索诊断：-")
+        else:
+            self._set_result_status(f"创作节点暂无已存图片：{node.title}")
+            self.search_diagnostics_label.setText("搜索诊断：点击“搜索当前节点”可从图库匹配参考图。")
+
+    def _show_gallery_view(self) -> None:
+        self._current_board_node_id = None
+        self._current_board_temp_project_id = None
+        self._current_board_image_ids = ()
+        self._set_board_focus_mode(False)
+        self._set_board_window_pinned(False)
+        if hasattr(self, "center_result_stack"):
+            self.center_result_stack.setCurrentWidget(self.grid_view)
+        if hasattr(self, "load_more_button"):
+            self.load_more_button.show()
+        if hasattr(self, "save_project_board_layout_button"):
+            self.save_project_board_layout_button.setEnabled(False)
+        self._set_board_toolbar_visible(False)
+
+    def _show_current_creative_board(self) -> None:
+        node = self._current_creative_node()
+        if node is None:
+            self.statusBar().showMessage("先选择创作项目节点")
+            return
+        image_ids = self.store.creative_node_image_ids(node.id, include_descendants=True)
+        image_id_tuple = tuple(image_ids)
+        if (
+            self.center_result_stack.currentWidget() is self.project_board_view
+            and self._current_board_node_id == node.id
+            and self._current_board_image_ids == image_id_tuple
+        ):
+            self.load_more_button.hide()
+            self.save_project_board_layout_button.setEnabled(True)
+            self._set_board_toolbar_visible(True)
+            self._set_result_status(f"项目看板：{node.title} ｜ {len(image_ids)} 张")
+            self.project_board_view.setFocus(Qt.FocusReason.OtherFocusReason)
+            return
+        images = self.store.images_by_ids(image_ids)
+        layout_payload = self._creative_node_board_layout_payload(node.id)
+        title = self._creative_node_path_text(node.id) or node.title
+        badges = self.store.creative_node_image_badges(node.project_id)
+        self.project_board_view.set_images(
+            images,
+            title=title,
+            layout_payload=layout_payload,
+            badges_by_image_id=badges,
+        )
+        self._current_board_node_id = node.id
+        self._current_board_temp_project_id = None
+        self._current_board_image_ids = image_id_tuple
+        self.center_result_stack.setCurrentWidget(self.project_board_view)
+        self.project_board_view.setFocus(Qt.FocusReason.OtherFocusReason)
+        QTimer.singleShot(0, self.project_board_view.fit_all_images)
+        self.load_more_button.hide()
+        self.save_project_board_layout_button.setEnabled(True)
+        self._set_board_toolbar_visible(True)
+        self._set_result_status(f"项目看板：{node.title} ｜ {len(images)} 张")
+
+    def _show_current_project_board(self) -> None:
+        if self.current_result_mode == "temp_project" and self.current_temp_project_id is not None:
+            self._show_temporary_project_board(self.current_temp_project_id)
+            return
+        self._show_current_creative_board()
+
+    def _set_board_toolbar_visible(self, visible: bool) -> None:
+        if not hasattr(self, "board_pin_button"):
+            return
+        board_buttons = [
+            self.board_pin_button,
+            self.board_hide_selected_button,
+            self.board_fit_all_button,
+            self.board_flip_button,
+            self.board_grayscale_button,
+            self.board_import_button,
+            self.board_show_all_button,
+        ]
+        for button in board_buttons:
+            button.setVisible(visible)
+        self.board_pin_button.setChecked(self._board_window_pinned)
+        if hasattr(self, "board_focus_shortcut"):
+            self.board_focus_shortcut.setEnabled(visible or self._board_focus_mode)
+        self.shuffle_results_button.setVisible(not visible)
+        self.thumbnail_size_label.setVisible(not visible)
+        self.thumbnail_size_slider.setVisible(not visible)
+        if self._board_focus_mode:
+            self._hide_board_focus_chrome_widgets()
+
+    def _save_current_creative_board_layout(self) -> None:
+        node = self._current_creative_node()
+        if node is None:
+            return
+        payload = self.project_board_view.layout_payload()
+        self.store.save_creative_node_board_layout(
+            node.id,
+            json.dumps(payload, ensure_ascii=False),
+        )
+        self.statusBar().showMessage("看板布局已保存")
+
+    def _toggle_board_window_pin(self, checked: bool = False) -> None:
+        self._set_board_window_pinned(bool(checked))
+
+    def _set_board_window_pinned(self, pinned: bool) -> None:
+        pinned = bool(pinned)
+        if self._board_window_pinned == pinned:
+            if hasattr(self, "board_pin_button"):
+                self.board_pin_button.setChecked(pinned)
+            return
+        if not self._set_native_window_pinned(pinned):
+            if sys.platform == "darwin":
+                if hasattr(self, "board_pin_button"):
+                    self.board_pin_button.setChecked(self._board_window_pinned)
+                self.statusBar().showMessage("看板窗口置顶失败，已保持原状态")
+                return
+            self._set_qt_window_pinned_fallback(pinned)
+        self._board_window_pinned = pinned
+        if hasattr(self, "board_pin_button"):
+            self.board_pin_button.setChecked(pinned)
+        self.statusBar().showMessage("看板窗口已置顶" if pinned else "看板窗口已取消置顶")
+
+    def _set_native_window_pinned(self, pinned: bool) -> bool:
+        if sys.platform != "darwin":
+            return False
+        app = QApplication.instance()
+        if app is None or app.platformName().lower() != "cocoa":
+            return False
+        try:
+            return self._set_macos_window_level(floating=pinned)
+        except Exception as exc:
+            self._record_error(f"macOS 窗口置顶设置失败：{exc}")
+            return False
+
+    def _set_macos_window_level(self, *, floating: bool) -> bool:
+        import ctypes
+        import ctypes.util
+
+        objc_path = ctypes.util.find_library("objc")
+        if not objc_path:
+            return False
+        objc = ctypes.cdll.LoadLibrary(objc_path)
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        msg_send = objc.objc_msgSend
+
+        def sel(name: str) -> int:
+            return int(objc.sel_registerName(name.encode("utf-8")) or 0)
+
+        def send_id(receiver: int, selector: str, *args) -> int:
+            if not receiver:
+                return 0
+            msg_send.restype = ctypes.c_void_p
+            return int(msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), *args) or 0)
+
+        def send_void_long(receiver: int, selector: str, value: int) -> None:
+            if receiver:
+                msg_send.restype = None
+                msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), ctypes.c_long(value))
+
+        native_view = int(self.winId())
+        window = send_id(native_view, "window")
+        if not window:
+            return False
+        normal_window_level = 0
+        floating_window_level = 3
+        send_void_long(window, "setLevel:", floating_window_level if floating else normal_window_level)
+        if self.isVisible():
+            self.raise_()
+            if floating:
+                self.activateWindow()
+        return True
+
+    def _set_qt_window_pinned_fallback(self, pinned: bool) -> None:
+        geometry = self.saveGeometry()
+        was_visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, pinned)
+        self.restoreGeometry(geometry)
+        if was_visible:
+            self.show()
+            self.raise_()
+            if pinned:
+                self.activateWindow()
+
+    def _toggle_board_focus_mode(self, _checked: bool = False) -> None:
+        self._set_board_focus_mode(not self._board_focus_mode)
+
+    def _set_board_focus_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled and self.center_result_stack.currentWidget() is not self.project_board_view:
+            self.statusBar().showMessage("先进入看板，再隐藏界面")
+            return
+        if self._board_focus_mode == enabled:
+            return
+        if enabled:
+            self._board_focus_previous_splitter_sizes = self.root_splitter.sizes()
+            self._board_focus_widget_visibility = {
+                widget: widget.isVisible()
+                for widget in self._board_focus_chrome_widgets()
+            }
+            self._board_focus_mode = True
+            if hasattr(self, "board_focus_shortcut"):
+                self.board_focus_shortcut.setEnabled(True)
+            self._hide_board_focus_chrome_widgets()
+            total = max(1, sum(self.root_splitter.sizes()))
+            self.root_splitter.setSizes([0, total, 0])
+            self.project_board_view.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            QTimer.singleShot(0, self._reapply_board_window_pin)
+            QTimer.singleShot(0, self.project_board_view.fit_all_images)
+            return
+        self._board_focus_mode = False
+        for widget, was_visible in list(self._board_focus_widget_visibility.items()):
+            widget.setVisible(was_visible)
+        self._board_focus_widget_visibility.clear()
+        if self._board_focus_previous_splitter_sizes is not None:
+            self.root_splitter.setSizes(self._board_focus_previous_splitter_sizes)
+            self._board_focus_previous_splitter_sizes = None
+            QTimer.singleShot(0, self._enforce_fixed_sidebar_widths)
+        if hasattr(self, "board_focus_shortcut"):
+            self.board_focus_shortcut.setEnabled(
+                self.center_result_stack.currentWidget() is self.project_board_view
+            )
+        self.project_board_view.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        QTimer.singleShot(0, self._reapply_board_window_pin)
+        QTimer.singleShot(0, self.project_board_view.fit_all_images)
+
+    def _board_focus_chrome_widgets(self) -> list[QWidget]:
+        widgets: list[QWidget] = [
+            self.search_input,
+            self.reverse_exclusion_button,
+            self.color_mode_button,
+            self.keyword_mode_button,
+            self.semantic_mode_button,
+            self.collection_filter_button,
+            self.tag_filter_button,
+            self.similar_image_button,
+            self.search_button,
+            self.clear_search_button,
+            self.advanced_search_toggle_button,
+            self.advanced_search_widget,
+            self.filter_chain_widget,
+            self.score_threshold_label,
+            self.score_threshold_slider,
+            self.result_state_label,
+            self.search_diagnostics_label,
+            self.load_more_button,
+            self.show_gallery_button,
+            self.show_project_board_button,
+            self.save_project_board_layout_button,
+            self.board_pin_button,
+            self.board_hide_selected_button,
+            self.board_fit_all_button,
+            self.board_flip_button,
+            self.board_grayscale_button,
+            self.board_import_button,
+            self.board_show_all_button,
+            self.shuffle_results_button,
+            self.thumbnail_size_label,
+            self.thumbnail_size_slider,
+            self.statusBar(),
+        ]
+        return [widget for widget in widgets if widget is not None]
+
+    def _hide_board_focus_chrome_widgets(self) -> None:
+        for widget in self._board_focus_chrome_widgets():
+            widget.hide()
+
+    def _reapply_board_window_pin(self) -> None:
+        if not self._board_window_pinned:
+            return
+        if not self._set_native_window_pinned(True) and sys.platform != "darwin":
+            self._set_qt_window_pinned_fallback(True)
+
+    def _fit_board_all_images(self) -> None:
+        self.project_board_view.fit_all_images()
+
+    def _flip_board_selected_images(self) -> None:
+        changed = self.project_board_view.toggle_selected_flipped()
+        self.statusBar().showMessage(f"已左右翻转：{changed} 张")
+
+    def _toggle_board_selected_grayscale(self) -> None:
+        changed = self.project_board_view.toggle_selected_grayscale()
+        self.statusBar().showMessage(f"已切换黑白显示：{changed} 张")
+
+    def _show_all_board_images(self) -> None:
+        self.project_board_view.show_all_items()
+        self.statusBar().showMessage("已显示全部看板图片")
+
+    def _import_images_to_current_board(self) -> None:
+        node = self._current_creative_node()
+        if node is None:
+            self.statusBar().showMessage("先选择创作节点")
+            return
+        collection_id = self._selected_collection_id()
+        if collection_id is None:
+            self.statusBar().showMessage("先在左侧选择导入目标文件夹")
+            return
+        filters = "Media Files (*.jpg *.jpeg *.png *.webp *.mp4 *.mov *.m4v *.avi *.mkv *.webm)"
+        files, _selected_filter = QFileDialog.getOpenFileNames(
+            self,
+            "导入图片到当前节点",
+            str(Path.home()),
+            filters,
+        )
+        if not files:
+            return
+        self._pending_board_import_node_id = node.id
+        self._start_file_import(files, collection_id)
+
+    def _open_project_board_image_preview(self, image_id: int) -> None:
+        image = self.store.get_image(int(image_id))
+        if image is not None:
+            self._open_image_preview(image)
+
+    def _remove_images_from_current_creative_board(self, image_ids: list[int]) -> None:
+        node = self._current_creative_node()
+        if node is None or not image_ids:
+            return
+        removed = self.store.remove_images_from_creative_node_branch(node.id, image_ids)
+        if removed:
+            self._show_current_creative_board()
+            self._refresh_creative_projects(select_project_id=node.project_id)
+            self.statusBar().showMessage(f"已从“{node.title}”分支移除 {removed} 个图片链接")
+
+    def _creative_board_groups(self, project_id: int) -> list[dict[str, object]]:
+        groups: list[dict[str, object]] = []
+        nodes = self.store.list_creative_nodes(project_id)
+        for node in nodes:
+            image_ids = self.store.creative_node_image_ids(node.id)
+            if not image_ids:
+                continue
+            images = self.store.images_by_ids(image_ids)
+            if images:
+                groups.append({"node_id": node.id, "title": node.title, "images": images})
+        return groups
+
+    def _creative_board_layout_payload(self, project_id: int) -> dict[str, object] | None:
+        payload_json = self.store.get_creative_board_layout(project_id)
+        if not payload_json:
+            return None
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _creative_node_board_layout_payload(self, node_id: int) -> dict[str, object] | None:
+        payload_json = self.store.get_creative_node_board_layout(node_id)
+        if not payload_json:
+            return None
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def _refresh_temporary_projects(self, select_project_id: int | None = None) -> None:
+        self._refresh_project_sidebar(select_kind="temporary", select_id=select_project_id)
+
+    def _refresh_project_sidebar(
+        self,
+        *,
+        select_kind: str | None = None,
+        select_id: int | None = None,
+    ) -> None:
+        if not hasattr(self, "temp_project_list"):
+            return
+        temporary_projects = self.store.list_temporary_projects()
+        creative_projects = self.store.list_creative_projects()
+        current_item = self.temp_project_list.currentItem()
+        if select_kind is None and current_item is not None:
+            current_kind = current_item.data(PROJECT_LIST_KIND_ROLE)
+            current_id = current_item.data(PROJECT_LIST_ID_ROLE)
+            if current_kind in {"temporary", "creative"} and current_id is not None:
+                select_kind = str(current_kind)
+                select_id = int(current_id)
+        selected_item: QListWidgetItem | None = None
+        needs_sections = bool(temporary_projects and creative_projects)
+
         self.temp_project_list.blockSignals(True)
         self.temp_project_list.clear()
-        selected_item: QListWidgetItem | None = None
-        for project in self.store.list_temporary_projects():
-            item = QListWidgetItem(f"{project.name}    {project.image_count}")
-            item.setData(Qt.ItemDataRole.UserRole, project.id)
-            item.setData(Qt.ItemDataRole.UserRole + 1, project.name)
-            item.setData(Qt.ItemDataRole.UserRole + 2, project.color_hex)
-            self._apply_temporary_project_item_color(item, project.color_hex)
-            tooltip_parts = [project.name, f"{project.image_count} 张"]
-            if project.summary:
-                tooltip_parts.append(project.summary)
-            item.setToolTip("\n".join(tooltip_parts))
+
+        def add_section(title: str) -> None:
+            item = QListWidgetItem(title)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable & ~Qt.ItemFlag.ItemIsEnabled)
+            item.setForeground(QBrush(QColor("#aab4c0")))
+            item.setBackground(QBrush(QColor("#2d343d")))
             self.temp_project_list.addItem(item)
-            if select_project_id == project.id:
-                selected_item = item
+
+        if temporary_projects:
+            if needs_sections:
+                add_section("◇ 语义探针项目")
+            for project in temporary_projects:
+                item = QListWidgetItem(f"◇ {project.name}    {project.image_count}")
+                item.setData(PROJECT_LIST_KIND_ROLE, "temporary")
+                item.setData(PROJECT_LIST_ID_ROLE, project.id)
+                item.setData(PROJECT_LIST_NAME_ROLE, project.name)
+                item.setData(PROJECT_LIST_COLOR_ROLE, project.color_hex)
+                item.setData(PROJECT_LIST_COUNT_ROLE, project.image_count)
+                item.setData(PROJECT_LIST_PINNED_ROLE, False)
+                item.setData(Qt.ItemDataRole.UserRole, project.id)
+                item.setData(Qt.ItemDataRole.UserRole + 1, project.name)
+                item.setData(Qt.ItemDataRole.UserRole + 2, project.color_hex)
+                self._apply_temporary_project_item_color(item, project.color_hex)
+                tooltip_parts = ["灵感暂存", project.name, f"{project.image_count} 张"]
+                if project.summary:
+                    tooltip_parts.append(project.summary)
+                item.setToolTip("\n".join(tooltip_parts))
+                self.temp_project_list.addItem(item)
+                if select_kind == "temporary" and select_id == project.id:
+                    selected_item = item
+
+        if creative_projects:
+            if needs_sections:
+                add_section("◆ 创作节点项目")
+            for project in creative_projects:
+                pin = "⬆ " if project.is_pinned else ""
+                item = QListWidgetItem(f"◆ {pin}{project.title}    {project.image_count}")
+                item.setData(PROJECT_LIST_KIND_ROLE, "creative")
+                item.setData(PROJECT_LIST_ID_ROLE, project.id)
+                item.setData(PROJECT_LIST_NAME_ROLE, project.title)
+                item.setData(PROJECT_LIST_COUNT_ROLE, project.image_count)
+                item.setData(PROJECT_LIST_PINNED_ROLE, project.is_pinned)
+                item.setData(Qt.ItemDataRole.UserRole, project.id)
+                item.setData(Qt.ItemDataRole.UserRole + 1, project.title)
+                item.setData(Qt.ItemDataRole.UserRole + 2, "")
+                item.setToolTip("\n".join(["创作项目", project.title, f"{project.node_count} 个节点", f"{project.image_count} 张"]))
+                if project.is_pinned:
+                    item.setForeground(QBrush(QColor("#f1d58a")))
+                self.temp_project_list.addItem(item)
+                if select_kind == "creative" and select_id == project.id:
+                    selected_item = item
+
         if selected_item is not None:
             self.temp_project_list.setCurrentItem(selected_item)
         self.temp_project_list.blockSignals(False)
@@ -9743,10 +11737,22 @@ class MainWindow(QMainWindow):
         item = self.temp_project_list.currentItem()
         if item is None:
             return
-        project_id = item.data(Qt.ItemDataRole.UserRole)
+        kind = item.data(PROJECT_LIST_KIND_ROLE) or "temporary"
+        project_id = item.data(PROJECT_LIST_ID_ROLE)
+        if project_id is None:
+            project_id = item.data(Qt.ItemDataRole.UserRole)
         if project_id is None:
             return
-        self._load_temporary_project(int(project_id))
+        if kind == "creative":
+            self._set_ai_workflow_mode("project")
+            self.creative_project_combo.blockSignals(True)
+            self._set_combo_to_data(self.creative_project_combo, int(project_id))
+            self.creative_project_combo.blockSignals(False)
+            self._load_creative_project(int(project_id), show_board=True)
+            self.right_tab_widget.setCurrentIndex(1)
+            self._refresh_project_sidebar(select_kind="creative", select_id=int(project_id))
+            return
+        self._show_temporary_project_board(int(project_id))
 
     def _load_temporary_project(self, project_id: int) -> None:
         project = self.store.get_temporary_project(project_id)
@@ -9792,6 +11798,46 @@ class MainWindow(QMainWindow):
         suffix = f" ｜ {project.summary}" if project.summary else ""
         self._set_result_status(f"灵感暂存：{project.name} ｜ {len(images)} 张{suffix}")
         self.search_diagnostics_label.setText("搜索诊断：-")
+        self._refresh_project_sidebar(select_kind="temporary", select_id=project_id)
+
+    def _show_temporary_project_board(self, project_id: int) -> None:
+        project = self.store.get_temporary_project(project_id)
+        if project is None:
+            self._refresh_temporary_projects()
+            self.statusBar().showMessage("该灵感暂存已不存在")
+            return
+        self._load_temporary_project(project_id)
+        images = list(self.current_temp_project_images)
+        image_id_tuple = tuple(image.id for image in images)
+        if (
+            self.center_result_stack.currentWidget() is self.project_board_view
+            and self._current_board_temp_project_id == project_id
+            and self._current_board_image_ids == image_id_tuple
+        ):
+            self.load_more_button.hide()
+            self.save_project_board_layout_button.setEnabled(False)
+            self._set_board_toolbar_visible(True)
+            self._set_result_status(f"灵感暂存看板：{project.name} ｜ {len(images)} 张")
+            self.project_board_view.setFocus(Qt.FocusReason.OtherFocusReason)
+            return
+        title = f"灵感暂存：{project.name}"
+        self.project_board_view.set_images(
+            images,
+            title=title,
+            badges_by_image_id=self.current_temp_project_badges,
+        )
+        self._current_board_node_id = None
+        self._current_board_temp_project_id = project_id
+        self._current_board_image_ids = image_id_tuple
+        self.center_result_stack.setCurrentWidget(self.project_board_view)
+        self.project_board_view.setFocus(Qt.FocusReason.OtherFocusReason)
+        QTimer.singleShot(0, self.project_board_view.fit_all_images)
+        self.load_more_button.hide()
+        self.save_project_board_layout_button.setEnabled(False)
+        self._set_board_toolbar_visible(True)
+        suffix = f" ｜ {project.summary}" if project.summary else ""
+        self._set_result_status(f"灵感暂存看板：{project.name} ｜ {len(images)} 张{suffix}")
+        self.search_diagnostics_label.setText("搜索诊断：-")
 
     def _show_temporary_project_context_menu(self, position) -> None:
         item = self.temp_project_list.itemAt(position)
@@ -9804,9 +11850,20 @@ class MainWindow(QMainWindow):
                 self._clear_all_temporary_projects()
             return
         self.temp_project_list.setCurrentItem(item)
-        project_id = item.data(Qt.ItemDataRole.UserRole)
-        project_name = item.data(Qt.ItemDataRole.UserRole + 1)
+        kind = item.data(PROJECT_LIST_KIND_ROLE) or "temporary"
+        project_id = item.data(PROJECT_LIST_ID_ROLE)
         if project_id is None:
+            project_id = item.data(Qt.ItemDataRole.UserRole)
+        project_name = item.data(PROJECT_LIST_NAME_ROLE)
+        if project_name is None:
+            project_name = item.data(Qt.ItemDataRole.UserRole + 1)
+        if project_id is None:
+            return
+        if kind == "creative":
+            self._show_creative_sidebar_project_context_menu(
+                int(project_id),
+                self.temp_project_list.viewport().mapToGlobal(position),
+            )
             return
         menu = QMenu(self)
         open_action = menu.addAction("打开暂存项目")
@@ -9817,7 +11874,7 @@ class MainWindow(QMainWindow):
         delete_action = menu.addAction("删除暂存项目")
         action = menu.exec(self.temp_project_list.viewport().mapToGlobal(position))
         if action == open_action:
-            self._load_temporary_project(int(project_id))
+            self._show_temporary_project_board(int(project_id))
         elif action == edit_action:
             self._edit_temporary_project_details(int(project_id))
         elif action == ai_details_action:
@@ -9828,6 +11885,28 @@ class MainWindow(QMainWindow):
             self._move_temporary_project(int(project_id), 1)
         elif action == delete_action:
             self._delete_temporary_project(int(project_id), str(project_name or "暂存项目"))
+
+    def _show_creative_sidebar_project_context_menu(self, project_id: int, global_pos) -> None:
+        project = self.store.get_creative_project(project_id)
+        if project is None:
+            self._refresh_creative_projects()
+            self.statusBar().showMessage("该创作项目已不存在")
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("打开项目看板")
+        pin_action = menu.addAction("取消置顶项目" if project.is_pinned else "置顶项目")
+        delete_action = menu.addAction("删除创作项目")
+        chosen = menu.exec(global_pos)
+        if chosen == open_action:
+            self._set_ai_workflow_mode("project")
+            self._load_creative_project(project.id, show_board=True)
+            self.right_tab_widget.setCurrentIndex(1)
+        elif chosen == pin_action:
+            self.store.set_creative_project_pinned(project.id, not project.is_pinned)
+            self._refresh_creative_projects(select_project_id=project.id)
+            self.statusBar().showMessage("已置顶项目" if not project.is_pinned else "已取消置顶项目")
+        elif chosen == delete_action:
+            self._delete_creative_project(project.id)
 
     def _move_temporary_project(self, project_id: int, direction: int) -> None:
         moved = self.store.move_temporary_project(project_id, direction)
@@ -9895,7 +11974,14 @@ class MainWindow(QMainWindow):
             return
         self._refresh_temporary_projects(select_project_id=project_id)
         if self.current_temp_project_id == project_id:
-            self._load_temporary_project(project_id)
+            if (
+                hasattr(self, "center_result_stack")
+                and self.center_result_stack.currentWidget() is self.project_board_view
+                and self._current_board_temp_project_id == project_id
+            ):
+                self._show_temporary_project_board(project_id)
+            else:
+                self._load_temporary_project(project_id)
         self.statusBar().showMessage(f"已更新灵感暂存：{updated.name}")
 
     def _request_temporary_project_ai_details(self, project_id: int) -> None:
@@ -10791,6 +12877,7 @@ class MainWindow(QMainWindow):
             "color",
             "search_chain",
             "inspiration",
+            "creative_node",
             "temp_project",
             "duplicate_group",
             "keyword",
@@ -10802,6 +12889,7 @@ class MainWindow(QMainWindow):
             "color",
             "search_chain",
             "inspiration",
+            "creative_node",
             "temp_project",
             "duplicate_group",
             "keyword",
@@ -10886,6 +12974,12 @@ class MainWindow(QMainWindow):
             self.grid_view.set_images(images, badges_by_image_id=self._inspiration_badges_by_image_id())
             self._set_inspiration_result_status(images)
             self._update_inspiration_diagnostics(images)
+        elif self.current_result_mode == "creative_node":
+            self._apply_creative_node_result_filters()
+            images = self.current_creative_node_filtered_images
+            self.grid_view.set_images(images, badges_by_image_id=self.current_creative_node_badges)
+            self._set_creative_node_result_status(images)
+            self._update_creative_node_search_diagnostics(images)
 
     def _semantic_score_threshold(self, images: list[ImageItem], *, value: int | None = None) -> float | None:
         if value is None:

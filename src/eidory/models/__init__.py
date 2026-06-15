@@ -1,5 +1,7 @@
 from .image_item import (
     CollectionItem,
+    CreativeNodeItem,
+    CreativeProjectItem,
     FolderItem,
     ImageItem,
     InspirationProjectItem,
@@ -10,6 +12,8 @@ from .image_item import (
 
 __all__ = [
     "CollectionItem",
+    "CreativeNodeItem",
+    "CreativeProjectItem",
     "FolderItem",
     "ImageItem",
     "InspirationProjectItem",

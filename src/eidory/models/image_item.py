@@ -89,3 +89,33 @@ class TemporaryProjectItem:
     updated_at: str
     summary: str = ""
     color_hex: str = ""
+
+
+@dataclass(frozen=True)
+class CreativeProjectItem:
+    id: int
+    title: str
+    brief: str
+    language: str
+    provider_name: str
+    model_name: str
+    node_count: int
+    image_count: int
+    created_at: str
+    updated_at: str
+    is_pinned: bool = False
+    copy_text: str = ""
+
+
+@dataclass(frozen=True)
+class CreativeNodeItem:
+    id: int
+    project_id: int
+    parent_id: int | None
+    title: str
+    note: str
+    search_query: str
+    sort_order: int
+    image_count: int
+    created_at: str
+    updated_at: str

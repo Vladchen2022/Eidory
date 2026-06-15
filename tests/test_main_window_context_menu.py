@@ -10,7 +10,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAccessible, QKeySequence
+from PySide6.QtGui import QAccessible, QColor, QKeySequence, QPixmap
 from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem, QMessageBox, QPushButton, QTextEdit, QTreeWidget, QTreeWidgetItem
 
 from eidory.config import AppPaths
@@ -32,7 +32,10 @@ from eidory.ui.main_window import (
     EqualWidthTabBar,
     LEFT_SIDEBAR_WIDTH,
     MainWindow,
+    PROJECT_LIST_ID_ROLE,
+    PROJECT_LIST_KIND_ROLE,
     RIGHT_SIDEBAR_WIDTH,
+    SIDEBAR_COLLAPSE_THRESHOLD,
     SIDEBAR_COUNT_COLUMN_WIDTH,
     TOOL_BUTTON_MIN_WIDTH,
 )
@@ -352,7 +355,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.app.processEvents()
             window._enforce_fixed_sidebar_widths()
             self.assertEqual(window.root_splitter.sizes()[0], LEFT_SIDEBAR_WIDTH)
-            self.assertGreaterEqual(window.collection_tree.columnWidth(0), 230)
+            self.assertGreaterEqual(window.collection_tree.columnWidth(0), 210)
 
             window.root_splitter.setSizes([360, 700, 640])
             window._enforce_fixed_sidebar_widths()
@@ -822,6 +825,37 @@ class MainWindowContextMenuTest(unittest.TestCase):
             sizes = [int(part) for part in saved.split(",")]
             self.assertEqual(len(sizes), 3)
             self.assertTrue(all(size > 0 for size in sizes))
+            self.assertEqual(sizes[0], LEFT_SIDEBAR_WIDTH)
+            self.assertEqual(sizes[2], RIGHT_SIDEBAR_WIDTH)
+
+    def test_root_splitter_recovers_from_saved_narrow_sidebar_width(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            store.set_setting(
+                "ui.root_splitter_sizes",
+                f"{SIDEBAR_COLLAPSE_THRESHOLD + 40},900,{RIGHT_SIDEBAR_WIDTH - 80}",
+            )
+
+            window = MainWindow(paths=paths, store=store)
+            window.resize(1500, 900)
+            window.show()
+            self.app.processEvents()
+            window._enforce_fixed_sidebar_widths()
+
+            left, _center, right = window.root_splitter.sizes()
+            self.assertEqual(left, LEFT_SIDEBAR_WIDTH)
+            self.assertEqual(right, RIGHT_SIDEBAR_WIDTH)
+            self.assertEqual(window.collection_tree.columnWidth(1), SIDEBAR_COUNT_COLUMN_WIDTH)
+            self.assertGreaterEqual(window.collection_tree.columnWidth(0), 210)
+            window.close()
 
     def test_filter_panel_preferences_restore_and_persist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2330,6 +2364,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                     "文件与导出",
                     "收藏与标签",
                     "灵感暂存",
+                    "创作项目",
                     "文件夹归类",
                     "当前结果",
                 ],
@@ -2350,6 +2385,10 @@ class MainWindowContextMenuTest(unittest.TestCase):
                     "从当前灵感暂存移除",
                     "AI 分组选中图片",
                 ],
+            )
+            self.assertEqual(
+                self._submenu_texts(menu, "创作项目"),
+                ["存入当前创作节点", "从当前节点移除"],
             )
             self.assertEqual(
                 self._submenu_texts(menu, "文件夹归类"),
@@ -3458,6 +3497,229 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             reload_images.assert_not_called()
             self.assertEqual([image.id for image in window.grid_view.images()], [1, 2])
+            window.close()
+
+    def test_project_sidebar_groups_temporary_and_creative_projects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            temporary_id = store.create_temporary_project("临时参考", [image_id])
+            creative_id = store.create_creative_project(
+                title="故事项目",
+                brief="一个室内场景",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(creative_id)
+            self.assertIsNotNone(root_id)
+            store.add_images_to_creative_node(int(root_id), [image_id], intent_label="世界观")
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            texts = [window.temp_project_list.item(index).text() for index in range(window.temp_project_list.count())]
+            self.assertIn("◇ 语义探针项目", texts)
+            self.assertIn("◆ 创作节点项目", texts)
+            temporary_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "temporary"
+            )
+            creative_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "creative"
+            )
+            self.assertEqual(temporary_item.data(PROJECT_LIST_ID_ROLE), temporary_id)
+            self.assertEqual(creative_item.data(PROJECT_LIST_ID_ROLE), creative_id)
+            self.assertIn("临时参考", temporary_item.text())
+            self.assertIn("故事项目", creative_item.text())
+            window.close()
+
+    def test_selecting_creative_project_from_project_sidebar_opens_board(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            project_id = store.create_creative_project(
+                title="故事项目",
+                brief="一个室内场景",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            store.add_images_to_creative_node(int(root_id), [image_id], intent_label="世界观")
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            creative_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "creative"
+            )
+
+            window.temp_project_list.setCurrentItem(creative_item)
+            self.app.processEvents()
+
+            self.assertEqual(window.current_creative_project_id, project_id)
+            self.assertEqual(window.center_result_stack.currentWidget(), window.project_board_view)
+            self.assertIn("项目看板", window.result_state_label.text())
+            window.close()
+
+    def test_selecting_temporary_project_from_project_sidebar_opens_board_with_badges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library_dir = Path(tmp) / "library"
+            library_dir.mkdir()
+            image_path = library_dir / "first.jpg"
+            pixmap = QPixmap(320, 180)
+            pixmap.fill(QColor("#445566"))
+            self.assertTrue(pixmap.save(str(image_path)))
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library_dir))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=320,
+                height=180,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            project_id = store.create_temporary_project("临时参考", [image_id])
+            store.add_images_to_temporary_project(
+                project_id,
+                [image_id],
+                intent_labels={image_id: "世界观"},
+            )
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            temporary_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "temporary"
+            )
+
+            window.temp_project_list.setCurrentItem(temporary_item)
+            self.app.processEvents()
+
+            self.assertEqual(window.current_temp_project_id, project_id)
+            self.assertEqual(window.center_result_stack.currentWidget(), window.project_board_view)
+            self.assertIn("灵感暂存看板", window.result_state_label.text())
+            item = window.project_board_view._image_items[image_id]
+            self.assertEqual(getattr(item, "badge_text"), "世界观")
+            window.close()
+
+    def test_selecting_creative_node_opens_node_board_not_gallery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids = []
+            for index in range(2):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{index}.jpg"),
+                    file_size=123,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=index + 1,
+                )
+                image_ids.append(image_id)
+            project_id = store.create_creative_project(
+                title="故事项目",
+                brief="一个室内场景",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            child_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="地点",
+                note="旧公寓走廊",
+                search_query="旧公寓走廊",
+            )
+            store.add_images_to_creative_node(child_id, image_ids, intent_label="地点")
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=int(root_id), show_board=True)
+            self.app.processEvents()
+
+            child_item = None
+            root_item = window.creative_node_tree.topLevelItem(0)
+            for index in range(root_item.childCount()):
+                item = root_item.child(index)
+                if item.data(0, Qt.ItemDataRole.UserRole) == child_id:
+                    child_item = item
+                    break
+            self.assertIsNotNone(child_item)
+            window.creative_node_tree.setCurrentItem(child_item)
+            self.app.processEvents()
+
+            self.assertEqual(window.current_creative_node_id, child_id)
+            self.assertEqual(window.center_result_stack.currentWidget(), window.project_board_view)
+            self.assertNotEqual(window.center_result_stack.currentWidget(), window.grid_view)
+            self.assertIn("项目看板：地点", window.result_state_label.text())
             window.close()
 
     def test_preserve_current_view_scan_refresh_does_not_reset_grid(self) -> None:

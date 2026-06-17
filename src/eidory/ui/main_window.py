@@ -100,7 +100,14 @@ from eidory.core.creative_templates import (
     creative_template_by_id,
     template_search_query,
 )
-from eidory.core.duplicate_detection import DuplicateGroup, find_duplicate_groups
+from eidory.core.duplicate_detection import (
+    DuplicateGroup,
+    ImageDHashRecord,
+    NearDuplicateCandidate,
+    build_image_dhash_records,
+    find_duplicate_groups,
+    find_near_duplicate_candidates,
+)
 from eidory.core.ai_vision_worker import AIVisionProgress, AIVisionWorker
 from eidory.core.embedding_provider import JinaClipV2Provider
 from eidory.core.embedding_worker import EmbeddingProgress, EmbeddingWorker
@@ -150,6 +157,7 @@ from eidory.ui.accessibility import disable_qt_accessibility
 from eidory.ui.collection_tree import CollectionTreeWidget
 from eidory.ui.image_preview_dialog import ImagePreviewDialog
 from eidory.ui.justified_image_grid import JustifiedImageGridView
+from eidory.ui.near_duplicate_dialog import NearDuplicateDecision, NearDuplicateDialog
 from eidory.ui.project_board import ProjectBoardView
 
 
@@ -691,6 +699,13 @@ class MainWindow(QMainWindow):
         self._database_maintenance_active = False
         self._background_threads: set[threading.Thread] = set()
         self._background_threads_lock = threading.Lock()
+        self._near_duplicate_hash_records_cache: list[ImageDHashRecord] | None = None
+        self._near_duplicate_hash_records_cache_count: int | None = None
+        self._near_duplicate_job_counter = 0
+        self._near_duplicate_callbacks: dict[
+            int,
+            tuple[Callable[[list[str], set[str], list[int], int], None], list[str]],
+        ] = {}
         self.file_watch_enabled = self._setting_choice("ui.file_watch_enabled", "1", {"0", "1"}) == "1"
         self.file_watcher = QFileSystemWatcher(self)
         self._watch_path_roots: dict[str, str] = {}
@@ -855,7 +870,7 @@ class MainWindow(QMainWindow):
         self._stop_file_watcher_for_maintenance()
         self._stop_index_workers_for_maintenance(timeout_seconds=2.0)
         self._wait_for_background_tasks(timeout_seconds=2.0)
-        if hasattr(self, "video_player"):
+        if getattr(self, "video_player", None) is not None:
             self.video_player.stop()
         if hasattr(self, "root_splitter"):
             self.store.set_setting(
@@ -1608,17 +1623,12 @@ class MainWindow(QMainWindow):
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumHeight(180)
         self.preview_label.setStyleSheet("background:#2d3138;color:#d8dee9;")
-        self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumHeight(180)
-        self.video_widget.setStyleSheet("background:#2d3138;")
-        self.video_player = QMediaPlayer(self)
-        self.video_audio_output = QAudioOutput(self)
-        self.video_player.setAudioOutput(self.video_audio_output)
-        self.video_player.setVideoOutput(self.video_widget)
+        self.video_widget: QVideoWidget | None = None
+        self.video_player: QMediaPlayer | None = None
+        self.video_audio_output: QAudioOutput | None = None
 
         self.preview_stack = QStackedWidget()
         self.preview_stack.addWidget(self.preview_label)
-        self.preview_stack.addWidget(self.video_widget)
 
         self.file_name_input = QLineEdit()
         self.file_name_input.setPlaceholderText("文件名")
@@ -1731,7 +1741,14 @@ class MainWindow(QMainWindow):
         self.note_input = QTextEdit()
         self.note_input.setPlaceholderText("备注")
         self.note_input.setAcceptRichText(False)
-        self.save_detail_button = QPushButton("保存详情")
+        self.rename_file_button = QPushButton("重命名")
+        self.rename_file_button.setToolTip("重命名硬盘上的源文件")
+        self.note_auto_save_timer = QTimer(self)
+        self.note_auto_save_timer.setSingleShot(True)
+        self.note_auto_save_timer.setInterval(700)
+        self._suppress_detail_auto_save = False
+        self._pending_note_image_id: int | None = None
+        self._pending_note_text: str | None = None
         self.delete_source_button = QPushButton("删除/移除图片")
         self.delete_source_button.setToolTip("选择删除源文件，或只从 Eidory 移除索引")
         self.play_pause_button = QPushButton("播放", panel)
@@ -1838,7 +1855,12 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         self.detail_form = form
         self._configure_sidebar_form(form)
-        form.addRow("文件名", self.file_name_input)
+        file_name_row = QHBoxLayout()
+        file_name_row.setContentsMargins(0, 0, 0, 0)
+        file_name_row.setSpacing(6)
+        file_name_row.addWidget(self.file_name_input, 1)
+        file_name_row.addWidget(self.rename_file_button)
+        form.addRow("文件名", file_name_row)
         form.addRow("路径", self.path_label)
         form.addRow("文件夹", self.image_collections_label)
         form.addRow("尺寸", self.size_label)
@@ -1870,7 +1892,6 @@ class MainWindow(QMainWindow):
         image_detail_layout.addWidget(self.tags_display)
         image_detail_layout.addWidget(QLabel("备注"))
         image_detail_layout.addWidget(self.note_input)
-        image_detail_layout.addWidget(self.save_detail_button)
         image_detail_layout.addWidget(self.delete_source_button)
         image_detail_layout.addStretch(1)
 
@@ -2283,7 +2304,11 @@ class MainWindow(QMainWindow):
         self.grid_view.imageContextMenuRequested.connect(self._show_grid_context_menu)
         self.grid_view.filesDropped.connect(self._import_dropped_files_to_selected_collection)
         self.grid_view.dropPayloadDropped.connect(self._import_drop_payload_to_selected_collection)
-        self.save_detail_button.clicked.connect(self._save_current_details)
+        self.rename_file_button.clicked.connect(self._rename_current_file)
+        self.file_name_input.returnPressed.connect(self._rename_current_file)
+        self.favorite_checkbox.toggled.connect(self._save_current_favorite)
+        self.note_input.textChanged.connect(self._queue_note_auto_save)
+        self.note_auto_save_timer.timeout.connect(self._save_pending_note)
         self.delete_source_button.clicked.connect(self._delete_selected_source_files)
         self.undo_removal_action = QAction("撤销删除/移除", self)
         self.undo_removal_action.setShortcut(QKeySequence.StandardKey.Undo)
@@ -2298,14 +2323,13 @@ class MainWindow(QMainWindow):
         self.addAction(self.minimize_window_action)
         self.board_focus_shortcut = QShortcut(QKeySequence("Tab"), self)
         self.board_focus_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-        self.board_focus_shortcut.setEnabled(False)
+        self.board_focus_shortcut.setEnabled(True)
         self.board_focus_shortcut.activated.connect(self._toggle_board_focus_mode)
         self.open_collection_import_dir_button.clicked.connect(self._open_selected_collection_import_dir)
         self.open_original_button.clicked.connect(self._open_selected_original)
         self.reveal_in_finder_button.clicked.connect(self._reveal_selected_in_finder)
         self.copy_path_button.clicked.connect(self._copy_selected_path)
         self.play_pause_button.clicked.connect(self._toggle_video_playback)
-        self.video_player.playbackStateChanged.connect(self._update_video_play_button)
         self.batch_add_tags_button.clicked.connect(self._batch_add_tags_from_panel)
         self.batch_remove_tag_button.clicked.connect(self._batch_remove_selected_tag)
         self.batch_clear_tags_button.clicked.connect(self._batch_clear_tags)
@@ -2707,6 +2731,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
     def _refresh_after_database_change(self) -> None:
+        self._invalidate_near_duplicate_hash_cache()
         self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
         self._load_settings_controls()
         self._apply_runtime_language_settings()
@@ -2920,7 +2945,8 @@ class MainWindow(QMainWindow):
             self.search_operation_label.setText("Search Logic")
             self.shuffle_results_button.setText("Shuffle")
             self.save_result_set_button.setText("Save Results")
-            self.save_detail_button.setText("Save Details")
+            self.rename_file_button.setText("Rename")
+            self.rename_file_button.setToolTip("Rename the source file on disk")
             self.delete_source_button.setText("Delete / Remove")
             self.delete_source_button.setToolTip("Delete source files, or only remove them from Eidory")
             self.tag_panel_input.setPlaceholderText("Add tags to selected items, one per line")
@@ -3044,7 +3070,8 @@ class MainWindow(QMainWindow):
             self.search_operation_label.setText("搜索逻辑")
             self.shuffle_results_button.setText("打乱排序")
             self.save_result_set_button.setText("暂存结果")
-            self.save_detail_button.setText("保存详情")
+            self.rename_file_button.setText("重命名")
+            self.rename_file_button.setToolTip("重命名硬盘上的源文件")
             self.delete_source_button.setText("删除/移除图片")
             self.delete_source_button.setToolTip("选择删除源文件，或只从 Eidory 移除索引")
             self.tag_panel_input.setPlaceholderText("给选中图片添加标签，每行一个")
@@ -3537,6 +3564,34 @@ class MainWindow(QMainWindow):
         if not supported_files:
             self.statusBar().showMessage("没有可导入的受支持图片或视频")
             return
+        self._start_near_duplicate_resolution(
+            supported_files,
+            include_same_path=True,
+            on_resolved=lambda accepted_paths, _skip_paths, replaced_ids, skipped_count: (
+                self._continue_file_import_after_duplicate_resolution(
+                    accepted_paths,
+                    collection_id=collection_id,
+                    replaced_count=len(replaced_ids),
+                    skipped_count=skipped_count,
+                )
+            ),
+        )
+        return
+
+    def _continue_file_import_after_duplicate_resolution(
+        self,
+        supported_files: list[str],
+        *,
+        collection_id: int,
+        replaced_count: int,
+        skipped_count: int,
+    ) -> None:
+        if not supported_files:
+            self._refresh_after_scan_database_change(select_collection_id=collection_id)
+            self.statusBar().showMessage(
+                f"近似图片处理完成：替换 {replaced_count}，放弃 {skipped_count}，没有新图片导入"
+            )
+            return
         collection_name = self._collection_name(collection_id) or "当前文件夹"
         self.statusBar().showMessage(f"导入图片到“{collection_name}”")
         self._set_import_controls_enabled(False)
@@ -3578,6 +3633,27 @@ class MainWindow(QMainWindow):
         if not folders:
             self.statusBar().showMessage("没有可导入的磁盘文件夹")
             return
+        folder_media_paths = self._folder_supported_media_paths(folders)
+        self._start_near_duplicate_resolution(
+            folder_media_paths,
+            include_same_path=False,
+            on_resolved=lambda _accepted_paths, skip_paths, _replaced_ids, _skipped_count: (
+                self._continue_folder_tree_import_after_duplicate_resolution(
+                    folders,
+                    skip_paths=skip_paths,
+                    parent_collection_id=parent_collection_id,
+                )
+            ),
+        )
+        return
+
+    def _continue_folder_tree_import_after_duplicate_resolution(
+        self,
+        folders: list[str],
+        *,
+        skip_paths: set[str],
+        parent_collection_id: int | None,
+    ) -> None:
         parent_name = (
             self._collection_name(parent_collection_id)
             if parent_collection_id is not None
@@ -3592,7 +3668,7 @@ class MainWindow(QMainWindow):
                 assigned_total = 0
                 imported_image_ids: list[int] = []
                 for folder in folders:
-                    result = self.scanner.scan_folder(folder)
+                    result = self.scanner.scan_folder(folder, skip_paths=skip_paths)
                     results.append(result)
                     imported_image_ids.extend(result.image_ids)
                     assigned_total += self._assign_import_result(
@@ -3632,6 +3708,49 @@ class MainWindow(QMainWindow):
             if parent_collection_id is not None
             else "根层级"
         ) or "文件夹"
+        folder_media_paths = self._folder_supported_media_paths(folder_paths)
+        self._start_near_duplicate_resolution(
+            file_paths,
+            include_same_path=True,
+            on_resolved=lambda accepted_files, file_skip_paths, file_replaced_ids, file_skipped_count: (
+                self._start_near_duplicate_resolution(
+                    folder_media_paths,
+                    include_same_path=False,
+                    on_resolved=lambda _accepted_folder_paths, folder_skip_paths, folder_replaced_ids, folder_skipped_count: (
+                        self._continue_local_paths_import_after_duplicate_resolution(
+                            target_name=target_name,
+                            file_paths=accepted_files,
+                            folder_paths=folder_paths,
+                            parent_collection_id=parent_collection_id,
+                            skip_paths=file_skip_paths | folder_skip_paths,
+                            replaced_count=len(file_replaced_ids) + len(folder_replaced_ids),
+                            skipped_count=file_skipped_count + folder_skipped_count,
+                        )
+                    ),
+                )
+            ),
+        )
+        return
+
+    def _continue_local_paths_import_after_duplicate_resolution(
+        self,
+        *,
+        target_name: str,
+        file_paths: list[str],
+        folder_paths: list[str],
+        parent_collection_id: int | None,
+        skip_paths: set[str],
+        replaced_count: int,
+        skipped_count: int,
+    ) -> None:
+        if not file_paths and not folder_paths:
+            self._refresh_after_scan_database_change(select_collection_id=parent_collection_id)
+            self.statusBar().showMessage(
+                "近似图片处理完成："
+                f"替换 {replaced_count}，"
+                f"放弃 {skipped_count}，没有新图片导入"
+            )
+            return
         self.statusBar().showMessage(f"导入拖入内容到“{target_name}”")
         self._set_import_controls_enabled(False)
 
@@ -3651,7 +3770,7 @@ class MainWindow(QMainWindow):
                         parent_collection_id,
                     )
                 for folder in folder_paths:
-                    folder_result = self.scanner.scan_folder(folder)
+                    folder_result = self.scanner.scan_folder(folder, skip_paths=skip_paths)
                     results.append(folder_result)
                     imported_image_ids.extend(folder_result.image_ids)
                     assigned_total += self._assign_import_result(
@@ -3694,6 +3813,328 @@ class MainWindow(QMainWindow):
             seen.add(normalized)
             folders.append(normalized)
         return folders
+
+    def _start_near_duplicate_resolution(
+        self,
+        file_paths: list[str],
+        *,
+        include_same_path: bool,
+        on_resolved: Callable[[list[str], set[str], list[int], int], None],
+    ) -> None:
+        normalized_paths = self._normalized_near_duplicate_import_paths(file_paths)
+        if not normalized_paths:
+            on_resolved([], set(), [], 0)
+            return
+        image_paths = [path for path in normalized_paths if is_supported_image(path)]
+        if not image_paths:
+            on_resolved(normalized_paths, set(), [], 0)
+            return
+
+        self._near_duplicate_job_counter += 1
+        job_id = self._near_duplicate_job_counter
+        self._near_duplicate_callbacks[job_id] = (on_resolved, normalized_paths)
+        self.statusBar().showMessage("正在后台检查近似图片...")
+
+        def run() -> None:
+            try:
+                candidate_map = self._near_duplicate_candidate_map(
+                    normalized_paths,
+                    include_same_path=include_same_path,
+                )
+                self.events.put((
+                    "near_duplicate_candidates_ready",
+                    (job_id, normalized_paths, candidate_map),
+                ))
+            except Exception as exc:
+                self.events.put(("near_duplicate_candidates_failed", (job_id, str(exc))))
+
+        self._start_background_task(
+            run,
+            name="near-duplicate-check",
+            on_rejected=lambda: self._finish_rejected_near_duplicate_job(job_id),
+        )
+
+    def _finish_rejected_near_duplicate_job(self, job_id: int) -> None:
+        entry = self._near_duplicate_callbacks.pop(job_id, None)
+        if entry is not None:
+            callback, _normalized_paths = entry
+            callback([], set(), [], 0)
+
+    @staticmethod
+    def _normalized_near_duplicate_import_paths(file_paths: list[str]) -> list[str]:
+        normalized_paths = [
+            os.path.abspath(os.path.expanduser(str(path)))
+            for path in file_paths
+            if os.path.isfile(os.path.abspath(os.path.expanduser(str(path))))
+            and is_supported_media(os.path.abspath(os.path.expanduser(str(path))))
+        ]
+        return sorted(set(normalized_paths))
+
+    def _near_duplicate_candidate_map(
+        self,
+        file_paths: list[str],
+        *,
+        include_same_path: bool,
+    ) -> dict[str, list[NearDuplicateCandidate]]:
+        image_paths = [path for path in file_paths if is_supported_image(path)]
+        candidates_by_path: dict[str, list[NearDuplicateCandidate]] = {}
+        if include_same_path and image_paths:
+            candidates_by_path.update(self._same_path_near_duplicate_candidates(image_paths))
+        for file_path in image_paths:
+            if file_path in candidates_by_path:
+                continue
+            candidates = self._find_import_near_duplicate_candidates(
+                file_path,
+                include_same_path=include_same_path,
+            )
+            if candidates:
+                candidates_by_path[file_path] = candidates
+        return candidates_by_path
+
+    def _handle_near_duplicate_candidates_ready(self, payload: object) -> None:
+        job_id, normalized_paths, candidate_map = payload
+        entry = self._near_duplicate_callbacks.pop(int(job_id), None)
+        if entry is None:
+            return
+        callback, _original_paths = entry
+        accepted, skipped, replaced, skipped_count = self._resolve_near_duplicate_decisions(
+            list(normalized_paths),
+            dict(candidate_map),
+        )
+        callback(accepted, skipped, replaced, skipped_count)
+
+    def _handle_near_duplicate_candidates_failed(self, payload: object) -> None:
+        job_id, error = payload
+        entry = self._near_duplicate_callbacks.pop(int(job_id), None)
+        QMessageBox.warning(
+            self,
+            "近似图片检查失败",
+            f"近似图片检查失败：{error}\n\n这次导入将继续进行。",
+        )
+        if entry is not None:
+            callback, original_paths = entry
+            callback(original_paths, set(), [], 0)
+
+    def _resolve_near_duplicate_import_paths(
+        self,
+        file_paths: list[str],
+        *,
+        include_same_path: bool = False,
+    ) -> tuple[list[str], set[str], list[int], int]:
+        normalized_paths = self._normalized_near_duplicate_import_paths(file_paths)
+        if not normalized_paths:
+            return [], set(), [], 0
+        candidate_map = self._near_duplicate_candidate_map(
+            normalized_paths,
+            include_same_path=include_same_path,
+        )
+        return self._resolve_near_duplicate_decisions(normalized_paths, candidate_map)
+
+    def _resolve_near_duplicate_decisions(
+        self,
+        normalized_paths: list[str],
+        candidate_map: dict[str, list[NearDuplicateCandidate]],
+    ) -> tuple[list[str], set[str], list[int], int]:
+        accepted_paths: list[str] = []
+        skipped_paths: set[str] = set()
+        replaced_image_ids: list[int] = []
+        skipped_count = 0
+        for file_path in normalized_paths:
+            if not is_supported_image(file_path):
+                accepted_paths.append(file_path)
+                continue
+            candidates = candidate_map.get(file_path, [])
+            if not candidates:
+                accepted_paths.append(file_path)
+                continue
+            decision, candidate = self._ask_near_duplicate_decision(file_path, candidates)
+            if decision == NearDuplicateDecision.IMPORT:
+                accepted_paths.append(file_path)
+            elif decision == NearDuplicateDecision.REPLACE and candidate is not None:
+                try:
+                    replaced_id = self._replace_existing_image_from_import(
+                        candidate.image,
+                        Path(file_path),
+                    )
+                except Exception as exc:
+                    QMessageBox.warning(
+                        self,
+                        "替换失败",
+                        f"替换已有图片失败：{exc}\n\n这张新图片将继续按新图片导入。",
+                    )
+                    accepted_paths.append(file_path)
+                    continue
+                replaced_image_ids.append(replaced_id)
+                skipped_paths.add(file_path)
+                skipped_count += 1
+            else:
+                skipped_paths.add(file_path)
+                skipped_count += 1
+        return accepted_paths, skipped_paths, replaced_image_ids, skipped_count
+
+    def _find_import_near_duplicate_candidates(
+        self,
+        file_path: str,
+        *,
+        include_same_path: bool,
+    ) -> list[NearDuplicateCandidate]:
+        width, height, file_size = self._quick_image_file_metadata(file_path)
+        candidate_images = self.store.near_duplicate_metadata_candidates(
+            width=width,
+            height=height,
+            file_size=file_size,
+            limit=400,
+        )
+        if not candidate_images:
+            return []
+        exact_metadata_images = [
+            image
+            for image in candidate_images
+            if image.width == width
+            and image.height == height
+            and image.file_size == file_size
+        ]
+        candidates = self._near_duplicate_candidates_from_images(
+            file_path,
+            exact_metadata_images,
+            include_same_path=include_same_path,
+        )
+        if candidates:
+            return candidates
+        exact_image_ids = {image.id for image in exact_metadata_images}
+        remaining_images = [
+            image
+            for image in candidate_images
+            if image.id not in exact_image_ids
+        ]
+        return self._near_duplicate_candidates_from_images(
+            file_path,
+            remaining_images,
+            include_same_path=include_same_path,
+        )
+
+    @staticmethod
+    def _near_duplicate_candidates_from_images(
+        file_path: str,
+        images: list[ImageItem],
+        *,
+        include_same_path: bool,
+    ) -> list[NearDuplicateCandidate]:
+        if not images:
+            return []
+        hash_records = build_image_dhash_records(images)
+        return find_near_duplicate_candidates(
+            file_path,
+            hash_records=hash_records,
+            near_distance=8,
+            limit=5,
+            include_same_path=include_same_path,
+        )
+
+    @staticmethod
+    def _quick_image_file_metadata(file_path: str) -> tuple[int | None, int | None, int]:
+        try:
+            file_size = Path(file_path).stat().st_size
+        except OSError:
+            file_size = 0
+        reader = QImageReader(file_path)
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if not size.isValid():
+            return None, None, file_size
+        return int(size.width()), int(size.height()), int(file_size)
+
+    def _same_path_near_duplicate_candidates(
+        self,
+        file_paths: list[str],
+    ) -> dict[str, list[NearDuplicateCandidate]]:
+        candidates_by_path: dict[str, list[NearDuplicateCandidate]] = {}
+        for file_path in file_paths:
+            image = self.store.get_image_by_path(file_path)
+            if image is None:
+                continue
+            candidates_by_path[file_path] = [
+                NearDuplicateCandidate(
+                    image=image,
+                    distance=0,
+                    similarity=1.0,
+                    hash_source=image.thumbnail_path or image.file_path,
+                )
+            ]
+        return candidates_by_path
+
+    def _build_near_duplicate_hash_records(self) -> list[ImageDHashRecord]:
+        image_count = max(self.store.count_images(), 1)
+        if (
+            self._near_duplicate_hash_records_cache is not None
+            and self._near_duplicate_hash_records_cache_count == image_count
+        ):
+            return self._near_duplicate_hash_records_cache
+        images = self.store.list_images(limit=image_count, include_missing=False)
+        records = build_image_dhash_records(images)
+        self._near_duplicate_hash_records_cache = records
+        self._near_duplicate_hash_records_cache_count = image_count
+        return records
+
+    def _invalidate_near_duplicate_hash_cache(self) -> None:
+        self._near_duplicate_hash_records_cache = None
+        self._near_duplicate_hash_records_cache_count = None
+
+    def _ask_near_duplicate_decision(
+        self,
+        file_path: str,
+        candidates: list[NearDuplicateCandidate],
+    ) -> tuple[str, NearDuplicateCandidate | None]:
+        dialog = NearDuplicateDialog(file_path, candidates, self)
+        dialog.exec()
+        return dialog.decision, dialog.selected_candidate()
+
+    def _replace_existing_image_from_import(
+        self,
+        existing_image: ImageItem,
+        source_path: Path,
+    ) -> int:
+        target_path = Path(existing_image.file_path)
+        if not target_path.parent.is_dir():
+            raise FileNotFoundError(f"已有图片所在文件夹不存在：{target_path.parent}")
+        if source_path.resolve() != target_path.resolve():
+            temp_path = target_path.with_name(
+                f".{target_path.name}.eidory-replace-{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                shutil.copy2(source_path, temp_path)
+                os.replace(temp_path, target_path)
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
+        result = self.scanner.import_files([str(target_path)])
+        if result.image_ids:
+            self._invalidate_near_duplicate_hash_cache()
+            self.vector_index.invalidate()
+            self._refresh_embedding_stats()
+            self._refresh_ai_vision_stats()
+            return int(result.image_ids[0])
+        return existing_image.id
+
+    @staticmethod
+    def _folder_supported_media_paths(folder_paths: list[str]) -> list[str]:
+        paths: list[str] = []
+        for folder in folder_paths:
+            if os.path.isdir(folder):
+                paths.extend(ImageScanner._iter_image_files(folder))
+        return sorted(set(paths))
+
+    @staticmethod
+    def _remove_materialized_import_files(file_paths: list[str], skip_paths: set[str]) -> None:
+        for file_path in skip_paths:
+            if file_path not in file_paths:
+                continue
+            try:
+                Path(file_path).unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
 
     def _assign_import_result(
         self,
@@ -6965,7 +7406,7 @@ class MainWindow(QMainWindow):
         dialog.indexRemoved.connect(self._handle_preview_index_removed)
         dialog.exec()
         current = dialog.current_image()
-        if current is not None:
+        if current is not None and (self.selected_image is None or self.selected_image.id != current.id):
             self._sync_preview_selection(current)
 
     def _sync_preview_selection(self, image: ImageItem) -> None:
@@ -7474,7 +7915,7 @@ class MainWindow(QMainWindow):
             self.file_name_input,
             self.favorite_checkbox,
             self.note_input,
-            self.save_detail_button,
+            self.rename_file_button,
             self.delete_source_button,
             self.play_pause_button,
             self.open_original_button,
@@ -7484,6 +7925,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(enabled)
 
     def _show_multi_selection_details(self, images: list[ImageItem]) -> None:
+        self._save_pending_note()
         count = len(images)
         total_size = sum(image.file_size for image in images)
         ready_count = sum(1 for image in images if image.embedding_status == "ready")
@@ -7495,6 +7937,7 @@ class MainWindow(QMainWindow):
         self.preview_stack.setCurrentWidget(self.preview_label)
         self.preview_label.setPixmap(QPixmap())
         self.preview_label.setText(f"已选择 {count} 张")
+        self._suppress_detail_auto_save = True
         self.file_name_input.setText(f"已选择 {count} 张")
         self._set_path_text("-")
         self.image_collections_label.setText("-")
@@ -7506,6 +7949,7 @@ class MainWindow(QMainWindow):
         self.favorite_checkbox.setChecked(favorite_count == count)
         self.tags_display.setPlainText("多选标签请到“标签”页编辑。")
         self.note_input.clear()
+        self._suppress_detail_auto_save = False
         self._refresh_feedback_buttons(None)
         self._set_detail_controls_enabled(False)
         self.delete_source_button.setEnabled(True)
@@ -7520,6 +7964,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已选择 {count} 张")
 
     def _show_image_details(self, image: ImageItem | None) -> None:
+        self._save_pending_note()
         if image is None:
             self._show_collection_details(self._selected_collection_id())
             return
@@ -7529,6 +7974,7 @@ class MainWindow(QMainWindow):
         self._set_creative_selection_controls_visible(False)
         self.image_detail_widget.show()
         self.collection_detail_widget.hide()
+        self._suppress_detail_auto_save = True
         self.file_name_input.setText(image.file_name)
         self._set_path_text(image.file_path)
         collection_paths = self.store.collection_paths_for_image(image.id)
@@ -7548,6 +7994,7 @@ class MainWindow(QMainWindow):
         tags = self.store.get_image_tags(image.id)
         self.tags_display.setPlainText("\n".join(tags) if tags else "无标签")
         self.note_input.setPlainText(image.note or "")
+        self._suppress_detail_auto_save = False
         self._refresh_feedback_buttons(image)
         if self.current_result_mode == "creative_node":
             self._refresh_creative_selection_panel([image])
@@ -7580,9 +8027,24 @@ class MainWindow(QMainWindow):
         max_height = max(1, target_size.height() * 2)
         return _load_scaled_qt_pixmap(image_path, max_width, max_height)
 
+    def _ensure_detail_video_preview(self) -> tuple[QVideoWidget, QMediaPlayer]:
+        if self.video_widget is None:
+            self.video_widget = QVideoWidget()
+            self.video_widget.setMinimumHeight(180)
+            self.video_widget.setStyleSheet("background:#2d3138;")
+            self.preview_stack.addWidget(self.video_widget)
+        if self.video_player is None:
+            self.video_player = QMediaPlayer(self)
+            self.video_audio_output = QAudioOutput(self)
+            self.video_player.setAudioOutput(self.video_audio_output)
+            self.video_player.playbackStateChanged.connect(self._update_video_play_button)
+        self.video_player.setVideoOutput(self.video_widget)
+        return self.video_widget, self.video_player
+
     def _show_collection_details(self, collection_id: int | None) -> None:
         if not hasattr(self, "collection_detail_widget"):
             return
+        self._save_pending_note()
         self._stop_video_preview()
         self.selected_image = None
         self.image_detail_widget.hide()
@@ -7647,19 +8109,20 @@ class MainWindow(QMainWindow):
         self.open_collection_import_dir_button.setEnabled(True)
 
     def _show_video_details(self, image: ImageItem) -> None:
+        video_widget, video_player = self._ensure_detail_video_preview()
         self.preview_label.setPixmap(QPixmap())
         self.preview_label.setText("")
-        self.preview_stack.setCurrentWidget(self.video_widget)
+        self.preview_stack.setCurrentWidget(video_widget)
         self.play_pause_button.setEnabled(not image.is_missing and Path(image.file_path).exists())
         self.play_pause_button.setText("播放")
         self.size_label.setText(self._format_media_dimensions(image))
         self.embedding_label.setText("无需语义索引")
-        self.video_player.stop()
+        video_player.stop()
         if image.is_missing or not Path(image.file_path).exists():
             self.preview_stack.setCurrentWidget(self.preview_label)
             self.preview_label.setText("视频文件不存在")
             return
-        self.video_player.setSource(QUrl.fromLocalFile(image.file_path))
+        video_player.setSource(QUrl.fromLocalFile(image.file_path))
 
     def _format_ai_vision_details(self, image_id: int) -> str:
         tags = self.store.ai_vision_tags_for_image(image_id)
@@ -7856,12 +8319,13 @@ class MainWindow(QMainWindow):
         if image.is_missing or not Path(image.file_path).exists():
             QMessageBox.warning(self, "Eidory", "视频文件不存在，无法播放。")
             return
-        if self.video_player.source().isEmpty():
-            self.video_player.setSource(QUrl.fromLocalFile(image.file_path))
-        if self.video_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.video_player.pause()
+        _video_widget, video_player = self._ensure_detail_video_preview()
+        if video_player.source().isEmpty():
+            video_player.setSource(QUrl.fromLocalFile(image.file_path))
+        if video_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            video_player.pause()
         else:
-            self.video_player.play()
+            video_player.play()
 
     def _update_video_play_button(self, state) -> None:
         self.play_pause_button.setText(
@@ -7888,8 +8352,9 @@ class MainWindow(QMainWindow):
         return f"{minutes:02d}:{seconds:02d}"
 
     def _stop_video_preview(self) -> None:
-        self.video_player.stop()
-        self.video_player.setSource(QUrl())
+        if self.video_player is not None:
+            self.video_player.stop()
+            self.video_player.setSource(QUrl())
         self.play_pause_button.setText("播放")
 
     def resizeEvent(self, event) -> None:
@@ -7906,20 +8371,53 @@ class MainWindow(QMainWindow):
                 return
             self._show_image_details(self.selected_image)
 
-    def _save_current_details(self) -> None:
+    def _rename_current_file(self) -> None:
         if self.selected_image is None:
             return
+        self._save_pending_note()
         image = self._rename_selected_image_if_needed(self.selected_image)
         if image is None:
             return
-        image_id = image.id
-        self.store.update_note(image_id, self.note_input.toPlainText())
-        self.store.update_favorite(image_id, self.favorite_checkbox.isChecked())
         self._refresh_current_results_for_filters()
-        refreshed = self.store.get_image(image_id)
+        refreshed = self.store.get_image(image.id)
         self.selected_image = refreshed
         self._show_image_details(refreshed)
-        self.statusBar().showMessage("详情已保存")
+
+    def _queue_note_auto_save(self) -> None:
+        if self._suppress_detail_auto_save or self.selected_image is None:
+            return
+        if not self.note_input.isEnabled():
+            return
+        self._pending_note_image_id = self.selected_image.id
+        self._pending_note_text = self.note_input.toPlainText()
+        self.note_auto_save_timer.start()
+
+    def _save_pending_note(self) -> None:
+        image_id = self._pending_note_image_id
+        note_text = self._pending_note_text
+        if image_id is None or note_text is None:
+            return
+        self.note_auto_save_timer.stop()
+        self._pending_note_image_id = None
+        self._pending_note_text = None
+        self.store.update_note(image_id, note_text)
+        if self.selected_image is not None and self.selected_image.id == image_id:
+            refreshed = self.store.get_image(image_id)
+            if refreshed is not None:
+                self.selected_image = refreshed
+        self.statusBar().showMessage("备注已自动保存")
+
+    def _save_current_favorite(self, checked: bool) -> None:
+        if self._suppress_detail_auto_save or self.selected_image is None:
+            return
+        image_id = self.selected_image.id
+        self.store.update_favorite(image_id, checked)
+        self._refresh_virtual_collection_counts()
+        self._refresh_current_results_for_filters()
+        refreshed = self.store.get_image(image_id)
+        if refreshed is not None:
+            self.selected_image = refreshed
+        self.statusBar().showMessage("收藏已自动保存")
 
     def _rename_selected_image_if_needed(self, image: ImageItem) -> ImageItem | None:
         desired = self.file_name_input.text().strip()
@@ -8204,7 +8702,70 @@ class MainWindow(QMainWindow):
                 saved_paths = self._materialize_drop_payload(prepared_payload, target_dir)
                 if not saved_paths:
                     raise FileNotFoundError("没有可导入的受支持图片或视频")
-                result = self.scanner.import_files([str(path) for path in saved_paths])
+                self.events.put((
+                    "drop_payload_materialized",
+                    (
+                        collection_id,
+                        collection_name,
+                        [str(path) for path in saved_paths],
+                    ),
+                ))
+            except Exception as exc:
+                self.events.put(("error", f"拖入保存失败：{exc}"))
+
+        self._start_background_task(
+            run,
+            on_rejected=lambda: self._set_import_controls_enabled(True),
+        )
+
+    def _handle_drop_payload_materialized(
+        self,
+        *,
+        collection_id: int,
+        collection_name: str,
+        saved_paths: list[str],
+    ) -> None:
+        self._start_near_duplicate_resolution(
+            saved_paths,
+            include_same_path=False,
+            on_resolved=lambda accepted_paths, skip_paths, replaced_ids, skipped_count: (
+                self._continue_drop_payload_materialized_after_duplicate_resolution(
+                    collection_id=collection_id,
+                    collection_name=collection_name,
+                    saved_paths=saved_paths,
+                    accepted_paths=accepted_paths,
+                    skip_paths=skip_paths,
+                    replaced_count=len(replaced_ids),
+                    skipped_count=skipped_count,
+                )
+            ),
+        )
+        return
+
+    def _continue_drop_payload_materialized_after_duplicate_resolution(
+        self,
+        *,
+        collection_id: int,
+        collection_name: str,
+        saved_paths: list[str],
+        accepted_paths: list[str],
+        skip_paths: set[str],
+        replaced_count: int,
+        skipped_count: int,
+    ) -> None:
+        self._remove_materialized_import_files(saved_paths, skip_paths)
+        if not accepted_paths:
+            self._set_import_controls_enabled(True)
+            self._refresh_after_scan_database_change(select_collection_id=collection_id)
+            self.statusBar().showMessage(
+                f"近似图片处理完成：替换 {replaced_count}，放弃 {skipped_count}，没有新图片导入"
+            )
+            return
+        self.statusBar().showMessage(f"导入拖入图片到“{collection_name}”")
+
+        def run() -> None:
+            try:
+                result = self.scanner.import_files(accepted_paths)
                 assigned = self.store.assign_images_to_collection(
                     list(result.image_ids),
                     collection_id,
@@ -8222,7 +8783,7 @@ class MainWindow(QMainWindow):
                     ),
                 ))
             except Exception as exc:
-                self.events.put(("error", f"拖入保存失败：{exc}"))
+                self.events.put(("error", f"拖入导入失败：{exc}"))
 
         self._start_background_task(
             run,
@@ -9127,6 +9688,7 @@ class MainWindow(QMainWindow):
         image_ids = [image.id for image in clean_images]
         undo_snapshot = snapshot or self.store.snapshot_images_for_restore(image_ids)
         self.store.remove_images_from_library(image_ids)
+        self._invalidate_near_duplicate_hash_cache()
         self.vector_index.invalidate()
         self.selected_image = None
         self._register_removal_undo(
@@ -9300,6 +9862,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已撤销：恢复 {restored} 个项目")
 
     def _refresh_after_library_removal(self) -> None:
+        self._invalidate_near_duplicate_hash_cache()
         self._refresh_folders()
         self._refresh_collections()
         self._refresh_tags()
@@ -9337,6 +9900,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 failed += 1
                 self.store.update_thumbnail(image.id, None, "failed")
+        self._invalidate_near_duplicate_hash_cache()
         self._refresh_current_results_for_filters()
         self._record_operation_history(f"重建缩略图：成功 {rebuilt}，失败 {failed}")
         self.statusBar().showMessage(
@@ -9477,6 +10041,7 @@ class MainWindow(QMainWindow):
         select_collection_id: int | None = None,
         preserve_current_view: bool = False,
     ) -> None:
+        self._invalidate_near_duplicate_hash_cache()
         self._refresh_folders()
         self._refresh_collections(select_collection_id=select_collection_id)
         self.store.seed_default_ai_vision_collection_rules()
@@ -9893,6 +10458,17 @@ class MainWindow(QMainWindow):
                     assigned=assigned,
                     imported_image_ids=list(imported_image_ids),
                 )
+            elif kind == "drop_payload_materialized":
+                collection_id, collection_name, saved_paths = payload
+                self._handle_drop_payload_materialized(
+                    collection_id=collection_id,
+                    collection_name=collection_name,
+                    saved_paths=list(saved_paths),
+                )
+            elif kind == "near_duplicate_candidates_ready":
+                self._handle_near_duplicate_candidates_ready(payload)
+            elif kind == "near_duplicate_candidates_failed":
+                self._handle_near_duplicate_candidates_failed(payload)
             elif kind == "search_done":
                 self.search_button.setEnabled(True)
                 revision, result = payload
@@ -11394,11 +11970,16 @@ class MainWindow(QMainWindow):
             button.setVisible(visible)
         self.board_pin_button.setChecked(self._board_window_pinned)
         if hasattr(self, "board_focus_shortcut"):
-            self.board_focus_shortcut.setEnabled(visible or self._board_focus_mode)
+            self.board_focus_shortcut.setEnabled(True)
         self.shuffle_results_button.setVisible(not visible)
         self.thumbnail_size_label.setVisible(not visible)
         self.thumbnail_size_slider.setVisible(not visible)
         if self._board_focus_mode:
+            if visible and not self._board_focus_widget_visibility:
+                self._board_focus_widget_visibility = {
+                    widget: widget.isVisible()
+                    for widget in self._board_focus_chrome_widgets()
+                }
             self._hide_board_focus_chrome_widgets()
 
     def _save_current_creative_board_layout(self) -> None:
@@ -11502,26 +12083,29 @@ class MainWindow(QMainWindow):
 
     def _set_board_focus_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
-        if enabled and self.center_result_stack.currentWidget() is not self.project_board_view:
-            self.statusBar().showMessage("先进入看板，再隐藏界面")
-            return
         if self._board_focus_mode == enabled:
             return
+        is_board_view = self.center_result_stack.currentWidget() is self.project_board_view
         if enabled:
             self._board_focus_previous_splitter_sizes = self.root_splitter.sizes()
-            self._board_focus_widget_visibility = {
-                widget: widget.isVisible()
-                for widget in self._board_focus_chrome_widgets()
-            }
+            self._board_focus_widget_visibility = {}
+            if is_board_view:
+                self._board_focus_widget_visibility = {
+                    widget: widget.isVisible()
+                    for widget in self._board_focus_chrome_widgets()
+                }
             self._board_focus_mode = True
             if hasattr(self, "board_focus_shortcut"):
                 self.board_focus_shortcut.setEnabled(True)
-            self._hide_board_focus_chrome_widgets()
+            if is_board_view:
+                self._hide_board_focus_chrome_widgets()
             total = max(1, sum(self.root_splitter.sizes()))
             self.root_splitter.setSizes([0, total, 0])
-            self.project_board_view.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            focus_widget = self.project_board_view if is_board_view else self.grid_view
+            focus_widget.setFocus(Qt.FocusReason.ShortcutFocusReason)
             QTimer.singleShot(0, self._reapply_board_window_pin)
-            QTimer.singleShot(0, self.project_board_view.fit_all_images)
+            if is_board_view:
+                QTimer.singleShot(0, self.project_board_view.fit_all_images)
             return
         self._board_focus_mode = False
         for widget, was_visible in list(self._board_focus_widget_visibility.items()):
@@ -11532,12 +12116,13 @@ class MainWindow(QMainWindow):
             self._board_focus_previous_splitter_sizes = None
             QTimer.singleShot(0, self._enforce_fixed_sidebar_widths)
         if hasattr(self, "board_focus_shortcut"):
-            self.board_focus_shortcut.setEnabled(
-                self.center_result_stack.currentWidget() is self.project_board_view
-            )
-        self.project_board_view.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            self.board_focus_shortcut.setEnabled(True)
+        if self.center_result_stack.currentWidget() is self.project_board_view:
+            self.project_board_view.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            QTimer.singleShot(0, self.project_board_view.fit_all_images)
+        else:
+            self.grid_view.setFocus(Qt.FocusReason.ShortcutFocusReason)
         QTimer.singleShot(0, self._reapply_board_window_pin)
-        QTimer.singleShot(0, self.project_board_view.fit_all_images)
 
     def _board_focus_chrome_widgets(self) -> list[QWidget]:
         widgets: list[QWidget] = [
@@ -11559,16 +12144,6 @@ class MainWindow(QMainWindow):
             self.result_state_label,
             self.search_diagnostics_label,
             self.load_more_button,
-            self.show_gallery_button,
-            self.show_project_board_button,
-            self.save_project_board_layout_button,
-            self.board_pin_button,
-            self.board_hide_selected_button,
-            self.board_fit_all_button,
-            self.board_flip_button,
-            self.board_grayscale_button,
-            self.board_import_button,
-            self.board_show_all_button,
             self.shuffle_results_button,
             self.thumbnail_size_label,
             self.thumbnail_size_slider,

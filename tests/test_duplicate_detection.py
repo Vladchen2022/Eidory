@@ -7,7 +7,13 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from eidory.core.duplicate_detection import find_duplicate_groups, hamming_distance, image_dhash
+from eidory.core.duplicate_detection import (
+    build_image_dhash_records,
+    find_duplicate_groups,
+    find_near_duplicate_candidates,
+    hamming_distance,
+    image_dhash,
+)
 from eidory.models import ImageItem
 
 
@@ -63,6 +69,65 @@ class DuplicateDetectionTest(unittest.TestCase):
             near = [group for group in groups if group.kind == "near"]
             self.assertEqual(len(near), 1)
             self.assertEqual({member.image.id for member in near[0].members}, {1, 2})
+
+    def test_find_near_duplicate_candidates_uses_cached_library_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library = root / "library.jpg"
+            imported = root / "imported.jpg"
+            other = root / "other.jpg"
+            image = Image.new("RGB", (200, 120), color="white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((30, 25, 170, 95), fill="black")
+            draw.line((30, 95, 170, 25), fill="blue", width=5)
+            image.save(library)
+            image.resize((100, 60)).save(imported)
+            Image.new("RGB", (200, 120), color="orange").save(other)
+
+            records = build_image_dhash_records(
+                [
+                    self._image(1, library, width=200, height=120),
+                    self._image(2, other, width=200, height=120),
+                ]
+            )
+            candidates = find_near_duplicate_candidates(
+                imported,
+                hash_records=records,
+                near_distance=8,
+            )
+
+            self.assertEqual([candidate.image.id for candidate in candidates], [1])
+            self.assertLessEqual(candidates[0].distance, 8)
+
+    def test_find_near_duplicate_candidates_can_include_same_path_for_import_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            existing = root / "existing.jpg"
+            image = Image.new("RGB", (160, 90), color="white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((20, 20, 130, 70), fill="black")
+            image.save(existing)
+
+            records = build_image_dhash_records([
+                self._image(1, existing, width=160, height=90)
+            ])
+
+            default_candidates = find_near_duplicate_candidates(
+                existing,
+                hash_records=records,
+                near_distance=8,
+            )
+            import_candidates = find_near_duplicate_candidates(
+                existing,
+                hash_records=records,
+                near_distance=8,
+                include_same_path=True,
+            )
+
+            self.assertEqual(default_candidates, [])
+            self.assertEqual([candidate.image.id for candidate in import_candidates], [1])
+            self.assertEqual(import_candidates[0].distance, 0)
+            self.assertEqual(import_candidates[0].similarity, 1.0)
 
     @staticmethod
     def _image(

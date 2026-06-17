@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAccessible, QColor, QKeySequence, QPixmap
 from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem, QMessageBox, QPushButton, QTextEdit, QTreeWidget, QTreeWidgetItem
+from PIL import Image
 
 from eidory.config import AppPaths
 from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
@@ -371,6 +375,78 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(right, 0)
             window.close()
 
+    def test_tab_focus_mode_collapses_sidebars_in_gallery_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.resize(1500, 900)
+            window.show()
+            self.app.processEvents()
+            window._show_gallery_view()
+            window.root_splitter.setSizes([LEFT_SIDEBAR_WIDTH, 900, RIGHT_SIDEBAR_WIDTH])
+            self.app.processEvents()
+
+            self.assertTrue(window.board_focus_shortcut.isEnabled())
+            self.assertIs(window.center_result_stack.currentWidget(), window.grid_view)
+
+            window._toggle_board_focus_mode()
+            self.app.processEvents()
+            left, _center, right = window.root_splitter.sizes()
+            self.assertEqual(left, 0)
+            self.assertEqual(right, 0)
+            self.assertIs(window.center_result_stack.currentWidget(), window.grid_view)
+            self.assertTrue(window.search_input.isVisible())
+
+            window._toggle_board_focus_mode()
+            self.app.processEvents()
+            left, _center, right = window.root_splitter.sizes()
+            self.assertEqual(left, LEFT_SIDEBAR_WIDTH)
+            self.assertEqual(right, RIGHT_SIDEBAR_WIDTH)
+            self.assertIs(window.center_result_stack.currentWidget(), window.grid_view)
+            window.close()
+
+    def test_tab_focus_mode_keeps_board_toolbar_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.resize(1500, 900)
+            window.show()
+            self.app.processEvents()
+            window.center_result_stack.setCurrentWidget(window.project_board_view)
+            window._set_board_toolbar_visible(True)
+            window.root_splitter.setSizes([LEFT_SIDEBAR_WIDTH, 900, RIGHT_SIDEBAR_WIDTH])
+            self.app.processEvents()
+
+            window._toggle_board_focus_mode()
+            self.app.processEvents()
+
+            left, _center, right = window.root_splitter.sizes()
+            self.assertEqual(left, 0)
+            self.assertEqual(right, 0)
+            self.assertFalse(window.search_input.isVisible())
+            self.assertTrue(window.show_gallery_button.isVisible())
+            self.assertTrue(window.show_project_board_button.isVisible())
+            self.assertTrue(window.board_hide_selected_button.isVisible())
+            self.assertTrue(window.board_fit_all_button.isVisible())
+            self.assertTrue(window.board_grayscale_button.isVisible())
+            window.close()
+
     def test_search_operation_defaults_to_replace_until_results_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -606,6 +682,169 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertIn("结果 -", status)
             window.close()
 
+    def test_near_duplicate_import_prompts_for_same_existing_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library = Path(tmp) / "library"
+            library.mkdir()
+            image_path = library / "existing.jpg"
+            Image.new("RGB", (120, 80), color="white").save(image_path)
+
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library))
+            stat = image_path.stat()
+            store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=stat.st_size,
+                width=120,
+                height=80,
+                created_time_ns=None,
+                modified_time_ns=stat.st_mtime_ns,
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            with (
+                patch.object(window, "_ask_near_duplicate_decision", return_value=("skip", None)) as ask,
+                patch.object(
+                    window,
+                    "_build_near_duplicate_hash_records",
+                    side_effect=AssertionError("same-path import should not scan library hashes"),
+                ),
+            ):
+                accepted, skipped, replaced, skipped_count = window._resolve_near_duplicate_import_paths(
+                    [str(image_path)],
+                    include_same_path=True,
+                )
+
+            self.assertEqual(accepted, [])
+            self.assertEqual(skipped, {str(image_path)})
+            self.assertEqual(replaced, [])
+            self.assertEqual(skipped_count, 1)
+            ask.assert_called_once()
+            self.assertEqual(ask.call_args.args[1][0].image.file_path, str(image_path))
+            window.close()
+
+    def test_near_duplicate_import_uses_metadata_candidates_for_different_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library = Path(tmp) / "library"
+            incoming = Path(tmp) / "incoming"
+            library.mkdir()
+            incoming.mkdir()
+            image_path = library / "existing.jpg"
+            import_path = incoming / "existing-copy.jpg"
+            Image.new("RGB", (160, 90), color="white").save(image_path)
+            shutil.copy2(image_path, import_path)
+
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library))
+            stat = image_path.stat()
+            store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=stat.st_size,
+                width=160,
+                height=90,
+                created_time_ns=None,
+                modified_time_ns=stat.st_mtime_ns,
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            with (
+                patch.object(window, "_ask_near_duplicate_decision", return_value=("skip", None)) as ask,
+                patch.object(
+                    window,
+                    "_build_near_duplicate_hash_records",
+                    side_effect=AssertionError("near import should not build full-library hashes"),
+                ),
+            ):
+                accepted, skipped, replaced, skipped_count = window._resolve_near_duplicate_import_paths(
+                    [str(import_path)],
+                    include_same_path=True,
+                )
+
+            self.assertEqual(accepted, [])
+            self.assertEqual(skipped, {str(import_path)})
+            self.assertEqual(replaced, [])
+            self.assertEqual(skipped_count, 1)
+            ask.assert_called_once()
+            self.assertEqual(ask.call_args.args[1][0].image.file_path, str(image_path))
+            window.close()
+
+    def test_file_import_near_duplicate_check_does_not_block_ui_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library = Path(tmp) / "library"
+            library.mkdir()
+            image_path = library / "incoming.jpg"
+            Image.new("RGB", (120, 80), color="white").save(image_path)
+
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library))
+            collection_id = store.create_collection("测试")
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_candidate_map(_paths, *, include_same_path):
+                started.set()
+                release.wait(timeout=1.0)
+                return {}
+
+            with (
+                patch.object(window, "_near_duplicate_candidate_map", side_effect=slow_candidate_map),
+                patch.object(
+                    window,
+                    "_resolve_near_duplicate_import_paths",
+                    side_effect=AssertionError("file import must not do synchronous duplicate checking"),
+                ),
+                patch.object(window, "_continue_file_import_after_duplicate_resolution") as continue_import,
+            ):
+                started_at = time.monotonic()
+                window._start_file_import([str(image_path)], collection_id)
+                elapsed = time.monotonic() - started_at
+                self.assertLess(elapsed, 0.2)
+                self.assertTrue(started.wait(timeout=1.0))
+                self.assertFalse(continue_import.called)
+                release.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not continue_import.called:
+                    self.app.processEvents()
+                    time.sleep(0.01)
+
+            self.assertTrue(continue_import.called)
+            self.assertEqual(continue_import.call_args.args[0], [str(image_path)])
+            window.close()
+
     def test_main_window_has_minimize_shortcut(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -770,6 +1009,139 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             self.assertEqual(window.path_label.toPlainText(), long_path)
             self.assertGreater(window.path_label.height(), 34)
+            window.close()
+
+    def test_detail_note_and_favorite_auto_save_without_renaming_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library = Path(tmp) / "library"
+            library.mkdir()
+            image_path = library / "original.jpg"
+            image_path.write_bytes(b"fake image bytes")
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=100,
+                height=80,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            image = store.get_image(image_id)
+            self.assertIsNotNone(image)
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window.selected_image = image
+            window._show_image_details(image)
+            window.file_name_input.setText("not-renamed.jpg")
+            window.note_input.setPlainText("new note")
+            window._save_pending_note()
+            window.favorite_checkbox.setChecked(True)
+            self.app.processEvents()
+
+            updated = store.get_image(image_id)
+            self.assertIsNotNone(updated)
+            self.assertEqual(updated.note, "new note")
+            self.assertTrue(updated.is_favorite)
+            self.assertEqual(updated.file_name, "original.jpg")
+            self.assertTrue(image_path.exists())
+            self.assertFalse((library / "not-renamed.jpg").exists())
+            window.close()
+
+    def test_detail_rename_requires_explicit_rename_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library = Path(tmp) / "library"
+            library.mkdir()
+            image_path = library / "original.jpg"
+            image_path.write_bytes(b"fake image bytes")
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=100,
+                height=80,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            image = store.get_image(image_id)
+            self.assertIsNotNone(image)
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window.selected_image = image
+            window._show_image_details(image)
+            window.file_name_input.setText("renamed.jpg")
+            window.rename_file_button.click()
+            self.app.processEvents()
+
+            renamed_path = library / "renamed.jpg"
+            updated = store.get_image(image_id)
+            self.assertIsNotNone(updated)
+            self.assertFalse(image_path.exists())
+            self.assertTrue(renamed_path.exists())
+            self.assertEqual(updated.file_name, "renamed.jpg")
+            self.assertEqual(updated.file_path, str(renamed_path))
+            window.close()
+
+    def test_image_detail_does_not_initialize_video_preview_stack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library = Path(tmp) / "library"
+            library.mkdir()
+            image_path = library / "image.jpg"
+            image_path.write_bytes(b"fake image bytes")
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=100,
+                height=80,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            image = store.get_image(image_id)
+            self.assertIsNotNone(image)
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._show_image_details(image)
+            self.app.processEvents()
+
+            self.assertIsNone(window.video_player)
+            self.assertIsNone(window.video_widget)
+            self.assertIs(window.preview_stack.currentWidget(), window.preview_label)
             window.close()
 
     def test_sort_preference_restores_and_persists(self) -> None:

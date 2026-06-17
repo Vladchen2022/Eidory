@@ -44,11 +44,13 @@ class ImageScanner:
         folder_path: str,
         *,
         on_progress: ScanProgressCallback | None = None,
+        skip_paths: set[str] | None = None,
     ) -> ScanResult:
         return self._scan_folder(
             folder_path,
             on_progress=on_progress,
             mark_missing=True,
+            skip_paths=skip_paths,
         )
 
     def scan_folder_new_only(
@@ -56,11 +58,13 @@ class ImageScanner:
         folder_path: str,
         *,
         on_progress: ScanProgressCallback | None = None,
+        skip_paths: set[str] | None = None,
     ) -> ScanResult:
         return self._scan_folder(
             folder_path,
             on_progress=on_progress,
             mark_missing=False,
+            skip_paths=skip_paths,
         )
 
     def _scan_folder(
@@ -69,6 +73,7 @@ class ImageScanner:
         *,
         on_progress: ScanProgressCallback | None,
         mark_missing: bool,
+        skip_paths: set[str] | None,
     ) -> ScanResult:
         root = os.path.abspath(os.path.expanduser(folder_path))
         if not os.path.isdir(root):
@@ -96,8 +101,15 @@ class ImageScanner:
         unchanged_files = 0
         thumbnail_failures = 0
         image_ids: list[int] = []
+        normalized_skip_paths = {
+            os.path.abspath(os.path.expanduser(path))
+            for path in (skip_paths or set())
+        }
 
         for file_path in self._iter_image_files(root):
+            if file_path in normalized_skip_paths:
+                seen_paths.append(file_path)
+                continue
             scanned += 1
             seen_paths.append(file_path)
             stat = os.stat(file_path, follow_symlinks=False)

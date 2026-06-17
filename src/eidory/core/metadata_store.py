@@ -1864,6 +1864,69 @@ class MetadataStore:
             row = conn.execute("SELECT COUNT(*) AS c FROM images").fetchone()
             return int(row["c"])
 
+    def near_duplicate_metadata_candidates(
+        self,
+        *,
+        width: int | None,
+        height: int | None,
+        file_size: int,
+        limit: int = 400,
+    ) -> list[ImageItem]:
+        clauses = ["is_missing = 0"]
+        params: list[object] = []
+        image_placeholders = ",".join("?" for _ in SUPPORTED_IMAGE_EXTENSIONS)
+        clauses.append(f"file_ext IN ({image_placeholders})")
+        params.extend(sorted(SUPPORTED_IMAGE_EXTENSIONS))
+
+        source_area = int(width or 0) * int(height or 0)
+        size_low = max(0, int(file_size * 0.45)) if file_size > 0 else 0
+        size_high = int(file_size * 2.2) if file_size > 0 else 0
+        if width and height:
+            aspect_tolerance = max(int(source_area * 0.04), 1)
+            clauses.append(
+                """
+                (
+                    (width = ? AND height = ?)
+                    OR (
+                        width IS NOT NULL
+                        AND height IS NOT NULL
+                        AND ABS((width * ?) - (height * ?)) <= ?
+                    )
+                    OR (file_size BETWEEN ? AND ?)
+                )
+                """
+            )
+            params.extend([width, height, height, width, aspect_tolerance, size_low, size_high])
+        elif file_size > 0:
+            clauses.append("file_size BETWEEN ? AND ?")
+            params.extend([size_low, size_high])
+        else:
+            return []
+
+        params.extend([
+            width or -1,
+            height or -1,
+            file_size,
+            source_area,
+            max(1, int(limit)),
+        ])
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM images
+                WHERE {' AND '.join(clauses)}
+                ORDER BY
+                    CASE WHEN width = ? AND height = ? THEN 0 ELSE 1 END,
+                    ABS(file_size - ?),
+                    ABS((COALESCE(width, 0) * COALESCE(height, 0)) - ?),
+                    id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._image_from_row(row) for row in rows]
+
     def count_missing_images(self) -> int:
         with self.connect() as conn:
             row = conn.execute(
@@ -1924,6 +1987,15 @@ class MetadataStore:
     def get_image(self, image_id: int) -> ImageItem | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+            return self._image_from_row(row) if row else None
+
+    def get_image_by_path(self, file_path: str | Path) -> ImageItem | None:
+        normalized = os.path.abspath(os.path.expanduser(str(file_path)))
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM images WHERE file_path = ? AND is_missing = 0",
+                (normalized,),
+            ).fetchone()
             return self._image_from_row(row) if row else None
 
     def images_by_ids(self, image_ids: Sequence[int], scores: dict[int, float] | None = None) -> list[ImageItem]:

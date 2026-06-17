@@ -279,6 +279,152 @@ class ImagePreviewDialogTest(unittest.TestCase):
         self.assertEqual(right.green(), right.blue())
         self.assertLess(left.red(), right.red())
 
+    def test_preview_transform_actions_use_icon_buttons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            store.mark_embedding_not_required(image_id)
+
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+
+            self.assertEqual(dialog.grayscale_button.text(), "")
+            self.assertEqual(dialog.mirror_button.text(), "")
+            self.assertFalse(dialog.grayscale_button.icon().isNull())
+            self.assertFalse(dialog.mirror_button.icon().isNull())
+            self.assertEqual(dialog.grayscale_button.accessibleName(), "黑白")
+            self.assertEqual(dialog.mirror_button.accessibleName(), "左右翻转")
+            dialog.close()
+
+    def test_preview_transform_actions_do_not_reload_source_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (1600, 1000), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=1600,
+                height=1000,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+
+            with patch.object(dialog, "_load_preview_pixmap", wraps=dialog._load_preview_pixmap) as load_preview:
+                dialog._set_grayscale_preview(True)
+                dialog._set_mirrored_preview(True)
+                dialog._set_grayscale_preview(False)
+                dialog._set_mirrored_preview(False)
+
+            self.assertEqual(load_preview.call_count, 0)
+            dialog.close()
+
+    def test_preview_transform_actions_reuse_thumbnail_before_source_refine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            thumbnail_path = root / "thumb.webp"
+            Image.new("RGB", (1600, 1000), color="red").save(image_path)
+            Image.new("RGB", (512, 320), color="red").save(thumbnail_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=1600,
+                height=1000,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            store.update_thumbnail(image_id, str(thumbnail_path), "ready")
+
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+
+            self.assertTrue(dialog._preview_base_pixmap.isNull())
+            with patch.object(dialog, "_load_preview_pixmap", wraps=dialog._load_preview_pixmap) as load_preview:
+                dialog._set_grayscale_preview(True)
+                dialog._set_mirrored_preview(True)
+
+            self.assertEqual(load_preview.call_count, 0)
+            dialog.close()
+
+    def test_image_preview_does_not_initialize_video_player(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+
+            self.assertIsNone(dialog.video_player)
+            self.assertIsNone(dialog.video_widget)
+            self.assertIs(dialog.preview_stack.currentWidget(), dialog.image_view)
+            dialog.close()
+
     def test_preview_double_click_fits_image_surface(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -27,6 +27,21 @@ class DuplicateGroup:
     members: tuple[DuplicateMember, ...]
 
 
+@dataclass(frozen=True)
+class NearDuplicateCandidate:
+    image: ImageItem
+    distance: int
+    similarity: float
+    hash_source: str
+
+
+@dataclass(frozen=True)
+class ImageDHashRecord:
+    image: ImageItem
+    dhash: int
+    hash_source: str
+
+
 class _DisjointSet:
     def __init__(self) -> None:
         self.parent: dict[int, int] = {}
@@ -172,6 +187,81 @@ def find_duplicate_groups(
     return groups
 
 
+def find_near_duplicate_candidates(
+    source_path: str | Path,
+    images: list[ImageItem] | None = None,
+    *,
+    hash_records: list[ImageDHashRecord] | None = None,
+    near_distance: int = 8,
+    limit: int = 5,
+    include_same_path: bool = False,
+) -> list[NearDuplicateCandidate]:
+    source = Path(source_path)
+    if not source.is_file() or not is_supported_image(str(source)):
+        return []
+    try:
+        source_hash = image_dhash(source)
+    except Exception:
+        return []
+
+    source_resolved = _safe_resolve(source)
+    candidates: list[NearDuplicateCandidate] = []
+    records = hash_records if hash_records is not None else build_image_dhash_records(images or [])
+    for record in records:
+        image = record.image
+        image_path = Path(image.file_path)
+        if (
+            not include_same_path
+            and source_resolved is not None
+            and _safe_resolve(image_path) == source_resolved
+        ):
+            continue
+        distance = hamming_distance(source_hash, record.dhash)
+        if distance > near_distance:
+            continue
+        similarity = 1.0 - (distance / 64.0)
+        candidates.append(
+            NearDuplicateCandidate(
+                image=image,
+                distance=distance,
+                similarity=max(0.0, min(1.0, similarity)),
+                hash_source=record.hash_source,
+            )
+        )
+
+    candidates.sort(
+        key=lambda candidate: (
+            candidate.distance,
+            -(candidate.image.width or 0) * (candidate.image.height or 0),
+            -candidate.image.file_size,
+            candidate.image.file_name.casefold(),
+        )
+    )
+    return candidates[:limit]
+
+
+def build_image_dhash_records(images: list[ImageItem]) -> list[ImageDHashRecord]:
+    records: list[ImageDHashRecord] = []
+    for image in images:
+        if image.is_missing or not is_supported_image(image.file_path):
+            continue
+        hash_path = _hash_source_for_image(image)
+        if hash_path is None:
+            continue
+        try:
+            dhash = image_dhash(hash_path)
+        except Exception:
+            continue
+        records.append(
+            ImageDHashRecord(
+                image=image,
+                dhash=dhash,
+                hash_source=str(hash_path),
+            )
+        )
+    return records
+
+
 def image_dhash(path: Path, *, hash_size: int = 8) -> int:
     with open_local_image(path) as image:
         image = ImageOps.exif_transpose(image).convert("L")
@@ -204,3 +294,19 @@ def _sort_members(members: Iterable[DuplicateMember]) -> list[DuplicateMember]:
             member.image.file_name.casefold(),
         ),
     )
+
+
+def _hash_source_for_image(image: ImageItem) -> Path | None:
+    if image.thumbnail_status == "ready" and image.thumbnail_path:
+        thumbnail_path = Path(image.thumbnail_path)
+        if thumbnail_path.is_file():
+            return thumbnail_path
+    path = Path(image.file_path)
+    return path if path.is_file() else None
+
+
+def _safe_resolve(path: Path) -> Path | None:
+    try:
+        return path.resolve()
+    except OSError:
+        return None

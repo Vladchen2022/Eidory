@@ -80,6 +80,31 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(store.count_images(), 0)
             self.assertEqual(store.list_folders(include_inactive=True), [])
 
+    def test_scan_folder_skip_paths_do_not_import_or_mark_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            first_path = root / "first.jpg"
+            skipped_path = root / "skipped.jpg"
+            self._make_image(first_path, "red")
+            self._make_image(skipped_path, "blue")
+
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+            scanner = ImageScanner(store, Thumbnailer(Path(tmp) / "thumbs"))
+
+            result = scanner.scan_folder(str(root), skip_paths={str(skipped_path)})
+            self.assertEqual(result.scanned_files, 1)
+            self.assertEqual([image.file_name for image in store.list_images(limit=10)], ["first.jpg"])
+
+            result = scanner.scan_folder(str(root), skip_paths={str(first_path), str(skipped_path)})
+            self.assertEqual(result.scanned_files, 0)
+            self.assertEqual(result.missing_marked, 0)
+            self.assertEqual(
+                [image.file_name for image in store.list_images(limit=10)],
+                ["first.jpg"],
+            )
+
     def test_scan_regenerates_failed_thumbnail_without_file_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "library"

@@ -5,11 +5,13 @@ from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image, ImageOps
-from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
+    QIcon,
     QImage,
+    QImageReader,
     QKeyEvent,
     QKeySequence,
     QPainter,
@@ -44,6 +46,47 @@ from eidory.core.image_loader import open_local_image
 from eidory.core.media_types import is_supported_video
 from eidory.core.metadata_store import MetadataStore
 from eidory.models import ImageItem
+
+
+PREVIEW_ICON_BUTTON_SIZE = QSize(32, 26)
+PREVIEW_ICON_SIZE = QSize(18, 18)
+
+
+def _preview_transform_icon(kind: str) -> QIcon:
+    pixmap = QPixmap(24, 24)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    line_color = QColor("#e4e9f1")
+    fill_color = QColor("#e4e9f1")
+    painter.setPen(QPen(line_color, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    if kind == "flip":
+        painter.drawLine(12, 4, 12, 20)
+        painter.drawLine(5, 7, 10, 12)
+        painter.drawLine(5, 17, 10, 12)
+        painter.drawLine(19, 7, 14, 12)
+        painter.drawLine(19, 17, 14, 12)
+    elif kind == "grayscale":
+        painter.setBrush(fill_color)
+        painter.drawPie(5, 5, 14, 14, 90 * 16, 180 * 16)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(5, 5, 14, 14)
+        painter.drawLine(12, 5, 12, 19)
+
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _configure_preview_icon_button(button: QPushButton, icon_name: str, name: str, tooltip: str) -> None:
+    button.setText("")
+    button.setIcon(_preview_transform_icon(icon_name))
+    button.setIconSize(PREVIEW_ICON_SIZE)
+    button.setFixedSize(PREVIEW_ICON_BUTTON_SIZE)
+    button.setToolTip(tooltip)
+    button.setAccessibleName(name)
+    button.setAccessibleDescription(tooltip)
 
 
 class PreviewNavigator(QWidget):
@@ -209,6 +252,20 @@ class PreviewImageView(QGraphicsView):
         self.resetTransform()
         self._scene.setSceneRect(QRectF(0, 0, max(1, self.viewport().width()), max(1, self.viewport().height())))
         self._center_message()
+        self._update_drag_mode()
+
+    def clear_pixmap(self) -> None:
+        self._smooth_timer.stop()
+        self._has_pixmap = False
+        self._fit_to_window = True
+        self._zoom_factor = 1.0
+        self._navigator_thumb = QPixmap()
+        self._navigator.hide()
+        self._pixmap_item.setPixmap(QPixmap())
+        self._pixmap_item.hide()
+        self._message_item.hide()
+        self.resetTransform()
+        self._scene.setSceneRect(QRectF(0, 0, max(1, self.viewport().width()), max(1, self.viewport().height())))
         self._update_drag_mode()
 
     def set_pixmap(
@@ -468,12 +525,18 @@ class ImagePreviewDialog(QDialog):
         self._pan_start_vertical = 0
         self._shortcuts: list[QShortcut] = []
         self._app_event_filter_installed = False
-        self._preview_source_key: tuple[int, str, int, int, bool, bool] | None = None
-        self._preview_source_pixmap = QPixmap()
+        self._preview_base_key: tuple[int, str, int, int] | None = None
+        self._preview_base_pixmap = QPixmap()
+        self._preview_base_is_fallback = False
+        self._preview_variant_cache: dict[tuple[bool, bool], QPixmap] = {}
         self._zoom_refine_timer = QTimer(self)
         self._zoom_refine_timer.setSingleShot(True)
         self._zoom_refine_timer.setInterval(90)
         self._zoom_refine_timer.timeout.connect(self._render_current_image)
+        self._preview_refine_timer = QTimer(self)
+        self._preview_refine_timer.setSingleShot(True)
+        self._preview_refine_timer.setInterval(35)
+        self._preview_refine_timer.timeout.connect(self._render_current_image)
 
         self.setWindowTitle("Eidory 预览")
         self.resize(1200, 820)
@@ -487,20 +550,12 @@ class ImagePreviewDialog(QDialog):
         self.image_view.doubleClicked.connect(self._fit_image_to_window)
         self.image_view.zoomChanged.connect(self._handle_image_zoom_changed)
 
-        self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumHeight(420)
-        self.video_widget.setStyleSheet("background:#2d3138;")
-        self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.video_widget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
-        self.video_widget.installEventFilter(self)
-        self.video_player = QMediaPlayer(self)
-        self.video_audio_output = QAudioOutput(self)
-        self.video_player.setAudioOutput(self.video_audio_output)
-        self.video_player.setVideoOutput(self.video_widget)
+        self.video_widget: QVideoWidget | None = None
+        self.video_player: QMediaPlayer | None = None
+        self.video_audio_output: QAudioOutput | None = None
 
         self.preview_stack = QStackedWidget()
         self.preview_stack.addWidget(self.image_view)
-        self.preview_stack.addWidget(self.video_widget)
 
         self.info_label = QLabel("-")
         self.info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -509,10 +564,22 @@ class ImagePreviewDialog(QDialog):
         self.next_button = QPushButton("下一张")
         self.fit_button = QPushButton("适应窗口")
         self.actual_size_button = QPushButton("100%")
-        self.grayscale_button = QPushButton("黑白")
+        self.grayscale_button = QPushButton()
         self.grayscale_button.setCheckable(True)
-        self.mirror_button = QPushButton("左右翻转")
+        _configure_preview_icon_button(
+            self.grayscale_button,
+            "grayscale",
+            "黑白",
+            "把当前图片切换为黑白显示",
+        )
+        self.mirror_button = QPushButton()
         self.mirror_button.setCheckable(True)
+        _configure_preview_icon_button(
+            self.mirror_button,
+            "flip",
+            "左右翻转",
+            "左右镜像翻转当前图片",
+        )
         self.video_play_pause_button = QPushButton("播放")
         self.video_position_slider = QSlider(Qt.Orientation.Horizontal)
         self.video_position_slider.setRange(0, 0)
@@ -598,9 +665,6 @@ class ImagePreviewDialog(QDialog):
         self.remove_index_button.clicked.connect(self._remove_current_index)
         self.video_play_pause_button.clicked.connect(self._toggle_video_playback)
         self.video_position_slider.sliderMoved.connect(self._seek_video)
-        self.video_player.positionChanged.connect(self._update_video_position)
-        self.video_player.durationChanged.connect(self._update_video_duration)
-        self.video_player.playbackStateChanged.connect(self._update_video_play_button)
         self._install_shortcuts()
         app = QApplication.instance()
         if app is not None:
@@ -610,17 +674,24 @@ class ImagePreviewDialog(QDialog):
         self._refresh()
 
     def closeEvent(self, event) -> None:
+        self._zoom_refine_timer.stop()
+        self._preview_refine_timer.stop()
         if self._app_event_filter_installed:
             app = QApplication.instance()
             if app is not None:
                 app.removeEventFilter(self)
             self._app_event_filter_installed = False
         self._stop_video()
+        self._clear_preview_pixmap_cache()
+        self.image_view.clear_pixmap()
         super().closeEvent(event)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._schedule_fit_to_window()
+        image = self.current_image()
+        if image is not None and not is_supported_video(image.file_path):
+            self._preview_refine_timer.start()
 
     def current_image(self) -> ImageItem | None:
         if not self.images:
@@ -717,7 +788,7 @@ class ImagePreviewDialog(QDialog):
         if is_supported_video(image.file_path):
             self._render_current_video(image)
         else:
-            self._render_current_image()
+            self._render_current_image(use_thumbnail_first=not self.isVisible())
         self.imageChanged.emit(image)
 
     def _handle_space_pressed(self) -> None:
@@ -773,7 +844,7 @@ class ImagePreviewDialog(QDialog):
             f"{image.file_name}    {dimensions}    相似度 {score}    {zoom_text}"
         )
 
-    def _render_current_image(self) -> None:
+    def _render_current_image(self, *, use_thumbnail_first: bool = False) -> None:
         image = self.current_image()
         if image is None:
             return
@@ -786,7 +857,13 @@ class ImagePreviewDialog(QDialog):
         self.mirror_button.setEnabled(True)
         self.copy_image_button.setEnabled(True)
         max_width, max_height = self._render_bounds()
-        pixmap = self._load_preview_source_pixmap(image, max_width, max_height)
+        pixmap = (
+            self._load_quick_preview_pixmap(image, max_width, max_height)
+            if use_thumbnail_first
+            else QPixmap()
+        )
+        if pixmap.isNull():
+            pixmap = self._load_preview_source_pixmap(image, max_width, max_height)
         if pixmap.isNull():
             self.image_view.set_message("无法预览")
             return
@@ -799,20 +876,40 @@ class ImagePreviewDialog(QDialog):
         )
         self._update_info(image)
 
+    def _ensure_video_preview(self) -> tuple[QVideoWidget, QMediaPlayer]:
+        if self.video_widget is None:
+            self.video_widget = QVideoWidget()
+            self.video_widget.setMinimumHeight(420)
+            self.video_widget.setStyleSheet("background:#2d3138;")
+            self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.video_widget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+            self.video_widget.installEventFilter(self)
+            self.preview_stack.addWidget(self.video_widget)
+        if self.video_player is None:
+            self.video_player = QMediaPlayer(self)
+            self.video_audio_output = QAudioOutput(self)
+            self.video_player.setAudioOutput(self.video_audio_output)
+            self.video_player.positionChanged.connect(self._update_video_position)
+            self.video_player.durationChanged.connect(self._update_video_duration)
+            self.video_player.playbackStateChanged.connect(self._update_video_play_button)
+        self.video_player.setVideoOutput(self.video_widget)
+        return self.video_widget, self.video_player
+
     def _render_current_video(self, image: ImageItem) -> None:
+        video_widget, video_player = self._ensure_video_preview()
         self.fit_button.setEnabled(False)
         self.actual_size_button.setEnabled(False)
         self.grayscale_button.setEnabled(False)
         self.mirror_button.setEnabled(False)
         self.copy_image_button.setEnabled(False)
         self._stop_pan()
-        self.preview_stack.setCurrentWidget(self.video_widget)
+        self.preview_stack.setCurrentWidget(video_widget)
         self.video_controls_widget.show()
         self.video_position_slider.setValue(0)
         self.video_position_slider.setRange(0, 0)
         self.video_time_label.setText("00:00 / 00:00")
-        self.video_player.stop()
-        self.video_player.setSource(QUrl())
+        video_player.stop()
+        video_player.setSource(QUrl())
 
         path = Path(image.file_path)
         if image.is_missing or not path.exists():
@@ -821,8 +918,8 @@ class ImagePreviewDialog(QDialog):
             return
 
         self.video_play_pause_button.setEnabled(True)
-        self.video_player.setSource(QUrl.fromLocalFile(str(path)))
-        self.video_player.play()
+        video_player.setSource(QUrl.fromLocalFile(str(path)))
+        video_player.play()
         self._update_info(image)
 
     def _render_bounds(self) -> tuple[int, int]:
@@ -875,13 +972,17 @@ class ImagePreviewDialog(QDialog):
         self.grayscale_preview = checked
         image = self.current_image()
         if image is not None and not is_supported_video(image.file_path):
-            self._render_current_image()
+            self._render_current_image(use_thumbnail_first=self._preview_base_pixmap.isNull())
+            if self._preview_base_pixmap.isNull():
+                self._preview_refine_timer.start()
 
     def _set_mirrored_preview(self, checked: bool) -> None:
         self.mirrored_preview = checked
         image = self.current_image()
         if image is not None and not is_supported_video(image.file_path):
-            self._render_current_image()
+            self._render_current_image(use_thumbnail_first=self._preview_base_pixmap.isNull())
+            if self._preview_base_pixmap.isNull():
+                self._preview_refine_timer.start()
 
     def _zoom_by(self, wheel_delta: int) -> None:
         image = self.current_image()
@@ -932,7 +1033,8 @@ class ImagePreviewDialog(QDialog):
         if image is None:
             return
         if is_supported_video(image.file_path):
-            self.video_widget.updateGeometry()
+            if self.video_widget is not None:
+                self.video_widget.updateGeometry()
             return
         if self.fit_to_window:
             self._fit_image_to_window()
@@ -958,7 +1060,7 @@ class ImagePreviewDialog(QDialog):
             return True
         if hasattr(self, "image_view") and watched is self.image_view.viewport():
             return True
-        if hasattr(self, "video_widget") and watched is self.video_widget:
+        if self.video_widget is not None and watched is self.video_widget:
             return True
         return False
 
@@ -966,51 +1068,95 @@ class ImagePreviewDialog(QDialog):
         viewport = self.image_view.viewport().size()
         return max(1, viewport.width() - 2), max(1, viewport.height() - 2)
 
+    def _load_quick_preview_pixmap(
+        self,
+        image: ImageItem,
+        target_width: int,
+        target_height: int,
+    ) -> QPixmap:
+        if not image.thumbnail_path:
+            return QPixmap()
+        thumbnail_path = Path(image.thumbnail_path)
+        if not thumbnail_path.exists():
+            return QPixmap()
+        pixmap = QPixmap(str(thumbnail_path))
+        if pixmap.isNull():
+            return QPixmap()
+        pixmap = self._scale_pixmap_to_bounds(
+            pixmap,
+            target_width,
+            target_height,
+            smooth=False,
+        )
+        return self._apply_preview_transforms(
+            pixmap,
+            grayscale=self.grayscale_preview,
+            mirror_horizontal=self.mirrored_preview,
+        )
+
     def _load_preview_source_pixmap(
         self,
         image: ImageItem,
         target_width: int,
         target_height: int,
     ) -> QPixmap:
-        key = (
+        base_key = (
             image.id,
             image.file_path,
             image.file_size,
             image.modified_time_ns,
-            self.grayscale_preview,
-            self.mirrored_preview,
         )
-        if key != self._preview_source_key:
+        if base_key != self._preview_base_key:
             self._clear_preview_pixmap_cache()
-            self._preview_source_key = key
+            self._preview_base_key = base_key
 
-        if self._preview_source_pixmap.isNull() or self._preview_source_is_too_small(
-            target_width,
-            target_height,
-        ):
+        needs_source_load = self._preview_base_pixmap.isNull() or (
+            not self._preview_base_is_fallback
+            and self._preview_pixmap_is_too_small(
+                self._preview_base_pixmap,
+                target_width,
+                target_height,
+            )
+        )
+        if needs_source_load:
+            previous_base = self._preview_base_pixmap
+            previous_fallback = self._preview_base_is_fallback
             load_width, load_height = self._source_load_bounds(image, target_width, target_height)
             pixmap = self._load_preview_pixmap(image.file_path, load_width, load_height)
+            fallback_used = False
             if pixmap.isNull():
-                fallback = (
-                    image.thumbnail_path
-                    if image.thumbnail_path and Path(image.thumbnail_path).exists()
-                    else None
-                )
+                fallback = image.thumbnail_path if image.thumbnail_path and Path(image.thumbnail_path).exists() else None
                 pixmap = QPixmap(fallback) if fallback else QPixmap()
-            pixmap = self._apply_preview_transforms(
-                pixmap,
-                grayscale=self.grayscale_preview,
-                mirror_horizontal=self.mirrored_preview,
-            )
-            self._preview_source_pixmap = pixmap
-        return self._preview_source_pixmap
+                fallback_used = not pixmap.isNull()
+            if pixmap.isNull():
+                if previous_base.isNull():
+                    return QPixmap()
+                pixmap = previous_base
+                fallback_used = previous_fallback
+            self._preview_base_pixmap = pixmap
+            self._preview_base_is_fallback = fallback_used
+            self._preview_variant_cache.clear()
 
-    def _preview_source_is_too_small(self, target_width: int, target_height: int) -> bool:
-        if self._preview_source_pixmap.isNull():
+        variant_key = (self.grayscale_preview, self.mirrored_preview)
+        cached = self._preview_variant_cache.get(variant_key)
+        if cached is not None and not cached.isNull():
+            return cached
+
+        pixmap = self._apply_preview_transforms(
+            self._preview_base_pixmap,
+            grayscale=self.grayscale_preview,
+            mirror_horizontal=self.mirrored_preview,
+        )
+        self._preview_variant_cache[variant_key] = pixmap
+        return pixmap
+
+    @staticmethod
+    def _preview_pixmap_is_too_small(pixmap: QPixmap, target_width: int, target_height: int) -> bool:
+        if pixmap.isNull():
             return True
         return (
-            target_width > int(self._preview_source_pixmap.width() * 0.9)
-            or target_height > int(self._preview_source_pixmap.height() * 0.9)
+            target_width > int(pixmap.width() * 0.9)
+            or target_height > int(pixmap.height() * 0.9)
         )
 
     @staticmethod
@@ -1027,12 +1173,16 @@ class ImagePreviewDialog(QDialog):
         return wanted_width, wanted_height
 
     def _clear_preview_pixmap_cache(self) -> None:
-        self._preview_source_key = None
-        self._preview_source_pixmap = QPixmap()
+        self._preview_base_key = None
+        self._preview_base_pixmap = QPixmap()
+        self._preview_base_is_fallback = False
+        self._preview_variant_cache.clear()
 
     def _toggle_video_playback(self) -> None:
         image = self.current_image()
         if image is None or not is_supported_video(image.file_path):
+            return
+        if self.video_player is None:
             return
         if self.video_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.video_player.pause()
@@ -1040,6 +1190,8 @@ class ImagePreviewDialog(QDialog):
             self.video_player.play()
 
     def _seek_video(self, position: int) -> None:
+        if self.video_player is None:
+            return
         self.video_player.setPosition(position)
 
     def _update_video_position(self, position: int) -> None:
@@ -1057,12 +1209,18 @@ class ImagePreviewDialog(QDialog):
         )
 
     def _update_video_time_label(self) -> None:
+        if self.video_player is None:
+            self.video_time_label.setText("00:00 / 00:00")
+            return
         self.video_time_label.setText(
             f"{self._format_video_time(self.video_player.position())} / "
             f"{self._format_video_time(self.video_player.duration())}"
         )
 
     def _stop_video(self) -> None:
+        if self.video_player is None:
+            self.video_play_pause_button.setText("播放")
+            return
         self.video_player.stop()
         self.video_player.setSource(QUrl())
         self.video_play_pause_button.setText("播放")
@@ -1263,6 +1421,20 @@ class ImagePreviewDialog(QDialog):
     def _load_preview_pixmap(image_path: str, max_width: int, max_height: int) -> QPixmap:
         if max_width <= 0 or max_height <= 0:
             return QPixmap()
+        path = Path(image_path)
+        if not path.exists():
+            return QPixmap()
+        reader = QImageReader(str(path))
+        reader.setAutoTransform(True)
+        source_size = reader.size()
+        if source_size.isValid():
+            scaled_size = QSize(source_size.width(), source_size.height())
+            scaled_size.scale(max_width, max_height, Qt.AspectRatioMode.KeepAspectRatio)
+            if scaled_size.width() < source_size.width() or scaled_size.height() < source_size.height():
+                reader.setScaledSize(scaled_size)
+        qimage = reader.read()
+        if not qimage.isNull():
+            return QPixmap.fromImage(qimage)
         try:
             with open_local_image(image_path) as image:
                 if image.format == "JPEG":

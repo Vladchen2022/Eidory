@@ -205,6 +205,7 @@ CREATE TABLE IF NOT EXISTS temporary_projects (
     name TEXT NOT NULL UNIQUE,
     summary TEXT NOT NULL DEFAULT '',
     color_hex TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'semantic',
     sort_order INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -227,6 +228,13 @@ CREATE TABLE IF NOT EXISTS temporary_project_images (
 
 CREATE INDEX IF NOT EXISTS idx_temporary_project_images_project_order
 ON temporary_project_images(project_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS temporary_project_board_layouts (
+    project_id INTEGER PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES temporary_projects(id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS inspiration_projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,12 +276,16 @@ CREATE TABLE IF NOT EXISTS creative_projects (
     model_name TEXT NOT NULL DEFAULT '',
     is_pinned INTEGER NOT NULL DEFAULT 0,
     copy_text TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_creative_projects_updated_at
 ON creative_projects(updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_creative_projects_sort_order
+ON creative_projects(sort_order);
 
 CREATE TABLE IF NOT EXISTS creative_nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

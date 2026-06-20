@@ -46,6 +46,7 @@ TEMPORARY_PROJECT_COLORS = (
     "#586E78",
     "#6F5970",
 )
+TEMPORARY_PROJECT_KINDS = {"semantic", "quick"}
 
 DEFAULT_AI_VISION_COLLECTION_PATHS = (
     ("黑白摄影",),
@@ -68,6 +69,11 @@ def _clean_color_hex(value: object) -> str:
     return ""
 
 
+def _clean_temporary_project_kind(kind: str | None) -> str:
+    clean_kind = (kind or "semantic").strip().lower()
+    return clean_kind if clean_kind in TEMPORARY_PROJECT_KINDS else "semantic"
+
+
 class MetadataStore:
     _connection_lock = threading.RLock()
     _busy_timeout_ms = 30_000
@@ -81,8 +87,44 @@ class MetadataStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         schema_path = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
         with self.connect() as conn:
+            self._prepare_existing_schema_for_schema_script(conn)
             conn.executescript(schema_path.read_text(encoding="utf-8"))
             self._ensure_schema_migrations(conn)
+
+    @staticmethod
+    def _prepare_existing_schema_for_schema_script(conn: sqlite3.Connection) -> None:
+        table_names = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "temporary_projects" in table_names:
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(temporary_projects)").fetchall()
+            }
+            if "summary" not in columns:
+                conn.execute("ALTER TABLE temporary_projects ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+            if "color_hex" not in columns:
+                conn.execute("ALTER TABLE temporary_projects ADD COLUMN color_hex TEXT NOT NULL DEFAULT ''")
+            if "kind" not in columns:
+                conn.execute("ALTER TABLE temporary_projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'semantic'")
+            if "sort_order" not in columns:
+                conn.execute("ALTER TABLE temporary_projects ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+                MetadataStore._backfill_temporary_project_sort_order(conn)
+        if "creative_projects" in table_names:
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(creative_projects)").fetchall()
+            }
+            if "is_pinned" not in columns:
+                conn.execute("ALTER TABLE creative_projects ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0")
+            if "copy_text" not in columns:
+                conn.execute("ALTER TABLE creative_projects ADD COLUMN copy_text TEXT NOT NULL DEFAULT ''")
+            if "sort_order" not in columns:
+                conn.execute("ALTER TABLE creative_projects ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+                MetadataStore._backfill_creative_project_sort_order(conn)
 
     @staticmethod
     def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
@@ -116,6 +158,7 @@ class MetadataStore:
                 name TEXT NOT NULL UNIQUE,
                 summary TEXT NOT NULL DEFAULT '',
                 color_hex TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT 'semantic',
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -130,6 +173,8 @@ class MetadataStore:
             conn.execute("ALTER TABLE temporary_projects ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
         if "color_hex" not in temporary_project_columns:
             conn.execute("ALTER TABLE temporary_projects ADD COLUMN color_hex TEXT NOT NULL DEFAULT ''")
+        if "kind" not in temporary_project_columns:
+            conn.execute("ALTER TABLE temporary_projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'semantic'")
         if "sort_order" not in temporary_project_columns:
             conn.execute("ALTER TABLE temporary_projects ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
             MetadataStore._backfill_temporary_project_sort_order(conn)
@@ -144,6 +189,12 @@ class MetadataStore:
             """
             CREATE INDEX IF NOT EXISTS idx_temporary_projects_sort_order
             ON temporary_projects(sort_order)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_temporary_projects_kind_sort
+            ON temporary_projects(kind, sort_order)
             """
         )
         conn.execute(
@@ -173,6 +224,16 @@ class MetadataStore:
             """
             CREATE INDEX IF NOT EXISTS idx_temporary_project_images_project_order
             ON temporary_project_images(project_id, sort_order)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS temporary_project_board_layouts (
+                project_id INTEGER PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES temporary_projects(id) ON DELETE CASCADE
+            )
             """
         )
         conn.execute(
@@ -234,6 +295,7 @@ class MetadataStore:
                 model_name TEXT NOT NULL DEFAULT '',
                 is_pinned INTEGER NOT NULL DEFAULT 0,
                 copy_text TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -247,10 +309,19 @@ class MetadataStore:
             conn.execute("ALTER TABLE creative_projects ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0")
         if "copy_text" not in project_columns:
             conn.execute("ALTER TABLE creative_projects ADD COLUMN copy_text TEXT NOT NULL DEFAULT ''")
+        if "sort_order" not in project_columns:
+            conn.execute("ALTER TABLE creative_projects ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+            MetadataStore._backfill_creative_project_sort_order(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_creative_projects_updated_at
             ON creative_projects(updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_creative_projects_sort_order
+            ON creative_projects(sort_order)
             """
         )
         conn.execute(
@@ -2869,6 +2940,7 @@ class MetadataStore:
         *,
         summary: str = "",
         color_hex: str = "",
+        kind: str = "semantic",
     ) -> int:
         clean_name = name.strip()
         if not clean_name:
@@ -2877,6 +2949,7 @@ class MetadataStore:
         if not clean_ids:
             raise ValueError("temporary project must contain at least one image")
         clean_summary = _clean_optional_text(summary, max_length=600) or ""
+        clean_kind = _clean_temporary_project_kind(kind)
         now = utc_now_iso()
         with self.connect() as conn:
             clean_color = _clean_color_hex(color_hex) or self._next_temporary_project_color(conn)
@@ -2900,10 +2973,20 @@ class MetadataStore:
 
             cur = conn.execute(
                 """
-                INSERT INTO temporary_projects(name, summary, color_hex, sort_order, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO temporary_projects(
+                    name, summary, color_hex, kind, sort_order, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (clean_name, clean_summary, clean_color, self._next_temporary_project_sort_order(conn), now, now),
+                (
+                    clean_name,
+                    clean_summary,
+                    clean_color,
+                    clean_kind,
+                    self._next_temporary_project_sort_order(conn),
+                    now,
+                    now,
+                ),
             )
             project_id = int(cur.lastrowid)
             for index, image_id in enumerate(clean_ids):
@@ -2918,16 +3001,21 @@ class MetadataStore:
                 )
             return project_id
 
-    def list_temporary_projects(self) -> list[TemporaryProjectItem]:
+    def list_temporary_projects(self, *, kind: str | None = None) -> list[TemporaryProjectItem]:
+        clean_kind = _clean_temporary_project_kind(kind) if kind is not None else None
         with self.connect() as conn:
+            where = "WHERE p.kind = ?" if clean_kind is not None else ""
+            params: tuple[object, ...] = (clean_kind,) if clean_kind is not None else ()
             rows = conn.execute(
-                """
+                f"""
                 SELECT p.*, COUNT(tpi.image_id) AS image_count
                 FROM temporary_projects p
                 LEFT JOIN temporary_project_images tpi ON tpi.project_id = p.id
+                {where}
                 GROUP BY p.id
                 ORDER BY p.sort_order DESC, p.updated_at DESC, p.id DESC
-                """
+                """,
+                params,
             ).fetchall()
         return [
             TemporaryProjectItem(
@@ -2938,6 +3026,7 @@ class MetadataStore:
                 updated_at=str(row["updated_at"]),
                 summary=str(row["summary"] or ""),
                 color_hex=str(row["color_hex"] or ""),
+                kind=_clean_temporary_project_kind(str(row["kind"] or "semantic")),
             )
             for row in rows
         ]
@@ -2973,6 +3062,38 @@ class MetadataStore:
             for row in rows
         }
 
+    def temporary_project_image_links(
+        self,
+        project_id: int,
+        image_ids: Sequence[int],
+    ) -> list[dict[str, object]]:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return []
+        placeholders = ",".join("?" for _ in clean_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT image_id, sort_order, created_at, intent_label, intent_query
+                FROM temporary_project_images
+                WHERE project_id = ?
+                  AND image_id IN ({placeholders})
+                ORDER BY sort_order, image_id
+                """,
+                [project_id, *clean_ids],
+            ).fetchall()
+        return [
+            {
+                "project_id": int(project_id),
+                "image_id": int(row["image_id"]),
+                "sort_order": int(row["sort_order"]),
+                "created_at": str(row["created_at"]),
+                "intent_label": row["intent_label"],
+                "intent_query": row["intent_query"],
+            }
+            for row in rows
+        ]
+
     def get_temporary_project(self, project_id: int) -> TemporaryProjectItem | None:
         with self.connect() as conn:
             row = conn.execute(
@@ -2995,6 +3116,7 @@ class MetadataStore:
             updated_at=str(row["updated_at"]),
             summary=str(row["summary"] or ""),
             color_hex=str(row["color_hex"] or ""),
+            kind=_clean_temporary_project_kind(str(row["kind"] or "semantic")),
         )
 
     def next_temporary_project_color(self) -> str:
@@ -3006,24 +3128,44 @@ class MetadataStore:
             cur = conn.execute("DELETE FROM temporary_projects WHERE id = ?", (project_id,))
             return int(cur.rowcount) > 0
 
-    def clear_temporary_projects(self) -> int:
+    def clear_temporary_projects(self, *, kind: str | None = None) -> int:
+        clean_kind = _clean_temporary_project_kind(kind) if kind is not None else None
         with self.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS count FROM temporary_projects").fetchone()
+            if clean_kind is None:
+                row = conn.execute("SELECT COUNT(*) AS count FROM temporary_projects").fetchone()
+                count = int(row["count"]) if row is not None else 0
+                conn.execute("DELETE FROM temporary_projects")
+                return count
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM temporary_projects WHERE kind = ?",
+                (clean_kind,),
+            ).fetchone()
             count = int(row["count"]) if row is not None else 0
-            conn.execute("DELETE FROM temporary_projects")
+            conn.execute("DELETE FROM temporary_projects WHERE kind = ?", (clean_kind,))
             return count
 
-    def move_temporary_project(self, project_id: int, direction: int) -> bool:
+    def move_temporary_project(
+        self,
+        project_id: int,
+        direction: int,
+        *,
+        kind: str | None = None,
+    ) -> bool:
         if direction == 0:
             return False
+        clean_kind = _clean_temporary_project_kind(kind) if kind is not None else None
         with self.connect() as conn:
             self._normalize_temporary_project_sort_order(conn)
+            where = "WHERE kind = ?" if clean_kind is not None else ""
+            params: tuple[object, ...] = (clean_kind,) if clean_kind is not None else ()
             rows = conn.execute(
-                """
+                f"""
                 SELECT id, sort_order
                 FROM temporary_projects
+                {where}
                 ORDER BY sort_order DESC, updated_at DESC, id DESC
-                """
+                """,
+                params,
             ).fetchall()
             ids = [int(row["id"]) for row in rows]
             try:
@@ -3269,6 +3411,89 @@ class MetadataStore:
                 )
             return removed
 
+    def restore_temporary_project_image_links(
+        self,
+        project_id: int,
+        links: Sequence[Mapping[str, object]],
+    ) -> int:
+        if not links:
+            return 0
+        now = utc_now_iso()
+        restored = 0
+        with self.connect() as conn:
+            project = conn.execute(
+                "SELECT id FROM temporary_projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                return 0
+            for link in links:
+                try:
+                    image_id = int(link.get("image_id", 0) or 0)
+                    sort_order = int(link.get("sort_order", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if image_id <= 0:
+                    continue
+                image = conn.execute("SELECT id FROM images WHERE id = ?", (image_id,)).fetchone()
+                if image is None:
+                    continue
+                created_at = str(link.get("created_at") or now)
+                label = _clean_optional_text(link.get("intent_label"), max_length=80)
+                query = _clean_optional_text(link.get("intent_query"), max_length=160)
+                cur = conn.execute(
+                    """
+                    INSERT INTO temporary_project_images(
+                        project_id, image_id, sort_order, created_at, intent_label, intent_query
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, image_id) DO UPDATE SET
+                        sort_order = excluded.sort_order,
+                        intent_label = excluded.intent_label,
+                        intent_query = excluded.intent_query
+                    """,
+                    (project_id, image_id, sort_order, created_at, label, query),
+                )
+                restored += int(cur.rowcount)
+            if restored:
+                conn.execute(
+                    "UPDATE temporary_projects SET updated_at = ? WHERE id = ?",
+                    (now, project_id),
+                )
+        return restored
+
+    def save_temporary_project_board_layout(self, project_id: int, payload_json: str) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            project = conn.execute(
+                "SELECT id FROM temporary_projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                return
+            conn.execute(
+                """
+                INSERT INTO temporary_project_board_layouts(project_id, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (project_id, payload_json, now),
+            )
+            conn.execute(
+                "UPDATE temporary_projects SET updated_at = ? WHERE id = ?",
+                (now, project_id),
+            )
+
+    def get_temporary_project_board_layout(self, project_id: int) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM temporary_project_board_layouts WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        return str(row["payload_json"]) if row is not None else None
+
     def create_inspiration_project(
         self,
         *,
@@ -3453,9 +3678,9 @@ class MetadataStore:
             cur = conn.execute(
                 """
                 INSERT INTO creative_projects(
-                    title, brief, language, provider_name, model_name, created_at, updated_at
+                    title, brief, language, provider_name, model_name, sort_order, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     clean_title,
@@ -3463,6 +3688,7 @@ class MetadataStore:
                     clean_language,
                     provider_name.strip()[:80],
                     model_name.strip()[:120],
+                    self._next_creative_project_sort_order(conn),
                     now,
                     now,
                 ),
@@ -3491,7 +3717,7 @@ class MetadataStore:
                 LEFT JOIN creative_nodes n ON n.project_id = p.id
                 LEFT JOIN creative_node_images cni ON cni.node_id = n.id
                 GROUP BY p.id
-                ORDER BY p.is_pinned DESC, p.updated_at DESC, p.id DESC
+                ORDER BY p.is_pinned DESC, p.sort_order DESC, p.updated_at DESC, p.id DESC
                 """
             ).fetchall()
         return [self._creative_project_from_row(row) for row in rows]
@@ -3531,6 +3757,100 @@ class MetadataStore:
                 (1 if pinned else 0, now, project_id),
             )
             return int(cur.rowcount) > 0
+
+    def move_creative_project(self, project_id: int, direction: int) -> bool:
+        if direction == 0:
+            return False
+        with self.connect() as conn:
+            self._normalize_creative_project_sort_order(conn)
+            current_row = conn.execute(
+                "SELECT is_pinned FROM creative_projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if current_row is None:
+                return False
+            rows = conn.execute(
+                """
+                SELECT id, sort_order
+                FROM creative_projects
+                WHERE is_pinned = ?
+                ORDER BY sort_order DESC, updated_at DESC, id DESC
+                """,
+                (int(current_row["is_pinned"] or 0),),
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            try:
+                index = ids.index(int(project_id))
+            except ValueError:
+                return False
+            target_index = index + (-1 if direction < 0 else 1)
+            if target_index < 0 or target_index >= len(rows):
+                return False
+            current = rows[index]
+            target = rows[target_index]
+            conn.execute(
+                "UPDATE creative_projects SET sort_order = ? WHERE id = ?",
+                (int(target["sort_order"]), int(current["id"])),
+            )
+            conn.execute(
+                "UPDATE creative_projects SET sort_order = ? WHERE id = ?",
+                (int(current["sort_order"]), int(target["id"])),
+            )
+            return True
+
+    def update_creative_project_details(
+        self,
+        project_id: int,
+        *,
+        title: str | None = None,
+        brief: str | None = None,
+    ) -> CreativeProjectItem | None:
+        clean_title: str | None = None
+        if title is not None:
+            clean_title = " ".join(title.strip().split())[:120]
+            if not clean_title:
+                raise ValueError("creative project title must not be empty")
+        clean_brief = brief.strip()[:1200] if brief is not None else None
+        if title is None and brief is None:
+            return self.get_creative_project(project_id)
+        now = utc_now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM creative_projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            assignments: list[str] = ["updated_at = ?"]
+            params: list[object] = [now]
+            if clean_title is not None:
+                assignments.append("title = ?")
+                params.append(clean_title)
+            if clean_brief is not None:
+                assignments.append("brief = ?")
+                params.append(clean_brief)
+            params.append(project_id)
+            conn.execute(
+                f"UPDATE creative_projects SET {', '.join(assignments)} WHERE id = ?",
+                params,
+            )
+            if clean_title is not None:
+                root = conn.execute(
+                    """
+                    SELECT id
+                    FROM creative_nodes
+                    WHERE project_id = ? AND parent_id IS NULL
+                    ORDER BY sort_order, id
+                    LIMIT 1
+                    """,
+                    (project_id,),
+                ).fetchone()
+                if root is not None:
+                    conn.execute(
+                        "UPDATE creative_nodes SET title = ?, updated_at = ? WHERE id = ?",
+                        (clean_title, now, int(root["id"])),
+                    )
+        return self.get_creative_project(project_id)
 
     def update_creative_project_copy(self, project_id: int, copy_text: str) -> bool:
         clean_copy = copy_text.strip()[:4000]
@@ -3813,6 +4133,99 @@ class MetadataStore:
                 )
             return removed
 
+    def creative_node_image_links_for_branch(
+        self,
+        node_id: int,
+        image_ids: Sequence[int],
+    ) -> list[dict[str, object]]:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return []
+        node = self.get_creative_node(node_id)
+        if node is None:
+            return []
+        node_ids = self._creative_descendant_node_ids(node.project_id, node_id)
+        if not node_ids:
+            return []
+        image_placeholders = ",".join("?" for _ in clean_ids)
+        node_placeholders = ",".join("?" for _ in node_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT node_id, image_id, sort_order, created_at, intent_label, intent_query
+                FROM creative_node_images
+                WHERE node_id IN ({node_placeholders})
+                  AND image_id IN ({image_placeholders})
+                ORDER BY node_id, sort_order, image_id
+                """,
+                [*node_ids, *clean_ids],
+            ).fetchall()
+        return [
+            {
+                "node_id": int(row["node_id"]),
+                "image_id": int(row["image_id"]),
+                "sort_order": int(row["sort_order"]),
+                "created_at": str(row["created_at"]),
+                "intent_label": row["intent_label"],
+                "intent_query": row["intent_query"],
+            }
+            for row in rows
+        ]
+
+    def restore_creative_node_image_links(
+        self,
+        links: Sequence[Mapping[str, object]],
+    ) -> int:
+        if not links:
+            return 0
+        now = utc_now_iso()
+        restored = 0
+        project_ids: set[int] = set()
+        with self.connect() as conn:
+            for link in links:
+                try:
+                    node_id = int(link.get("node_id", 0) or 0)
+                    image_id = int(link.get("image_id", 0) or 0)
+                    sort_order = int(link.get("sort_order", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if node_id <= 0 or image_id <= 0:
+                    continue
+                node = conn.execute(
+                    "SELECT project_id FROM creative_nodes WHERE id = ?",
+                    (node_id,),
+                ).fetchone()
+                if node is None:
+                    continue
+                image = conn.execute("SELECT id FROM images WHERE id = ?", (image_id,)).fetchone()
+                if image is None:
+                    continue
+                project_ids.add(int(node["project_id"]))
+                created_at = str(link.get("created_at") or now)
+                label = _clean_optional_text(link.get("intent_label"), max_length=80)
+                query = _clean_optional_text(link.get("intent_query"), max_length=200)
+                cur = conn.execute(
+                    """
+                    INSERT INTO creative_node_images(
+                        node_id, image_id, sort_order, created_at, intent_label, intent_query
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id, image_id) DO UPDATE SET
+                        sort_order = excluded.sort_order,
+                        intent_label = excluded.intent_label,
+                        intent_query = excluded.intent_query
+                    """,
+                    (node_id, image_id, sort_order, created_at, label, query),
+                )
+                restored += int(cur.rowcount)
+            if restored:
+                for project_id in project_ids:
+                    conn.execute(
+                        "UPDATE creative_projects SET updated_at = ? WHERE id = ?",
+                        (now, project_id),
+                    )
+        return restored
+
     def creative_node_image_ids(self, node_id: int, *, include_descendants: bool = False) -> list[int]:
         node_ids = [node_id]
         if include_descendants:
@@ -3963,6 +4376,43 @@ class MetadataStore:
 
         visit(node_id)
         return ordered
+
+    @staticmethod
+    def _backfill_creative_project_sort_order(conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM creative_projects
+            ORDER BY updated_at ASC, id ASC
+            """
+        ).fetchall()
+        for index, row in enumerate(rows):
+            conn.execute(
+                "UPDATE creative_projects SET sort_order = ? WHERE id = ?",
+                (index, int(row["id"])),
+            )
+
+    @staticmethod
+    def _normalize_creative_project_sort_order(conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM creative_projects
+            ORDER BY sort_order ASC, updated_at ASC, id ASC
+            """
+        ).fetchall()
+        for index, row in enumerate(rows):
+            conn.execute(
+                "UPDATE creative_projects SET sort_order = ? WHERE id = ?",
+                (index, int(row["id"])),
+            )
+
+    @staticmethod
+    def _next_creative_project_sort_order(conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM creative_projects"
+        ).fetchone()
+        return int(row["next_order"]) if row is not None else 0
 
     @staticmethod
     def _creative_project_from_row(row: sqlite3.Row) -> CreativeProjectItem:

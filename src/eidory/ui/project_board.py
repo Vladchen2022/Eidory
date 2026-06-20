@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QImage, QImageReader, QPainter, QPen, QPixmap, QTransform
+from PySide6.QtGui import QColor, QFontMetrics, QImage, QImageReader, QKeySequence, QPainter, QPen, QPixmap, QTransform
 from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPixmapItem,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsTextItem,
     QGraphicsView,
+    QMenu,
 )
 
 from eidory.models import ImageItem
@@ -142,13 +143,34 @@ class BoardImageItem(QGraphicsPixmapItem):
         self.set_pinned(not self._pinned)
         return self._pinned
 
+    def is_pinned(self) -> bool:
+        return self._pinned
+
+    def set_flipped(self, flipped: bool) -> None:
+        flipped = bool(flipped)
+        if self._flipped == flipped:
+            return
+        self._flipped = flipped
+        self._refresh_display_pixmap()
+
     def toggle_flipped(self) -> None:
-        self._flipped = not self._flipped
+        self.set_flipped(not self._flipped)
+
+    def is_flipped(self) -> bool:
+        return self._flipped
+
+    def set_grayscale(self, grayscale: bool) -> None:
+        grayscale = bool(grayscale)
+        if self._grayscale == grayscale:
+            return
+        self._grayscale = grayscale
         self._refresh_display_pixmap()
 
     def toggle_grayscale(self) -> None:
-        self._grayscale = not self._grayscale
-        self._refresh_display_pixmap()
+        self.set_grayscale(not self._grayscale)
+
+    def is_grayscale(self) -> bool:
+        return self._grayscale
 
     def _apply_flags(self) -> None:
         flags = (
@@ -300,6 +322,7 @@ class BoardImageItem(QGraphicsPixmapItem):
 class ProjectBoardView(QGraphicsView):
     imageDoubleClicked = Signal(int)
     removeImagesRequested = Signal(list)
+    undoRemovalRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -404,6 +427,7 @@ class ProjectBoardView(QGraphicsView):
                     item_height,
                     normalized_badges.get(image.id, []),
                 )
+                self._apply_item_payload_state(image.id, item_payload)
                 row_height = max(row_height, item_height)
                 default_x += item_width + DEFAULT_LAYOUT_GAP_X
 
@@ -477,7 +501,16 @@ class ProjectBoardView(QGraphicsView):
                 "y": float(item.pos().y()),
                 "width": float(width),
                 "height": float(height),
+                "visible": bool(item.isVisible()),
             }
+            if isinstance(item, BoardImageItem):
+                items[str(image_id)].update(
+                    {
+                        "pinned": item.is_pinned(),
+                        "flipped": item.is_flipped(),
+                        "grayscale": item.is_grayscale(),
+                    }
+                )
         return {"version": 1, "items": items}
 
     def fit_visible_images(self) -> None:
@@ -529,6 +562,13 @@ class ProjectBoardView(QGraphicsView):
         super().wheelEvent(event)
 
     def keyPressEvent(self, event) -> None:
+        undo_modifier = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
+        if event.matches(QKeySequence.StandardKey.Undo) or (
+            event.key() == Qt.Key.Key_Z and bool(event.modifiers() & undo_modifier)
+        ):
+            self.undoRemovalRequested.emit()
+            event.accept()
+            return
         if event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}:
             image_ids = self.selected_image_ids()
             if image_ids:
@@ -636,6 +676,25 @@ class ProjectBoardView(QGraphicsView):
             return
         super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event) -> None:
+        image_id = self._image_id_at(event.pos())
+        if image_id is None:
+            super().contextMenuEvent(event)
+            return
+        if image_id not in self.selected_image_ids():
+            self._select_image_id(image_id)
+        menu = QMenu(self)
+        remove_action = menu.addAction("从当前项目移除")
+        remove_action.setEnabled(bool(self.selected_image_ids()))
+        chosen = menu.exec(event.globalPos())
+        if chosen == remove_action:
+            image_ids = self.selected_image_ids()
+            if image_ids:
+                self.removeImagesRequested.emit(image_ids)
+            event.accept()
+            return
+        event.accept()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self._view_mode in {"fit_all", "fit_selection"}:
@@ -722,6 +781,22 @@ class ProjectBoardView(QGraphicsView):
         item.setZValue(len(self._image_items) + 1)
         self._scene.addItem(item)
         self._image_items[image.id] = item
+
+    def _apply_item_payload_state(self, image_id: int, item_payload: object) -> None:
+        if not isinstance(item_payload, dict):
+            return
+        item = self._image_items.get(image_id)
+        if item is None:
+            return
+        if "visible" in item_payload:
+            item.setVisible(bool(item_payload.get("visible")))
+        if isinstance(item, BoardImageItem):
+            if "pinned" in item_payload:
+                item.set_pinned(bool(item_payload.get("pinned")))
+            if "flipped" in item_payload:
+                item.set_flipped(bool(item_payload.get("flipped")))
+            if "grayscale" in item_payload:
+                item.set_grayscale(bool(item_payload.get("grayscale")))
 
     def _selected_image_items(self) -> list[QGraphicsItem]:
         items: list[QGraphicsItem] = []

@@ -405,6 +405,7 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(projects[0].image_count, 2)
             self.assertEqual(projects[0].summary, "飞行器和引擎结构参考")
             self.assertEqual(projects[0].color_hex, TEMPORARY_PROJECT_COLORS[0])
+            self.assertEqual(projects[0].kind, "semantic")
             self.assertEqual(store.temporary_project_image_ids(project_id), [second_id, first_id])
             self.assertEqual(
                 store.temporary_project_image_badges(project_id),
@@ -451,10 +452,40 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(projects[0].name, "长期项目")
             self.assertEqual(projects[0].summary, "关闭软件后仍应保留。")
             self.assertEqual(projects[0].color_hex, "#756742")
+            self.assertEqual(projects[0].kind, "semantic")
             self.assertEqual(reopened.temporary_project_image_ids(project_id), [image_id])
             self.assertEqual(
                 reopened.temporary_project_image_badges(project_id),
                 {image_id: ["机械住处"]},
+            )
+
+    def test_temporary_project_board_layout_persists_after_reopening_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            project_id = store.create_temporary_project("机械参考", [image_id])
+
+            store.save_temporary_project_board_layout(
+                project_id,
+                '{"version":1,"items":{"1":{"x":88,"visible":false}}}',
+            )
+
+            reopened = MetadataStore(db_path)
+            reopened.initialize()
+            self.assertEqual(
+                reopened.get_temporary_project_board_layout(project_id),
+                '{"version":1,"items":{"1":{"x":88,"visible":false}}}',
             )
 
     def test_temporary_project_details_can_be_updated_with_unique_name(self) -> None:
@@ -555,8 +586,86 @@ class MetadataStoreTest(unittest.TestCase):
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(temporary_projects)")}
                 indexes = {row[1] for row in conn.execute("PRAGMA index_list(temporary_projects)")}
             self.assertIn("sort_order", columns)
+            self.assertIn("kind", columns)
             self.assertIn("idx_temporary_projects_sort_order", indexes)
+            self.assertIn("idx_temporary_projects_kind_sort", indexes)
             self.assertEqual([project.name for project in store.list_temporary_projects()], ["旧项目"])
+            self.assertEqual(store.list_temporary_projects()[0].kind, "semantic")
+
+    def test_creative_project_sort_order_migrates_before_schema_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE creative_projects (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        title TEXT NOT NULL,
+                        brief TEXT NOT NULL DEFAULT '',
+                        language TEXT NOT NULL DEFAULT 'zh',
+                        provider_name TEXT NOT NULL DEFAULT '',
+                        model_name TEXT NOT NULL DEFAULT '',
+                        is_pinned INTEGER NOT NULL DEFAULT 0,
+                        copy_text TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE creative_nodes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project_id INTEGER NOT NULL,
+                        parent_id INTEGER,
+                        title TEXT NOT NULL,
+                        note TEXT NOT NULL DEFAULT '',
+                        search_query TEXT NOT NULL DEFAULT '',
+                        sort_order INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO creative_projects(
+                        title, brief, language, provider_name, model_name,
+                        is_pinned, copy_text, created_at, updated_at
+                    )
+                    VALUES (
+                        '旧创作项目', '', 'zh', '', '', 0, '',
+                        '2026-01-01T00:00:00+00:00',
+                        '2026-01-01T00:00:00+00:00'
+                    )
+                    """
+                )
+                project_id = int(conn.execute("SELECT id FROM creative_projects").fetchone()[0])
+                conn.execute(
+                    """
+                    INSERT INTO creative_nodes(
+                        project_id, parent_id, title, note, search_query,
+                        sort_order, created_at, updated_at
+                    )
+                    VALUES (
+                        ?, NULL, '旧创作项目', '', '',
+                        0,
+                        '2026-01-01T00:00:00+00:00',
+                        '2026-01-01T00:00:00+00:00'
+                    )
+                    """,
+                    (project_id,),
+                )
+
+            store = MetadataStore(db_path)
+            store.initialize()
+
+            with sqlite3.connect(db_path) as conn:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(creative_projects)")}
+                indexes = {row[1] for row in conn.execute("PRAGMA index_list(creative_projects)")}
+            self.assertIn("sort_order", columns)
+            self.assertIn("idx_creative_projects_sort_order", indexes)
+            self.assertEqual([project.title for project in store.list_creative_projects()], ["旧创作项目"])
 
     def test_temporary_project_add_and_remove_only_changes_project_links(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -626,6 +735,54 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(store.list_temporary_projects(), [])
             self.assertEqual(store.temporary_project_image_ids(first_project), [])
             self.assertIsNotNone(store.get_image(image_id))
+
+    def test_temporary_project_kind_filters_clear_and_move_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            semantic_first = store.create_temporary_project("语义一", [image_id], kind="semantic")
+            semantic_second = store.create_temporary_project("语义二", [image_id], kind="semantic")
+            quick_project = store.create_temporary_project("临时收藏", [image_id], kind="quick")
+
+            self.assertEqual(
+                [project.name for project in store.list_temporary_projects(kind="semantic")],
+                ["语义二", "语义一"],
+            )
+            self.assertEqual(
+                [project.name for project in store.list_temporary_projects(kind="quick")],
+                ["临时收藏"],
+            )
+            self.assertTrue(store.move_temporary_project(semantic_first, -1, kind="semantic"))
+            self.assertEqual(
+                [project.name for project in store.list_temporary_projects(kind="semantic")],
+                ["语义一", "语义二"],
+            )
+            self.assertEqual(
+                [project.name for project in store.list_temporary_projects(kind="quick")],
+                ["临时收藏"],
+            )
+
+            cleared = store.clear_temporary_projects(kind="quick")
+
+            self.assertEqual(cleared, 1)
+            self.assertEqual(store.list_temporary_projects(kind="quick"), [])
+            self.assertEqual(
+                [project.id for project in store.list_temporary_projects(kind="semantic")],
+                [semantic_first, semantic_second],
+            )
+            self.assertIsNotNone(store.get_image(image_id))
+            self.assertEqual(store.temporary_project_image_ids(quick_project), [])
 
     def test_creative_projects_persist_nodes_images_and_board_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -723,6 +880,48 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertTrue(reopened.delete_creative_project(project_id))
             self.assertIsNotNone(reopened.get_image(first_id))
             self.assertIsNotNone(reopened.get_image(second_id))
+
+    def test_creative_projects_can_be_edited_and_reordered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+
+            first_id = store.create_creative_project(title="第一个项目", brief="旧摘要")
+            second_id = store.create_creative_project(title="第二个项目", brief="第二个摘要")
+            third_id = store.create_creative_project(title="第三个项目", brief="第三个摘要")
+
+            self.assertEqual(
+                [project.id for project in store.list_creative_projects()],
+                [third_id, second_id, first_id],
+            )
+            self.assertTrue(store.move_creative_project(second_id, -1))
+            self.assertEqual(
+                [project.id for project in store.list_creative_projects()],
+                [second_id, third_id, first_id],
+            )
+            self.assertTrue(store.move_creative_project(second_id, 1))
+            self.assertEqual(
+                [project.id for project in store.list_creative_projects()],
+                [third_id, second_id, first_id],
+            )
+            self.assertFalse(store.move_creative_project(third_id, -1))
+
+            updated = store.update_creative_project_details(
+                first_id,
+                title="更新后的项目",
+                brief="更新后的摘要",
+            )
+            self.assertIsNotNone(updated)
+            self.assertEqual(updated.title, "更新后的项目")
+            self.assertEqual(updated.brief, "更新后的摘要")
+            root_id = store.creative_root_node_id(first_id)
+            self.assertIsNotNone(root_id)
+            root = store.get_creative_node(int(root_id))
+            self.assertIsNotNone(root)
+            self.assertEqual(root.title, "更新后的项目")
+            with self.assertRaises(ValueError):
+                store.update_creative_project_details(first_id, title="   ")
 
     def test_duration_persists_and_images_can_sort_by_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -89,6 +89,7 @@ class TemporaryProjectItem:
     updated_at: str
     summary: str = ""
     color_hex: str = ""
+    kind: str = "semantic"
 
 
 @dataclass(frozen=True)

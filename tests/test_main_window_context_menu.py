@@ -38,6 +38,7 @@ from eidory.ui.main_window import (
     MainWindow,
     PROJECT_LIST_ID_ROLE,
     PROJECT_LIST_KIND_ROLE,
+    PROJECT_LIST_SECTION_ID_ROLE,
     RIGHT_SIDEBAR_WIDTH,
     SIDEBAR_COLLAPSE_THRESHOLD,
     SIDEBAR_COUNT_COLUMN_WIDTH,
@@ -845,6 +846,97 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(continue_import.call_args.args[0], [str(image_path)])
             window.close()
 
+    def test_file_import_copies_to_collection_import_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            source_dir = Path(tmp) / "source"
+            source_dir.mkdir()
+            source_image = source_dir / "incoming.jpg"
+            Image.new("RGB", (120, 80), color="white").save(source_image)
+            import_dir = Path(tmp) / "imports" / "AI生成图库"
+
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            collection_id = store.create_collection("AI生成图库")
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            with patch.object(window, "_collection_import_directory", return_value=import_dir):
+                window._continue_file_import_after_duplicate_resolution(
+                    [str(source_image)],
+                    collection_id=collection_id,
+                    replaced_count=0,
+                    skipped_count=0,
+                )
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    window._poll_events()
+                    self.app.processEvents()
+                    if store.collection_image_counts().get(collection_id) == 1:
+                        break
+                    time.sleep(0.01)
+
+            images = store.list_images(limit=10)
+            self.assertEqual(len(images), 1)
+            self.assertEqual(Path(images[0].file_path), import_dir / "incoming.jpg")
+            self.assertTrue((import_dir / "incoming.jpg").exists())
+            self.assertEqual(store.collection_image_counts().get(collection_id), 1)
+            window.close()
+
+    def test_local_file_drop_copies_to_selected_collection_import_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            source_dir = Path(tmp) / "external"
+            source_dir.mkdir()
+            source_image = source_dir / "dragged.jpg"
+            Image.new("RGB", (128, 96), color="black").save(source_image)
+            import_dir = Path(tmp) / "imports" / "AI生成图库"
+
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            collection_id = store.create_collection("AI生成图库")
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            with patch.object(window, "_collection_import_directory", return_value=import_dir):
+                window._continue_local_paths_import_after_duplicate_resolution(
+                    target_name="AI生成图库",
+                    file_paths=[str(source_image)],
+                    folder_paths=[],
+                    parent_collection_id=collection_id,
+                    skip_paths=set(),
+                    replaced_count=0,
+                    skipped_count=0,
+                )
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    window._poll_events()
+                    self.app.processEvents()
+                    if store.collection_image_counts().get(collection_id) == 1:
+                        break
+                    time.sleep(0.01)
+
+            images = store.list_images(limit=10)
+            self.assertEqual(len(images), 1)
+            self.assertEqual(Path(images[0].file_path), import_dir / "dragged.jpg")
+            self.assertTrue((import_dir / "dragged.jpg").exists())
+            self.assertEqual(store.collection_image_counts().get(collection_id), 1)
+            window.close()
+
     def test_main_window_has_minimize_shortcut(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -1614,7 +1706,14 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.app.processEvents()
 
             self.assertEqual(store.list_temporary_projects(), [])
-            self.assertEqual(window.temp_project_list.count(), 0)
+            self.assertEqual(
+                [
+                    window.temp_project_list.item(index).data(PROJECT_LIST_KIND_ROLE)
+                    for index in range(window.temp_project_list.count())
+                    if window.temp_project_list.item(index).data(PROJECT_LIST_ID_ROLE) is not None
+                ],
+                [],
+            )
             self.assertEqual(window.current_result_mode, "library")
             self.assertIsNotNone(store.get_image(image_id))
             window.close()
@@ -1711,7 +1810,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             )
 
             self.assertEqual(base_ids, {keep_id, other_project_id})
-            self.assertEqual(base_label, "基于灵感暂存：机械暂存")
+            self.assertEqual(base_label, "基于语义探针项目：机械暂存")
             self.assertEqual([image.id for image in result.images], [keep_id])
             self.assertNotIn(outside_id, [image.id for image in result.images])
             window.close()
@@ -1945,17 +2044,21 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ]
             self.assertNotIn("未标签", top_labels)
             self.assertNotIn("未AI标签", top_labels)
-            self.assertNotIn("未分类", top_labels)
-            virtual_labels = [
-                window.virtual_collection_tree.topLevelItem(index).text(0)
-                for index in range(window.virtual_collection_tree.topLevelItemCount())
+            self.assertEqual(top_labels[-1], "未分类")
+            tag_labels = [window.tag_list.item(index).text() for index in range(window.tag_list.count())]
+            self.assertTrue(any(label.startswith("未标签") for label in tag_labels))
+            ai_labels = [
+                window.ai_vision_virtual_filter_list.item(index).text()
+                for index in range(window.ai_vision_virtual_filter_list.count())
             ]
-            self.assertEqual(virtual_labels, ["未标签", "未AI标签", "未分类"])
+            self.assertTrue(any(label.startswith("未AI标签") for label in ai_labels))
 
-            untagged_item = window.virtual_collection_tree.topLevelItem(
-                virtual_labels.index("未标签")
+            untagged_item = next(
+                window.tag_list.item(index)
+                for index in range(window.tag_list.count())
+                if window.tag_list.item(index).text().startswith("未标签")
             )
-            window.virtual_collection_tree.setCurrentItem(untagged_item)
+            window.tag_list.setCurrentItem(untagged_item)
             self.app.processEvents()
 
             self.assertEqual(window._selected_virtual_filter(), "untagged")
@@ -2211,7 +2314,13 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(names, {"破旧工坊", "机械细节"})
             colors = {project.color_hex for project in projects}
             self.assertEqual(colors, {TEMPORARY_PROJECT_COLORS[0]})
-            self.assertEqual(window.temp_project_list.item(0).background().color().name().upper(), TEMPORARY_PROJECT_COLORS[0])
+            self._expand_project_sidebar_section(window, "temporary")
+            temporary_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "temporary"
+            )
+            self.assertEqual(temporary_item.background().style(), Qt.BrushStyle.NoBrush)
             first_project = next(project for project in projects if project.name == "破旧工坊")
             self.assertEqual(store.temporary_project_image_badges(first_project.id), {
                 image_ids[0]: ["破旧工坊"],
@@ -2735,8 +2844,9 @@ class MainWindowContextMenuTest(unittest.TestCase):
                     "查找相似图片",
                     "文件与导出",
                     "收藏与标签",
-                    "灵感暂存",
-                    "创作项目",
+                    "语义探针项目",
+                    "创作节点项目",
+                    "暂时收藏",
                     "文件夹归类",
                     "当前结果",
                 ],
@@ -2750,17 +2860,21 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 ["收藏选中 1 张", "取消收藏", "批量添加标签", "清除选中图片标签"],
             )
             self.assertEqual(
-                self._submenu_texts(menu, "灵感暂存"),
+                self._submenu_texts(menu, "语义探针项目"),
                 [
-                    "暂存选中图片",
-                    "加入已有灵感暂存",
-                    "从当前灵感暂存移除",
+                    "保存选中为语义探针项目",
+                    "加入已有语义探针项目",
+                    "从当前语义探针项目移除",
                     "AI 分组选中图片",
                 ],
             )
             self.assertEqual(
-                self._submenu_texts(menu, "创作项目"),
+                self._submenu_texts(menu, "创作节点项目"),
                 ["存入当前创作节点", "从当前节点移除"],
+            )
+            self.assertEqual(
+                self._submenu_texts(menu, "暂时收藏"),
+                ["新建暂时收藏", "加入已有暂时收藏", "从当前暂时收藏移除"],
             )
             self.assertEqual(
                 self._submenu_texts(menu, "文件夹归类"),
@@ -2768,7 +2882,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             )
             self.assertEqual(
                 self._submenu_texts(menu, "当前结果"),
-                ["暂存当前结果集", "从当前结果排除选中", "排除此图所在的文件夹"],
+                ["保存当前结果集", "从当前结果排除选中", "排除此图所在的文件夹"],
             )
             self.assertTrue(self._action_by_text(menu, "快速预览").isEnabled())
             self.assertFalse(self._action_by_text(menu, "对比查看").isEnabled())
@@ -3805,6 +3919,119 @@ class MainWindowContextMenuTest(unittest.TestCase):
             project = store.list_temporary_projects()[0]
             self.assertEqual(project.name, "当前结果")
             self.assertEqual(store.temporary_project_image_ids(project.id), image_ids)
+            self.assertTrue(window.project_sidebar_expanded_sections["temporary"])
+            self.assertFalse(window.project_sidebar_expanded_sections["creative"])
+            self.assertFalse(window.project_sidebar_expanded_sections["quick"])
+            semantic_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "temporary"
+            )
+            self.assertEqual(semantic_item.data(PROJECT_LIST_ID_ROLE), project.id)
+            self.assertIsNone(window.current_temp_project_id)
+            self.assertNotEqual(window.center_result_stack.currentWidget(), window.project_board_view)
+            window.close()
+
+    def test_adding_selection_to_quick_project_expands_quick_section_without_opening_board(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            first_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            second_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "second.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=2,
+            )
+            project_id = store.create_temporary_project("临时收藏", [first_id], kind="quick")
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window.grid_view.set_images(store.images_by_ids([second_id]), selected_image_ids=[second_id])
+
+            window._add_selection_to_temporary_project(project_id)
+
+            self.assertEqual(store.temporary_project_image_ids(project_id), [first_id, second_id])
+            self.assertTrue(window.project_sidebar_expanded_sections["quick"])
+            self.assertFalse(window.project_sidebar_expanded_sections["creative"])
+            self.assertFalse(window.project_sidebar_expanded_sections["temporary"])
+            quick_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "quick"
+            )
+            self.assertEqual(quick_item.data(PROJECT_LIST_ID_ROLE), project_id)
+            self.assertNotEqual(window.center_result_stack.currentWidget(), window.project_board_view)
+            window.close()
+
+    def test_saving_selection_to_creative_node_expands_creative_section_without_opening_board(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            project_id = store.create_creative_project(
+                title="故事项目",
+                brief="一个室内场景",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=int(root_id), show_board=False)
+            window.grid_view.set_images(store.images_by_ids([image_id]), selected_image_ids=[image_id])
+
+            window._save_selection_to_current_creative_node()
+
+            self.assertEqual(store.creative_node_image_ids(int(root_id)), [image_id])
+            self.assertTrue(window.project_sidebar_expanded_sections["creative"])
+            self.assertFalse(window.project_sidebar_expanded_sections["temporary"])
+            self.assertFalse(window.project_sidebar_expanded_sections["quick"])
+            creative_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "creative"
+            )
+            self.assertEqual(creative_item.data(PROJECT_LIST_ID_ROLE), project_id)
+            self.assertNotEqual(window.center_result_stack.currentWidget(), window.project_board_view)
             window.close()
 
     def test_shuffle_current_grid_images_preserves_badges_and_selection(self) -> None:
@@ -3892,7 +4119,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 created_time_ns=None,
                 modified_time_ns=1,
             )
-            temporary_id = store.create_temporary_project("临时参考", [image_id])
+            temporary_id = store.create_temporary_project("临时参考", [image_id], kind="semantic")
+            quick_id = store.create_temporary_project("临时收藏", [image_id], kind="quick")
             creative_id = store.create_creative_project(
                 title="故事项目",
                 brief="一个室内场景",
@@ -3909,22 +4137,50 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.app.processEvents()
 
             texts = [window.temp_project_list.item(index).text() for index in range(window.temp_project_list.count())]
-            self.assertIn("◇ 语义探针项目", texts)
-            self.assertIn("◆ 创作节点项目", texts)
-            temporary_item = next(
-                item
-                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
-                if item.data(PROJECT_LIST_KIND_ROLE) == "temporary"
+            self.assertEqual(texts, ["创作节点项目", "语义探针项目", "暂时收藏"])
+            self.assertEqual(
+                [
+                    window.temp_project_list.item(index).data(PROJECT_LIST_SECTION_ID_ROLE)
+                    for index in range(window.temp_project_list.count())
+                ],
+                ["creative", "temporary", "quick"],
             )
+            self.assertEqual(
+                [
+                    window.temp_project_list.item(index).data(PROJECT_LIST_KIND_ROLE)
+                    for index in range(window.temp_project_list.count())
+                    if window.temp_project_list.item(index).data(PROJECT_LIST_ID_ROLE) is not None
+                ],
+                [],
+            )
+            self._expand_project_sidebar_section(window, "creative")
             creative_item = next(
                 item
                 for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
                 if item.data(PROJECT_LIST_KIND_ROLE) == "creative"
             )
-            self.assertEqual(temporary_item.data(PROJECT_LIST_ID_ROLE), temporary_id)
             self.assertEqual(creative_item.data(PROJECT_LIST_ID_ROLE), creative_id)
-            self.assertIn("临时参考", temporary_item.text())
-            self.assertIn("故事项目", creative_item.text())
+            self.assertFalse(window.project_sidebar_expanded_sections["temporary"])
+            self.assertFalse(window.project_sidebar_expanded_sections["quick"])
+            self._expand_project_sidebar_section(window, "temporary")
+            temporary_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "temporary"
+            )
+            self.assertEqual(temporary_item.data(PROJECT_LIST_ID_ROLE), temporary_id)
+            self.assertFalse(window.project_sidebar_expanded_sections["creative"])
+            self.assertFalse(window.project_sidebar_expanded_sections["quick"])
+            self._expand_project_sidebar_section(window, "quick")
+            quick_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "quick"
+            )
+            self.assertEqual(quick_item.data(PROJECT_LIST_ID_ROLE), quick_id)
+            self.assertIn("临时收藏", quick_item.text())
+            self.assertFalse(window.project_sidebar_expanded_sections["creative"])
+            self.assertFalse(window.project_sidebar_expanded_sections["temporary"])
             window.close()
 
     def test_selecting_creative_project_from_project_sidebar_opens_board(self) -> None:
@@ -3962,6 +4218,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window = MainWindow(paths=paths, store=store)
             window.show()
             self.app.processEvents()
+            self._expand_project_sidebar_section(window, "creative")
             creative_item = next(
                 item
                 for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
@@ -3974,6 +4231,47 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.current_creative_project_id, project_id)
             self.assertEqual(window.center_result_stack.currentWidget(), window.project_board_view)
             self.assertIn("项目看板", window.result_state_label.text())
+            window.close()
+
+    def test_creative_project_sidebar_context_menu_matches_other_project_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="故事项目",
+                brief="一个室内场景",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            menu, _actions = window._build_creative_sidebar_project_context_menu()
+
+            self.assertEqual(
+                [
+                    (action.text(), action.isEnabled())
+                    for action in menu.actions()
+                    if not action.isSeparator()
+                ],
+                [
+                    ("打开创作节点项目", True),
+                    ("编辑名称和摘要", True),
+                    ("AI 重新命名和摘要", False),
+                    ("上移", True),
+                    ("下移", True),
+                    ("删除创作节点项目", True),
+                ],
+            )
             window.close()
 
     def test_selecting_temporary_project_from_project_sidebar_opens_board_with_badges(self) -> None:
@@ -4013,6 +4311,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window = MainWindow(paths=paths, store=store)
             window.show()
             self.app.processEvents()
+            self._expand_project_sidebar_section(window, "temporary")
             temporary_item = next(
                 item
                 for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
@@ -4024,9 +4323,235 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             self.assertEqual(window.current_temp_project_id, project_id)
             self.assertEqual(window.center_result_stack.currentWidget(), window.project_board_view)
-            self.assertIn("灵感暂存看板", window.result_state_label.text())
+            self.assertIn("语义探针项目看板", window.result_state_label.text())
             item = window.project_board_view._image_items[image_id]
             self.assertEqual(getattr(item, "badge_text"), "世界观")
+            window.close()
+
+    def test_temporary_project_board_removes_links_and_undo_restores_them(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids = []
+            for index in range(2):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{index}.jpg"),
+                    file_size=123,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=index + 1,
+                )
+                image_ids.append(image_id)
+            project_id = store.create_temporary_project("临时参考", image_ids)
+            store.add_images_to_temporary_project(
+                project_id,
+                [image_ids[0]],
+                intent_labels={image_ids[0]: "世界观"},
+            )
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._show_temporary_project_board(project_id)
+            window.project_board_view._image_items[image_ids[0]].setPos(222, 333)
+
+            window._remove_images_from_current_board([image_ids[0]])
+
+            self.assertEqual(store.temporary_project_image_ids(project_id), [image_ids[1]])
+            self.assertEqual({image.id for image in store.list_images()}, set(image_ids))
+
+            window._undo_last_board_removal()
+
+            self.assertEqual(store.temporary_project_image_ids(project_id), image_ids)
+            self.assertEqual(store.temporary_project_image_badges(project_id), {image_ids[0]: ["世界观"]})
+            restored = window.project_board_view._image_items[image_ids[0]]
+            self.assertEqual(restored.pos().x(), 222)
+            self.assertEqual(restored.pos().y(), 333)
+            window.close()
+
+    def test_temporary_project_board_autosaves_layout_when_switching_to_gallery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library_dir = Path(tmp) / "library"
+            library_dir.mkdir()
+            image_path = library_dir / "first.jpg"
+            pixmap = QPixmap(320, 180)
+            pixmap.fill(QColor("#445566"))
+            self.assertTrue(pixmap.save(str(image_path)))
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library_dir))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=320,
+                height=180,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            project_id = store.create_temporary_project("临时参考", [image_id])
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._show_temporary_project_board(project_id)
+            item = window.project_board_view._image_items[image_id]
+            item.setPos(333, 444)
+            getattr(item, "set_display_size")(260)
+            getattr(item, "set_pinned")(True)
+            getattr(item, "set_flipped")(True)
+            getattr(item, "set_grayscale")(True)
+            item.setVisible(False)
+
+            window._show_gallery_view()
+            window._show_temporary_project_board(project_id)
+
+            restored = window.project_board_view._image_items[image_id]
+            self.assertEqual(restored.pos().x(), 333)
+            self.assertEqual(restored.pos().y(), 444)
+            self.assertAlmostEqual(getattr(restored, "display_width"), 260)
+            self.assertFalse(restored.isVisible())
+            self.assertTrue(getattr(restored, "is_pinned")())
+            self.assertTrue(getattr(restored, "is_flipped")())
+            self.assertTrue(getattr(restored, "is_grayscale")())
+            window.close()
+
+    def test_creative_project_board_autosaves_layout_when_switching_to_gallery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library_dir = Path(tmp) / "library"
+            library_dir.mkdir()
+            image_path = library_dir / "first.jpg"
+            pixmap = QPixmap(320, 180)
+            pixmap.fill(QColor("#445566"))
+            self.assertTrue(pixmap.save(str(image_path)))
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library_dir))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=320,
+                height=180,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            project_id = store.create_creative_project(
+                title="故事项目",
+                brief="一个室内场景",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            store.add_images_to_creative_node(int(root_id), [image_id], intent_label="世界观")
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=int(root_id))
+            window._show_current_creative_board()
+            item = window.project_board_view._image_items[image_id]
+            item.setPos(444, 555)
+            getattr(item, "set_display_size")(280)
+            getattr(item, "set_pinned")(True)
+            getattr(item, "set_flipped")(True)
+
+            window._show_gallery_view()
+            window._show_current_creative_board()
+
+            restored = window.project_board_view._image_items[image_id]
+            self.assertEqual(restored.pos().x(), 444)
+            self.assertEqual(restored.pos().y(), 555)
+            self.assertAlmostEqual(getattr(restored, "display_width"), 280)
+            self.assertTrue(getattr(restored, "is_pinned")())
+            self.assertTrue(getattr(restored, "is_flipped")())
+            window.close()
+
+    def test_creative_project_board_removes_branch_links_and_undo_restores_original_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids = []
+            for index in range(2):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{index}.jpg"),
+                    file_size=123,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=index + 1,
+                )
+                image_ids.append(image_id)
+            project_id = store.create_creative_project(
+                title="故事项目",
+                brief="一个室内场景",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            child_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="地点",
+                note="旧公寓走廊",
+                search_query="旧公寓走廊",
+            )
+            store.add_images_to_creative_node(child_id, image_ids, intent_label="地点")
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=int(root_id))
+            window._show_current_creative_board()
+            window.project_board_view._image_items[image_ids[0]].setPos(244, 355)
+
+            window._remove_images_from_current_board([image_ids[0]])
+
+            self.assertEqual(store.creative_node_image_ids(child_id), [image_ids[1]])
+            self.assertEqual({image.id for image in store.list_images()}, set(image_ids))
+
+            window._undo_last_board_removal()
+
+            self.assertEqual(store.creative_node_image_ids(child_id), image_ids)
+            self.assertEqual(store.creative_node_image_badges(project_id)[image_ids[0]], ["地点"])
+            restored = window.project_board_view._image_items[image_ids[0]]
+            self.assertEqual(restored.pos().x(), 244)
+            self.assertEqual(restored.pos().y(), 355)
             window.close()
 
     def test_selecting_creative_node_opens_node_board_not_gallery(self) -> None:
@@ -4213,6 +4738,17 @@ class MainWindowContextMenuTest(unittest.TestCase):
             if item.data(Qt.ItemDataRole.UserRole) == value:
                 return item
         raise AssertionError(f"list item not found: {value}")
+
+    def _expand_project_sidebar_section(self, window: MainWindow, section_id: str) -> None:
+        if window.project_sidebar_expanded_sections.get(section_id, False):
+            return
+        for row in range(window.temp_project_list.count()):
+            item = window.temp_project_list.item(row)
+            if item.data(PROJECT_LIST_SECTION_ID_ROLE) == section_id:
+                window._handle_project_sidebar_item_clicked(item)
+                self.app.processEvents()
+                return
+        raise AssertionError(f"project sidebar section not found: {section_id}")
 
     @staticmethod
     def _tag_item(window: MainWindow, tag_name: str) -> QListWidgetItem:

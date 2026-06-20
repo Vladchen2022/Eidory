@@ -13,6 +13,8 @@ from eidory.core.image_loader import MAX_AI_VISION_UPLOAD_BYTES, open_local_imag
 
 
 AI_VISION_PROMPT_VERSION = "scene-v1"
+AI_VISION_MAX_TOKENS = 3072
+AI_VISION_REPAIR_MAX_RAW_CHARS = 12000
 
 AI_VISION_FIELD_VALUES: dict[str, list[str]] = {
     "scene_location": ["indoor", "outdoor", "threshold", "unknown"],
@@ -21,6 +23,16 @@ AI_VISION_FIELD_VALUES: dict[str, list[str]] = {
     "weather": ["sunny", "cloudy", "rain", "snow", "fog_haze", "not_visible", "unknown"],
     "shot_scale": ["close_up", "near", "medium", "long", "extreme_long", "unknown"],
     "view_angle": ["eye_level", "high_angle", "low_angle", "bird_eye", "unknown"],
+}
+AI_VISION_REQUIRED_KEYS = {
+    "scene_location",
+    "environment_type",
+    "time_of_day",
+    "weather",
+    "shot_scale",
+    "view_angle",
+    "lighting",
+    "notes",
 }
 
 AI_VISION_LIGHTING_VALUES = [
@@ -236,7 +248,16 @@ class AIVisionProvider:
             raise AIVisionProviderError(f"源文件不存在：{path}")
         model_name = self.model_name or self._first_available_model()
         raw = self._chat_completion(model_name=model_name, image_path=path)
-        return parse_ai_vision_analysis(raw)
+        try:
+            return parse_ai_vision_analysis(raw)
+        except AIVisionProviderError as original_error:
+            repaired = self._repair_chat_completion(model_name=model_name, raw=raw)
+            try:
+                return parse_ai_vision_analysis(repaired)
+            except AIVisionProviderError as repair_error:
+                raise AIVisionProviderError(
+                    f"{original_error}；JSON 修复失败：{repair_error}"
+                ) from repair_error
 
     def resolved_model_name(self) -> str:
         if self.model_name:
@@ -251,7 +272,9 @@ class AIVisionProvider:
                 {
                     "role": "system",
                     "content": (
+                        "/no_think\n"
                         "你是视觉元数据标注器。只输出严格 JSON，不要 Markdown，不要解释。"
+                        "第一字符必须是 {，最后字符必须是 }。"
                         "不要识别人物身份、艺术家、IP、年代、职业或故事剧情。"
                         "只能根据画面可见信息选择受控字段；看不清或不适用必须用 unknown/not_visible/unclear。"
                         "confidence 必须是 0 到 1 的数字。"
@@ -266,7 +289,7 @@ class AIVisionProvider:
                 },
             ],
             "temperature": self.temperature,
-            "max_tokens": 900,
+            "max_tokens": AI_VISION_MAX_TOKENS,
             "response_format": ai_vision_response_format(),
         }
         headers = self._headers()
@@ -299,6 +322,55 @@ class AIVisionProvider:
             raise AIVisionProviderError("视觉模型返回了空内容")
         return content
 
+    def _repair_chat_completion(self, *, model_name: str, raw: str) -> str:
+        payload: dict[str, Any] = {
+            "model": model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "/no_think\n"
+                        "你是 JSON 修复器。只输出一个严格 JSON 对象，不要 Markdown，不要解释。"
+                        "第一字符必须是 {，最后字符必须是 }。"
+                        "不要新增不可见事实；缺失或不确定字段用 unknown/not_visible/unclear。"
+                    ),
+                },
+                {"role": "user", "content": build_ai_vision_repair_prompt(raw)},
+            ],
+            "temperature": 0,
+            "max_tokens": AI_VISION_MAX_TOKENS,
+            "response_format": ai_vision_response_format(),
+        }
+        headers = self._headers()
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=self.timeout_seconds,
+            )
+            if response.status_code in {400, 422}:
+                payload.pop("response_format", None)
+                response = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout_seconds,
+                )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise AIVisionProviderError(f"{self.service_name} JSON 修复请求失败：{exc}") from exc
+        try:
+            message = response.json()["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise AIVisionProviderError("视觉模型 JSON 修复返回格式无效") from exc
+        content = str(message.get("content") or "").strip()
+        if not content:
+            content = str(message.get("reasoning_content") or "").strip()
+        if not content:
+            raise AIVisionProviderError("视觉模型 JSON 修复返回了空内容")
+        return content
+
     def _first_available_model(self) -> str:
         try:
             response = requests.get(
@@ -328,7 +400,9 @@ def build_ai_vision_prompt() -> str:
         "lighting": AI_VISION_LIGHTING_VALUES,
     }
     return (
+        "/no_think\n"
         "分析这张图，只返回一个 JSON 对象。\n"
+        "第一字符必须是 {，最后字符必须是 }。禁止输出推理、解释、自然语言前后缀或 Markdown。\n"
         "关键定义：\n"
         "- indoor 只用于人造建筑内部、房间内部、车船舱内等人工封闭空间。\n"
         "- outdoor 用于露天自然/城市/街道/山水环境。\n"
@@ -345,9 +419,32 @@ def build_ai_vision_prompt() -> str:
         f"- lighting 可以多选，取值 {AI_VISION_LIGHTING_VALUES}\n"
         "每个单选字段输出 {\"value\":\"...\",\"confidence\":0.0,\"note\":\"...\"}。\n"
         "lighting 输出 [{\"value\":\"...\",\"confidence\":0.0,\"note\":\"...\"}]。\n"
+        "所有 note 都必须很短，不超过 20 个中文字。\n"
         "notes 输出一句很短的中文说明，专门写不确定或容易误判的地方。\n"
         "不要输出允许值之外的值。\n"
         f"允许值全集：{json.dumps(allowed, ensure_ascii=False)}"
+    )
+
+
+def build_ai_vision_repair_prompt(raw: str) -> str:
+    allowed = {
+        **AI_VISION_FIELD_VALUES,
+        "lighting": AI_VISION_LIGHTING_VALUES,
+    }
+    clipped = raw.strip()[:AI_VISION_REPAIR_MAX_RAW_CHARS]
+    return (
+        "/no_think\n"
+        "把下面的视觉模型输出修复成 Eidory AI 视觉标签 JSON。\n"
+        "只输出 JSON 对象，不要 Markdown，不要解释，不要代码块。\n"
+        "字段必须完整：scene_location, environment_type, time_of_day, weather, "
+        "shot_scale, view_angle, lighting, notes。\n"
+        "每个单选字段格式：{\"value\":\"...\",\"confidence\":0.0,\"note\":\"...\"}。\n"
+        "lighting 格式：[{\"value\":\"...\",\"confidence\":0.0,\"note\":\"...\"}]。\n"
+        "如果原始输出缺失某字段，按可见信息补；不能判断就用 unknown/not_visible/unclear。\n"
+        "不要输出允许值之外的值。\n"
+        f"允许值全集：{json.dumps(allowed, ensure_ascii=False)}\n"
+        "原始输出：\n"
+        f"{clipped}"
     )
 
 
@@ -402,15 +499,36 @@ def parse_ai_vision_analysis(raw: str) -> AIVisionAnalysis:
         content = content.strip("`")
         if content.startswith("json"):
             content = content[4:].strip()
-    start = content.find("{")
-    end = content.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise AIVisionProviderError("视觉模型没有返回 JSON 对象")
-    try:
-        data = json.loads(content[start : end + 1])
-    except json.JSONDecodeError as exc:
-        raise AIVisionProviderError(f"视觉模型 JSON 无效：{exc}") from exc
+    data = _extract_ai_vision_json_object(content)
     return normalize_ai_vision_analysis(data)
+
+
+def _extract_ai_vision_json_object(content: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    found_json_start = False
+    last_error: json.JSONDecodeError | None = None
+    fallback: dict[str, Any] | None = None
+    for start, char in enumerate(content):
+        if char != "{":
+            continue
+        found_json_start = True
+        try:
+            data, _ = decoder.raw_decode(content[start:])
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if isinstance(data, dict):
+            if AI_VISION_REQUIRED_KEYS.issubset(data.keys()):
+                return data
+            if fallback is None:
+                fallback = data
+    if fallback is not None:
+        return fallback
+    if not found_json_start:
+        raise AIVisionProviderError("视觉模型没有返回 JSON 对象")
+    if last_error is not None:
+        raise AIVisionProviderError(f"视觉模型 JSON 无效：{last_error}") from last_error
+    raise AIVisionProviderError("视觉模型没有返回 JSON 对象")
 
 
 def normalize_ai_vision_analysis(data: dict[str, Any]) -> AIVisionAnalysis:

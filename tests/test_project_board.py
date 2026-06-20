@@ -7,7 +7,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QColor, QKeyEvent, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from eidory.models import ImageItem
@@ -98,6 +99,69 @@ class ProjectBoardViewTest(unittest.TestCase):
 
             item = board._image_items[1]
             self.assertEqual(getattr(item, "badge_text"), "世界观 +1")
+
+    def test_layout_payload_restores_item_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "first.jpg"
+            pixmap = QPixmap(320, 180)
+            pixmap.fill(QColor("#334455"))
+            self.assertTrue(pixmap.save(str(image_path)))
+
+            image = self._image(1, file_path=str(image_path), width=320, height=180)
+            board = ProjectBoardView()
+            board.set_images([image])
+            item = board._image_items[1]
+            item.setPos(210, 320)
+            getattr(item, "set_display_size")(260)
+            getattr(item, "set_pinned")(True)
+            getattr(item, "set_flipped")(True)
+            getattr(item, "set_grayscale")(True)
+            item.setVisible(False)
+
+            payload = board.layout_payload()
+
+            restored = ProjectBoardView()
+            restored.set_images([image], layout_payload=payload)
+            restored_item = restored._image_items[1]
+            self.assertEqual(restored_item.pos().x(), 210)
+            self.assertEqual(restored_item.pos().y(), 320)
+            self.assertAlmostEqual(getattr(restored_item, "display_width"), 260)
+            self.assertFalse(restored_item.isVisible())
+            self.assertTrue(getattr(restored_item, "is_pinned")())
+            self.assertTrue(getattr(restored_item, "is_flipped")())
+            self.assertTrue(getattr(restored_item, "is_grayscale")())
+
+    def test_delete_key_requests_selected_image_removal(self) -> None:
+        board = ProjectBoardView()
+        board.set_images([self._image(1), self._image(2)])
+        emitted: list[list[int]] = []
+        board.removeImagesRequested.connect(lambda image_ids: emitted.append(list(image_ids)))
+
+        board._select_image_id(1)
+        event = QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_Delete,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        board.keyPressEvent(event)
+
+        self.assertEqual(emitted, [[1]])
+        self.assertTrue(event.isAccepted())
+
+    def test_undo_shortcut_requests_board_removal_undo(self) -> None:
+        board = ProjectBoardView()
+        emitted: list[bool] = []
+        board.undoRemovalRequested.connect(lambda: emitted.append(True))
+
+        event = QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_Z,
+            Qt.KeyboardModifier.MetaModifier,
+        )
+        board.keyPressEvent(event)
+
+        self.assertEqual(emitted, [True])
+        self.assertTrue(event.isAccepted())
 
     def test_cached_pixmap_respects_max_side(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

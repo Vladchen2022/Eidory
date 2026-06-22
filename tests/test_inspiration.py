@@ -6,6 +6,7 @@ from pathlib import Path
 
 from eidory.core.inspiration import InspirationTerm, mix_inspiration_search_results
 from eidory.core.llm_provider import (
+    LMStudioProvider,
     _terms_from_plain_text,
     parse_creative_project_copy_suggestion,
     parse_creative_node_note_suggestion,
@@ -142,6 +143,107 @@ class InspirationTest(unittest.TestCase):
         self.assertIn("工程师", suggestion.copy_text)
         self.assertEqual(len(suggestion.nodes), 1)
         self.assertEqual(suggestion.nodes[0].title, "地点")
+
+    def test_parse_creative_project_copy_suggestion_unwraps_chat_response_content(self) -> None:
+        suggestion = parse_creative_project_copy_suggestion(
+            """
+{
+  "choices": [
+    {
+      "message": {
+        "content": "{\\"copy_text\\": \\"雨夜站台上，维修师背对远处灯箱，湿地反光压出孤独感。\\", \\"nodes\\": []}"
+      }
+    }
+  ]
+}
+            """
+        )
+
+        self.assertIn("雨夜站台", suggestion.copy_text)
+
+    def test_parse_creative_project_copy_suggestion_accepts_plain_content_text(self) -> None:
+        suggestion = parse_creative_project_copy_suggestion(
+            """
+{
+  "content": "冷色维修棚里，主角低头检查满是划痕的车体，背景灯牌被雨雾晕开。"
+}
+            """
+        )
+
+        self.assertIn("维修棚", suggestion.copy_text)
+
+    def test_parse_creative_project_copy_suggestion_accepts_plain_response_text(self) -> None:
+        suggestion = parse_creative_project_copy_suggestion(
+            "雨夜维修棚里，灯箱和积水反光包围着沉默的维修师。"
+        )
+
+        self.assertIn("维修棚", suggestion.copy_text)
+        self.assertEqual(suggestion.nodes, [])
+
+    def test_parse_creative_project_copy_suggestion_extracts_thinking_draft(self) -> None:
+        suggestion = parse_creative_project_copy_suggestion(
+            """
+Here's a thinking process:
+
+1. **Analyze User Input:**
+- **Project Theme:** 维修师在屋前的小院里教两个学徒修理一辆汽车
+
+3. **Synthesize & Draft:**
+傍晚时分，低矮平房前的水泥小院被夕阳余晖和暖黄工作灯切开。维修师俯身指向敞开的汽车引擎舱，机械义眼映出冷蓝霓虹；两名学徒穿着沾满油污的围裙，半蹲在砖石地面旁记录零件拆装。生锈底盘与发光管线交织，旧轮胎、零件箱、晾衣绳和斑驳外墙共同撑起未来市井的日常质感。
+
+4. **Character Count Check:**
+Total: about 220 Chinese characters.
+            """
+        )
+
+        self.assertTrue(suggestion.copy_text.startswith("傍晚时分"))
+        self.assertIn("未来市井", suggestion.copy_text)
+        self.assertNotIn("thinking process", suggestion.copy_text)
+
+    def test_parse_creative_project_copy_suggestion_extracts_partial_json_copy_text(self) -> None:
+        suggestion = parse_creative_project_copy_suggestion(
+            """
+{
+  "copy_text": "暮色四合，低矮平房的院落被冷蓝环境光与暖黄工作灯切割出明暗交界。维修师站在掀开的引擎盖旁，向两个学徒指点底盘节点，金属反光与生活痕迹交织
+            """
+        )
+
+        self.assertTrue(suggestion.copy_text.startswith("暮色四合"))
+        self.assertNotIn("copy_text", suggestion.copy_text)
+
+    def test_parse_creative_project_copy_suggestion_strips_english_prefix(self) -> None:
+        suggestion = parse_creative_project_copy_suggestion(
+            "Start with the low-angle composition and time/lighting: 低角度仰视镜头切入黄昏时分的小院，屋檐灯与暖黄工作探照灯交织出斑驳光影。"
+        )
+
+        self.assertTrue(suggestion.copy_text.startswith("低角度仰视"))
+        self.assertNotIn("Start with", suggestion.copy_text)
+
+    def test_generate_creative_project_copy_requests_plain_text(self) -> None:
+        class FakeProvider(LMStudioProvider):
+            def __init__(self) -> None:
+                super().__init__(model_name="fake-model")
+                self.calls: list[dict[str, object]] = []
+
+            def _chat_completion(self, **kwargs: object) -> str:  # type: ignore[override]
+                self.calls.append(kwargs)
+                return "雨夜维修棚里，灯箱和积水反光包围着沉默的维修师。"
+
+        provider = FakeProvider()
+
+        suggestion, model_name = provider.generate_creative_project_copy(
+            project_brief="雨夜维修棚",
+            nodes=[{"title": "地点", "path": "项目 / 地点", "note": "潮湿维修棚", "search_query": ""}],
+            language="zh",
+        )
+
+        self.assertEqual(model_name, "fake-model")
+        self.assertIn("维修棚", suggestion.copy_text)
+        self.assertEqual(suggestion.nodes, [])
+        self.assertEqual(provider.calls[0]["prefer_json"], False)
+        messages = provider.calls[0]["messages"]
+        self.assertIsInstance(messages, list)
+        self.assertIn("只输出最终文案正文", messages[1]["content"])  # type: ignore[index]
 
     def test_parse_search_plan_proposal_normalizes_filters(self) -> None:
         proposal = parse_search_plan_proposal(

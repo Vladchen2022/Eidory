@@ -352,14 +352,15 @@ class LMStudioProvider:
                 "role": "system",
                 "content": (
                     "You write concise, visual illustration concept copy from fixed planning nodes. "
-                    "Respect any existing node information. Return strict JSON only."
+                    "Respect any existing node information. Output only the final copy text. "
+                    "Do not output JSON, Markdown, explanation, or reasoning."
                     if language == "en"
-                    else "你负责根据固定创作节点写一段画面感强的插画概念文案。必须尊重已有节点信息。只输出严格 JSON。"
+                    else "你负责根据固定创作节点写一段画面感强的插画概念文案。必须尊重已有节点信息。只输出最终文案正文，不要输出 JSON、Markdown、解释或思考过程。"
                 ),
             },
             {
                 "role": "user",
-                "content": _build_creative_project_copy_prompt(
+                "content": _build_creative_project_copy_text_prompt(
                     project_brief=clean_brief,
                     nodes=nodes,
                     language=language,
@@ -369,10 +370,9 @@ class LMStudioProvider:
         content = self._chat_completion(
             model_name=model_name,
             messages=messages,
-            prefer_json=True,
-            response_format=_creative_project_copy_response_format(),
+            prefer_json=False,
             temperature=0.75,
-            max_tokens=1800,
+            max_tokens=1400,
         )
         return parse_creative_project_copy_suggestion(content, language=language), model_name
 
@@ -650,10 +650,20 @@ def parse_creative_project_copy_suggestion(
     *,
     language: str = "zh",
 ) -> CreativeProjectCopySuggestion:
-    payload = _load_json_object(content)
+    try:
+        payload = _unwrap_creative_project_copy_payload(_load_json_object(content))
+    except LLMProviderError:
+        copy_text = _clean_plain_project_copy_text(content)
+        if copy_text:
+            return CreativeProjectCopySuggestion(copy_text=copy_text, nodes=[])
+        raise
     fallback_copy = "A focused visual reference concept." if language == "en" else "一段围绕当前创作节点展开的视觉参考文案。"
-    copy_text = _clean_project_text(payload.get("copy_text"), max_length=1600) or fallback_copy
-    raw_nodes = payload.get("nodes", [])
+    copy_text = _first_clean_project_text(
+        payload,
+        ("copy_text", "copyText", "copy text", "copy", "text", "文案"),
+        max_length=1600,
+    ) or fallback_copy
+    raw_nodes = payload.get("nodes", payload.get("node_updates", []))
     if not isinstance(raw_nodes, list):
         raw_nodes = []
     suggestions: list[CreativeNodeSuggestion] = []
@@ -677,6 +687,174 @@ def parse_creative_project_copy_suggestion(
         )
         seen_titles.add(title)
     return CreativeProjectCopySuggestion(copy_text=copy_text, nodes=suggestions)
+
+
+def _unwrap_creative_project_copy_payload(payload: dict[str, object]) -> dict[str, object]:
+    if "copy_text" in payload or "nodes" in payload:
+        return payload
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first_choice = choices[0]
+        if isinstance(first_choice, dict):
+            message = first_choice.get("message")
+            if isinstance(message, dict):
+                unwrapped = _payload_from_nested_content(message.get("content"))
+                if unwrapped is not None:
+                    return _unwrap_creative_project_copy_payload(unwrapped)
+    message = payload.get("message")
+    if isinstance(message, dict):
+        unwrapped = _payload_from_nested_content(message.get("content"))
+        if unwrapped is not None:
+            return _unwrap_creative_project_copy_payload(unwrapped)
+    content_payload = _payload_from_nested_content(payload.get("content"))
+    if content_payload is not None:
+        return _unwrap_creative_project_copy_payload(content_payload)
+    content_text = _clean_project_text(payload.get("content"), max_length=1600)
+    if content_text:
+        return {"copy_text": content_text, "nodes": payload.get("nodes", [])}
+    return payload
+
+
+def _payload_from_nested_content(value: object) -> dict[str, object] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    clean_value = value.strip()
+    if not clean_value:
+        return None
+    try:
+        nested = _load_json_object(clean_value)
+    except LLMProviderError:
+        copy_text = _clean_plain_project_copy_text(clean_value)
+        return {"copy_text": copy_text or clean_value, "nodes": []}
+    return nested if isinstance(nested, dict) else None
+
+
+def _clean_plain_project_copy_text(content: str) -> str:
+    partial_copy = _extract_partial_project_copy_text(content)
+    if partial_copy:
+        return partial_copy
+    draft = _extract_best_project_copy_paragraph(content)
+    if draft:
+        return draft
+    return _strip_project_copy_prefix(_clean_project_text(content, max_length=1600))
+
+
+def _extract_partial_project_copy_text(content: str) -> str:
+    candidates: list[str] = []
+    for key in ("copy_text", "copyText", "copy text", "copy", "text", "文案"):
+        pattern = rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)'
+        for match in re.finditer(pattern, content, flags=re.DOTALL):
+            value = _decode_json_string_fragment(match.group(1))
+            clean_value = _strip_project_copy_prefix(_clean_project_text(value, max_length=1600))
+            if _cjk_count(clean_value) >= 24 or len(clean_value) >= 80:
+                candidates.append(clean_value)
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda text: (_cjk_count(text), len(text)))
+
+
+def _decode_json_string_fragment(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except json.JSONDecodeError:
+        return (
+            value.replace(r"\\", "\\")
+            .replace(r"\"", '"')
+            .replace(r"\n", "\n")
+            .replace(r"\t", "\t")
+        )
+
+
+def _extract_best_project_copy_paragraph(content: str) -> str:
+    text = re.sub(r"(?is)<think>.*?</think>", "", content).strip()
+    lines = [_strip_project_copy_prefix(line.strip()) for line in text.splitlines()]
+    blocks: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        if current:
+            blocks.append(" ".join(current))
+            current.clear()
+
+    for line in lines:
+        if not line:
+            flush()
+            continue
+        if _looks_like_reasoning_line(line):
+            flush()
+            continue
+        if _cjk_count(line) < 20 and len(line) < 80:
+            flush()
+            continue
+        current.append(line)
+    flush()
+
+    candidates = [
+        _clean_project_text(block, max_length=1600)
+        for block in blocks
+        if _cjk_count(block) >= 40 or len(block) >= 120
+    ]
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda text: (_cjk_count(text), len(text)))
+
+
+def _looks_like_reasoning_line(line: str) -> bool:
+    clean = line.strip()
+    lower = clean.lower()
+    if re.match(r"^\d+[\.)]\s", clean):
+        return True
+    if clean.startswith(("-", "*", "•")):
+        return True
+    if "**" in clean or "```" in clean:
+        return True
+    reasoning_markers = (
+        "thinking process",
+        "analyze user input",
+        "deconstruct",
+        "synthesize",
+        "draft",
+        "character count",
+        "cross-check",
+        "requirements",
+        "project theme",
+        "json nodes",
+        "total:",
+        "perfectly",
+    )
+    return any(marker in lower for marker in reasoning_markers)
+
+
+def _strip_project_copy_prefix(text: str) -> str:
+    clean = re.sub(
+        r"^\s*(?:最终文案|文案正文|项目文案|文案|copy_text|copy|final)\s*[:：]\s*",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    )
+    english_prefix = re.match(r"^[A-Za-z][^。！？\n]*[:：]\s*([\u3400-\u9fff].*)$", clean)
+    if english_prefix:
+        return english_prefix.group(1).strip()
+    return clean
+
+
+def _cjk_count(text: str) -> int:
+    return len(re.findall(r"[\u3400-\u9fff]", text))
+
+
+def _first_clean_project_text(
+    payload: dict[str, object],
+    keys: tuple[str, ...],
+    *,
+    max_length: int,
+) -> str:
+    for key in keys:
+        text = _clean_project_text(payload.get(key), max_length=max_length)
+        if text:
+            return text
+    return ""
 
 
 def _clean_project_text(value: object, *, max_length: int) -> str:
@@ -809,34 +987,6 @@ def _creative_node_note_response_format() -> dict[str, object]:
                     "search_query": {"type": "string"},
                 },
                 "required": ["note", "search_query"],
-            },
-        },
-    }
-
-
-def _creative_project_copy_response_format() -> dict[str, object]:
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "eidory_creative_project_copy",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "copy_text": {"type": "string"},
-                    "nodes": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "title": {"type": "string"},
-                                "note": {"type": "string"},
-                                "search_query": {"type": "string"},
-                            },
-                            "required": ["title", "note", "search_query"],
-                        },
-                    },
-                },
-                "required": ["copy_text", "nodes"],
             },
         },
     }
@@ -1291,7 +1441,7 @@ Rules:
 """.strip()
 
 
-def _build_creative_project_copy_prompt(
+def _build_creative_project_copy_text_prompt(
     *,
     project_brief: str,
     nodes: list[dict[str, str]],
@@ -1307,15 +1457,8 @@ def _build_creative_project_copy_prompt(
                 "search_query": str(node.get("search_query", "")).strip()[:240],
             }
         )
-    has_any_detail = any(node["note"] or node["search_query"] for node in clean_nodes)
     nodes_json = json.dumps(clean_nodes, ensure_ascii=False, indent=2)
     if language == "en":
-        mode_note = (
-            "Some nodes already contain information. Do not contradict, overwrite, or ignore them. "
-            "You may only fill empty nodes when it helps the copy."
-            if has_any_detail
-            else "All nodes are empty. Invent one coherent visual concept and fill every listed node."
-        )
         return f"""
 Project brief:
 {project_brief or "-"}
@@ -1323,29 +1466,13 @@ Project brief:
 Planning nodes JSON:
 {nodes_json}
 
-Task:
-Write a concise visual concept copy for an illustrator. Also return node updates.
+Write one vivid visual concept paragraph for an illustrator, 100-220 English words.
+Respect the existing node information as hard constraints. Do not add characters, locations, weather, era, events, or mood that conflict with the nodes.
 
-Return JSON:
-{{
-  "copy_text": "one vivid paragraph, 100-220 English words",
-  "nodes": [
-    {{"title": "existing node title exactly", "note": "node visual detail", "search_query": "concrete English image-search phrase"}}
-  ]
-}}
+Output only the final copy text. Do not output JSON, Markdown, headings, explanation, or reasoning.
 
-Rules:
-1. {mode_note}
-2. Keep node titles exactly the same as the provided titles.
-3. If existing node information exists, the copy must preserve it as hard constraints.
-4. Do not add characters, location, weather, era, or events that conflict with existing node notes.
-5. Do not output Markdown or any text outside JSON.
+/no_think
 """.strip()
-    mode_note = (
-        "部分节点已经有信息。不得推翻、篡改或忽略已有信息；只在不冲突时补全空节点。"
-        if has_any_detail
-        else "所有节点都为空。请随机生成一个统一、可画、画面感强的创作主题，并补全每个节点。"
-    )
     return f"""
 项目主题：
 {project_brief or "-"}
@@ -1353,23 +1480,12 @@ Rules:
 规划节点 JSON：
 {nodes_json}
 
-任务：
-为插画师写一段画面感强的短文，并返回节点补全。
+请根据这些固定节点写一段画面感强、可直接给插画师参考的中文文案，约 180 到 360 个汉字。
+必须把已有节点信息当作硬约束，不要加入与节点说明冲突的角色、地点、天气、年代、事件或氛围。
 
-输出 JSON：
-{{
-  "copy_text": "一段视觉性强的短文，约 180 到 360 个汉字",
-  "nodes": [
-    {{"title": "必须使用已有节点名", "note": "该节点的视觉信息", "search_query": "具体中文语义搜图短语"}}
-  ]
-}}
+只输出最终文案正文。不要输出 JSON、Markdown、标题、解释或思考过程。
 
-规则：
-1. {mode_note}
-2. 节点 title 必须和输入中的节点名完全一致。
-3. 如果已有节点信息存在，文案必须把它当作硬约束。
-4. 不要加入与已有节点说明冲突的角色、地点、天气、年代或事件。
-5. 不要输出 Markdown，不要解释 JSON 之外的内容。
+/no_think
 """.strip()
 
 

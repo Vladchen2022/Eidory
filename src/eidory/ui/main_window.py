@@ -1698,6 +1698,7 @@ class MainWindow(QMainWindow):
         self.tags_display.setMaximumHeight(86)
         self.tags_display.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.tags_display.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.tags_display.setStyleSheet("QTextEdit { background: transparent; border: 0; padding: 0; }")
 
         self.batch_tag_summary_label = QLabel("-")
         self.batch_tag_summary_label.setWordWrap(True)

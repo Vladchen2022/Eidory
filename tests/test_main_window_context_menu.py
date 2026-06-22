@@ -1074,6 +1074,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(window.copy_path_button.isHidden())
             self.assertTrue(window.feedback_widget.isHidden())
             self.assertLessEqual(window.note_input.maximumHeight(), 96)
+            self.assertIn("border: 0", window.tags_display.styleSheet())
             window.close()
 
     def test_detail_path_shows_complete_wrapped_text(self) -> None:
@@ -4272,6 +4273,46 @@ class MainWindowContextMenuTest(unittest.TestCase):
                     ("删除创作节点项目", True),
                 ],
             )
+            window.close()
+
+    def test_creative_project_copy_done_updates_copy_text_area(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="雨夜维修场",
+                brief="维修师在雨夜检查车辆",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=int(root_id), show_board=False)
+
+            window._handle_creative_project_copy_done(
+                project_id,
+                int(root_id),
+                False,
+                SimpleNamespace(copy_text="雨夜维修棚里，灯箱和积水反光包围着沉默的维修师。", nodes=[]),
+                "fake",
+            )
+
+            self.assertIn("雨夜维修棚", window.creative_project_copy_input.toPlainText())
+            updated = store.get_creative_project(project_id)
+            self.assertIsNotNone(updated)
+            self.assertIn("雨夜维修棚", updated.copy_text)
+            self.assertEqual(window.creative_content_tabs.currentIndex(), 1)
             window.close()
 
     def test_selecting_temporary_project_from_project_sidebar_opens_board_with_badges(self) -> None:

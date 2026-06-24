@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, Mapping
 
 from PIL import Image, ImageOps
 
@@ -40,6 +40,19 @@ class ImageDHashRecord:
     image: ImageItem
     dhash: int
     hash_source: str
+
+
+@dataclass(frozen=True)
+class ImageHashCacheRecord:
+    image_id: int
+    file_path: str
+    file_size: int
+    modified_time_ns: int
+    file_sha256: str
+    dhash: int
+    hash_source: str
+    hash_source_size: int
+    hash_source_modified_time_ns: int
 
 
 class _DisjointSet:
@@ -112,6 +125,8 @@ def find_duplicate_groups(
     images: list[ImageItem],
     *,
     folder_label_for_image: dict[int, str] | None = None,
+    hash_records: Mapping[int, ImageHashCacheRecord] | None = None,
+    on_hash_record: Callable[[ImageHashCacheRecord], None] | None = None,
     near_distance: int = 8,
 ) -> list[DuplicateGroup]:
     members: dict[int, DuplicateMember] = {}
@@ -125,10 +140,20 @@ def find_duplicate_groups(
         path = Path(image.file_path)
         if not path.is_file():
             continue
-        try:
-            sha = _file_sha256(path)
-            dhash = image_dhash(path)
-        except Exception:
+        hash_record = _valid_hash_record_for_image(
+            image,
+            hash_records or {},
+            prefer_thumbnail=False,
+        )
+        if hash_record is None:
+            hash_record = build_image_hash_cache_record(image, prefer_thumbnail=False)
+            if hash_record is None:
+                continue
+            if on_hash_record is not None:
+                on_hash_record(hash_record)
+        sha = hash_record.file_sha256
+        dhash = hash_record.dhash
+        if dhash is None:
             continue
         folder_label = (
             folder_label_for_image.get(image.id, "")
@@ -240,26 +265,68 @@ def find_near_duplicate_candidates(
     return candidates[:limit]
 
 
-def build_image_dhash_records(images: list[ImageItem]) -> list[ImageDHashRecord]:
+def build_image_dhash_records(
+    images: list[ImageItem],
+    *,
+    hash_records: Mapping[int, ImageHashCacheRecord] | None = None,
+    on_hash_record: Callable[[ImageHashCacheRecord], None] | None = None,
+) -> list[ImageDHashRecord]:
     records: list[ImageDHashRecord] = []
     for image in images:
         if image.is_missing or not is_supported_image(image.file_path):
             continue
-        hash_path = _hash_source_for_image(image)
-        if hash_path is None:
-            continue
-        try:
-            dhash = image_dhash(hash_path)
-        except Exception:
+        hash_record = _valid_hash_record_for_image(image, hash_records or {})
+        if hash_record is None:
+            hash_record = build_image_hash_cache_record(image)
+            if hash_record is None:
+                continue
+            if on_hash_record is not None:
+                on_hash_record(hash_record)
+        if hash_record.dhash is None:
             continue
         records.append(
             ImageDHashRecord(
                 image=image,
-                dhash=dhash,
-                hash_source=str(hash_path),
+                dhash=hash_record.dhash,
+                hash_source=hash_record.hash_source,
             )
         )
     return records
+
+
+def build_image_hash_cache_record(
+    image: ImageItem,
+    *,
+    prefer_thumbnail: bool = True,
+) -> ImageHashCacheRecord | None:
+    if image.is_missing or not is_supported_image(image.file_path):
+        return None
+    path = Path(image.file_path)
+    source_stat = _safe_stat(path)
+    if source_stat is None:
+        return None
+    hash_path = _hash_source_for_image(image, prefer_thumbnail=prefer_thumbnail)
+    if hash_path is None:
+        return None
+    hash_source_stat = _safe_stat(hash_path)
+    if hash_source_stat is None:
+        return None
+    try:
+        sha = _file_sha256(path)
+        dhash = image_dhash(hash_path)
+    except Exception:
+        return None
+    return ImageHashCacheRecord(
+        image_id=int(image.id),
+        file_path=str(path),
+        file_size=int(source_stat.st_size),
+        modified_time_ns=int(source_stat.st_mtime_ns),
+        file_sha256=sha,
+        dhash=int(dhash),
+        hash_source=str(hash_path),
+        hash_source_size=int(hash_source_stat.st_size),
+        hash_source_modified_time_ns=int(hash_source_stat.st_mtime_ns),
+    )
 
 
 def image_dhash(path: Path, *, hash_size: int = 8) -> int:
@@ -296,13 +363,54 @@ def _sort_members(members: Iterable[DuplicateMember]) -> list[DuplicateMember]:
     )
 
 
-def _hash_source_for_image(image: ImageItem) -> Path | None:
-    if image.thumbnail_status == "ready" and image.thumbnail_path:
+def _hash_source_for_image(image: ImageItem, *, prefer_thumbnail: bool = True) -> Path | None:
+    if prefer_thumbnail and image.thumbnail_status == "ready" and image.thumbnail_path:
         thumbnail_path = Path(image.thumbnail_path)
         if thumbnail_path.is_file():
             return thumbnail_path
     path = Path(image.file_path)
     return path if path.is_file() else None
+
+
+def _valid_hash_record_for_image(
+    image: ImageItem,
+    hash_records: Mapping[int, ImageHashCacheRecord],
+    *,
+    prefer_thumbnail: bool = True,
+) -> ImageHashCacheRecord | None:
+    record = hash_records.get(int(image.id))
+    if record is None:
+        return None
+    if record.file_path != image.file_path:
+        return None
+    path = Path(image.file_path)
+    source_stat = _safe_stat(path)
+    if source_stat is None:
+        return None
+    if int(source_stat.st_size) != int(record.file_size):
+        return None
+    if int(source_stat.st_mtime_ns) != int(record.modified_time_ns):
+        return None
+    hash_path = _hash_source_for_image(image, prefer_thumbnail=prefer_thumbnail)
+    if hash_path is None or str(hash_path) != record.hash_source:
+        return None
+    hash_source_stat = _safe_stat(hash_path)
+    if hash_source_stat is None:
+        return None
+    if int(hash_source_stat.st_size) != int(record.hash_source_size):
+        return None
+    if int(hash_source_stat.st_mtime_ns) != int(record.hash_source_modified_time_ns):
+        return None
+    if not record.file_sha256 or record.dhash is None:
+        return None
+    return record
+
+
+def _safe_stat(path: Path):
+    try:
+        return path.stat()
+    except OSError:
+        return None
 
 
 def _safe_resolve(path: Path) -> Path | None:

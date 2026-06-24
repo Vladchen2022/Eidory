@@ -4,14 +4,52 @@ from bisect import bisect_right
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QRect, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDrag, QImageReader, QPainter, QPen, QPixmap
+from PySide6.QtCore import (
+    QEvent,
+    QMimeData,
+    QObject,
+    QPoint,
+    QRect,
+    QRunnable,
+    QSize,
+    Qt,
+    QThreadPool,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import QColor, QDrag, QImage, QImageReader, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication
 
 from eidory.core.media_types import is_supported_video
 from eidory.models import ImageItem
 from eidory.ui.collection_tree import IMAGE_IDS_MIME, CollectionTreeWidget
 from eidory.ui.drop_import_box import payload_from_mime_data, payload_supports_mime_data
+
+
+PixmapCacheKey = tuple[str, int, int, int]
+
+
+class _PixmapLoadSignals(QObject):
+    loaded = Signal(object, object)
+
+
+class _PixmapLoadTask(QRunnable):
+    def __init__(
+        self,
+        key: PixmapCacheKey,
+        path: Path,
+        max_side: int,
+        signals: _PixmapLoadSignals,
+    ):
+        super().__init__()
+        self.key = key
+        self.path = path
+        self.max_side = max_side
+        self.signals = signals
+
+    def run(self) -> None:
+        image = JustifiedImageGridView._load_scaled_image(self.path, self.max_side)
+        self.signals.loaded.emit(self.key, image)
 
 
 class JustifiedImageGridView(QAbstractScrollArea):
@@ -37,7 +75,11 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._selection_anchor = -1
         self._drag_start_position: QPoint | None = None
         self._drag_start_index = -1
-        self._pixmap_cache: OrderedDict[str, QPixmap] = OrderedDict()
+        self._pixmap_cache: OrderedDict[PixmapCacheKey, QPixmap] = OrderedDict()
+        self._pending_pixmap_loads: set[PixmapCacheKey] = set()
+        self._pixmap_load_signals = _PixmapLoadSignals()
+        self._pixmap_load_signals.loaded.connect(self._handle_async_pixmap_loaded)
+        self._thread_pool = QThreadPool.globalInstance()
         self._cache_limit = 700
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -106,7 +148,9 @@ class JustifiedImageGridView(QAbstractScrollArea):
             current = self.current_image()
             current_image_id = current.id if current is not None else None
 
-        self._images = list(images)
+        new_images = list(images)
+        should_rebuild_layout = self._layout_keys(self._images) != self._layout_keys(new_images)
+        self._images = new_images
         self._badges_by_image_id = dict(badges_by_image_id or {})
         indexes_by_id = {image.id: index for index, image in enumerate(self._images)}
         self._selected_indexes = {
@@ -121,7 +165,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         else:
             self._selected_index = -1
         self._selection_anchor = self._selected_index
-        self._rebuild_layout()
+        if should_rebuild_layout:
+            self._rebuild_layout()
         self.viewport().update()
         self._emit_selection()
 
@@ -177,7 +222,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
                 if not draw_rect.intersects(visible):
                     continue
                 image = self._images[index]
-                pixmap = self._pixmap_for(image)
+                pixmap = self._pixmap_for(image, schedule_load=True)
                 if pixmap.isNull():
                     self._draw_placeholder(painter, draw_rect, image)
                 else:
@@ -503,6 +548,22 @@ class JustifiedImageGridView(QAbstractScrollArea):
         bar.setPageStep(self.viewport().height())
         bar.setRange(0, max(0, content_height - self.viewport().height()))
 
+    @staticmethod
+    def _layout_keys(images: list[ImageItem]) -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            (
+                image.id,
+                image.width,
+                image.height,
+                image.thumbnail_path,
+                image.file_path,
+                image.file_size,
+                image.modified_time_ns,
+                image.is_missing,
+            )
+            for image in images
+        )
+
     def _layout_row(
         self,
         rects: list[QRect],
@@ -539,35 +600,78 @@ class JustifiedImageGridView(QAbstractScrollArea):
             return max(0.2, min(6.0, pixmap.width() / pixmap.height()))
         return 1.0
 
-    def _pixmap_for(self, image: ImageItem) -> QPixmap:
+    def _pixmap_for(self, image: ImageItem, *, schedule_load: bool = False) -> QPixmap:
+        if image.is_missing:
+            return QPixmap()
         source = image.thumbnail_path or image.file_path
-        cached = self._pixmap_cache.get(source)
+        key = self._pixmap_cache_key(source)
+        if key is None:
+            return QPixmap()
+        cached = self._pixmap_cache.get(key)
         if cached is not None:
-            self._pixmap_cache.move_to_end(source)
+            self._pixmap_cache.move_to_end(key)
             return cached
+
+        if schedule_load:
+            self._schedule_pixmap_load(key)
+            return QPixmap()
 
         pixmap = QPixmap()
         if not image.is_missing:
-            path = Path(source)
-            if path.exists():
-                pixmap = self._load_scaled_pixmap(path)
+            pixmap = self._load_scaled_pixmap(Path(source))
 
-        self._pixmap_cache[source] = pixmap
-        if len(self._pixmap_cache) > self._cache_limit:
-            self._pixmap_cache.popitem(last=False)
+        self._cache_pixmap(key, pixmap)
         return pixmap
 
     def _load_scaled_pixmap(self, path: Path) -> QPixmap:
+        image = self._load_scaled_image(path, max(256, int(self._target_height * 3)))
+        return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+
+    @staticmethod
+    def _load_scaled_image(path: Path, max_side: int) -> QImage:
         reader = QImageReader(str(path))
         reader.setAutoTransform(True)
-        max_side = max(256, int(self._target_height * 3))
+        max_side = max(256, int(max_side))
         size = reader.size()
         if size.isValid() and max(size.width(), size.height()) > max_side:
             scaled_size = QSize(size.width(), size.height())
             scaled_size.scale(max_side, max_side, Qt.AspectRatioMode.KeepAspectRatio)
             reader.setScaledSize(scaled_size)
-        image = reader.read()
-        return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+        return reader.read()
+
+    def _pixmap_cache_key(self, source: str) -> PixmapCacheKey | None:
+        try:
+            stat = Path(source).stat()
+        except OSError:
+            return None
+        max_side = max(256, int(self._target_height * 3))
+        return (source, int(stat.st_mtime_ns), int(stat.st_size), max_side)
+
+    def _schedule_pixmap_load(self, key: PixmapCacheKey) -> None:
+        if key in self._pending_pixmap_loads:
+            return
+        self._pending_pixmap_loads.add(key)
+        source, _mtime, _size, max_side = key
+        self._thread_pool.start(
+            _PixmapLoadTask(key, Path(source), max_side, self._pixmap_load_signals)
+        )
+
+    def _handle_async_pixmap_loaded(self, key: object, image: object) -> None:
+        cache_key = key
+        if not isinstance(cache_key, tuple) or len(cache_key) != 4:
+            return
+        self._pending_pixmap_loads.discard(cache_key)
+        if not isinstance(image, QImage):
+            return
+        pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+        self._cache_pixmap(cache_key, pixmap)
+        self.viewport().update()
+
+    def _cache_pixmap(self, key: PixmapCacheKey, pixmap: QPixmap) -> None:
+        self._pixmap_cache[key] = pixmap
+        self._pixmap_cache.move_to_end(key)
+        while len(self._pixmap_cache) > self._cache_limit:
+            self._pixmap_cache.popitem(last=False)
 
     def _draw_placeholder(self, painter: QPainter, rect: QRect, image: ImageItem) -> None:
         painter.fillRect(rect, QColor("#2d3138"))

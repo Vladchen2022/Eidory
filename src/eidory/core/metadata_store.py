@@ -13,6 +13,7 @@ import numpy as np
 
 from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
 from eidory.core.color_features import COLOR_VECTOR_DIM, COLOR_VECTOR_VERSION
+from eidory.core.duplicate_detection import ImageHashCacheRecord
 from eidory.core.inspiration import InspirationTerm
 from eidory.core.media_types import SUPPORTED_IMAGE_EXTENSIONS
 from eidory.core.time_utils import timestamp_ns_to_iso, utc_now_iso
@@ -143,6 +144,74 @@ class MetadataStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
+            """
+        )
+        MetadataStore._ensure_remaining_schema_migrations(conn)
+
+    @staticmethod
+    def _ensure_remaining_schema_migrations(conn: sqlite3.Connection) -> None:
+        for statement in (
+            """
+            CREATE INDEX IF NOT EXISTS idx_images_missing_name
+            ON images(is_missing, file_name COLLATE NOCASE, id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_images_missing_modified
+            ON images(is_missing, modified_time_ns, id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_images_missing_imported
+            ON images(is_missing, imported_at, id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_images_missing_file_size
+            ON images(is_missing, file_size, id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_images_missing_width
+            ON images(is_missing, width, id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_images_missing_height
+            ON images(is_missing, height, id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_images_missing_duration
+            ON images(is_missing, duration_ms, id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_images_missing_pixels
+            ON images(is_missing, (width * height), id)
+            """,
+        ):
+            conn.execute(statement)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS image_hashes (
+                image_id INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                modified_time_ns INTEGER NOT NULL,
+                file_sha256 TEXT NOT NULL,
+                dhash TEXT NOT NULL,
+                hash_source TEXT NOT NULL,
+                hash_source_size INTEGER NOT NULL,
+                hash_source_modified_time_ns INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_image_hashes_file_sha256
+            ON image_hashes(file_sha256)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_image_hashes_dhash
+            ON image_hashes(dhash)
             """
         )
         conn.execute(
@@ -2079,6 +2148,86 @@ class MetadataStore:
             ).fetchall()
         by_id = {int(row["id"]): self._image_from_row(row, scores.get(int(row["id"])) if scores else None) for row in rows}
         return [by_id[image_id] for image_id in image_ids if image_id in by_id]
+
+    def image_hash_records(self, image_ids: Sequence[int]) -> dict[int, ImageHashCacheRecord]:
+        clean_ids = sorted({int(image_id) for image_id in image_ids})
+        if not clean_ids:
+            return {}
+        placeholders = ",".join("?" for _ in clean_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM image_hashes
+                WHERE image_id IN ({placeholders})
+                """,
+                tuple(clean_ids),
+            ).fetchall()
+        records: dict[int, ImageHashCacheRecord] = {}
+        for row in rows:
+            try:
+                dhash = int(str(row["dhash"]), 16)
+            except (TypeError, ValueError):
+                continue
+            image_id = int(row["image_id"])
+            records[image_id] = ImageHashCacheRecord(
+                image_id=image_id,
+                file_path=str(row["file_path"]),
+                file_size=int(row["file_size"]),
+                modified_time_ns=int(row["modified_time_ns"]),
+                file_sha256=str(row["file_sha256"]),
+                dhash=dhash,
+                hash_source=str(row["hash_source"]),
+                hash_source_size=int(row["hash_source_size"]),
+                hash_source_modified_time_ns=int(row["hash_source_modified_time_ns"]),
+            )
+        return records
+
+    def upsert_image_hash_record(self, record: ImageHashCacheRecord) -> None:
+        self.upsert_image_hash_records([record])
+
+    def upsert_image_hash_records(self, records: Sequence[ImageHashCacheRecord]) -> None:
+        clean_records = list(records)
+        if not clean_records:
+            return
+        now = utc_now_iso()
+        rows = [
+            (
+                int(record.image_id),
+                record.file_path,
+                int(record.file_size),
+                int(record.modified_time_ns),
+                record.file_sha256,
+                f"{int(record.dhash):016x}",
+                record.hash_source,
+                int(record.hash_source_size),
+                int(record.hash_source_modified_time_ns),
+                now,
+            )
+            for record in clean_records
+        ]
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO image_hashes(
+                    image_id, file_path, file_size, modified_time_ns,
+                    file_sha256, dhash, hash_source, hash_source_size,
+                    hash_source_modified_time_ns, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(image_id) DO UPDATE SET
+                    file_path = excluded.file_path,
+                    file_size = excluded.file_size,
+                    modified_time_ns = excluded.modified_time_ns,
+                    file_sha256 = excluded.file_sha256,
+                    dhash = excluded.dhash,
+                    hash_source = excluded.hash_source,
+                    hash_source_size = excluded.hash_source_size,
+                    hash_source_modified_time_ns = excluded.hash_source_modified_time_ns,
+                    updated_at = excluded.updated_at
+                """,
+                rows,
+            )
 
     def color_search_candidates(
         self,

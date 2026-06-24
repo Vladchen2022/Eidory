@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import tempfile
 import threading
@@ -1243,7 +1244,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             store.initialize()
             folder_id = store.add_folder(str(library_dir))
             image_ids: list[int] = []
-            for index in range(2):
+            for index in range(3):
                 image_path = library_dir / f"{index}.jpg"
                 image_path.write_bytes(b"fake")
                 image_id, _state = store.upsert_image(
@@ -1260,8 +1261,17 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
             images = store.images_by_ids(image_ids)
+            group = DuplicateGroup(
+                kind="exact",
+                reason="same hash",
+                members=tuple(DuplicateMember(image, "A", "hash", None) for image in images),
+            )
+            dialog = DuplicateResultsDialog([group], parent=window)
+            window._duplicate_groups = [group]
+            window._duplicate_results_dialog = dialog
             window.current_result_mode = "duplicate_group"
             window.current_duplicate_images = list(images)
+            window.current_duplicate_badges = {image.id: ["完全重复 #1"] for image in images}
 
             removed = window._remove_images_from_library_with_undo(
                 [images[0]],
@@ -1269,7 +1279,11 @@ class MainWindowContextMenuTest(unittest.TestCase):
             )
 
             self.assertEqual(removed, 1)
-            self.assertEqual([image.id for image in window.current_duplicate_images], [image_ids[1]])
+            self.assertEqual([image.id for image in window.current_duplicate_images], image_ids[1:])
+            self.assertEqual([[member.image.id for member in group.members] for group in window._duplicate_groups], [image_ids[1:]])
+            self.assertEqual(dialog.tree.topLevelItemCount(), 1)
+            self.assertEqual(dialog.tree.topLevelItem(0).childCount(), 2)
+            dialog.close()
             window.close()
 
     def test_detail_path_shows_complete_wrapped_text(self) -> None:
@@ -1297,6 +1311,38 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             self.assertEqual(window.path_label.toPlainText(), long_path)
             self.assertGreater(window.path_label.height(), 34)
+            window.close()
+
+    def test_selection_detail_state_handles_empty_single_and_multi_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            first = self._image(1, file_path=str(Path(tmp) / "first.jpg"))
+            second = self._image(2, file_path=str(Path(tmp) / "second.jpg"))
+
+            window._apply_selection_detail_state([first])
+            self.assertEqual(window.selected_image.id, 1)
+            self.assertTrue(window.image_detail_widget.isVisible())
+            self.assertEqual(window.file_name_input.text(), "first.jpg")
+
+            window._apply_selection_detail_state([first, second])
+            self.assertEqual(window.selected_image.id, 2)
+            self.assertIn("已选择 2 张", window.preview_label.text())
+            self.assertTrue(window.batch_tags_widget.isVisible())
+
+            window._apply_selection_detail_state([])
+            self.assertIsNone(window.selected_image)
+            self.assertTrue(window.collection_detail_widget.isVisible())
             window.close()
 
     def test_detail_note_and_favorite_auto_save_without_renaming_file(self) -> None:
@@ -4674,6 +4720,51 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(getattr(restored, "is_pinned")())
             self.assertTrue(getattr(restored, "is_flipped")())
             self.assertTrue(getattr(restored, "is_grayscale")())
+            window.close()
+
+    def test_temporary_project_board_autosave_timer_persists_dirty_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library_dir = Path(tmp) / "library"
+            library_dir.mkdir()
+            image_path = library_dir / "first.jpg"
+            pixmap = QPixmap(320, 180)
+            pixmap.fill(QColor("#445566"))
+            self.assertTrue(pixmap.save(str(image_path)))
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library_dir))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=320,
+                height=180,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            project_id = store.create_temporary_project("临时参考", [image_id])
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._show_temporary_project_board(project_id)
+            window.project_board_view._image_items[image_id].setPos(123, 456)
+
+            window._mark_current_board_layout_dirty()
+            window._autosave_current_board_layout()
+
+            payload_json = store.get_temporary_project_board_layout(project_id)
+            self.assertIsNotNone(payload_json)
+            payload = json.loads(str(payload_json))
+            self.assertEqual(payload["items"][str(image_id)]["x"], 123.0)
+            self.assertEqual(payload["items"][str(image_id)]["y"], 456.0)
+            self.assertFalse(window._board_layout_dirty)
             window.close()
 
     def test_creative_project_board_autosaves_layout_when_switching_to_gallery(self) -> None:

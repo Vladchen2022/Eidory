@@ -660,9 +660,24 @@ def parse_creative_project_copy_suggestion(
     fallback_copy = "A focused visual reference concept." if language == "en" else "一段围绕当前创作节点展开的视觉参考文案。"
     copy_text = _first_clean_project_text(
         payload,
-        ("copy_text", "copyText", "copy text", "copy", "text", "文案"),
+        (
+            "copy_text",
+            "copyText",
+            "copy text",
+            "copy",
+            "text",
+            "final_text",
+            "finalCopy",
+            "final_copy",
+            "caption",
+            "description",
+            "summary",
+            "正文",
+            "最终文案",
+            "文案",
+        ),
         max_length=1600,
-    ) or fallback_copy
+    ) or _fallback_project_copy_from_payload(payload) or fallback_copy
     raw_nodes = payload.get("nodes", payload.get("node_updates", []))
     if not isinstance(raw_nodes, list):
         raw_nodes = []
@@ -698,20 +713,27 @@ def _unwrap_creative_project_copy_payload(payload: dict[str, object]) -> dict[st
         if isinstance(first_choice, dict):
             message = first_choice.get("message")
             if isinstance(message, dict):
-                unwrapped = _payload_from_nested_content(message.get("content"))
+                for key in ("content", "text", "reasoning_content", "reasoning", "output"):
+                    unwrapped = _payload_from_nested_content(message.get(key))
+                    if unwrapped is not None:
+                        return _unwrap_creative_project_copy_payload(unwrapped)
+            for key in ("text", "content", "output_text"):
+                unwrapped = _payload_from_nested_content(first_choice.get(key))
                 if unwrapped is not None:
                     return _unwrap_creative_project_copy_payload(unwrapped)
     message = payload.get("message")
     if isinstance(message, dict):
-        unwrapped = _payload_from_nested_content(message.get("content"))
-        if unwrapped is not None:
-            return _unwrap_creative_project_copy_payload(unwrapped)
-    content_payload = _payload_from_nested_content(payload.get("content"))
-    if content_payload is not None:
-        return _unwrap_creative_project_copy_payload(content_payload)
-    content_text = _clean_project_text(payload.get("content"), max_length=1600)
-    if content_text:
-        return {"copy_text": content_text, "nodes": payload.get("nodes", [])}
+        for key in ("content", "text", "reasoning_content", "reasoning", "output"):
+            unwrapped = _payload_from_nested_content(message.get(key))
+            if unwrapped is not None:
+                return _unwrap_creative_project_copy_payload(unwrapped)
+    for key in ("content", "text", "output_text", "response", "result"):
+        content_payload = _payload_from_nested_content(payload.get(key))
+        if content_payload is not None:
+            return _unwrap_creative_project_copy_payload(content_payload)
+        content_text = _clean_project_text(payload.get(key), max_length=1600)
+        if content_text:
+            return {"copy_text": content_text, "nodes": payload.get("nodes", [])}
     return payload
 
 
@@ -739,6 +761,31 @@ def _clean_plain_project_copy_text(content: str) -> str:
     if draft:
         return draft
     return _strip_project_copy_prefix(_clean_project_text(content, max_length=1600))
+
+
+def _fallback_project_copy_from_payload(payload: dict[str, object]) -> str:
+    candidates: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, str):
+            copy_text = _clean_plain_project_copy_text(value)
+            if _cjk_count(copy_text) >= 24 or len(copy_text) >= 80:
+                candidates.append(copy_text)
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key in {"nodes", "node_updates", "title", "search_query", "note"}:
+                    continue
+                visit(nested)
+            return
+        if isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(payload)
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda text: (_cjk_count(text), len(text)))
 
 
 def _extract_partial_project_copy_text(content: str) -> str:
@@ -823,6 +870,12 @@ def _looks_like_reasoning_line(line: str) -> bool:
         "json nodes",
         "total:",
         "perfectly",
+        "用户需求",
+        "分析",
+        "思考",
+        "字数",
+        "检查",
+        "草稿",
     )
     return any(marker in lower for marker in reasoning_markers)
 

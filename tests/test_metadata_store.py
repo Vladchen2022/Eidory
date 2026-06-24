@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
+from eidory.core.duplicate_detection import ImageHashCacheRecord
 from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
 
 
@@ -36,6 +37,54 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(synchronous, 1)
             self.assertEqual(temp_store, 2)
             self.assertLess(cache_size, 0)
+
+    def test_image_performance_indexes_and_hash_cache_are_initialized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+
+            with sqlite3.connect(db_path) as conn:
+                image_indexes = {row[1] for row in conn.execute("PRAGMA index_list(images)")}
+                hash_indexes = {row[1] for row in conn.execute("PRAGMA index_list(image_hashes)")}
+
+            self.assertIn("idx_images_missing_name", image_indexes)
+            self.assertIn("idx_images_missing_modified", image_indexes)
+            self.assertIn("idx_images_missing_file_size", image_indexes)
+            self.assertIn("idx_image_hashes_file_sha256", hash_indexes)
+            self.assertIn("idx_image_hashes_dhash", hash_indexes)
+
+    def test_image_hash_records_round_trip_unsigned_dhash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1_700_000_000_000_000_010,
+            )
+            record = ImageHashCacheRecord(
+                image_id=image_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                modified_time_ns=1_700_000_000_000_000_010,
+                file_sha256="a" * 64,
+                dhash=0xFFFFFFFFFFFFFFFF,
+                hash_source=str(Path(tmp) / "library" / "first.jpg"),
+                hash_source_size=123,
+                hash_source_modified_time_ns=1_700_000_000_000_000_010,
+            )
+
+            store.upsert_image_hash_record(record)
+            cached = store.image_hash_records([image_id])
+
+            self.assertEqual(cached[image_id], record)
 
     def test_concurrent_upsert_same_path_is_serialized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

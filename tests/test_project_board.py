@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -157,6 +158,20 @@ class ProjectBoardViewTest(unittest.TestCase):
         board._select_image_id(2)
 
         self.assertEqual(emitted, [[2]])
+
+    def test_item_position_change_emits_debounced_layout_changed(self) -> None:
+        board = ProjectBoardView()
+        board.set_images([self._image(1)])
+        self.app.processEvents()
+        emitted: list[bool] = []
+        board.layoutChanged.connect(lambda: emitted.append(True))
+
+        board._image_items[1].setPos(123, 234)
+        self.app.processEvents()
+        time.sleep(0.35)
+        self.app.processEvents()
+
+        self.assertEqual(emitted, [True])
 
     def test_undo_shortcut_requests_board_removal_undo(self) -> None:
         board = ProjectBoardView()

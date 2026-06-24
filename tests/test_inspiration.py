@@ -219,6 +219,52 @@ Total: about 220 Chinese characters.
         self.assertTrue(suggestion.copy_text.startswith("低角度仰视"))
         self.assertNotIn("Start with", suggestion.copy_text)
 
+    def test_parse_creative_project_copy_suggestion_accepts_choice_text(self) -> None:
+        suggestion = parse_creative_project_copy_suggestion(
+            """
+{
+  "choices": [
+    {
+      "text": "雾气压低的车站外，维修师站在湿亮柏油路边检查引擎盖内的冷蓝光源，远处灯箱和人群剪影把雨夜拉出孤独层次。"
+    }
+  ]
+}
+            """
+        )
+
+        self.assertIn("维修师", suggestion.copy_text)
+        self.assertIn("雨夜", suggestion.copy_text)
+
+    def test_parse_creative_project_copy_suggestion_uses_reasoning_when_content_is_empty(self) -> None:
+        suggestion = parse_creative_project_copy_suggestion(
+            """
+{
+  "choices": [
+    {
+      "message": {
+        "content": "",
+        "reasoning": "分析：先确认节点。\\n最终文案：黄昏小院里，维修师俯身指向拆开的汽车底盘，两名学徒围在暖黄工作灯旁记录步骤，冷蓝霓虹从低矮屋檐下渗入，旧零件、油渍水泥地和晾衣绳共同形成生活化的未来市井感。"
+      }
+    }
+  ]
+}
+            """
+        )
+
+        self.assertTrue(suggestion.copy_text.startswith("黄昏小院"))
+        self.assertNotIn("分析", suggestion.copy_text)
+
+    def test_parse_creative_project_copy_suggestion_accepts_description_field(self) -> None:
+        suggestion = parse_creative_project_copy_suggestion(
+            """
+{
+  "description": "低矮棚屋前，主角在雨后的泥地上整理拆下的车门和线路，两名助手搬来工具箱，背景中的暖光窗户和冷色路灯形成清楚的明暗对比。"
+}
+            """
+        )
+
+        self.assertIn("低矮棚屋", suggestion.copy_text)
+
     def test_generate_creative_project_copy_requests_plain_text(self) -> None:
         class FakeProvider(LMStudioProvider):
             def __init__(self) -> None:

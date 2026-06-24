@@ -25,9 +25,8 @@ MIN_ZOOM = 0.15
 MAX_ZOOM = 16.0
 GRID_SIZE = 36
 PIXMAP_CACHE_LIMIT = 512
-SOURCE_PIXMAP_PROJECT_LIMIT = 80
 MAX_SOURCE_PIXMAP_SIDE = 2200
-MAX_BOARD_THUMBNAIL_SIDE = 900
+MAX_BOARD_THUMBNAIL_SIDE = 720
 DEFAULT_LAYOUT_LEFT = 80.0
 DEFAULT_LAYOUT_TOP = 110.0
 DEFAULT_LAYOUT_ROW_WIDTH = 1600.0
@@ -322,6 +321,7 @@ class BoardImageItem(QGraphicsPixmapItem):
 class ProjectBoardView(QGraphicsView):
     imageDoubleClicked = Signal(int)
     selectionChanged = Signal(list)
+    layoutChanged = Signal()
     removeImagesRequested = Signal(list)
     undoRemovalRequested = Signal()
 
@@ -353,8 +353,11 @@ class ProjectBoardView(QGraphicsView):
         self._view_mode = "fit_all"
         self._last_fit_selection_ids: tuple[int, ...] = ()
         self._refit_timer_pending = False
+        self._suppress_layout_changed = False
+        self._layout_changed_pending = False
         self._scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
         self._scene.selectionChanged.connect(self._emit_selection_changed)
+        self._scene.changed.connect(self._schedule_layout_changed)
 
     def set_images(
         self,
@@ -369,6 +372,7 @@ class ProjectBoardView(QGraphicsView):
             for image_id, badges in (badges_by_image_id or {}).items()
         }
         self.setUpdatesEnabled(False)
+        self._suppress_layout_changed = True
         try:
             self._scene.clear()
             self._image_items.clear()
@@ -398,14 +402,12 @@ class ProjectBoardView(QGraphicsView):
             default_y = DEFAULT_LAYOUT_TOP
             row_height = 0.0
             row_right = DEFAULT_LAYOUT_LEFT + DEFAULT_LAYOUT_ROW_WIDTH
-            prefer_source_pixmaps = len(images) <= SOURCE_PIXMAP_PROJECT_LIMIT
-            pixmap_max_side = MAX_SOURCE_PIXMAP_SIDE if prefer_source_pixmaps else MAX_BOARD_THUMBNAIL_SIDE
             for index, image in enumerate(images):
                 item_payload = stored_items.get(str(image.id), {})
                 pixmap = self._pixmap_for(
                     image,
-                    prefer_source=prefer_source_pixmaps,
-                    max_side=pixmap_max_side,
+                    prefer_source=False,
+                    max_side=MAX_BOARD_THUMBNAIL_SIDE,
                 )
                 item_width, item_height = self._default_item_size(pixmap)
                 if default_x > DEFAULT_LAYOUT_LEFT and default_x + item_width > row_right:
@@ -439,6 +441,7 @@ class ProjectBoardView(QGraphicsView):
                 text.setPos(80, 110)
         finally:
             self.setUpdatesEnabled(True)
+            QTimer.singleShot(0, self._finish_layout_reset)
 
         if images:
             self._schedule_refit_current_view_mode()
@@ -745,6 +748,24 @@ class ProjectBoardView(QGraphicsView):
     def _run_scheduled_refit(self) -> None:
         self._refit_timer_pending = False
         self._refit_current_view_mode()
+
+    def _finish_layout_reset(self) -> None:
+        self._layout_changed_pending = False
+        self._suppress_layout_changed = False
+
+    def _schedule_layout_changed(self) -> None:
+        if self._suppress_layout_changed or not self._image_items:
+            return
+        if self._layout_changed_pending:
+            return
+        self._layout_changed_pending = True
+        QTimer.singleShot(300, self._emit_layout_changed)
+
+    def _emit_layout_changed(self) -> None:
+        self._layout_changed_pending = False
+        if self._suppress_layout_changed or not self._image_items:
+            return
+        self.layoutChanged.emit()
 
     def _add_image_item(
         self,

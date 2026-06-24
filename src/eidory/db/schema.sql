@@ -40,6 +40,42 @@ CREATE INDEX IF NOT EXISTS idx_images_folder_id ON images(folder_id);
 CREATE INDEX IF NOT EXISTS idx_images_missing ON images(is_missing);
 CREATE INDEX IF NOT EXISTS idx_images_favorite ON images(is_favorite);
 CREATE INDEX IF NOT EXISTS idx_images_embedding_status ON images(embedding_status);
+CREATE INDEX IF NOT EXISTS idx_images_missing_name
+ON images(is_missing, file_name COLLATE NOCASE, id);
+CREATE INDEX IF NOT EXISTS idx_images_missing_modified
+ON images(is_missing, modified_time_ns, id);
+CREATE INDEX IF NOT EXISTS idx_images_missing_imported
+ON images(is_missing, imported_at, id);
+CREATE INDEX IF NOT EXISTS idx_images_missing_file_size
+ON images(is_missing, file_size, id);
+CREATE INDEX IF NOT EXISTS idx_images_missing_width
+ON images(is_missing, width, id);
+CREATE INDEX IF NOT EXISTS idx_images_missing_height
+ON images(is_missing, height, id);
+CREATE INDEX IF NOT EXISTS idx_images_missing_duration
+ON images(is_missing, duration_ms, id);
+CREATE INDEX IF NOT EXISTS idx_images_missing_pixels
+ON images(is_missing, (width * height), id);
+
+CREATE TABLE IF NOT EXISTS image_hashes (
+    image_id INTEGER PRIMARY KEY,
+    file_path TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    modified_time_ns INTEGER NOT NULL,
+    file_sha256 TEXT NOT NULL,
+    dhash TEXT NOT NULL,
+    hash_source TEXT NOT NULL,
+    hash_source_size INTEGER NOT NULL,
+    hash_source_modified_time_ns INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_image_hashes_file_sha256
+ON image_hashes(file_sha256);
+
+CREATE INDEX IF NOT EXISTS idx_image_hashes_dhash
+ON image_hashes(dhash);
 
 CREATE TABLE IF NOT EXISTS embeddings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

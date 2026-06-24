@@ -133,6 +133,21 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
             self.assertFalse(loaded.isNull())
             self.assertLessEqual(max(loaded.width(), loaded.height()), 270)
 
+    def test_set_images_skips_layout_rebuild_when_layout_keys_are_unchanged(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        image = self._image(1, width=120, height=80, file_path="/tmp/first.jpg")
+        grid.set_images([image])
+        calls: list[bool] = []
+
+        def rebuild_layout() -> None:
+            calls.append(True)
+
+        grid._rebuild_layout = rebuild_layout  # type: ignore[method-assign]
+
+        grid.set_images([image], badges_by_image_id={1: ["重复候选"]})
+
+        self.assertEqual(calls, [])
+
     @staticmethod
     def _image(
         image_id: int,

@@ -4,10 +4,13 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
 from eidory.core.duplicate_detection import (
+    ImageHashCacheRecord,
+    build_image_hash_cache_record,
     build_image_dhash_records,
     find_duplicate_groups,
     find_near_duplicate_candidates,
@@ -69,6 +72,34 @@ class DuplicateDetectionTest(unittest.TestCase):
             near = [group for group in groups if group.kind == "near"]
             self.assertEqual(len(near), 1)
             self.assertEqual({member.image.id for member in near[0].members}, {1, 2})
+
+    def test_find_duplicate_groups_reuses_valid_hash_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.jpg"
+            second = root / "second.jpg"
+            Image.new("RGB", (64, 48), color="red").save(first)
+            shutil.copy2(first, second)
+            images = [self._image(1, first), self._image(2, second)]
+            records = {
+                image.id: build_image_hash_cache_record(image)
+                for image in images
+            }
+            cache = {
+                image_id: record
+                for image_id, record in records.items()
+                if isinstance(record, ImageHashCacheRecord)
+            }
+
+            with (
+                patch("eidory.core.duplicate_detection._file_sha256", side_effect=AssertionError("sha should be cached")),
+                patch("eidory.core.duplicate_detection.image_dhash", side_effect=AssertionError("dhash should be cached")),
+            ):
+                groups = find_duplicate_groups(images, hash_records=cache)
+
+            exact = [group for group in groups if group.kind == "exact"]
+            self.assertEqual(len(exact), 1)
+            self.assertEqual({member.image.id for member in exact[0].members}, {1, 2})
 
     def test_find_near_duplicate_candidates_uses_cached_library_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

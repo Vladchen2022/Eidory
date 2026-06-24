@@ -457,6 +457,7 @@ class DuplicateResultsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("重复 / 近重复图片")
         self.resize(1040, 620)
+        self.groups = list(groups)
         self.selected_group_image_ids: list[int] = []
         self.all_group_image_ids: list[int] = []
         layout = QVBoxLayout(self)
@@ -474,7 +475,37 @@ class DuplicateResultsDialog(QDialog):
         self.tree.setColumnWidth(4, 420)
         layout.addWidget(self.tree, 1)
 
-        for index, group in enumerate(groups, start=1):
+        row = QHBoxLayout()
+        self.load_all_groups_button = QPushButton("载入全部组")
+        self.load_group_button = QPushButton("载入选中组")
+        close_button = QPushButton("关闭")
+        row.addWidget(self.load_all_groups_button)
+        row.addWidget(self.load_group_button)
+        row.addStretch(1)
+        row.addWidget(close_button)
+        layout.addLayout(row)
+        self.load_all_groups_button.clicked.connect(self.allGroupsLoadRequested.emit)
+        self.load_group_button.clicked.connect(self._accept_selected_group)
+        close_button.clicked.connect(self.reject)
+        self._populate_tree()
+
+    def remove_image_ids(self, image_ids: set[int]) -> None:
+        removed_ids = {int(image_id) for image_id in image_ids}
+        if not removed_ids:
+            return
+        groups: list[DuplicateGroup] = []
+        for group in self.groups:
+            members = tuple(member for member in group.members if member.image.id not in removed_ids)
+            if len(members) >= 2:
+                groups.append(DuplicateGroup(kind=group.kind, reason=group.reason, members=members))
+        self.groups = groups
+        self._populate_tree()
+
+    def _populate_tree(self) -> None:
+        self.tree.clear()
+        self.selected_group_image_ids = []
+        self.all_group_image_ids = []
+        for index, group in enumerate(self.groups, start=1):
             title = "完全重复" if group.kind == "exact" else "近重复"
             parent_item = QTreeWidgetItem([
                 f"{title} #{index}：{len(group.members)} 张",
@@ -499,19 +530,9 @@ class DuplicateResultsDialog(QDialog):
                 child.setData(0, Qt.ItemDataRole.UserRole, [image.id])
                 parent_item.addChild(child)
             parent_item.setExpanded(index <= 8)
-
-        row = QHBoxLayout()
-        self.load_all_groups_button = QPushButton("载入全部组")
-        self.load_group_button = QPushButton("载入选中组")
-        close_button = QPushButton("关闭")
-        row.addWidget(self.load_all_groups_button)
-        row.addWidget(self.load_group_button)
-        row.addStretch(1)
-        row.addWidget(close_button)
-        layout.addLayout(row)
-        self.load_all_groups_button.clicked.connect(self.allGroupsLoadRequested.emit)
-        self.load_group_button.clicked.connect(self._accept_selected_group)
-        close_button.clicked.connect(self.reject)
+        has_groups = bool(self.groups)
+        self.load_all_groups_button.setEnabled(has_groups)
+        self.load_group_button.setEnabled(has_groups)
 
     def _accept_selected_group(self) -> None:
         item = self.tree.currentItem()
@@ -712,6 +733,7 @@ class MainWindow(QMainWindow):
         self._board_focus_previous_splitter_sizes: list[int] | None = None
         self._board_focus_widget_visibility: dict[QWidget, bool] = {}
         self._board_window_pinned = False
+        self._board_layout_dirty = False
         self.search_filters: list[SearchFilter] = []
         self.active_filter_index: int | None = None
         self.current_chain_images: list[ImageItem] = []
@@ -759,6 +781,10 @@ class MainWindow(QMainWindow):
         self.watch_scan_timer = QTimer(self)
         self.watch_scan_timer.setSingleShot(True)
         self.watch_scan_timer.timeout.connect(self._run_pending_watch_scans)
+        self.board_autosave_timer = QTimer(self)
+        self.board_autosave_timer.setSingleShot(True)
+        self.board_autosave_timer.setInterval(900)
+        self.board_autosave_timer.timeout.connect(self._autosave_current_board_layout)
 
         self.setWindowTitle("Eidory")
         self._configure_native_titlebar()
@@ -2331,6 +2357,7 @@ class MainWindow(QMainWindow):
         self.board_import_button.clicked.connect(self._import_images_to_current_board)
         self.board_show_all_button.clicked.connect(self._show_all_board_images)
         self.project_board_view.selectionChanged.connect(self._on_project_board_selection_changed)
+        self.project_board_view.layoutChanged.connect(self._mark_current_board_layout_dirty)
         self.project_board_view.removeImagesRequested.connect(self._remove_images_from_current_board)
         self.project_board_view.undoRemovalRequested.connect(self._undo_last_board_removal)
         self.load_more_button.clicked.connect(self._load_more)
@@ -4064,8 +4091,8 @@ class MainWindow(QMainWindow):
             include_same_path=include_same_path,
         )
 
-    @staticmethod
     def _near_duplicate_candidates_from_images(
+        self,
         file_path: str,
         images: list[ImageItem],
         *,
@@ -4073,7 +4100,14 @@ class MainWindow(QMainWindow):
     ) -> list[NearDuplicateCandidate]:
         if not images:
             return []
-        hash_records = build_image_dhash_records(images)
+        updated_records = []
+        hash_records = build_image_dhash_records(
+            images,
+            hash_records=self.store.image_hash_records([image.id for image in images]),
+            on_hash_record=updated_records.append,
+        )
+        if updated_records:
+            self.store.upsert_image_hash_records(updated_records)
         return find_near_duplicate_candidates(
             file_path,
             hash_records=hash_records,
@@ -4122,7 +4156,14 @@ class MainWindow(QMainWindow):
         ):
             return self._near_duplicate_hash_records_cache
         images = self.store.list_images(limit=image_count, include_missing=False)
-        records = build_image_dhash_records(images)
+        updated_records = []
+        records = build_image_dhash_records(
+            images,
+            hash_records=self.store.image_hash_records([image.id for image in images]),
+            on_hash_record=updated_records.append,
+        )
+        if updated_records:
+            self.store.upsert_image_hash_records(updated_records)
         self._near_duplicate_hash_records_cache = records
         self._near_duplicate_hash_records_cache_count = image_count
         return records
@@ -7997,25 +8038,9 @@ class MainWindow(QMainWindow):
 
     def _on_grid_image_selected(self, image: ImageItem | None) -> None:
         self.selected_image = image
-        self._show_image_details(image)
-        if self.current_result_mode == "creative_node":
-            self._refresh_creative_selection_panel([image] if image is not None else [])
-        else:
-            self._refresh_tag_panel_assignment([image] if image is not None else [])
-        self._refresh_temp_project_save_button()
 
     def _on_grid_selection_changed(self, images: list[ImageItem]) -> None:
-        if len(images) > 1:
-            self.selected_image = images[-1]
-            self._show_multi_selection_details(images)
-        elif not images:
-            self.selected_image = None
-            self._show_collection_details(self._selected_collection_id())
-        if self.current_result_mode == "creative_node":
-            self._refresh_creative_selection_panel(images)
-        else:
-            self._refresh_tag_panel_assignment(images)
-        self._refresh_temp_project_save_button()
+        self._apply_selection_detail_state(images)
 
     def _on_project_board_selection_changed(self, image_ids: list[int]) -> None:
         if self.center_result_stack.currentWidget() is not self.project_board_view:
@@ -8025,6 +8050,9 @@ class MainWindow(QMainWindow):
             image = self.store.get_image(int(image_id))
             if image is not None:
                 images.append(image)
+        self._apply_selection_detail_state(images)
+
+    def _apply_selection_detail_state(self, images: list[ImageItem]) -> None:
         if len(images) > 1:
             self.selected_image = images[-1]
             self._show_multi_selection_details(images)
@@ -9930,19 +9958,7 @@ class MainWindow(QMainWindow):
         if not clean_images:
             return 0
         image_ids = [image.id for image in clean_images]
-        if self.current_result_mode == "duplicate_group" and self.current_duplicate_images:
-            removed_ids = set(image_ids)
-            self.current_duplicate_images = [
-                image for image in self.current_duplicate_images
-                if image.id not in removed_ids
-            ]
-            for image_id in removed_ids:
-                self.current_duplicate_badges.pop(image_id, None)
-            if self.manual_result_order_ids:
-                self.manual_result_order_ids = [
-                    image_id for image_id in self.manual_result_order_ids
-                    if image_id not in removed_ids
-                ]
+        self._remove_images_from_duplicate_result_state(set(image_ids))
         undo_snapshot = snapshot or self.store.snapshot_images_for_restore(image_ids)
         self.store.remove_images_from_library(image_ids)
         self._invalidate_near_duplicate_hash_cache()
@@ -9957,6 +9973,31 @@ class MainWindow(QMainWindow):
         )
         self._refresh_after_library_removal()
         return len(image_ids)
+
+    def _remove_images_from_duplicate_result_state(self, removed_ids: set[int]) -> None:
+        if not removed_ids:
+            return
+        if self.current_duplicate_images:
+            self.current_duplicate_images = [
+                image for image in self.current_duplicate_images
+                if image.id not in removed_ids
+            ]
+        for image_id in removed_ids:
+            self.current_duplicate_badges.pop(image_id, None)
+        if self.manual_result_order_ids:
+            self.manual_result_order_ids = [
+                image_id for image_id in self.manual_result_order_ids
+                if image_id not in removed_ids
+            ]
+        if self._duplicate_groups:
+            groups: list[DuplicateGroup] = []
+            for group in self._duplicate_groups:
+                members = tuple(member for member in group.members if member.image.id not in removed_ids)
+                if len(members) >= 2:
+                    groups.append(DuplicateGroup(kind=group.kind, reason=group.reason, members=members))
+            self._duplicate_groups = groups
+        if self._duplicate_results_dialog is not None:
+            self._duplicate_results_dialog.remove_image_ids(removed_ids)
 
     def _delete_source_files_with_undo(self, images: list[ImageItem]) -> None:
         image_ids = [image.id for image in images]
@@ -10479,11 +10520,16 @@ class MainWindow(QMainWindow):
                     sort_desc=False,
                 )
                 folder_labels = {image.id: self._folder_label_for_image(image) for image in images}
+                updated_records = []
                 groups = find_duplicate_groups(
                     images,
                     folder_label_for_image=folder_labels,
+                    hash_records=self.store.image_hash_records([image.id for image in images]),
+                    on_hash_record=updated_records.append,
                     near_distance=8,
                 )
+                if updated_records:
+                    self.store.upsert_image_hash_records(updated_records)
                 self.events.put(("duplicates_done", groups))
             except Exception as exc:
                 self.events.put(("error", f"重复检测失败：{exc}"))
@@ -12347,6 +12393,7 @@ class MainWindow(QMainWindow):
         self._current_board_node_id = node.id
         self._current_board_temp_project_id = None
         self._current_board_image_ids = image_id_tuple
+        self._mark_current_board_layout_clean()
         self.center_result_stack.setCurrentWidget(self.project_board_view)
         self.project_board_view.setFocus(Qt.FocusReason.OtherFocusReason)
         self.load_more_button.hide()
@@ -12393,6 +12440,26 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("看板布局已保存")
         else:
             self.statusBar().showMessage("当前没有可保存的看板布局")
+
+    def _mark_current_board_layout_dirty(self) -> None:
+        if not hasattr(self, "center_result_stack"):
+            return
+        if self.center_result_stack.currentWidget() is not self.project_board_view:
+            return
+        if self._current_board_temp_project_id is None and self._current_board_node_id is None:
+            return
+        self._board_layout_dirty = True
+        self.board_autosave_timer.start()
+
+    def _mark_current_board_layout_clean(self) -> None:
+        self._board_layout_dirty = False
+        if hasattr(self, "board_autosave_timer"):
+            self.board_autosave_timer.stop()
+
+    def _autosave_current_board_layout(self) -> None:
+        if not self._board_layout_dirty:
+            return
+        self._save_current_board_layout_if_needed()
 
     def _toggle_board_window_pin(self, checked: bool = False) -> None:
         self._set_board_window_pinned(bool(checked))
@@ -12818,6 +12885,7 @@ class MainWindow(QMainWindow):
                 self._current_board_temp_project_id,
                 json.dumps(payload, ensure_ascii=False, sort_keys=True),
             )
+            self._mark_current_board_layout_clean()
             return True
         if self._current_board_node_id is not None:
             payload = self._merged_board_layout_payload(
@@ -12828,6 +12896,7 @@ class MainWindow(QMainWindow):
                 self._current_board_node_id,
                 json.dumps(payload, ensure_ascii=False, sort_keys=True),
             )
+            self._mark_current_board_layout_clean()
             return True
         return False
 
@@ -13072,6 +13141,7 @@ class MainWindow(QMainWindow):
         self._current_board_node_id = None
         self._current_board_temp_project_id = project_id
         self._current_board_image_ids = image_id_tuple
+        self._mark_current_board_layout_clean()
         self.center_result_stack.setCurrentWidget(self.project_board_view)
         self.project_board_view.setFocus(Qt.FocusReason.OtherFocusReason)
         self.load_more_button.hide()

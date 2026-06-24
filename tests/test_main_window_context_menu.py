@@ -19,6 +19,7 @@ from PIL import Image
 
 from eidory.config import AppPaths
 from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
+from eidory.core.duplicate_detection import DuplicateGroup, DuplicateMember
 from eidory.core.embedding_worker import EmbeddingProgress
 from eidory.core.inspiration import InspirationMatch, InspirationTerm
 from eidory.core.llm_provider import GroupNameSuggestion, ProjectSuggestion, SearchPlanFilter
@@ -33,6 +34,7 @@ from eidory.core.search_filters import (
 )
 from eidory.models import ImageItem
 from eidory.ui.main_window import (
+    DuplicateResultsDialog,
     EqualWidthTabBar,
     LEFT_SIDEBAR_WIDTH,
     MainWindow,
@@ -1075,6 +1077,199 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(window.feedback_widget.isHidden())
             self.assertLessEqual(window.note_input.maximumHeight(), 96)
             self.assertIn("border: 0", window.tags_display.styleSheet())
+            window.close()
+
+    def test_duplicate_results_loads_parent_group_from_child_without_closing(self) -> None:
+        group = DuplicateGroup(
+            kind="exact",
+            reason="same hash",
+            members=(
+                DuplicateMember(self._image(1), "A", "hash", None),
+                DuplicateMember(self._image(2), "A", "hash", None),
+            ),
+        )
+        dialog = DuplicateResultsDialog([group])
+        dialog.show()
+        self.app.processEvents()
+        emitted: list[list[int]] = []
+        dialog.groupLoadRequested.connect(lambda image_ids: emitted.append(list(image_ids)))
+
+        dialog.tree.setCurrentItem(dialog.tree.topLevelItem(0).child(1))
+        dialog._accept_selected_group()
+
+        self.assertEqual(emitted, [[1, 2]])
+        self.assertTrue(dialog.isVisible())
+        dialog.close()
+
+    def test_clear_search_restores_open_duplicate_results_dialog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            dialog = DuplicateResultsDialog([
+                DuplicateGroup(
+                    kind="exact",
+                    reason="same hash",
+                    members=(
+                        DuplicateMember(self._image(1), "A", "hash", None),
+                        DuplicateMember(self._image(2), "A", "hash", None),
+                    ),
+                )
+            ], parent=window)
+            window._duplicate_results_dialog = dialog
+            window.current_result_mode = "duplicate_group"
+            dialog.hide()
+
+            with patch.object(window, "_reload_images"):
+                window._clear_search()
+                self.app.processEvents()
+
+            self.assertTrue(dialog.isVisible())
+            dialog.close()
+            window.close()
+
+    def test_duplicate_detection_loads_all_groups_into_grid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            images = [self._image(image_id) for image_id in [1, 2, 3, 4]]
+            groups = [
+                DuplicateGroup(
+                    kind="exact",
+                    reason="same hash",
+                    members=(
+                        DuplicateMember(images[0], "A", "hash-a", None),
+                        DuplicateMember(images[1], "A", "hash-a", None),
+                    ),
+                ),
+                DuplicateGroup(
+                    kind="near",
+                    reason="near hash",
+                    members=(
+                        DuplicateMember(images[2], "B", "hash-b", 1),
+                        DuplicateMember(images[3], "B", "hash-c", 2),
+                    ),
+                ),
+            ]
+
+            window._handle_duplicates_done(groups)
+
+            self.assertEqual([image.id for image in window.grid_view.images()], [1, 2, 3, 4])
+            self.assertEqual(window.current_result_mode, "duplicate_group")
+            self.assertEqual(window.manual_result_order_ids, [1, 2, 3, 4])
+            self.assertEqual(window.current_duplicate_badges[1], ["完全重复 #1"])
+            self.assertEqual(window.current_duplicate_badges[3], ["近重复 #2"])
+            self.assertIsNotNone(window._duplicate_results_dialog)
+            window._duplicate_results_dialog.close()
+            window.close()
+
+    def test_duplicate_results_load_all_button_restores_all_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            images = [self._image(image_id) for image_id in [1, 2, 3, 4]]
+            groups = [
+                DuplicateGroup(
+                    kind="exact",
+                    reason="same hash",
+                    members=(
+                        DuplicateMember(images[0], "A", "hash-a", None),
+                        DuplicateMember(images[1], "A", "hash-a", None),
+                    ),
+                ),
+                DuplicateGroup(
+                    kind="near",
+                    reason="near hash",
+                    members=(
+                        DuplicateMember(images[2], "B", "hash-b", 1),
+                        DuplicateMember(images[3], "B", "hash-c", 2),
+                    ),
+                ),
+            ]
+            window._handle_duplicates_done(groups)
+            dialog = window._duplicate_results_dialog
+            self.assertIsNotNone(dialog)
+            assert dialog is not None
+
+            window._show_duplicate_images([images[0], images[1]], badges_by_image_id={1: ["重复组"], 2: ["重复组"]})
+            dialog.allGroupsLoadRequested.emit()
+
+            self.assertEqual([image.id for image in window.grid_view.images()], [1, 2, 3, 4])
+            self.assertEqual(window.current_duplicate_badges[3], ["近重复 #2"])
+            dialog.close()
+            window.close()
+
+    def test_duplicate_group_library_removal_updates_loaded_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            library_dir = Path(tmp) / "library"
+            library_dir.mkdir()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(library_dir))
+            image_ids: list[int] = []
+            for index in range(2):
+                image_path = library_dir / f"{index}.jpg"
+                image_path.write_bytes(b"fake")
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(image_path),
+                    file_size=image_path.stat().st_size,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=index + 1,
+                )
+                image_ids.append(image_id)
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            images = store.images_by_ids(image_ids)
+            window.current_result_mode = "duplicate_group"
+            window.current_duplicate_images = list(images)
+
+            removed = window._remove_images_from_library_with_undo(
+                [images[0]],
+                undo_label="移除重复候选",
+            )
+
+            self.assertEqual(removed, 1)
+            self.assertEqual([image.id for image in window.current_duplicate_images], [image_ids[1]])
             window.close()
 
     def test_detail_path_shows_complete_wrapped_text(self) -> None:
@@ -4367,6 +4562,14 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertIn("语义探针项目看板", window.result_state_label.text())
             item = window.project_board_view._image_items[image_id]
             self.assertEqual(getattr(item, "badge_text"), "世界观")
+
+            window.project_board_view._select_image_id(image_id)
+            self.app.processEvents()
+
+            self.assertIsNotNone(window.selected_image)
+            self.assertEqual(window.selected_image.id, image_id)
+            self.assertEqual(window.file_name_input.text(), "first.jpg")
+            self.assertIn(str(image_path), window.path_label.toPlainText())
             window.close()
 
     def test_temporary_project_board_removes_links_and_undo_restores_them(self) -> None:

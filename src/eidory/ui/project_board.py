@@ -321,6 +321,7 @@ class BoardImageItem(QGraphicsPixmapItem):
 
 class ProjectBoardView(QGraphicsView):
     imageDoubleClicked = Signal(int)
+    selectionChanged = Signal(list)
     removeImagesRequested = Signal(list)
     undoRemovalRequested = Signal()
 
@@ -353,6 +354,7 @@ class ProjectBoardView(QGraphicsView):
         self._last_fit_selection_ids: tuple[int, ...] = ()
         self._refit_timer_pending = False
         self._scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
+        self._scene.selectionChanged.connect(self._emit_selection_changed)
 
     def set_images(
         self,
@@ -812,8 +814,19 @@ class ProjectBoardView(QGraphicsView):
         return items
 
     def _select_image_id(self, image_id: int) -> None:
-        for current_id, item in self._image_items.items():
-            item.setSelected(current_id == image_id)
+        previous_ids = self.selected_image_ids()
+        self._scene.blockSignals(True)
+        try:
+            for current_id, item in self._image_items.items():
+                item.setSelected(current_id == image_id)
+        finally:
+            self._scene.blockSignals(False)
+        selected_ids = self.selected_image_ids()
+        if selected_ids != previous_ids:
+            self.selectionChanged.emit(selected_ids)
+
+    def _emit_selection_changed(self) -> None:
+        self.selectionChanged.emit(self.selected_image_ids())
 
     def _visible_image_items(self) -> list[QGraphicsItem]:
         return [item for item in self._image_items.values() if item.isVisible()]

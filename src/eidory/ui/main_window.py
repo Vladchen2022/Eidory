@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
 
 import numpy as np
-from PySide6.QtCore import QFile, QBuffer, QFileSystemWatcher, QIODevice, QRect, QSize, QStringListModel, Qt, QTimer, QUrl
+from PySide6.QtCore import QFile, QBuffer, QFileSystemWatcher, QIODevice, QRect, QSize, QStringListModel, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -450,11 +450,15 @@ class MissingFilesDialog(QDialog):
 
 
 class DuplicateResultsDialog(QDialog):
+    groupLoadRequested = Signal(list)
+    allGroupsLoadRequested = Signal()
+
     def __init__(self, groups: list[DuplicateGroup], *, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("重复 / 近重复图片")
         self.resize(1040, 620)
         self.selected_group_image_ids: list[int] = []
+        self.all_group_image_ids: list[int] = []
         layout = QVBoxLayout(self)
         intro = QLabel("完全重复是文件内容相同；近重复是同图不同尺寸、轻微裁切或同构图变体的候选。不要默认删除，先看所在文件夹。")
         intro.setWordWrap(True)
@@ -483,6 +487,8 @@ class DuplicateResultsDialog(QDialog):
             self.tree.addTopLevelItem(parent_item)
             for member in group.members:
                 image = member.image
+                if image.id not in self.all_group_image_ids:
+                    self.all_group_image_ids.append(image.id)
                 child = QTreeWidgetItem([
                     image.file_name,
                     member.folder_label or "-",
@@ -495,12 +501,15 @@ class DuplicateResultsDialog(QDialog):
             parent_item.setExpanded(index <= 8)
 
         row = QHBoxLayout()
+        self.load_all_groups_button = QPushButton("载入全部组")
         self.load_group_button = QPushButton("载入选中组")
         close_button = QPushButton("关闭")
+        row.addWidget(self.load_all_groups_button)
         row.addWidget(self.load_group_button)
         row.addStretch(1)
         row.addWidget(close_button)
         layout.addLayout(row)
+        self.load_all_groups_button.clicked.connect(self.allGroupsLoadRequested.emit)
         self.load_group_button.clicked.connect(self._accept_selected_group)
         close_button.clicked.connect(self.reject)
 
@@ -508,11 +517,13 @@ class DuplicateResultsDialog(QDialog):
         item = self.tree.currentItem()
         if item is None:
             return
+        if item.parent() is not None:
+            item = item.parent()
         value = item.data(0, Qt.ItemDataRole.UserRole)
         if not value:
             return
         self.selected_group_image_ids = [int(image_id) for image_id in value]
-        self.accept()
+        self.groupLoadRequested.emit(list(self.selected_group_image_ids))
 
 
 def _load_scaled_qt_pixmap(image_path: str, max_width: int, max_height: int) -> QPixmap:
@@ -710,6 +721,9 @@ class MainWindow(QMainWindow):
         self.current_chain_base_label: str | None = None
         self.current_chain_operation_mode = "replace"
         self.current_duplicate_images: list[ImageItem] = []
+        self.current_duplicate_badges: dict[int, list[str]] = {}
+        self._duplicate_groups: list[DuplicateGroup] = []
+        self._duplicate_results_dialog: DuplicateResultsDialog | None = None
         self.manual_result_order_ids: list[int] | None = None
         self.result_excluded_image_ids: set[int] = set()
         self.result_excluded_collection_ids: set[int] = set()
@@ -2316,6 +2330,7 @@ class MainWindow(QMainWindow):
         self.board_grayscale_button.clicked.connect(self._toggle_board_selected_grayscale)
         self.board_import_button.clicked.connect(self._import_images_to_current_board)
         self.board_show_all_button.clicked.connect(self._show_all_board_images)
+        self.project_board_view.selectionChanged.connect(self._on_project_board_selection_changed)
         self.project_board_view.removeImagesRequested.connect(self._remove_images_from_current_board)
         self.project_board_view.undoRemovalRequested.connect(self._undo_last_board_removal)
         self.load_more_button.clicked.connect(self._load_more)
@@ -6516,6 +6531,8 @@ class MainWindow(QMainWindow):
         self.current_chain_base_image_ids = None
         self.current_chain_base_label = None
         self.current_chain_operation_mode = "replace"
+        self.current_duplicate_images = []
+        self.current_duplicate_badges = {}
         self._show_gallery_view()
         self.load_more_button.setEnabled(True)
         images = self.store.list_images(
@@ -6572,6 +6589,10 @@ class MainWindow(QMainWindow):
         self._set_result_status(f"已加载 {self.grid_view.rowCount()} 张，新增加载 {len(images)} 张")
 
     def _clear_search(self) -> None:
+        should_restore_duplicate_dialog = (
+            self.current_result_mode == "duplicate_group"
+            and self._duplicate_results_dialog is not None
+        )
         self.semantic_search_revision += 1
         self._clear_result_management_state()
         self.search_filters.clear()
@@ -6606,10 +6627,14 @@ class MainWindow(QMainWindow):
         self.current_chain_base_image_ids = None
         self.current_chain_base_label = None
         self.current_chain_operation_mode = "replace"
+        self.current_duplicate_images = []
+        self.current_duplicate_badges = {}
         self.search_input.clear()
         self.search_button.setEnabled(True)
         self._refresh_filter_chain_ui()
         self._reload_images()
+        if should_restore_duplicate_dialog:
+            QTimer.singleShot(0, self._show_duplicate_results_dialog)
 
     def _refresh_current_results_for_filters(self) -> None:
         self._refresh_filter_chain_ui()
@@ -6702,7 +6727,7 @@ class MainWindow(QMainWindow):
             )
             images = self._sort_images(images)
             self.load_more_button.setEnabled(False)
-            self.grid_view.set_images(images)
+            self.grid_view.set_images(images, badges_by_image_id=self.current_duplicate_badges)
             self._set_result_status(f"重复候选组：{len(images)} 张{self._result_management_status_suffix()}")
             return
 
@@ -6775,7 +6800,7 @@ class MainWindow(QMainWindow):
             )
             images = self._sort_images(images)
             self.load_more_button.setEnabled(False)
-            self.grid_view.set_images(images)
+            self.grid_view.set_images(images, badges_by_image_id=self.current_duplicate_badges)
             self._set_result_status(f"重复候选组：{len(images)} 张{self._result_management_status_suffix()}")
             return
 
@@ -7984,6 +8009,29 @@ class MainWindow(QMainWindow):
             self.selected_image = images[-1]
             self._show_multi_selection_details(images)
         elif not images:
+            self.selected_image = None
+            self._show_collection_details(self._selected_collection_id())
+        if self.current_result_mode == "creative_node":
+            self._refresh_creative_selection_panel(images)
+        else:
+            self._refresh_tag_panel_assignment(images)
+        self._refresh_temp_project_save_button()
+
+    def _on_project_board_selection_changed(self, image_ids: list[int]) -> None:
+        if self.center_result_stack.currentWidget() is not self.project_board_view:
+            return
+        images: list[ImageItem] = []
+        for image_id in image_ids:
+            image = self.store.get_image(int(image_id))
+            if image is not None:
+                images.append(image)
+        if len(images) > 1:
+            self.selected_image = images[-1]
+            self._show_multi_selection_details(images)
+        elif images:
+            self.selected_image = images[0]
+            self._show_image_details(images[0])
+        else:
             self.selected_image = None
             self._show_collection_details(self._selected_collection_id())
         if self.current_result_mode == "creative_node":
@@ -9882,6 +9930,19 @@ class MainWindow(QMainWindow):
         if not clean_images:
             return 0
         image_ids = [image.id for image in clean_images]
+        if self.current_result_mode == "duplicate_group" and self.current_duplicate_images:
+            removed_ids = set(image_ids)
+            self.current_duplicate_images = [
+                image for image in self.current_duplicate_images
+                if image.id not in removed_ids
+            ]
+            for image_id in removed_ids:
+                self.current_duplicate_badges.pop(image_id, None)
+            if self.manual_result_order_ids:
+                self.manual_result_order_ids = [
+                    image_id for image_id in self.manual_result_order_ids
+                    if image_id not in removed_ids
+                ]
         undo_snapshot = snapshot or self.store.snapshot_images_for_restore(image_ids)
         self.store.remove_images_from_library(image_ids)
         self._invalidate_near_duplicate_hash_cache()
@@ -10434,28 +10495,125 @@ class MainWindow(QMainWindow):
 
     def _handle_duplicates_done(self, groups: list[DuplicateGroup]) -> None:
         self._set_maintenance_controls_enabled(True)
+        if self._duplicate_results_dialog is not None:
+            old_dialog = self._duplicate_results_dialog
+            self._duplicate_results_dialog = None
+            old_dialog.close()
+        self._duplicate_groups = list(groups)
         if not groups:
+            self._duplicate_groups = []
             self.settings_status_label.setText("没有发现重复/近重复图片。")
             self.statusBar().showMessage("没有发现重复/近重复图片")
             return
         exact_count = sum(1 for group in groups if group.kind == "exact")
         near_count = len(groups) - exact_count
         dialog = DuplicateResultsDialog(groups, parent=self)
-        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_group_image_ids:
-            images = self.store.images_by_ids(dialog.selected_group_image_ids)
-            self.current_duplicate_images = images
-            self.current_result_mode = "duplicate_group"
-            self._clear_result_management_state()
-            self.search_filters.clear()
-            self.active_filter_index = None
-            self.current_offset = len(images)
-            self.load_more_button.setEnabled(False)
-            self.grid_view.set_images(images)
-            self._set_result_status(f"重复候选组：{len(images)} 张")
-            self.search_diagnostics_label.setText("搜索诊断：重复/近重复候选组")
+        dialog.allGroupsLoadRequested.connect(self._load_all_duplicate_group_images)
+        dialog.groupLoadRequested.connect(self._load_duplicate_group_images)
+        dialog.finished.connect(lambda _result: self._clear_duplicate_results_dialog(dialog))
+        self._duplicate_results_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        all_images, badges = self._duplicate_groups_grid_payload(groups)
+        self._show_duplicate_images(
+            all_images,
+            badges_by_image_id=badges,
+            status_prefix=f"全部重复候选（{len(groups)} 组）",
+        )
         message = f"重复检测完成：完全重复 {exact_count} 组，近重复 {near_count} 组"
         self.settings_status_label.setText(message)
         self.statusBar().showMessage(message)
+
+    def _clear_duplicate_results_dialog(self, dialog: DuplicateResultsDialog) -> None:
+        if self._duplicate_results_dialog is dialog:
+            self._duplicate_results_dialog = None
+
+    def _show_duplicate_results_dialog(self) -> bool:
+        dialog = self._duplicate_results_dialog
+        if dialog is None:
+            return False
+        if dialog.isMinimized():
+            dialog.showNormal()
+        else:
+            dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        return True
+
+    def _duplicate_groups_grid_payload(
+        self,
+        groups: list[DuplicateGroup],
+    ) -> tuple[list[ImageItem], dict[int, list[str]]]:
+        member_images: list[ImageItem] = []
+        badges: dict[int, list[str]] = {}
+        seen: set[int] = set()
+        for index, group in enumerate(groups, start=1):
+            kind_label = "完全重复" if group.kind == "exact" else "近重复"
+            badge = f"{kind_label} #{index}"
+            for member in group.members:
+                image = member.image
+                image_badges = badges.setdefault(image.id, [])
+                if badge not in image_badges:
+                    image_badges.append(badge)
+                if image.id in seen:
+                    continue
+                seen.add(image.id)
+                member_images.append(image)
+        fresh_images = self.store.images_by_ids([image.id for image in member_images])
+        if fresh_images:
+            fresh_ids = {image.id for image in fresh_images}
+            badges = {
+                image_id: image_badges
+                for image_id, image_badges in badges.items()
+                if image_id in fresh_ids
+            }
+            return fresh_images, badges
+        if member_images and self.store.count_images() > 0:
+            return [], {}
+        return member_images, badges
+
+    def _load_all_duplicate_group_images(self) -> None:
+        all_images, badges = self._duplicate_groups_grid_payload(self._duplicate_groups)
+        if not all_images:
+            self.statusBar().showMessage("没有可载入的重复候选")
+            return
+        self._show_duplicate_images(
+            all_images,
+            badges_by_image_id=badges,
+            status_prefix=f"全部重复候选（{len(self._duplicate_groups)} 组）",
+        )
+
+    def _show_duplicate_images(
+        self,
+        images: list[ImageItem],
+        *,
+        badges_by_image_id: dict[int, list[str]] | None = None,
+        status_prefix: str = "重复候选组",
+    ) -> None:
+        self.current_duplicate_images = list(images)
+        self.current_duplicate_badges = {
+            int(image_id): list(badges)
+            for image_id, badges in (badges_by_image_id or {}).items()
+        }
+        self.current_result_mode = "duplicate_group"
+        self._clear_result_management_state()
+        self.search_filters.clear()
+        self.active_filter_index = None
+        self.current_offset = len(images)
+        self.load_more_button.setEnabled(False)
+        self._set_manual_result_order(images)
+        self.grid_view.set_images(images, badges_by_image_id=self.current_duplicate_badges)
+        self._set_result_status(f"{status_prefix}：{len(images)} 张")
+        self.search_diagnostics_label.setText("搜索诊断：重复/近重复候选组")
+
+    def _load_duplicate_group_images(self, image_ids: list[int]) -> None:
+        images = self.store.images_by_ids([int(image_id) for image_id in image_ids])
+        if not images:
+            self.statusBar().showMessage("该重复组里的图片已经不存在")
+            return
+        badges = {image.id: ["重复组"] for image in images}
+        self._show_duplicate_images(images, badges_by_image_id=badges)
 
     def _compare_selected_images(self) -> None:
         images = self._selected_grid_images()

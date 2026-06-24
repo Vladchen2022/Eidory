@@ -148,6 +148,16 @@ class ProjectBoardViewTest(unittest.TestCase):
         self.assertEqual(emitted, [[1]])
         self.assertTrue(event.isAccepted())
 
+    def test_select_image_emits_selection_changed(self) -> None:
+        board = ProjectBoardView()
+        board.set_images([self._image(1), self._image(2)])
+        emitted: list[list[int]] = []
+        board.selectionChanged.connect(lambda image_ids: emitted.append(list(image_ids)))
+
+        board._select_image_id(2)
+
+        self.assertEqual(emitted, [[2]])
+
     def test_undo_shortcut_requests_board_removal_undo(self) -> None:
         board = ProjectBoardView()
         emitted: list[bool] = []

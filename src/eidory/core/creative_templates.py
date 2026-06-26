@@ -24,14 +24,8 @@ STORY_ILLUSTRATION_TEMPLATE = CreativeTemplateNode(
         CreativeTemplateNode("世界观", "时代、技术水平、社会秩序或幻想规则。"),
         CreativeTemplateNode("时间", "季节、昼夜、事件发生的具体时刻。"),
         CreativeTemplateNode("地点", "场景位置、空间尺度、环境状态。"),
-        CreativeTemplateNode(
-            "人物",
-            "参与事件的主要人物与次要人物。",
-            (
-                CreativeTemplateNode("主角", "画面叙事的中心人物。"),
-                CreativeTemplateNode("次要角色", "推动关系或冲突的人物。"),
-            ),
-        ),
+        CreativeTemplateNode("物件", "重要道具、武器、载具、家具、工具、器皿、标识、残片、痕迹物或能激发世界观联想的附属物。"),
+        CreativeTemplateNode("人物", "参与事件的人物造型、阵营差异、体态动作和表情互动。"),
         CreativeTemplateNode("事件", "画面中正在发生的动作、冲突或转折。"),
         CreativeTemplateNode("氛围", "情绪、光线、色彩倾向和观看感受。"),
         CreativeTemplateNode("构图", "视角、主体位置、画面层次和视觉焦点。"),

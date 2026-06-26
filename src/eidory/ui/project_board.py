@@ -402,6 +402,35 @@ class ProjectBoardView(QGraphicsView):
             default_y = DEFAULT_LAYOUT_TOP
             row_height = 0.0
             row_right = DEFAULT_LAYOUT_LEFT + DEFAULT_LAYOUT_ROW_WIDTH
+            stored_positions: set[tuple[int, int]] = set()
+            has_duplicate_stored_position = False
+            for image in images:
+                payload = stored_items.get(str(image.id), {})
+                if not isinstance(payload, dict):
+                    continue
+                position = (
+                    int(round(_safe_float(payload.get("x"), DEFAULT_LAYOUT_LEFT))),
+                    int(round(_safe_float(payload.get("y"), DEFAULT_LAYOUT_TOP))),
+                )
+                if position in stored_positions:
+                    has_duplicate_stored_position = True
+                    break
+                stored_positions.add(position)
+            if (
+                has_duplicate_stored_position
+                or any(not isinstance(stored_items.get(str(image.id)), dict) for image in images)
+            ):
+                stored_bottom = DEFAULT_LAYOUT_TOP
+                for image in images:
+                    payload = stored_items.get(str(image.id), {})
+                    if not isinstance(payload, dict):
+                        continue
+                    y = _safe_float(payload.get("y"), DEFAULT_LAYOUT_TOP)
+                    height = max(80.0, _safe_float(payload.get("height"), 160.0))
+                    stored_bottom = max(stored_bottom, y + height)
+                if stored_bottom > DEFAULT_LAYOUT_TOP:
+                    default_y = stored_bottom + DEFAULT_LAYOUT_GAP_Y
+            placed_positions: set[tuple[int, int]] = set()
             for index, image in enumerate(images):
                 item_payload = stored_items.get(str(image.id), {})
                 pixmap = self._pixmap_for(
@@ -419,6 +448,11 @@ class ProjectBoardView(QGraphicsView):
                     y = _safe_float(item_payload.get("y"), default_y)
                     item_width = max(80.0, _safe_float(item_payload.get("width"), item_width))
                     item_height = max(80.0, _safe_float(item_payload.get("height"), item_height))
+                    position = (int(round(x)), int(round(y)))
+                    if position in placed_positions:
+                        item_payload = {}
+                        x = float(default_x)
+                        y = float(default_y)
                 else:
                     x = float(default_x)
                     y = float(default_y)
@@ -432,6 +466,7 @@ class ProjectBoardView(QGraphicsView):
                     normalized_badges.get(image.id, []),
                 )
                 self._apply_item_payload_state(image.id, item_payload)
+                placed_positions.add((int(round(x)), int(round(y))))
                 row_height = max(row_height, item_height)
                 default_x += item_width + DEFAULT_LAYOUT_GAP_X
 

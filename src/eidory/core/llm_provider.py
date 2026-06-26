@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 
 import requests
@@ -295,6 +296,8 @@ class LMStudioProvider:
         self,
         *,
         project_brief: str,
+        project_extra: str = "",
+        project_outline: str = "",
         node_title: str,
         current_note: str = "",
         node_path: str = "",
@@ -310,15 +313,18 @@ class LMStudioProvider:
                 "role": "system",
                 "content": (
                     "You fill one fixed illustration planning node. Do not create child nodes. "
-                    "Return strict JSON only."
+                    "Return one strict JSON object only. Do not output analysis, reasoning, "
+                    "chain-of-thought, or a thinking process."
                     if language == "en"
-                    else "你只负责补全一个固定插画规划节点。不要生成子节点。只输出严格 JSON。"
+                    else "你只负责补全一个固定插画规划节点。不要生成子节点。只输出严格 JSON 对象，不要输出分析、推理、思考过程或步骤。"
                 ),
             },
             {
                 "role": "user",
                 "content": _build_creative_node_note_prompt(
                     project_brief=clean_brief,
+                    project_extra=project_extra.strip(),
+                    project_outline=project_outline.strip(),
                     node_title=clean_title,
                     current_note=current_note.strip(),
                     node_path=node_path.strip(),
@@ -329,12 +335,21 @@ class LMStudioProvider:
         content = self._chat_completion(
             model_name=model_name,
             messages=messages,
-            prefer_json=True,
-            response_format=_creative_node_note_response_format(),
-            temperature=0.45,
+            prefer_json=False,
+            reasoning_effort="none",
+            temperature=0.35,
             max_tokens=900,
         )
-        return parse_creative_node_note_suggestion(content, language=language), model_name
+        suggestion = parse_creative_node_note_suggestion(content, language=language)
+        return _refine_creative_node_note_suggestion(
+            suggestion,
+            project_brief=clean_brief,
+            project_extra=project_extra.strip(),
+            node_title=clean_title,
+            current_note=current_note.strip(),
+            node_path=node_path.strip(),
+            language=language,
+        ), model_name
 
     def generate_creative_project_copy(
         self,
@@ -371,8 +386,10 @@ class LMStudioProvider:
             model_name=model_name,
             messages=messages,
             prefer_json=False,
+            reasoning_effort="none",
             temperature=0.75,
             max_tokens=1400,
+            allow_reasoning_content=True,
         )
         return parse_creative_project_copy_suggestion(content, language=language), model_name
 
@@ -383,8 +400,10 @@ class LMStudioProvider:
         messages: list[dict[str, str]],
         prefer_json: bool,
         response_format: dict[str, object] | None = None,
+        reasoning_effort: str | None = None,
         temperature: float = 0.75,
         max_tokens: int = 2200,
+        allow_reasoning_content: bool = False,
     ) -> str:
         payload: dict[str, object] = {
             "model": model_name,
@@ -394,33 +413,63 @@ class LMStudioProvider:
         }
         if prefer_json:
             payload["response_format"] = response_format or _inspiration_response_format()
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
         headers = self._headers()
-        try:
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=self.timeout_seconds,
-            )
-            if response.status_code in {400, 422} and prefer_json:
-                payload.pop("response_format", None)
+        response = None
+        for attempt in range(2):
+            try:
                 response = requests.post(
                     f"{self.base_url}/chat/completions",
                     json=payload,
                     headers=headers,
                     timeout=self.timeout_seconds,
                 )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise LLMProviderError(f"{self.service_name} 请求失败：{exc}") from exc
+                if response.status_code in {400, 422} and (
+                    (prefer_json and "response_format" in payload) or "reasoning_effort" in payload
+                ):
+                    if prefer_json:
+                        payload.pop("response_format", None)
+                    payload.pop("reasoning_effort", None)
+                    response = requests.post(
+                        f"{self.base_url}/chat/completions",
+                        json=payload,
+                        headers=headers,
+                        timeout=self.timeout_seconds,
+                    )
+                response.raise_for_status()
+                break
+            except requests.Timeout as exc:
+                raise LLMProviderError(
+                    f"{self.service_name} 请求超时：模型在 {self.timeout_seconds} 秒内没有返回。"
+                    "请确认本地模型未在排队/卡住，或换用更快的文本模型后重试。"
+                ) from exc
+            except (requests.ConnectionError, requests.ChunkedEncodingError) as exc:
+                if attempt == 0:
+                    time.sleep(0.35)
+                    continue
+                raise LLMProviderError(
+                    f"{self.service_name} 连接被中断：本地模型服务关闭了连接。"
+                    "请确认 LM Studio 仍在运行且模型已加载，然后重试。"
+                ) from exc
+            except requests.RequestException as exc:
+                raise LLMProviderError(f"{self.service_name} 请求失败：{exc}") from exc
+        if response is None:
+            raise LLMProviderError(f"{self.service_name} 请求失败：没有收到响应")
 
         try:
             message = response.json()["choices"][0]["message"]
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMProviderError("LM Studio 返回格式无效") from exc
         content = str(message.get("content") or "").strip()
-        if not content:
-            content = str(message.get("reasoning_content") or "").strip()
+        reasoning_content = str(message.get("reasoning_content") or "").strip()
+        if not content and reasoning_content:
+            if allow_reasoning_content:
+                return reasoning_content
+            raise LLMProviderError(
+                f"{self.service_name} 只返回了思考过程，没有返回最终内容。"
+                "请在模型设置中关闭 Thinking/Reasoning，或换用非推理文本模型后重试。"
+            )
         if not content:
             raise LLMProviderError("LM Studio 返回了空内容")
         return content
@@ -633,16 +682,406 @@ def parse_creative_node_note_suggestion(
     *,
     language: str = "zh",
 ) -> CreativeNodeNoteSuggestion:
-    payload = _load_json_object(content)
+    if _looks_like_model_reasoning(content):
+        raise LLMProviderError("AI 返回了思考过程，而不是可用的节点说明")
+    try:
+        payload = _load_json_object(content)
+    except LLMProviderError:
+        note = _clean_creative_node_note_plain_text(content, max_length=900)
+        search_query = _creative_node_search_query_from_plain_note(note, max_length=240)
+        if not _is_useful_creative_node_note(note):
+            raise LLMProviderError("AI 没有返回可用的节点说明")
+        return CreativeNodeNoteSuggestion(note=note, search_query=search_query)
     note = _clean_project_text(payload.get("note"), max_length=900)
     search_query = _clean_project_text(payload.get("search_query"), max_length=240)
-    if not note and not search_query:
+    if not _is_useful_creative_node_note(note) and not _is_useful_creative_node_note(search_query):
         raise LLMProviderError("AI 没有返回可用的节点说明")
     if not search_query:
         search_query = note[:240]
     if not note:
         note = search_query
     return CreativeNodeNoteSuggestion(note=note, search_query=search_query)
+
+
+def _refine_creative_node_note_suggestion(
+    suggestion: CreativeNodeNoteSuggestion,
+    *,
+    project_brief: str,
+    project_extra: str,
+    node_title: str,
+    current_note: str,
+    node_path: str,
+    language: str,
+) -> CreativeNodeNoteSuggestion:
+    if language == "en":
+        return suggestion
+    refined_query = _refine_creative_node_search_query(
+        suggestion.search_query,
+        project_brief=project_brief,
+        project_extra=project_extra,
+        node_title=node_title,
+        current_note=current_note,
+        node_path=node_path,
+    )
+    if not refined_query:
+        refined_query = suggestion.search_query
+    return CreativeNodeNoteSuggestion(note=suggestion.note, search_query=refined_query[:240])
+
+
+def _refine_creative_node_search_query(
+    query: str,
+    *,
+    project_brief: str,
+    project_extra: str,
+    node_title: str,
+    current_note: str,
+    node_path: str,
+) -> str:
+    kind = _creative_node_scope_kind(node_title=node_title, node_path=node_path)
+    if kind in {"root", "world", "unknown"}:
+        if kind == "world":
+            return _remove_query_terms(query, _CREATIVE_EVENT_TERMS)
+        return query
+
+    user_context = f"{project_brief} {project_extra} {current_note}"
+    natural_location = any(term in user_context for term in _CREATIVE_NATURAL_LOCATION_TERMS)
+    built_location = any(term in user_context for term in _CREATIVE_BUILT_LOCATION_TERMS)
+
+    if kind == "time":
+        return _remove_query_terms(
+            query,
+            _CREATIVE_WORLD_TERMS
+            | _CREATIVE_EVENT_TERMS
+            | _CREATIVE_IDENTITY_TERMS
+            | _CREATIVE_LOCATION_TERMS
+            | _CREATIVE_OBJECT_CONTEXT_TERMS,
+        )
+    if kind == "place":
+        remove_terms = _CREATIVE_EVENT_TERMS | _CREATIVE_IDENTITY_TERMS | _CREATIVE_TIME_TERMS
+        if natural_location and not built_location:
+            remove_terms |= _CREATIVE_WORLD_TERMS | _CREATIVE_BUILT_LOCATION_TERMS
+        return _remove_query_terms(query, remove_terms)
+    if kind == "object":
+        return _remove_query_terms(query, _CREATIVE_EVENT_TERMS | _CREATIVE_IDENTITY_TERMS)
+    if kind == "person":
+        return _remove_query_terms(query, _CREATIVE_LOCATION_TERMS | _CREATIVE_TIME_TERMS)
+    if kind == "event":
+        return _remove_query_terms(
+            query,
+            _CREATIVE_WORLD_TERMS
+            | _CREATIVE_IDENTITY_TERMS
+            | _CREATIVE_LOCATION_TERMS
+            | _CREATIVE_TIME_TERMS
+            | _CREATIVE_OBJECT_CONTEXT_TERMS,
+        )
+    if kind == "mood":
+        return _remove_query_terms(
+            query,
+            _CREATIVE_WORLD_TERMS
+            | _CREATIVE_IDENTITY_TERMS
+            | _CREATIVE_LOCATION_TERMS
+            | _CREATIVE_EVENT_TERMS,
+        )
+    if kind == "composition":
+        refined = _remove_query_terms(
+            query,
+            _CREATIVE_WORLD_TERMS
+            | _CREATIVE_IDENTITY_TERMS
+            | _CREATIVE_LOCATION_TERMS
+            | _CREATIVE_TIME_TERMS
+            | (_CREATIVE_EVENT_TERMS - {"冲突"})
+            | _CREATIVE_SINGLE_CHARACTER_COMPOSITION_TERMS,
+        )
+        return _ensure_composition_scene_query(refined)
+    return query
+
+
+def _creative_node_scope_kind(*, node_title: str, node_path: str) -> str:
+    clean_title = node_title.strip()
+    clean_path = node_path.strip()
+    if clean_title and clean_path in {"", clean_title}:
+        return "root"
+    target = f"{clean_path} / {clean_title}".lower()
+    checks: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("world", ("世界观", "设定", "时代", "技术", "社会", "秩序", "world", "worldview", "setting")),
+        ("time", ("时间", "天气", "季节", "昼夜", "time", "weather", "season")),
+        ("place", ("地点", "场景", "环境", "空间", "location", "place", "environment", "scene")),
+        ("object", ("物件", "道具", "武器", "工具", "载具", "家具", "器皿", "装备", "object", "prop", "weapon", "tool", "vehicle")),
+        ("person", ("人物", "角色", "主角", "次要角色", "服装", "姿态", "character", "person", "people", "costume", "pose")),
+        ("event", ("事件", "动作", "行为", "互动", "event", "action", "behavior", "gesture")),
+        ("mood", ("氛围", "气氛", "情绪", "色调", "光影", "光线", "mood", "atmosphere", "lighting")),
+        ("composition", ("构图", "镜头", "视角", "画面", "布局", "景别", "composition", "camera", "framing")),
+    )
+    for kind, keywords in checks:
+        if any(keyword.lower() in target for keyword in keywords):
+            return kind
+    return "unknown"
+
+
+def _remove_query_terms(query: str, remove_terms: set[str]) -> str:
+    terms = _split_creative_search_query_terms(query)
+    if not terms:
+        return ""
+    refined: list[str] = []
+    seen: set[str] = set()
+    ordered_removals = sorted(remove_terms, key=len, reverse=True)
+    for term in terms:
+        clean = term
+        for remove in ordered_removals:
+            clean = clean.replace(remove, "")
+        clean = re.sub(r"[\s,，、;；]+", " ", clean).strip(" -_/，,、;；")
+        clean = " ".join(clean.split())
+        if not clean or clean in _CREATIVE_QUERY_DROP_TERMS:
+            continue
+        if len(re.findall(r"[\w\u4e00-\u9fff]", clean)) < 2:
+            continue
+        if clean not in seen:
+            refined.append(clean)
+            seen.add(clean)
+    return " ".join(refined)[:240]
+
+
+def _split_creative_search_query_terms(query: str) -> list[str]:
+    return [
+        term.strip()
+        for term in re.split(r"[,，、;；|/\n]+|\s{1,}", str(query or ""))
+        if term.strip()
+    ]
+
+
+def _ensure_composition_scene_query(query: str) -> str:
+    clean = " ".join(str(query or "").split())
+    if not clean:
+        return "场景空间构图 镜头位置 广角环境 前中后景 空间纵深"
+    scene_anchors = (
+        "场景",
+        "空间",
+        "环境",
+        "镜头",
+        "构图",
+        "广角",
+        "群像",
+        "前景",
+        "中景",
+        "后景",
+        "纵深",
+        "透视",
+        "视角",
+        "机位",
+    )
+    if any(anchor in clean for anchor in scene_anchors):
+        return clean[:240]
+    return f"场景空间构图 镜头位置 {clean}"[:240]
+
+
+_CREATIVE_WORLD_TERMS = {
+    "中世纪",
+    "古代",
+    "近未来",
+    "未来",
+    "现代",
+    "科幻",
+    "赛博朋克",
+    "幻想",
+    "魔法",
+    "太空",
+    "空间站",
+    "太空舱",
+    "飞船",
+}
+
+_CREATIVE_EVENT_TERMS = {
+    "战斗",
+    "战争",
+    "战场",
+    "搏斗",
+    "打斗",
+    "斗殴",
+    "厮杀",
+    "冲突",
+    "追逐",
+    "吃饭",
+    "用餐",
+    "进食",
+    "交火",
+}
+
+_CREATIVE_IDENTITY_TERMS = {
+    "士兵",
+    "骑士",
+    "步兵",
+    "弓箭手",
+    "军队",
+    "阵营",
+    "宇航员",
+    "航天员",
+    "角色",
+    "人物",
+}
+
+_CREATIVE_LOCATION_TERMS = {
+    "田野",
+    "农田",
+    "战场",
+    "草地",
+    "草坡",
+    "泥地",
+    "泥泞地面",
+    "城堡",
+    "村庄",
+    "空间站",
+    "太空舱",
+    "室内",
+    "餐桌",
+    "餐厅",
+    "房间",
+    "地面",
+}
+
+_CREATIVE_BUILT_LOCATION_TERMS = {
+    "城堡",
+    "村庄",
+    "街道",
+    "市场",
+    "教堂",
+    "桥",
+    "宫殿",
+    "酒馆",
+    "餐厅",
+    "室内",
+    "房间",
+    "空间站",
+    "太空舱",
+    "飞船",
+    "城市",
+}
+
+_CREATIVE_NATURAL_LOCATION_TERMS = {
+    "田野",
+    "农田",
+    "草地",
+    "草坡",
+    "泥泞",
+    "泥地",
+    "平原",
+    "森林",
+    "山地",
+    "山坡",
+    "河流",
+    "湖泊",
+    "海岸",
+    "荒野",
+    "沼泽",
+    "丘陵",
+}
+
+_CREATIVE_TIME_TERMS = {
+    "傍晚",
+    "黄昏",
+    "暮色",
+    "清晨",
+    "黎明",
+    "正午",
+    "白天",
+    "夜晚",
+    "夜间",
+    "雨天",
+    "雪天",
+    "雾天",
+}
+
+_CREATIVE_OBJECT_CONTEXT_TERMS = {
+    "武器",
+    "盾牌",
+    "长矛",
+    "铁剑",
+    "盔甲",
+    "马车",
+    "水车",
+    "旗帜",
+    "头盔",
+    "道具",
+}
+
+_CREATIVE_SINGLE_CHARACTER_COMPOSITION_TERMS = {
+    "单人",
+    "单个角色",
+    "单角色",
+    "角色特写",
+    "人物特写",
+    "肖像",
+    "半身",
+    "头像",
+    "大头照",
+    "站姿",
+    "坐姿",
+    "表情",
+    "人物姿态",
+    "角色姿态",
+    "角色设定",
+    "人物设定",
+}
+
+_CREATIVE_QUERY_DROP_TERMS = {
+    "参考",
+    "参考图",
+    "写实",
+    "风格",
+    "写实风格",
+    "环境参考",
+    "感",
+}
+
+
+def _clean_creative_node_note_plain_text(content: str, *, max_length: int) -> str:
+    text = str(content or "").strip()
+    text = re.sub(r"^```(?:json|markdown|text)?", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"```$", "", text).strip()
+    text = re.sub(r"(?im)^\s*(节点说明|当前节点说明|note)\s*[:：]\s*", "", text).strip()
+    text = re.sub(r"(?im)^\s*(搜索语句|搜索短语|search_query|search query)\s*[:：].*$", "", text).strip()
+    return " ".join(text.split())[:max_length]
+
+
+def _creative_node_search_query_from_plain_note(note: str, *, max_length: int) -> str:
+    clean = " ".join(str(note or "").split())
+    if not clean:
+        return ""
+    stop_index = len(clean)
+    for separator in ("。", "；", ";", ".", "\n"):
+        index = clean.find(separator)
+        if index > 0:
+            stop_index = min(stop_index, index)
+    return clean[:stop_index].strip()[:max_length] or clean[:max_length]
+
+
+def _is_useful_creative_node_note(text: str) -> bool:
+    clean = str(text or "").strip()
+    if not clean:
+        return False
+    if _looks_like_model_reasoning(clean):
+        return False
+    if not re.search(r"[\w\u4e00-\u9fff]", clean):
+        return False
+    meaningful = re.findall(r"[\w\u4e00-\u9fff]", clean)
+    return len(meaningful) >= 6
+
+
+def _looks_like_model_reasoning(text: str) -> bool:
+    clean = str(text or "")
+    if not clean.strip():
+        return False
+    patterns = (
+        r"here'?s\s+a\s+thinking\s+process",
+        r"\bthinking\s+process\b",
+        r"\banaly[sz]e\s+user\s+input\b",
+        r"\bdeconstruct\s+constraints\b",
+        r"\bchain[-\s]?of[-\s]?thought\b",
+        r"\breasoning\s+process\b",
+        r"思考过程",
+        r"推理过程",
+        r"分析用户输入",
+    )
+    return any(re.search(pattern, clean, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def parse_creative_project_copy_suggestion(
@@ -677,7 +1116,10 @@ def parse_creative_project_copy_suggestion(
             "文案",
         ),
         max_length=1600,
-    ) or _fallback_project_copy_from_payload(payload) or fallback_copy
+    ) or _fallback_project_copy_from_payload(payload)
+    if not copy_text and _payload_has_reasoning_text(payload):
+        raise LLMProviderError("AI 只返回了思考过程，没有返回可用项目文案")
+    copy_text = copy_text or fallback_copy
     raw_nodes = payload.get("nodes", payload.get("node_updates", []))
     if not isinstance(raw_nodes, list):
         raw_nodes = []
@@ -749,8 +1191,24 @@ def _payload_from_nested_content(value: object) -> dict[str, object] | None:
         nested = _load_json_object(clean_value)
     except LLMProviderError:
         copy_text = _clean_plain_project_copy_text(clean_value)
-        return {"copy_text": copy_text or clean_value, "nodes": []}
+        if copy_text:
+            return {"copy_text": copy_text, "nodes": []}
+        if _looks_like_model_reasoning(clean_value) or _looks_like_reasoning_line(clean_value):
+            return None
+        return {"copy_text": clean_value, "nodes": []}
     return nested if isinstance(nested, dict) else None
+
+
+def _payload_has_reasoning_text(value: object) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key in {"reasoning", "reasoning_content"} and isinstance(nested, str) and nested.strip():
+                return True
+            if _payload_has_reasoning_text(nested):
+                return True
+    if isinstance(value, list):
+        return any(_payload_has_reasoning_text(nested) for nested in value)
+    return False
 
 
 def _clean_plain_project_copy_text(content: str) -> str:
@@ -760,6 +1218,8 @@ def _clean_plain_project_copy_text(content: str) -> str:
     draft = _extract_best_project_copy_paragraph(content)
     if draft:
         return draft
+    if _looks_like_model_reasoning(content) or _looks_like_reasoning_line(str(content).strip()):
+        return ""
     return _strip_project_copy_prefix(_clean_project_text(content, max_length=1600))
 
 
@@ -874,7 +1334,6 @@ def _looks_like_reasoning_line(line: str) -> bool:
         "分析",
         "思考",
         "字数",
-        "检查",
         "草稿",
     )
     return any(marker in lower for marker in reasoning_markers)
@@ -1438,6 +1897,8 @@ Rules:
 def _build_creative_node_note_prompt(
     *,
     project_brief: str,
+    project_extra: str,
+    project_outline: str = "",
     node_title: str,
     current_note: str,
     node_path: str,
@@ -1447,51 +1908,253 @@ def _build_creative_node_note_prompt(
         "No detail has been provided yet." if language == "en" else "用户尚未填写具体内容。"
     )
     node_path_block = node_path if node_path else node_title
+    extra_block = project_extra if project_extra else (
+        "No extra project context has been provided." if language == "en" else "用户未填写补充信息。"
+    )
+    outline_block = project_outline if project_outline else (
+        "No project node tree has been provided." if language == "en" else "未提供项目节点树。"
+    )
+    search_scope_block = _creative_node_search_scope_guidance(
+        project_extra=project_extra,
+        current_note=current_note,
+        node_title=node_title,
+        node_path=node_path,
+        language=language,
+    )
     if language == "en":
         return f"""
 Project brief:
 {project_brief or "-"}
 
+Extra project context:
+{extra_block}
+
 Current fixed planning node:
 {node_path_block or "-"}
 
-Existing node detail:
+Existing node detail, if any. Treat it as the strongest constraint:
 {current_note_block}
 
-Fill this node as an illustrator's reference-planning field.
+Current project node tree:
+{outline_block}
+
+Complete this node as an illustrator's reference-planning field. If existing node detail is provided, treat it as fixed information, then add missing visual decisions around it. Do not merely rewrite the existing sentence.
+
+Search-query scope guidance:
+{search_scope_block}
 
 Return JSON:
 {{"note":"one concise paragraph about what this node should define visually","search_query":"concrete English semantic image-search phrase"}}
 
 Rules:
 1. Do not create or rename nodes.
-2. Keep the note specific to this node only.
-3. The search_query must be concrete enough for text-image embedding search.
-4. Avoid story-only abstractions; describe visible environment, objects, action, lighting, mood, material, or composition.
-5. Do not output Markdown or text outside JSON.
+2. The project brief and extra context are hard constraints. Do not add an era, weather, location, object, character, action, or mood that conflicts with them.
+3. If existing node detail is provided, preserve it as the highest-priority user constraint. You may infer and add related environment, objects, lighting, atmosphere, material, action, or composition, but must not contradict, remove, or replace the user's content.
+4. Keep the note specific to this node only.
+5. The note may stay project-aware. The search_query must obey the search-query scope guidance even when the note mentions project-specific context.
+6. Do not copy all note details into search_query. Put only the reference target for this node in search_query.
+7. Avoid story-only abstractions; describe visible environment, objects, action, lighting, mood, material, or composition.
+8. The note must be a complete, useful sentence. Do not output placeholders such as "...", "TBD", or "same as above".
+9. Do not output Markdown, analysis, reasoning, or text outside JSON.
+10. If your model supports thinking mode, disable it and output only the final JSON.
+
+/no_think
 """.strip()
     return f"""
 项目主题：
 {project_brief or "-"}
 
+补充信息：
+{extra_block}
+
 当前固定规划节点：
 {node_path_block or "-"}
 
-现有节点说明：
+现有节点说明（如果有，优先级最高）：
 {current_note_block}
 
-请把这个节点补成插画师能直接拿来找参考图的规划内容。
+当前项目节点树：
+{outline_block}
+
+请把这个节点补成插画师能直接拿来找参考图的规划内容。如果用户已经写了节点说明，必须把这些内容当作已经确定的事实、约束和出发点，再补充用户没有写出的相关视觉信息；不是围绕原句扩写，也不是只重复、改写或输出占位符。
+
+搜索范围建议：
+{search_scope_block}
 
 输出 JSON：
 {{"note":"一段简洁说明，说明这个节点要明确哪些视觉参考","search_query":"具体的中文语义搜图短语"}}
 
 规则：
 1. 不要创建节点，不要改节点名。
-2. 只补当前节点，不要把其他节点的内容混进来。
-3. search_query 必须能直接用于图文 embedding 搜图。
-4. 避免只有剧情或抽象词，要落到可见环境、物件、动作、光线、气氛、材质或构图。
-5. 不要输出 Markdown，不要解释 JSON 之外的内容。
+2. “项目主题”和“补充信息”是硬约束，不要加入与它们冲突的时代、天气、地点、物件、角色、动作或氛围。
+3. 如果“现有节点说明”里有用户已写内容，它是最高优先级约束。允许基于它合理联想并补充相关的环境、物件、光线、气氛、材质、动作或构图，但不得推翻、删除、替换或违背。
+4. 只补当前节点，不要把其他节点的内容混进来。
+5. note 可以保留项目语境；search_query 必须严格服从“搜索范围建议”，即使 note 里提到了项目主题、世界观、地点、角色或事件。
+6. 不要把 note 的所有细节复制进 search_query。search_query 只写当前节点要找的参考目标。
+7. search_query 必须使用简体中文短语，不要输出英文，除非是不可翻译的专有名词。
+8. 避免只有剧情或抽象词，要落到可见环境、物件、动作、光线、气氛、材质或构图。
+9. note 必须是一句完整、有信息量的说明。不要输出“...”“待补充”“同上”这类占位内容。
+10. 不要输出 Markdown、分析、推理、思考过程或 JSON 之外的内容。
+11. 如果模型支持 Thinking/Reasoning 模式，请关闭它，只输出最终 JSON。
+
+/no_think
 """.strip()
+
+
+def _creative_node_search_scope_guidance(
+    *,
+    project_extra: str = "",
+    current_note: str = "",
+    node_title: str,
+    node_path: str,
+    language: str,
+) -> str:
+    target = f"{node_path} / {node_title}".lower()
+    user_context = f"{project_extra}\n{current_note}".lower()
+    is_root_node = bool(node_title.strip()) and node_path.strip() in {"", node_title.strip()}
+
+    def has_any(keywords: tuple[str, ...]) -> bool:
+        return any(keyword.lower() in target for keyword in keywords)
+
+    if language == "en":
+        base = (
+            "Node note and search_query serve different jobs. The note may explain how this node fits the project. "
+            "The search_query should retrieve useful reference images for this node, not recreate the whole final image. "
+            "Keep only the visual constraints necessary for this node; broaden the query when generic references are more useful."
+        )
+        if is_root_node:
+            return (
+                f"{base}\n"
+                "For the root/top project node, fully respect the project brief, extra context, and existing node detail. "
+                "The search_query should represent the fused theme and constraints as a whole."
+            )
+        if has_any(("world", "worldview", "setting", "era", "technology")):
+            return (
+                f"{base}\n"
+                "For worldview/setting nodes, remove concrete event/action terms, but keep the world's visual language: era, technology, material, weathering, class, terrain, props, vehicles, architecture, and social-order cues. "
+                "You may broaden to adjacent inspiration objects that fit the world, even if they are not in the project brief."
+            )
+        if has_any(("character", "person", "people", "protagonist", "secondary", "costume", "pose")):
+            return (
+                f"{base}\n"
+                "For character/person nodes, split the reference need into layers. Identity, costume, and silhouette may keep necessary project anchors such as astronaut or flight suit. "
+                "Body type, pose, eating gestures, facial expression, and group interaction should use broader human-reference terms when useful, such as people eating together, seated posture, or table conversation. "
+                "Do not include the whole world/space/station setting unless the node is specifically about the costume or role identity."
+            )
+        if has_any(("event", "action", "behavior", "gesture")):
+            return (
+                f"{base}\n"
+                "For event/action nodes, search the action and interaction itself first. Keep only theme anchors that change the mechanics of the action; otherwise omit worldbuilding, location, and role identity."
+            )
+        if has_any(("mood", "atmosphere", "color", "tone", "lighting")):
+            return (
+                f"{base}\n"
+                "For atmosphere or lighting nodes, search mood, color, contrast, and light behavior directly. Avoid subject or world terms unless required."
+            )
+        if has_any(("composition", "camera", "shot", "angle", "framing", "layout")):
+            return (
+                f"{base}\n"
+                "For composition nodes, search camera angle, framing, spatial layering, and layout. Avoid project-specific nouns unless the composition depends on them."
+            )
+        if has_any(("time", "season", "weather")):
+            return (
+                f"{base}\n"
+                "For time/weather nodes, if user context already provides a time, weather, or season, search that condition directly without worldbuilding or event terms. "
+                "If no such detail is provided, infer a fitting time/weather from the project, then still search the time/weather/light condition itself."
+            )
+        if has_any(("location", "place", "environment", "scene")):
+            return (
+                f"{base}\n"
+                "For location/environment nodes, split natural and cultural references. Natural terrain from user context should be searched directly without worldbuilding or event terms. "
+                "Cultural or built environments should keep necessary worldview anchors, such as medieval castle rather than generic/future castle. "
+                "Keep this node about the place itself; put standalone props, vehicles, weapons, tools, furniture, or containers in object/prop nodes when available."
+            )
+        if has_any(("object", "prop", "weapon", "tool", "vehicle", "furniture", "item", "equipment")):
+            return (
+                f"{base}\n"
+                "For object/prop nodes, search important visible objects separately from location and characters. Keep worldview anchors that affect object design, such as medieval weapon, muddy cart, field banner, wooden shield, or period tableware. "
+                "Do not include the concrete event/action unless the object is defined by its active state."
+            )
+        return base
+
+    base_zh = (
+        "节点说明和 search_query 分工不同：节点说明可以解释这个节点如何服务项目，"
+        "search_query 的用途是给当前节点找参考图，不是复原最终画面。"
+        "只保留当前节点必需的可见约束；如果普通人、普通场景或通用构图参考更有用，就主动泛化搜索词。"
+    )
+    if is_root_node:
+        return (
+            f"{base_zh}\n"
+            "父节点/最顶层节点：充分尊重项目主题、补充信息和已有节点说明。"
+            "search_query 应体现主题与补充信息融合后的整体画面，让相似于总主题的图片被呈现。"
+        )
+    if has_any(("世界观", "设定", "时代", "技术", "社会", "秩序")):
+        return (
+            f"{base_zh}\n"
+            "世界观/设定节点：不要体现具体事件或动作，例如不要把“战斗、吃饭、追逐”这类事件写进 search_query。"
+            "要体现世界的造型特征和质感：时代感、材质、脏污程度、天气痕迹、地貌、建筑、载具、工具、阶层和社会秩序。"
+            "允许基于补充信息做灵感泛化，例如“中世纪、泥泞”可以联想到城堡、马车、木栅栏、水车、破旗帜，即使主题没有明说这些物件。"
+        )
+    if has_any(("人物", "角色", "主角", "次要角色", "服装", "姿态")):
+        return (
+            f"{base_zh}\n"
+            "人物/角色节点：把参考需求拆开。身份、服装、轮廓可以保留必要的主题锚点，例如航天员、舱内服、轻便宇航服；"
+            "体格、姿态、吃饭动作、表情、多人互动则应该使用更通用的人类参考，例如多人围坐吃饭、餐桌交流、手部取餐、坐姿表情。"
+            "search_query 按“造型锚点 + 通用动作/体态”组织，不要写背景、地点和世界观环境词。"
+            "可以写：航天员舱内服、多人围坐吃饭、手部取餐、坐姿表情、群体互动。"
+            "不要写：空间站、太空舱背景、太空、失重、漂浮水杯，除非当前节点标题明确是服装、装备或身份设定。"
+        )
+    if has_any(("事件", "动作", "行为", "互动")):
+        return (
+            f"{base_zh}\n"
+            "事件/动作节点：search_query 必须体现事件本身，但不需要体现世界观、时间、地点或身份。"
+            "search_query 必须只包含动作/互动词；禁止包含时代、地点、时间、阵营身份。"
+            "例如主题是“几个对立阵营的士兵在战斗”，事件节点应搜索“多人战斗、混战、近身格斗、兵器交锋、冲突动作”；"
+            "禁止写“中世纪、田野、泥泞、傍晚、士兵、战场”。主题是吃饭时，则搜索“几个人一起吃饭、餐桌互动、传递食物、手部动作、表情交流”。"
+        )
+    if has_any(("氛围", "气氛", "情绪", "色调", "光影", "光线")):
+        return (
+            f"{base_zh}\n"
+            "氛围/光线节点：基本不需要体现世界观。note 和 search_query 应联想适合事件的灯光、质感和特效，"
+            "例如烟雾、火花、尘土、泥水飞溅、逆光、残阳、冷暖对比、低能见度、高反差阴影。"
+            "search_query 必须只包含氛围、灯光、质感、特效词；禁止包含时代、地点、人物身份和具体事件。"
+            "例如不要写“中世纪、田野、士兵、战斗、战场”，写“烟雾、火花、尘土、泥水飞溅、残阳逆光、冷暖对比、低能见度”。"
+        )
+    if has_any(("构图", "镜头", "视角", "画面", "布局", "景别")):
+        return (
+            f"{base_zh}\n"
+            "构图节点：基本不需要体现世界观。note 和 search_query 应联想适合事件的镜头、视角位置、景别、动线和画面层次，"
+            "例如低机位、俯视、广角群像、前中后景、对角线冲突、包围关系、纵深透视、混乱人群布局。"
+            "构图参考必须是场景类、空间类图片，用来看摄像机在场景空间里的摆放；禁止把 search_query 写成单个角色、肖像、半身、站姿、表情或角色设定参考。"
+            "search_query 必须只包含场景空间构图和镜头词；禁止包含时代、地点、人物身份和具体事件。"
+            "例如不要写“中世纪、田野、士兵、战斗、战场、单人角色、人物特写”，"
+            "写“场景空间构图、镜头位置、广角环境、前中后景、群像布局、空间纵深、环境遮挡、摄像机视角”。"
+        )
+    if has_any(("时间", "天气", "季节", "昼夜")):
+        return (
+            f"{base_zh}\n"
+            "时间/天气节点：如果用户已有节点说明或补充信息里提供了时间、季节、昼夜或天气，就按用户描述直接搜索这些条件，"
+            "不需要带世界观、地点或事件。例如补充信息有“傍晚”，search_query 只需要“傍晚、夕阳、暮色、低角度暖光”等。"
+            "如果用户没有描述，则由 AI 根据主题和补充信息补一个相得益彰的时间设定，但 search_query 仍优先搜索时间/光线本身。"
+        )
+    if has_any(("地点", "场景", "环境", "空间")):
+        return (
+            f"{base_zh}\n"
+            "地点/环境节点：如果用户已有节点说明或补充信息描述的是自然环境，就按自然环境直接搜索，不带世界观或事件，"
+            "例如“田野”只搜田野、泥地、草坡、农地、地形关系；禁止写中世纪、战斗、士兵、战场、傍晚。"
+            "如果描述的是人文/建筑环境，则必须带世界观锚点，例如“城堡”应写“中世纪城堡”，不能变成未来城堡。"
+            "如果用户没有描述，则 AI 应根据主题和补充信息补一个相得益彰的地点设定。"
+            "地点节点只负责环境本身；独立道具、武器、载具、家具、工具、器皿和环境附属物优先放到“物件”节点。"
+        )
+    if has_any(("物件", "道具", "武器", "工具", "载具", "家具", "器皿", "装备", "物品")):
+        return (
+            f"{base_zh}\n"
+            "物件/道具节点：把重要可见物从地点和人物里分出来搜索。search_query 可以保留影响物件造型的世界观锚点，"
+            "也可以主动联想没有被主题明说但能强化世界质感的间接物件，例如破损工具、脚印车辙、旗帜标识、箱笼容器、丢弃衣物、权力符号、生活器具、维修设备、环境附属结构。"
+            "例如中世纪武器、泥泞马车、木盾、破旗帜、水车、农具、粗木餐桌、陶碗、车辙、断裂绳索、临时路障。"
+            "不要默认带具体事件动作，例如不要写“正在战斗”或“正在吃饭”，除非物件本身必须呈现使用状态。"
+        )
+    return base_zh
 
 
 def _build_creative_project_copy_text_prompt(

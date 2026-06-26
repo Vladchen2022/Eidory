@@ -47,7 +47,7 @@ TEMPORARY_PROJECT_COLORS = (
     "#586E78",
     "#6F5970",
 )
-TEMPORARY_PROJECT_KINDS = {"semantic", "quick"}
+TEMPORARY_PROJECT_KINDS = {"semantic", "quick", "search"}
 
 DEFAULT_AI_VISION_COLLECTION_PATHS = (
     ("黑白摄影",),
@@ -298,6 +298,16 @@ class MetadataStore:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS temporary_project_board_layouts (
+                project_id INTEGER PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES temporary_projects(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS temporary_project_states (
                 project_id INTEGER PRIMARY KEY,
                 payload_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -3639,6 +3649,38 @@ class MetadataStore:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT payload_json FROM temporary_project_board_layouts WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        return str(row["payload_json"]) if row is not None else None
+
+    def save_temporary_project_state(self, project_id: int, payload_json: str) -> None:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            project = conn.execute(
+                "SELECT id FROM temporary_projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                return
+            conn.execute(
+                """
+                INSERT INTO temporary_project_states(project_id, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (project_id, payload_json, now),
+            )
+            conn.execute(
+                "UPDATE temporary_projects SET updated_at = ? WHERE id = ?",
+                (now, project_id),
+            )
+
+    def get_temporary_project_state(self, project_id: int) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM temporary_project_states WHERE project_id = ?",
                 (project_id,),
             ).fetchone()
         return str(row["payload_json"]) if row is not None else None

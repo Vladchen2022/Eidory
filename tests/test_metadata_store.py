@@ -803,6 +803,7 @@ class MetadataStoreTest(unittest.TestCase):
             semantic_first = store.create_temporary_project("语义一", [image_id], kind="semantic")
             semantic_second = store.create_temporary_project("语义二", [image_id], kind="semantic")
             quick_project = store.create_temporary_project("临时收藏", [image_id], kind="quick")
+            search_project = store.create_temporary_project("搜索结果", [image_id], kind="search")
 
             self.assertEqual(
                 [project.name for project in store.list_temporary_projects(kind="semantic")],
@@ -811,6 +812,10 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(
                 [project.name for project in store.list_temporary_projects(kind="quick")],
                 ["临时收藏"],
+            )
+            self.assertEqual(
+                [project.name for project in store.list_temporary_projects(kind="search")],
+                ["搜索结果"],
             )
             self.assertTrue(store.move_temporary_project(semantic_first, -1, kind="semantic"))
             self.assertEqual(
@@ -821,17 +826,52 @@ class MetadataStoreTest(unittest.TestCase):
                 [project.name for project in store.list_temporary_projects(kind="quick")],
                 ["临时收藏"],
             )
+            self.assertEqual(
+                [project.name for project in store.list_temporary_projects(kind="search")],
+                ["搜索结果"],
+            )
 
             cleared = store.clear_temporary_projects(kind="quick")
 
             self.assertEqual(cleared, 1)
             self.assertEqual(store.list_temporary_projects(kind="quick"), [])
             self.assertEqual(
+                [project.id for project in store.list_temporary_projects(kind="search")],
+                [search_project],
+            )
+            self.assertEqual(
                 [project.id for project in store.list_temporary_projects(kind="semantic")],
                 [semantic_first, semantic_second],
             )
             self.assertIsNotNone(store.get_image(image_id))
             self.assertEqual(store.temporary_project_image_ids(quick_project), [])
+            self.assertEqual(store.temporary_project_image_ids(search_project), [image_id])
+
+    def test_temporary_project_state_persists_and_cascades(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            project_id = store.create_temporary_project("搜索结果", [image_id], kind="search")
+            payload = '{"version":1,"view":{"score_threshold":42}}'
+
+            store.save_temporary_project_state(project_id, payload)
+
+            reopened = MetadataStore(db_path)
+            reopened.initialize()
+            self.assertEqual(reopened.get_temporary_project_state(project_id), payload)
+            self.assertTrue(reopened.delete_temporary_project(project_id))
+            self.assertIsNone(reopened.get_temporary_project_state(project_id))
 
     def test_creative_projects_persist_nodes_images_and_board_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

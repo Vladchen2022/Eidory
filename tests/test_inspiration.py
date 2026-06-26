@@ -3,10 +3,14 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from eidory.core.inspiration import InspirationTerm, mix_inspiration_search_results
+from eidory.core.creative_templates import STORY_ILLUSTRATION_TEMPLATE
 from eidory.core.llm_provider import (
+    LLMProviderError,
     LMStudioProvider,
+    _build_creative_node_note_prompt,
     _terms_from_plain_text,
     parse_creative_project_copy_suggestion,
     parse_creative_node_note_suggestion,
@@ -126,6 +130,329 @@ class InspirationTest(unittest.TestCase):
 
         self.assertEqual(suggestion.note, "雨夜小巷、潮湿地面和低位霓虹反光。")
         self.assertEqual(suggestion.search_query, "雨夜潮湿小巷 霓虹反光")
+
+    def test_parse_creative_node_note_suggestion_accepts_plain_text(self) -> None:
+        suggestion = parse_creative_node_note_suggestion(
+            """
+节点说明：空间站餐区是一个狭长的模块舱，几名航天员围着固定餐桌吃饭，餐具和小包装食物漂浮在半空，窗外能看到飞船和蓝色地球光。
+搜索语句：空间站餐区 航天员吃饭 漂浮餐具 蓝色地球光
+            """
+        )
+
+        self.assertIn("空间站餐区", suggestion.note)
+        self.assertNotIn("节点说明：", suggestion.note)
+        self.assertTrue(suggestion.search_query.startswith("空间站餐区"))
+
+    def test_parse_creative_node_note_suggestion_rejects_placeholder_text(self) -> None:
+        with self.assertRaises(LLMProviderError):
+            parse_creative_node_note_suggestion("...")
+        with self.assertRaises(LLMProviderError):
+            parse_creative_node_note_suggestion('{"note":"...","search_query":"..."}')
+
+    def test_parse_creative_node_note_suggestion_rejects_reasoning_process(self) -> None:
+        with self.assertRaises(LLMProviderError):
+            parse_creative_node_note_suggestion(
+                "Here's a thinking process: 1. **Analyze User Input:** "
+                "Project Theme: 空间站里的几个航天员在吃饭. "
+                "2. **Deconstruct Constraints:** Only output JSON."
+            )
+
+    def test_generate_creative_node_note_uses_single_relaxed_json_request(self) -> None:
+        provider = LMStudioProvider(model_name="fake")
+        model_output = (
+            '{"note":"白天的空间站餐区应以舱内柔和人工照明表现日间作息，窗外仍是黑色太空，可见飞船轮廓和冷色星光。",'
+            '"search_query":"白天 空间站餐区 黑色太空 舱内人工照明"}'
+        )
+        with patch.object(provider, "_chat_completion", return_value=model_output) as chat:
+            suggestion, model_name = provider.generate_creative_node_note(
+                project_brief="空间站里的几个航天员在吃饭",
+                project_extra="",
+                project_outline="- 空间站里的几个航天员在吃饭\n  - 当前节点：时间",
+                node_title="时间",
+                current_note="白天，但应该符合太空气氛，空间站外部应该是黑的",
+                node_path="空间站里的几个航天员在吃饭 / 时间",
+                language="zh",
+            )
+
+        self.assertEqual(model_name, "fake")
+        self.assertEqual(chat.call_count, 1)
+        kwargs = chat.call_args.kwargs
+        self.assertFalse(kwargs["prefer_json"])
+        self.assertEqual(kwargs["reasoning_effort"], "none")
+        self.assertEqual(kwargs["temperature"], 0.35)
+        self.assertEqual(kwargs["max_tokens"], 900)
+        self.assertIn("黑色太空", suggestion.note)
+        self.assertNotIn("thinking process", suggestion.note.lower())
+
+    def test_generate_creative_node_note_retries_without_reasoning_effort_when_unsupported(self) -> None:
+        provider = LMStudioProvider(model_name="fake")
+
+        class FakeResponse:
+            def __init__(self, status_code: int, content: str = "") -> None:
+                self.status_code = status_code
+                self._content = content
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": self._content,
+                            }
+                        }
+                    ]
+                }
+
+        calls: list[dict[str, object]] = []
+
+        def fake_post(_url: str, **kwargs: object) -> FakeResponse:
+            payload = dict(kwargs["json"])  # type: ignore[index]
+            calls.append(payload)
+            if len(calls) == 1:
+                return FakeResponse(400)
+            return FakeResponse(
+                200,
+                '{"note":"舱内保持白天作息的明亮人造光，窗外是黑色太空和飞船剪影。",'
+                '"search_query":"空间站 白天 人造光 黑色太空 飞船剪影"}',
+            )
+
+        with patch("eidory.core.llm_provider.requests.post", side_effect=fake_post):
+            suggestion, _model_name = provider.generate_creative_node_note(
+                project_brief="空间站里的几个航天员在吃饭",
+                project_extra="",
+                project_outline="- 空间站里的几个航天员在吃饭\n  - 当前节点：时间",
+                node_title="时间",
+                current_note="白天，但应该符合太空气氛，空间站外部应该是黑的",
+                node_path="空间站里的几个航天员在吃饭 / 时间",
+                language="zh",
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].get("reasoning_effort"), "none")
+        self.assertNotIn("reasoning_effort", calls[1])
+        self.assertIn("黑色太空", suggestion.note)
+
+    def test_generate_creative_node_note_refines_scoped_search_query(self) -> None:
+        provider = LMStudioProvider(model_name="fake")
+        outputs = {
+            "时间": '{"note":"傍晚低角度光线。","search_query":"傍晚 夕阳 暮色 低角度暖光 田野泥地反光 士兵战斗"}',
+            "地点": '{"note":"田野泥地环境。","search_query":"中世纪农田 泥泞土地 车辙印 积水反光 傍晚光线 士兵战斗"}',
+            "事件": '{"note":"多人近身交锋。","search_query":"中世纪士兵混战 泥泞地面 兵器交锋 近身格斗 动态姿势"}',
+            "氛围": '{"note":"烟尘和逆光。","search_query":"中世纪战争 傍晚 逆光 泥泞地面 尘土飞扬 战场氛围感"}',
+            "构图": '{"note":"低机位群像。","search_query":"中世纪战场 士兵战斗 单人角色 肖像 低机位广角群像 对角线冲突 前中后景纵深"}',
+        }
+
+        def generate(title: str) -> str:
+            with patch.object(provider, "_chat_completion", return_value=outputs[title]):
+                suggestion, _model_name = provider.generate_creative_node_note(
+                    project_brief="几个对立阵营的士兵在战斗",
+                    project_extra="中世纪，田野，泥泞，傍晚",
+                    project_outline="- 几个对立阵营的士兵在战斗\n  - 世界观\n  - 时间\n  - 地点\n  - 物件\n  - 人物\n  - 事件\n  - 氛围\n  - 构图",
+                    node_title=title,
+                    current_note="",
+                    node_path=f"几个对立阵营的士兵在战斗 / {title}",
+                    language="zh",
+                )
+            return suggestion.search_query
+
+        time_query = generate("时间")
+        place_query = generate("地点")
+        event_query = generate("事件")
+        mood_query = generate("氛围")
+        composition_query = generate("构图")
+
+        self.assertIn("傍晚", time_query)
+        self.assertNotIn("田野", time_query)
+        self.assertNotIn("士兵", time_query)
+        self.assertIn("农田", place_query)
+        self.assertIn("泥泞土地", place_query)
+        self.assertNotIn("中世纪", place_query)
+        self.assertNotIn("战斗", place_query)
+        self.assertIn("混战", event_query)
+        self.assertIn("兵器交锋", event_query)
+        self.assertNotIn("中世纪", event_query)
+        self.assertNotIn("士兵", event_query)
+        self.assertIn("逆光", mood_query)
+        self.assertIn("尘土飞扬", mood_query)
+        self.assertNotIn("中世纪", mood_query)
+        self.assertNotIn("战场", mood_query)
+        self.assertIn("低机位广角群像", composition_query)
+        self.assertIn("对角线冲突", composition_query)
+        self.assertNotIn("中世纪", composition_query)
+        self.assertNotIn("士兵", composition_query)
+        self.assertNotIn("战斗", composition_query)
+        self.assertNotIn("单人", composition_query)
+        self.assertNotIn("肖像", composition_query)
+
+    def test_creative_node_note_prompt_prioritizes_user_context(self) -> None:
+        prompt = _build_creative_node_note_prompt(
+            project_brief="空间站里的几个航天员在吃饭",
+            project_extra="未来，科幻，太空，空间站外有飞船和太空设备",
+            project_outline="- 空间站里的几个航天员在吃饭\n  - 世界观\n  - 当前节点：时间",
+            node_title="时间",
+            current_note="必须是晚餐时间，舷窗外有蓝色地球光。",
+            node_path="空间站里的几个航天员在吃饭 / 时间",
+            language="zh",
+        )
+
+        self.assertIn("补充信息", prompt)
+        self.assertIn("空间站外有飞船和太空设备", prompt)
+        self.assertIn("现有节点说明（如果有，优先级最高）", prompt)
+        self.assertIn("不得推翻、删除、替换或违背", prompt)
+        self.assertIn("约束和出发点", prompt)
+        self.assertIn("合理联想并补充相关的环境、物件、光线", prompt)
+        self.assertIn("当前项目节点树", prompt)
+        self.assertIn("当前节点：时间", prompt)
+        self.assertIn("搜索范围建议", prompt)
+        self.assertIn("search_query 的用途是给当前节点找参考图", prompt)
+        self.assertIn("search_query 必须使用简体中文短语", prompt)
+        self.assertNotIn("围绕这句话扩写", prompt)
+        self.assertIn("不要输出“...”“待补充”“同上”", prompt)
+        self.assertIn("/no_think", prompt)
+
+    def test_creative_node_note_prompt_broadens_people_search_query_scope(self) -> None:
+        prompt = _build_creative_node_note_prompt(
+            project_brief="空间站里的几个航天员在吃饭",
+            project_extra="未来，科幻，太空，空间站外有飞船和太空设备",
+            project_outline="- 空间站里的几个航天员在吃饭\n  - 世界观\n  - 时间\n  - 当前节点：人物\n    - 主角\n    - 次要角色\n  - 事件\n  - 氛围\n  - 构图",
+            node_title="人物",
+            current_note="",
+            node_path="空间站里的几个航天员在吃饭 / 人物",
+            language="zh",
+        )
+
+        self.assertIn("人物/角色节点", prompt)
+        self.assertIn("把参考需求拆开", prompt)
+        self.assertIn("航天员、舱内服、轻便宇航服", prompt)
+        self.assertIn("更通用的人类参考", prompt)
+        self.assertIn("多人围坐吃饭", prompt)
+        self.assertIn("造型锚点 + 通用动作/体态", prompt)
+        self.assertIn("不要写：空间站、太空舱背景、太空、失重", prompt)
+
+    def test_creative_node_note_prompt_broadens_event_and_composition_search_scope(self) -> None:
+        event_prompt = _build_creative_node_note_prompt(
+            project_brief="空间站里的几个航天员在吃饭",
+            project_extra="未来，科幻，太空",
+            project_outline="- 空间站里的几个航天员在吃饭\n  - 当前节点：事件",
+            node_title="事件",
+            current_note="",
+            node_path="空间站里的几个航天员在吃饭 / 事件",
+            language="zh",
+        )
+        composition_prompt = _build_creative_node_note_prompt(
+            project_brief="空间站里的几个航天员在吃饭",
+            project_extra="未来，科幻，太空",
+            project_outline="- 空间站里的几个航天员在吃饭\n  - 当前节点：构图",
+            node_title="构图",
+            current_note="",
+            node_path="空间站里的几个航天员在吃饭 / 构图",
+            language="zh",
+        )
+
+        self.assertIn("事件/动作节点", event_prompt)
+        self.assertIn("几个人一起吃饭", event_prompt)
+        self.assertIn("禁止包含时代、地点、时间、阵营身份", event_prompt)
+        self.assertIn("禁止写“中世纪、田野、泥泞、傍晚、士兵、战场”", event_prompt)
+        self.assertIn("构图节点", composition_prompt)
+        self.assertIn("禁止包含时代、地点、人物身份和具体事件", composition_prompt)
+        self.assertIn("低机位、俯视、广角群像", composition_prompt)
+        self.assertIn("场景类、空间类图片", composition_prompt)
+        self.assertIn("禁止把 search_query 写成单个角色", composition_prompt)
+
+    def test_creative_node_note_prompt_keeps_location_anchors_but_broadens_subreferences(self) -> None:
+        prompt = _build_creative_node_note_prompt(
+            project_brief="空间站里的几个航天员在吃饭",
+            project_extra="未来，科幻，太空",
+            project_outline="- 空间站里的几个航天员在吃饭\n  - 当前节点：地点",
+            node_title="地点",
+            current_note="",
+            node_path="空间站里的几个航天员在吃饭 / 地点",
+            language="zh",
+        )
+
+        self.assertIn("地点/环境节点", prompt)
+        self.assertIn("自然环境", prompt)
+        self.assertIn("人文/建筑环境", prompt)
+        self.assertIn("独立道具、武器、载具、家具、工具、器皿和环境附属物", prompt)
+
+    def test_story_illustration_template_has_object_node(self) -> None:
+        titles = [node.title for node in STORY_ILLUSTRATION_TEMPLATE.children]
+
+        self.assertIn("物件", titles)
+        self.assertLess(titles.index("地点"), titles.index("物件"))
+        self.assertLess(titles.index("物件"), titles.index("人物"))
+        people_node = STORY_ILLUSTRATION_TEMPLATE.children[titles.index("人物")]
+        self.assertEqual(people_node.children, ())
+
+    def test_creative_node_note_prompt_applies_medieval_battle_scope_rules(self) -> None:
+        base_kwargs = {
+            "project_brief": "几个对立阵营的士兵在战斗",
+            "project_extra": "中世纪，田野，泥泞，傍晚",
+            "project_outline": "- 几个对立阵营的士兵在战斗\n  - 世界观\n  - 时间\n  - 地点\n  - 物件\n  - 人物\n  - 事件\n  - 氛围\n  - 构图",
+            "current_note": "",
+            "language": "zh",
+        }
+
+        root_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="几个对立阵营的士兵在战斗",
+            node_path="几个对立阵营的士兵在战斗",
+        )
+        world_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="世界观",
+            node_path="几个对立阵营的士兵在战斗 / 世界观",
+        )
+        time_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="时间",
+            node_path="几个对立阵营的士兵在战斗 / 时间",
+        )
+        place_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="地点",
+            node_path="几个对立阵营的士兵在战斗 / 地点",
+        )
+        object_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="物件",
+            node_path="几个对立阵营的士兵在战斗 / 物件",
+        )
+        event_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="事件",
+            node_path="几个对立阵营的士兵在战斗 / 事件",
+        )
+        atmosphere_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="氛围",
+            node_path="几个对立阵营的士兵在战斗 / 氛围",
+        )
+        composition_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="构图",
+            node_path="几个对立阵营的士兵在战斗 / 构图",
+        )
+
+        self.assertIn("父节点/最顶层节点", root_prompt)
+        self.assertIn("主题与补充信息融合后的整体画面", root_prompt)
+        self.assertIn("不要体现具体事件或动作", world_prompt)
+        self.assertIn("城堡、马车、木栅栏、水车", world_prompt)
+        self.assertIn("傍晚", time_prompt)
+        self.assertIn("不需要带世界观、地点或事件", time_prompt)
+        self.assertIn("田野", place_prompt)
+        self.assertIn("中世纪城堡", place_prompt)
+        self.assertIn("物件/道具节点", object_prompt)
+        self.assertIn("中世纪武器、泥泞马车", object_prompt)
+        self.assertIn("破损工具、脚印车辙、旗帜标识", object_prompt)
+        self.assertIn("search_query 必须体现事件本身", event_prompt)
+        self.assertIn("多人战斗、混战、近身格斗", event_prompt)
+        self.assertIn("烟雾、火花、尘土、泥水飞溅", atmosphere_prompt)
+        self.assertIn("低机位、俯视、广角群像", composition_prompt)
+        self.assertIn("场景空间构图、镜头位置、广角环境", composition_prompt)
 
     def test_parse_creative_project_copy_suggestion(self) -> None:
         suggestion = parse_creative_project_copy_suggestion(
@@ -254,6 +581,23 @@ Total: about 220 Chinese characters.
         self.assertTrue(suggestion.copy_text.startswith("黄昏小院"))
         self.assertNotIn("分析", suggestion.copy_text)
 
+    def test_parse_creative_project_copy_suggestion_rejects_reasoning_without_final_copy(self) -> None:
+        with self.assertRaises(LLMProviderError):
+            parse_creative_project_copy_suggestion(
+                """
+{
+  "choices": [
+    {
+      "message": {
+        "content": "",
+        "reasoning": "分析：先确认节点，再检查视觉约束，但这里没有真正输出最终文案。"
+      }
+    }
+  ]
+}
+                """
+            )
+
     def test_parse_creative_project_copy_suggestion_accepts_description_field(self) -> None:
         suggestion = parse_creative_project_copy_suggestion(
             """
@@ -287,9 +631,36 @@ Total: about 220 Chinese characters.
         self.assertIn("维修棚", suggestion.copy_text)
         self.assertEqual(suggestion.nodes, [])
         self.assertEqual(provider.calls[0]["prefer_json"], False)
+        self.assertEqual(provider.calls[0]["reasoning_effort"], "none")
+        self.assertEqual(provider.calls[0]["allow_reasoning_content"], True)
         messages = provider.calls[0]["messages"]
         self.assertIsInstance(messages, list)
         self.assertIn("只输出最终文案正文", messages[1]["content"])  # type: ignore[index]
+
+    def test_generate_creative_project_copy_extracts_final_copy_from_reasoning_content(self) -> None:
+        class FakeProvider(LMStudioProvider):
+            def __init__(self) -> None:
+                super().__init__(model_name="fake-model")
+
+            def _chat_completion(self, **kwargs: object) -> str:  # type: ignore[override]
+                assert kwargs["allow_reasoning_content"] is True
+                return (
+                    "分析：先检查节点约束。\n"
+                    "最终文案：黄昏的自动售货机街角，飞行器驾驶员停在湿亮路面旁，"
+                    "抬手按下饮料机按钮，冷蓝灯箱、透明货仓和远处低空航道共同形成轻微幽默的近未来生活场景。"
+                )
+
+        provider = FakeProvider()
+
+        suggestion, model_name = provider.generate_creative_project_copy(
+            project_brief="飞行器驾驶员买饮料",
+            nodes=[{"title": "事件", "path": "项目 / 事件", "note": "买饮料动作", "search_query": ""}],
+            language="zh",
+        )
+
+        self.assertEqual(model_name, "fake-model")
+        self.assertTrue(suggestion.copy_text.startswith("黄昏的自动售货机街角"))
+        self.assertNotIn("分析", suggestion.copy_text)
 
     def test_parse_search_plan_proposal_normalizes_filters(self) -> None:
         proposal = parse_search_plan_proposal(

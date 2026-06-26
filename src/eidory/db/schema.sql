@@ -272,6 +272,13 @@ CREATE TABLE IF NOT EXISTS temporary_project_board_layouts (
     FOREIGN KEY(project_id) REFERENCES temporary_projects(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS temporary_project_states (
+    project_id INTEGER PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES temporary_projects(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS inspiration_projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,

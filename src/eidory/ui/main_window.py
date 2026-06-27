@@ -1231,11 +1231,14 @@ class MainWindow(QMainWindow):
         self.creative_template_combo = QComboBox()
         for template in CREATIVE_TEMPLATES:
             self.creative_template_combo.addItem(template.label, template.id)
-        self.creative_new_project_button = QPushButton("按模板新建项目")
+        self.creative_template_label = QLabel("新建项目模板")
+        self.creative_new_project_button = QPushButton("按当前内容新建项目")
+        self.creative_ai_project_button = QPushButton("AI 生成完整项目")
         self.creative_add_child_button = QPushButton("新建子节点")
         self.creative_delete_node_button = QPushButton("删除节点")
         for button in [
             self.creative_new_project_button,
+            self.creative_ai_project_button,
             self.creative_add_child_button,
             self.creative_delete_node_button,
         ]:
@@ -1888,6 +1891,7 @@ class MainWindow(QMainWindow):
             self.save_creative_node_button,
             self.generate_creative_children_button,
             self.generate_all_creative_nodes_button,
+            self.creative_ai_project_button,
             self.generate_creative_copy_button,
             self.generate_creative_copy_tab_button,
             self.search_creative_node_button,
@@ -2055,10 +2059,14 @@ class MainWindow(QMainWindow):
         project_mode_layout = QVBoxLayout(project_mode_widget)
         project_mode_layout.setContentsMargins(0, 0, 0, 0)
         project_mode_layout.setSpacing(7)
-        project_mode_layout.addWidget(QLabel("绘画类型模板"))
+        project_mode_layout.addWidget(self.creative_template_label)
         project_mode_layout.addWidget(self.creative_template_combo)
         project_mode_layout.addSpacing(4)
-        project_mode_layout.addWidget(self.creative_new_project_button)
+        creative_project_button_row = QHBoxLayout()
+        creative_project_button_row.setContentsMargins(0, 0, 0, 0)
+        creative_project_button_row.addWidget(self.creative_new_project_button)
+        creative_project_button_row.addWidget(self.creative_ai_project_button)
+        project_mode_layout.addLayout(creative_project_button_row)
         project_mode_layout.addSpacing(8)
         self.creative_project_list.hide()
         project_mode_layout.addWidget(self.creative_project_combo)
@@ -2371,7 +2379,9 @@ class MainWindow(QMainWindow):
         self.creative_project_list.customContextMenuRequested.connect(self._show_creative_project_context_menu)
         self.creative_node_tree.customContextMenuRequested.connect(self._show_creative_node_context_menu)
         self.creative_node_tree.itemSelectionChanged.connect(self._on_creative_node_selection_changed)
+        self.creative_template_combo.currentIndexChanged.connect(self._on_creative_template_changed)
         self.creative_new_project_button.clicked.connect(self._create_creative_project_from_current_brief)
+        self.creative_ai_project_button.clicked.connect(self._generate_ai_creative_project)
         self.creative_add_child_button.clicked.connect(self._create_manual_creative_child_node)
         self.creative_delete_node_button.clicked.connect(self._delete_selected_creative_node)
         self.shuffle_results_button.clicked.connect(self._shuffle_current_grid_images)
@@ -3089,7 +3099,9 @@ class MainWindow(QMainWindow):
             self.use_ai_scene_tags_checkbox.setText("Generate AI scene tags with probes")
             self.ai_project_mode_button.setText("Project Nodes")
             self.ai_probe_mode_button.setText("Semantic Probes")
-            self.creative_new_project_button.setText("Create from Template")
+            self.creative_template_label.setText("New Project Template")
+            self.creative_new_project_button.setText("Create from Current Brief")
+            self.creative_ai_project_button.setText("AI Generate Project")
             self.creative_add_child_button.setText("New Child")
             self.creative_delete_node_button.setText("Delete Node")
             self.save_creative_node_button.setText("Save Node")
@@ -3219,7 +3231,9 @@ class MainWindow(QMainWindow):
             self.use_ai_scene_tags_checkbox.setText("生成探针时同时生成 AI 场景标签")
             self.ai_project_mode_button.setText("创作节点")
             self.ai_probe_mode_button.setText("语义探针")
-            self.creative_new_project_button.setText("按模板新建项目")
+            self.creative_template_label.setText("新建项目模板")
+            self.creative_new_project_button.setText("按当前内容新建项目")
+            self.creative_ai_project_button.setText("AI 生成完整项目")
             self.creative_add_child_button.setText("新建子节点")
             self.creative_delete_node_button.setText("删除节点")
             self.save_creative_node_button.setText("保存节点")
@@ -11612,8 +11626,6 @@ class MainWindow(QMainWindow):
             return
         projects = self.store.list_creative_projects()
         target_id = select_project_id if select_project_id is not None else self.current_creative_project_id
-        if target_id is None and projects:
-            target_id = projects[0].id
         self._refreshing_creative_projects = True
         self.creative_project_combo.blockSignals(True)
         self.creative_project_list.blockSignals(True)
@@ -11645,6 +11657,8 @@ class MainWindow(QMainWindow):
             select_kind="creative" if selected_index > 0 else None,
             select_id=target_id if selected_index > 0 else None,
         )
+        if selected_index == 0:
+            self._clear_temporary_project_selection()
         self._load_creative_project(target_id if selected_index > 0 else None)
 
     def _show_creative_project_context_menu(self, pos) -> None:
@@ -11715,10 +11729,18 @@ class MainWindow(QMainWindow):
             self.current_creative_node_id = None
             self._current_board_node_id = None
             self._current_board_image_ids = ()
-            self.creative_node_tree.clear()
+            self.creative_project_combo.blockSignals(True)
+            self.creative_project_combo.setCurrentIndex(0)
+            self.creative_project_combo.blockSignals(False)
+            self.creative_project_list.blockSignals(True)
+            self.creative_project_list.clearSelection()
+            self.creative_project_list.setCurrentItem(None)
+            self.creative_project_list.blockSignals(False)
             self.creative_project_copy_input.blockSignals(True)
             self.creative_project_copy_input.clear()
             self.creative_project_copy_input.blockSignals(False)
+            self._clear_temporary_project_selection()
+            self._refresh_creative_template_preview_tree()
             self._sync_creative_node_panel()
             return
         project = self.store.get_creative_project(project_id)
@@ -11733,6 +11755,44 @@ class MainWindow(QMainWindow):
         self._refresh_project_sidebar(select_kind="creative", select_id=project_id)
         if show_board and self.current_creative_node_id is not None:
             QTimer.singleShot(0, self._show_current_creative_board)
+
+    def _on_creative_template_changed(self, _index: int) -> None:
+        if self.current_creative_project_id is not None:
+            return
+        self._refresh_creative_template_preview_tree()
+        self._sync_creative_node_panel()
+
+    def _refresh_creative_template_preview_tree(self) -> None:
+        if not hasattr(self, "creative_node_tree"):
+            return
+        template_id = str(self.creative_template_combo.currentData() or "story")
+        template = creative_template_by_id(template_id)
+        root_title = "New Project" if self.current_language == "en" else "新创作项目"
+        self.creative_node_tree.blockSignals(True)
+        self.creative_node_tree.clear()
+
+        def add_preview_node(template_node: CreativeTemplateNode, parent_item: QTreeWidgetItem) -> None:
+            item = QTreeWidgetItem([template_node.title, "0"])
+            item.setData(0, Qt.ItemDataRole.UserRole, None)
+            item.setData(0, CREATIVE_NODE_HAS_NOTE_ROLE, False)
+            item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            item.setToolTip(0, template_node.note or template_node.title)
+            parent_item.addChild(item)
+            for child_template in template_node.children:
+                add_preview_node(child_template, item)
+
+        root_item = QTreeWidgetItem([root_title, "0"])
+        root_item.setData(0, Qt.ItemDataRole.UserRole, None)
+        root_item.setData(0, CREATIVE_NODE_HAS_NOTE_ROLE, False)
+        root_item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        root_item.setToolTip(0, template.label)
+        self.creative_node_tree.addTopLevelItem(root_item)
+        for template_node in template.root.children:
+            add_preview_node(template_node, root_item)
+        self.creative_node_tree.expandAll()
+        self.creative_node_tree.setCurrentItem(root_item)
+        self.creative_node_tree.blockSignals(False)
+        self.current_creative_node_id = None
 
     def _refresh_creative_node_tree(self, select_node_id: int | None = None) -> None:
         self.creative_node_tree.blockSignals(True)
@@ -11806,9 +11866,18 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_creative_node_selection_changed(self) -> None:
+        if self.current_creative_project_id is None:
+            self.current_creative_node_id = None
+            self._sync_creative_node_panel()
+            return
         item = self.creative_node_tree.currentItem()
         node_id = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
-        self.current_creative_node_id = int(node_id) if node_id is not None else None
+        node = self.store.get_creative_node(int(node_id)) if node_id is not None else None
+        self.current_creative_node_id = (
+            node.id
+            if node is not None and node.project_id == self.current_creative_project_id
+            else None
+        )
         self._sync_creative_node_panel()
         if self.current_creative_node_id is not None:
             self._show_current_creative_board()
@@ -11847,7 +11916,10 @@ class MainWindow(QMainWindow):
         self.creative_node_note_input.blockSignals(True)
         self.creative_node_query_input.blockSignals(True)
         if not has_node:
-            self.creative_node_status_label.setText("未选择创作项目。")
+            if self.current_creative_project_id is None:
+                self.creative_node_status_label.setText("新建项目模板预览。")
+            else:
+                self.creative_node_status_label.setText("未选择创作节点。")
             self.creative_node_note_input.clear()
             self.creative_node_query_input.clear()
         else:
@@ -11864,6 +11936,15 @@ class MainWindow(QMainWindow):
             has_node and not self._creative_all_nodes_in_progress
         )
         self.generate_all_creative_nodes_button.setEnabled(
+            not self._creative_all_nodes_in_progress
+        )
+        self.creative_new_project_button.setEnabled(
+            not self._creative_all_nodes_in_progress
+        )
+        self.creative_template_combo.setEnabled(
+            not self._creative_all_nodes_in_progress
+        )
+        self.creative_ai_project_button.setEnabled(
             not self._creative_all_nodes_in_progress
         )
         for button in [
@@ -11884,6 +11965,9 @@ class MainWindow(QMainWindow):
     def _create_creative_project_from_current_brief(self) -> None:
         self._set_ai_workflow_mode("project")
         brief = self.inspiration_brief_input.toPlainText().strip()
+        if not brief:
+            self.statusBar().showMessage("先填写创作主题，或使用 AI 生成完整项目")
+            return
         default_title = brief[:32].strip() if brief else "新创作项目"
         title, ok = QInputDialog.getText(self, "新建创作项目", "项目名称", text=default_title)
         if not ok:
@@ -11913,6 +11997,12 @@ class MainWindow(QMainWindow):
         self._refresh_creative_projects(select_project_id=project_id)
         self.right_tab_widget.setCurrentIndex(1)
         self.statusBar().showMessage(f"已新建创作项目：{title} / {template.label}")
+
+    def _generate_ai_creative_project(self) -> None:
+        self._set_ai_workflow_mode("project")
+        if self._creative_all_nodes_in_progress:
+            return
+        self._generate_creative_project_seed_then_all_nodes()
 
     def _create_creative_project_from_seed(
         self,

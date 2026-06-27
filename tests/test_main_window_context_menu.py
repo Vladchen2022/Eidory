@@ -4962,7 +4962,90 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             self.assertEqual(window.generate_creative_children_button.text(), "当前节点信息补全")
             self.assertEqual(window.generate_all_creative_nodes_button.text(), "补全所有节点信息")
+            self.assertEqual(window.creative_template_label.text(), "新建项目模板")
+            self.assertEqual(window.creative_new_project_button.text(), "按当前内容新建项目")
+            self.assertEqual(window.creative_ai_project_button.text(), "AI 生成完整项目")
             self.assertTrue(window.generate_all_creative_nodes_button.isEnabled())
+            self.assertTrue(window.creative_ai_project_button.isEnabled())
+            window.close()
+
+    def test_creative_template_preview_is_separate_from_selected_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            project_id = store.create_creative_project(
+                title="旧项目",
+                brief="飞行器驾驶员买饮料",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            store.add_images_to_creative_node(int(root_id), [image_id], intent_label="世界观")
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            self.assertIsNone(window.current_creative_project_id)
+            self.assertEqual(window.creative_node_tree.topLevelItemCount(), 1)
+            preview_root = window.creative_node_tree.topLevelItem(0)
+            self.assertEqual(preview_root.text(0), "新创作项目")
+            self.assertEqual(preview_root.child(0).text(0), "世界观")
+            self.assertIsNone(window.creative_project_combo.currentData())
+            self.assertIn("模板预览", window.creative_node_status_label.text())
+
+            natural_index = window.creative_template_combo.findData("sceneNatural")
+            self.assertGreaterEqual(natural_index, 0)
+            window.creative_template_combo.setCurrentIndex(natural_index)
+            self.app.processEvents()
+            preview_root = window.creative_node_tree.topLevelItem(0)
+            preview_children = [preview_root.child(index).text(0) for index in range(preview_root.childCount())]
+            self.assertIn("地貌结构", preview_children)
+            self.assertNotIn("人物", preview_children)
+
+            window._load_creative_project(project_id, select_node_id=int(root_id), show_board=True)
+            self.app.processEvents()
+            self.assertEqual(window.current_creative_project_id, project_id)
+            self.assertEqual(window.creative_node_tree.topLevelItem(0).text(0), "旧项目")
+            self.assertEqual(window.center_result_stack.currentWidget(), window.project_board_view)
+
+            object_index = window.creative_template_combo.findData("object")
+            self.assertGreaterEqual(object_index, 0)
+            window.creative_template_combo.setCurrentIndex(object_index)
+            self.app.processEvents()
+            self.assertEqual(window.creative_node_tree.topLevelItem(0).text(0), "旧项目")
+
+            self._expand_project_sidebar_section(window, "creative")
+            creative_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "creative"
+            )
+            window.temp_project_list.setCurrentItem(creative_item)
+            self.app.processEvents()
+
+            self.assertEqual(window.current_creative_project_id, project_id)
+            self.assertGreater(window.creative_node_tree.topLevelItemCount(), 0)
+            self.assertEqual(window.center_result_stack.currentWidget(), window.project_board_view)
             window.close()
 
     def test_complete_all_creative_nodes_preserves_existing_user_notes(self) -> None:
@@ -5040,7 +5123,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertFalse(window._creative_all_nodes_in_progress)
             window.close()
 
-    def test_complete_all_creative_nodes_can_seed_blank_project(self) -> None:
+    def test_ai_generate_project_button_seeds_blank_project_and_completes_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -5096,7 +5179,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 "_start_background_task",
                 side_effect=run_immediately,
             ):
-                window._generate_all_creative_node_notes()
+                window.creative_ai_project_button.click()
                 window._poll_events()
 
             projects = store.list_creative_projects()

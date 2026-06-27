@@ -11,6 +11,7 @@ from eidory.core.llm_provider import (
     LLMProviderError,
     LMStudioProvider,
     _build_creative_node_note_prompt,
+    _build_creative_project_seed_prompt,
     _terms_from_plain_text,
     parse_creative_project_copy_suggestion,
     parse_creative_project_seed_suggestion,
@@ -186,9 +187,27 @@ class InspirationTest(unittest.TestCase):
         kwargs = chat.call_args.kwargs
         self.assertFalse(kwargs["prefer_json"])
         self.assertEqual(kwargs["reasoning_effort"], "none")
-        self.assertEqual(kwargs["temperature"], 0.85)
+        self.assertEqual(kwargs["temperature"], 1.05)
         self.assertEqual(kwargs["max_tokens"], 900)
+        prompt = chat.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("本次随机创意抽签", prompt)
+        self.assertIn("不要默认回到同一种熟悉组合", prompt)
+        self.assertIn("随机编号", prompt)
         self.assertIn("/no_think", kwargs["messages"][1]["content"])
+
+    def test_creative_project_seed_prompt_varies_between_calls(self) -> None:
+        prompts = {
+            _build_creative_project_seed_prompt(
+                template_label="故事性插画",
+                template_outline="- 未命名故事性插画\n  - 世界观\n  - 时间",
+                language="zh",
+            )
+            for _index in range(4)
+        }
+
+        self.assertGreater(len(prompts), 1)
+        self.assertTrue(all("本次随机创意抽签" in prompt for prompt in prompts))
+        self.assertTrue(all("随机编号" in prompt for prompt in prompts))
 
     def test_generate_creative_node_note_uses_single_relaxed_json_request(self) -> None:
         provider = LMStudioProvider(model_name="fake")

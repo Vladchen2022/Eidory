@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -79,6 +80,9 @@ class CreativeProjectCopySuggestion:
 
 class LLMProviderError(RuntimeError):
     pass
+
+
+_CREATIVE_PROJECT_RANDOM = random.SystemRandom()
 
 
 class LMStudioProvider:
@@ -390,7 +394,7 @@ class LMStudioProvider:
             messages=messages,
             prefer_json=False,
             reasoning_effort="none",
-            temperature=0.85,
+            temperature=1.05,
             max_tokens=900,
         )
         return parse_creative_project_seed_suggestion(content, language=language), model_name
@@ -2284,6 +2288,7 @@ def _build_creative_project_seed_prompt(
     template_outline: str,
     language: str,
 ) -> str:
+    random_packet = _creative_project_seed_random_packet(language)
     if language == "en":
         return f"""
 Template:
@@ -2292,12 +2297,19 @@ Template:
 Template node outline:
 {template_outline or "-"}
 
+Random creative draw for this request:
+{random_packet}
+
 Create one original illustration planning test prompt for this template.
 Return JSON:
 {{"title":"short project title","brief":"one concrete visual creative theme","extra":"extra constraints: era, weather, lighting, mood, materials, atmosphere"}}
 
+The random draw must strongly affect the result. Do not treat it as optional decoration.
 The brief must describe a drawable scene or design task, not a generic category.
 The extra field should give useful constraints but leave room for later node completion.
+Avoid defaulting to the same familiar combination: cyberpunk, neon rain, mechanics repairing vehicles, lone repair workers, vending machines, wet streets, blue-purple reflections, or near-future aircraft drivers, unless the random draw explicitly requires it.
+Vary subject matter, era, location, social relationship, event type, mood, and visual materials across calls.
+Do not copy the random draw as a list. Fuse it into one coherent project.
 Do not output Markdown or reasoning.
 
 /no_think
@@ -2309,16 +2321,211 @@ Do not output Markdown or reasoning.
 模板节点结构：
 {template_outline or "-"}
 
+本次随机创意抽签：
+{random_packet}
+
 请为这个模板生成一个原创的插画创作测试题。
 输出 JSON：
 {{"title":"简短项目名","brief":"一句具体、可绘制的创作主题","extra":"补充信息：时代、天气、光源、画面气质、材质、氛围等"}}
 
+随机抽签必须强烈影响结果，不能只当作装饰性参考。
 创作主题必须是具体画面或设计任务，不要写成泛泛的类别。
 补充信息要给后续节点补全提供方向，但不要把所有节点都写死。
+不要默认回到同一种熟悉组合：赛博朋克、霓虹雨夜、机械师修车、孤独维修工、自动售货机、潮湿街道、蓝紫色反光、近未来飞行器驾驶员；除非随机抽签明确要求。
+每次都要主动变化题材、时代、地点、人物关系、事件类型、情绪和视觉材质。
+不要把随机抽签原样列成清单，要融合成一个完整项目。
 不要输出 Markdown、解释或推理过程。
 
 /no_think
 """.strip()
+
+
+_CREATIVE_PROJECT_SEED_AXES_ZH: dict[str, tuple[str, ...]] = {
+    "题材方向": (
+        "古代仪式与公共生活",
+        "荒野生存与临时秩序",
+        "海洋、船只或港口劳动",
+        "儿童、老人或家庭关系",
+        "灾后重建与日常协作",
+        "节庆、比赛或集体表演",
+        "边境、驿站或迁徙队伍",
+        "学院、工坊或知识传承",
+        "异星生态或非人文明",
+        "宗教、王权或民间信仰",
+        "乡村生产、集市或手工业",
+        "地下空间、矿区或考古现场",
+    ),
+    "核心对象或群体": (
+        "三到七人的群体关系",
+        "一支临时组成的小队",
+        "两个阵营之间的微妙接触",
+        "师徒、亲属或同事之间的协作",
+        "一群动物、机器或非人角色",
+        "人群中的一个关键行动者",
+        "被围观、照料或审判的对象",
+        "正在搬运、搭建或交换物品的人",
+    ),
+    "空间类型": (
+        "开阔自然地形",
+        "拥挤但有秩序的公共空间",
+        "半毁坏的人造环境",
+        "狭窄通道或夹层空间",
+        "临时营地、棚屋或移动设施",
+        "高处平台、桥梁或阶梯结构",
+        "水边、冰面、泥地或风沙环境",
+        "室内外交界的门廊、车厢或舱室",
+    ),
+    "事件类型": (
+        "交接、谈判或分配资源",
+        "训练、排练或考试",
+        "抢修、转移或避险",
+        "庆祝、祭祀或告别",
+        "发现异常物、遗迹或生物",
+        "等待某个信号或人物到来",
+        "集体劳动中的小冲突",
+        "安静日常里出现意外变化",
+    ),
+    "时代与世界质感": (
+        "史前或远古感",
+        "中世纪或前工业时代",
+        "十九世纪工业化早期",
+        "二十世纪现实主义",
+        "近未来但非赛博都市",
+        "幻想世界但材质写实",
+        "异星殖民但生活化",
+        "架空历史与民俗混合",
+    ),
+    "光线与时间": (
+        "清晨斜光",
+        "正午硬光",
+        "傍晚余晖",
+        "阴天漫射光",
+        "火光或烛光",
+        "雪地反光",
+        "沙尘或雾气中的低对比光",
+        "室内开口透入的自然光",
+    ),
+    "视觉材质": (
+        "粗布、木材、泥土和旧金属",
+        "石材、苔藓、水汽和磨损边缘",
+        "陶器、绳索、皮革和手工痕迹",
+        "玻璃、透明容器、液体和反射",
+        "纸张、布幔、旗帜和尘埃",
+        "冰雪、毛皮、骨骼和干裂表面",
+        "湿泥、草根、车辙和脚印",
+        "漆面剥落、临时补丁和重复使用痕迹",
+    ),
+    "情绪张力": (
+        "安静但隐含危险",
+        "紧张中的克制",
+        "温暖日常与陌生环境并存",
+        "庄重、缓慢、有仪式感",
+        "混乱之后的恢复秩序",
+        "喜悦表面下有压力",
+        "孤立空间里的集体互助",
+        "荒诞但可信的生活瞬间",
+    ),
+}
+
+
+_CREATIVE_PROJECT_SEED_AXES_EN: dict[str, tuple[str, ...]] = {
+    "genre direction": (
+        "ancient ritual and public life",
+        "wilderness survival and temporary order",
+        "ocean, ships, or harbor labor",
+        "children, elders, or family relationships",
+        "post-disaster rebuilding and everyday cooperation",
+        "festival, competition, or collective performance",
+        "borderland, relay station, or migrating caravan",
+        "academy, workshop, or knowledge transfer",
+        "alien ecology or non-human civilization",
+        "religion, monarchy, or folk belief",
+        "rural production, markets, or craftwork",
+        "underground space, mine, or archaeological site",
+    ),
+    "main subject": (
+        "a group relationship of three to seven figures",
+        "a temporary small team",
+        "a delicate contact between two factions",
+        "collaboration between mentor and apprentice, relatives, or coworkers",
+        "a group of animals, machines, or non-human characters",
+        "one key actor inside a crowd",
+        "an object being watched, cared for, or judged",
+        "people moving, building, or exchanging objects",
+    ),
+    "space type": (
+        "open natural terrain",
+        "crowded but orderly public space",
+        "partially damaged built environment",
+        "narrow passage or layered in-between space",
+        "temporary camp, shed, or mobile facility",
+        "high platform, bridge, or stair structure",
+        "waterside, ice, mud, or windblown sand",
+        "threshold between inside and outside",
+    ),
+    "event type": (
+        "handover, negotiation, or resource distribution",
+        "training, rehearsal, or examination",
+        "repair, relocation, or emergency avoidance",
+        "celebration, ritual, or farewell",
+        "discovery of an anomalous object, ruin, or creature",
+        "waiting for a signal or an arrival",
+        "a small conflict inside collective labor",
+        "an unexpected change inside a quiet daily moment",
+    ),
+    "era and world texture": (
+        "prehistoric or ancient",
+        "medieval or pre-industrial",
+        "early industrial nineteenth century",
+        "twentieth-century realism",
+        "near future but not cyberpunk city",
+        "fantasy world with realistic materials",
+        "alien colony with everyday life",
+        "alternate history mixed with folklore",
+    ),
+    "light and time": (
+        "early morning slant light",
+        "hard noon light",
+        "evening afterglow",
+        "overcast diffuse light",
+        "firelight or candlelight",
+        "snow bounce light",
+        "low-contrast light in dust or fog",
+        "natural light entering through an opening",
+    ),
+    "visual materials": (
+        "coarse cloth, wood, mud, and old metal",
+        "stone, moss, moisture, and worn edges",
+        "ceramics, rope, leather, and handmade marks",
+        "glass, transparent containers, liquid, and reflections",
+        "paper, curtains, flags, and dust",
+        "ice, fur, bones, and cracked surfaces",
+        "wet mud, grass roots, ruts, and footprints",
+        "peeling paint, field repairs, and reused parts",
+    ),
+    "emotional tension": (
+        "quiet but dangerous",
+        "restrained tension",
+        "warm daily life inside a strange environment",
+        "solemn, slow, and ritualistic",
+        "order returning after chaos",
+        "joy with pressure underneath",
+        "collective help inside an isolated space",
+        "absurd but believable slice of life",
+    ),
+}
+
+
+def _creative_project_seed_random_packet(language: str) -> str:
+    axes = _CREATIVE_PROJECT_SEED_AXES_EN if language == "en" else _CREATIVE_PROJECT_SEED_AXES_ZH
+    axis_names = list(axes)
+    selected_names = _CREATIVE_PROJECT_RANDOM.sample(axis_names, k=min(6, len(axis_names)))
+    lines = [f"- random id: {_CREATIVE_PROJECT_RANDOM.randrange(100000, 999999)}"] if language == "en" else [
+        f"- 随机编号：{_CREATIVE_PROJECT_RANDOM.randrange(100000, 999999)}"
+    ]
+    for name in selected_names:
+        lines.append(f"- {name}: {_CREATIVE_PROJECT_RANDOM.choice(axes[name])}")
+    return "\n".join(lines)
 
 
 def _build_project_suggestion_prompt(

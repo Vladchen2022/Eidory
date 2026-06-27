@@ -13,6 +13,7 @@ from eidory.core.llm_provider import (
     _build_creative_node_note_prompt,
     _terms_from_plain_text,
     parse_creative_project_copy_suggestion,
+    parse_creative_project_seed_suggestion,
     parse_creative_node_note_suggestion,
     parse_creative_node_suggestions,
     parse_group_name_suggestions,
@@ -156,6 +157,38 @@ class InspirationTest(unittest.TestCase):
                 "Project Theme: 空间站里的几个航天员在吃饭. "
                 "2. **Deconstruct Constraints:** Only output JSON."
             )
+
+    def test_parse_creative_project_seed_suggestion(self) -> None:
+        suggestion = parse_creative_project_seed_suggestion(
+            '{"title":"雨夜补给站","brief":"飞行器驾驶员在雨夜自动售货机旁买饮料",'
+            '"extra":"近未来，霓虹，潮湿街道，蓝紫色反光"}'
+        )
+
+        self.assertEqual(suggestion.title, "雨夜补给站")
+        self.assertIn("飞行器驾驶员", suggestion.brief)
+        self.assertIn("蓝紫色反光", suggestion.extra)
+
+    def test_generate_creative_project_seed_uses_relaxed_json_request(self) -> None:
+        provider = LMStudioProvider(model_name="fake")
+        model_output = (
+            '{"title":"雨夜补给站","brief":"飞行器驾驶员在雨夜自动售货机旁买饮料",'
+            '"extra":"近未来，霓虹，潮湿街道，蓝紫色反光"}'
+        )
+        with patch.object(provider, "_chat_completion", return_value=model_output) as chat:
+            suggestion, model_name = provider.generate_creative_project_seed(
+                template_label="故事性插画",
+                template_outline="- 未命名故事性插画\n  - 世界观\n  - 时间",
+                language="zh",
+            )
+
+        self.assertEqual(model_name, "fake")
+        self.assertIn("飞行器驾驶员", suggestion.brief)
+        kwargs = chat.call_args.kwargs
+        self.assertFalse(kwargs["prefer_json"])
+        self.assertEqual(kwargs["reasoning_effort"], "none")
+        self.assertEqual(kwargs["temperature"], 0.85)
+        self.assertEqual(kwargs["max_tokens"], 900)
+        self.assertIn("/no_think", kwargs["messages"][1]["content"])
 
     def test_generate_creative_node_note_uses_single_relaxed_json_request(self) -> None:
         provider = LMStudioProvider(model_name="fake")

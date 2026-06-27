@@ -65,6 +65,13 @@ class CreativeNodeNoteSuggestion:
 
 
 @dataclass(frozen=True)
+class CreativeProjectSeedSuggestion:
+    title: str
+    brief: str
+    extra: str
+
+
+@dataclass(frozen=True)
 class CreativeProjectCopySuggestion:
     copy_text: str
     nodes: list[CreativeNodeSuggestion]
@@ -350,6 +357,43 @@ class LMStudioProvider:
             node_path=node_path.strip(),
             language=language,
         ), model_name
+
+    def generate_creative_project_seed(
+        self,
+        *,
+        template_label: str,
+        template_outline: str,
+        language: str = "zh",
+    ) -> tuple[CreativeProjectSeedSuggestion, str]:
+        model_name = self.model_name or self._first_available_model()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You create one complete illustration planning test prompt. "
+                    "Return one strict JSON object only. Do not output reasoning or Markdown."
+                    if language == "en"
+                    else "你负责生成一个完整的插画创作测试题。只输出严格 JSON 对象，不要输出推理、解释或 Markdown。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _build_creative_project_seed_prompt(
+                    template_label=template_label,
+                    template_outline=template_outline,
+                    language=language,
+                ),
+            },
+        ]
+        content = self._chat_completion(
+            model_name=model_name,
+            messages=messages,
+            prefer_json=False,
+            reasoning_effort="none",
+            temperature=0.85,
+            max_tokens=900,
+        )
+        return parse_creative_project_seed_suggestion(content, language=language), model_name
 
     def generate_creative_project_copy(
         self,
@@ -701,6 +745,35 @@ def parse_creative_node_note_suggestion(
     if not note:
         note = search_query
     return CreativeNodeNoteSuggestion(note=note, search_query=search_query)
+
+
+def parse_creative_project_seed_suggestion(
+    content: str,
+    *,
+    language: str = "zh",
+) -> CreativeProjectSeedSuggestion:
+    payload = _load_json_object(content)
+    fallback_title = "AI Creative Test" if language == "en" else "AI创作测试题"
+    title = _first_clean_project_text(
+        payload,
+        ("title", "name", "project_title", "projectTitle", "项目名称", "标题"),
+        max_length=80,
+    )
+    brief = _first_clean_project_text(
+        payload,
+        ("brief", "theme", "topic", "creative_brief", "creativeBrief", "创作主题", "主题"),
+        max_length=500,
+    )
+    extra = _first_clean_project_text(
+        payload,
+        ("extra", "supplement", "supplemental", "context", "details", "补充信息", "补充"),
+        max_length=900,
+    )
+    if not brief:
+        raise LLMProviderError("AI 没有返回可用的创作主题")
+    if not title:
+        title = brief[:32].strip() or fallback_title
+    return CreativeProjectSeedSuggestion(title=title, brief=brief, extra=extra)
 
 
 def _refine_creative_node_note_suggestion(
@@ -2200,6 +2273,49 @@ Output only the final copy text. Do not output JSON, Markdown, headings, explana
 必须把已有节点信息当作硬约束，不要加入与节点说明冲突的角色、地点、天气、年代、事件或氛围。
 
 只输出最终文案正文。不要输出 JSON、Markdown、标题、解释或思考过程。
+
+/no_think
+""".strip()
+
+
+def _build_creative_project_seed_prompt(
+    *,
+    template_label: str,
+    template_outline: str,
+    language: str,
+) -> str:
+    if language == "en":
+        return f"""
+Template:
+{template_label or "-"}
+
+Template node outline:
+{template_outline or "-"}
+
+Create one original illustration planning test prompt for this template.
+Return JSON:
+{{"title":"short project title","brief":"one concrete visual creative theme","extra":"extra constraints: era, weather, lighting, mood, materials, atmosphere"}}
+
+The brief must describe a drawable scene or design task, not a generic category.
+The extra field should give useful constraints but leave room for later node completion.
+Do not output Markdown or reasoning.
+
+/no_think
+""".strip()
+    return f"""
+模板：
+{template_label or "-"}
+
+模板节点结构：
+{template_outline or "-"}
+
+请为这个模板生成一个原创的插画创作测试题。
+输出 JSON：
+{{"title":"简短项目名","brief":"一句具体、可绘制的创作主题","extra":"补充信息：时代、天气、光源、画面气质、材质、氛围等"}}
+
+创作主题必须是具体画面或设计任务，不要写成泛泛的类别。
+补充信息要给后续节点补全提供方向，但不要把所有节点都写死。
+不要输出 Markdown、解释或推理过程。
 
 /no_think
 """.strip()

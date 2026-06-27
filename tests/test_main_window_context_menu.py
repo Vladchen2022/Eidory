@@ -4942,7 +4942,174 @@ class MainWindowContextMenuTest(unittest.TestCase):
             question.assert_called_once()
             start_task.assert_not_called()
             self.assertTrue(window.generate_creative_children_button.isEnabled())
-            self.assertEqual(window.statusBar().currentMessage(), "已取消节点信息AI补全")
+            self.assertEqual(window.statusBar().currentMessage(), "已取消当前节点信息补全")
+            window.close()
+
+    def test_creative_node_completion_buttons_use_current_and_all_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            self.assertEqual(window.generate_creative_children_button.text(), "当前节点信息补全")
+            self.assertEqual(window.generate_all_creative_nodes_button.text(), "补全所有节点信息")
+            self.assertTrue(window.generate_all_creative_nodes_button.isEnabled())
+            window.close()
+
+    def test_complete_all_creative_nodes_preserves_existing_user_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="空间站晚餐",
+                brief="空间站里的几个航天员在吃饭",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            user_note = "用户确认：白天作息，但窗外必须是黑色太空。"
+            store.update_creative_node(int(root_id), note=user_note, search_query="空间站 白天 黑色太空")
+            time_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="时间",
+                note="季节、昼夜、事件发生的具体时刻。",
+                search_query="时间",
+            )
+
+            class FakeProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, str]] = []
+
+                def generate_creative_node_note(self, **kwargs: str) -> tuple[SimpleNamespace, str]:
+                    self.calls.append(dict(kwargs))
+                    title = str(kwargs["node_title"])
+                    current_note = str(kwargs["current_note"])
+                    note = f"{title} AI补充说明，补足画面参考信息。"
+                    return SimpleNamespace(note=note, search_query=f"{title} 搜索参考"), "fake"
+
+            provider = FakeProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=int(root_id), show_board=False)
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+
+            self.assertGreaterEqual(len(provider.calls), 2)
+            root_call = next(call for call in provider.calls if call["node_title"] == "空间站晚餐")
+            time_call = next(call for call in provider.calls if call["node_title"] == "时间")
+            self.assertIn(user_note, root_call["current_note"])
+            self.assertEqual(time_call["current_note"], "")
+            root = store.get_creative_node(int(root_id))
+            time_node = store.get_creative_node(time_id)
+            self.assertIsNotNone(root)
+            self.assertIsNotNone(time_node)
+            assert root is not None and time_node is not None
+            self.assertIn(user_note, root.note)
+            self.assertIn("空间站晚餐 AI补充说明", root.note)
+            self.assertIn("时间 AI补充说明", time_node.note)
+            self.assertFalse(window._creative_all_nodes_in_progress)
+            window.close()
+
+    def test_complete_all_creative_nodes_can_seed_blank_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeProvider:
+                def __init__(self) -> None:
+                    self.seed_calls = 0
+                    self.note_calls = 0
+
+                def generate_creative_project_seed(self, **_kwargs) -> tuple[SimpleNamespace, str]:
+                    self.seed_calls += 1
+                    return (
+                        SimpleNamespace(
+                            title="雨夜补给站",
+                            brief="飞行器驾驶员在雨夜自动售货机旁买饮料",
+                            extra="近未来，霓虹，潮湿街道，蓝紫色反光",
+                        ),
+                        "fake",
+                    )
+
+                def generate_creative_node_note(self, **kwargs: str) -> tuple[SimpleNamespace, str]:
+                    self.note_calls += 1
+                    title = str(kwargs["node_title"])
+                    return (
+                        SimpleNamespace(
+                            note=f"{title} AI补全后的节点说明，提供可执行视觉参考。",
+                            search_query=f"{title} 视觉参考",
+                        ),
+                        "fake",
+                    )
+
+            provider = FakeProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            self.assertIsNone(window.current_creative_project_id)
+            self.assertEqual(window.inspiration_brief_input.toPlainText(), "")
+            self.assertEqual(window.inspiration_answers_input.toPlainText(), "")
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+
+            projects = store.list_creative_projects()
+            self.assertEqual(len(projects), 1)
+            self.assertEqual(projects[0].title, "雨夜补给站")
+            self.assertIn("飞行器驾驶员", window.inspiration_brief_input.toPlainText())
+            self.assertIn("蓝紫色反光", window.inspiration_answers_input.toPlainText())
+            nodes = store.list_creative_nodes(projects[0].id)
+            self.assertGreater(len(nodes), 3)
+            self.assertGreaterEqual(provider.seed_calls, 1)
+            self.assertEqual(provider.note_calls, len(nodes))
+            self.assertTrue(any("AI补全后的节点说明" in node.note for node in nodes))
+            self.assertFalse(window._creative_all_nodes_in_progress)
             window.close()
 
     def test_creative_node_search_marks_images_already_saved_in_project(self) -> None:

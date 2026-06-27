@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFontMetrics, QImage, QImageReader, QKeySequence, QPainter, QPen, QPixmap, QTransform
@@ -26,7 +26,8 @@ MAX_ZOOM = 16.0
 GRID_SIZE = 36
 PIXMAP_CACHE_LIMIT = 512
 MAX_SOURCE_PIXMAP_SIDE = 2200
-MAX_BOARD_THUMBNAIL_SIDE = 720
+MAX_BOARD_THUMBNAIL_SIDE = 560
+LAYOUT_CHANGED_IDLE_MS = 450
 DEFAULT_LAYOUT_LEFT = 80.0
 DEFAULT_LAYOUT_TOP = 110.0
 DEFAULT_LAYOUT_ROW_WIDTH = 1600.0
@@ -78,11 +79,13 @@ class BoardImageItem(QGraphicsPixmapItem):
         pixmap: QPixmap,
         file_path: str,
         badges: list[str] | None = None,
+        on_layout_changed: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(pixmap)
         self.image_id = image_id
         self._source_pixmap = pixmap
         self._badges = self._normalize_badges(badges)
+        self._on_layout_changed = on_layout_changed
         self._display_width = float(max(1, pixmap.width()))
         self._display_height = float(max(1, pixmap.height()))
         self._resize_zone = ""
@@ -95,7 +98,7 @@ class BoardImageItem(QGraphicsPixmapItem):
         self._grayscale = False
         self.setToolTip(file_path)
         self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-        self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        self.setCacheMode(QGraphicsItem.CacheMode.ItemCoordinateCache)
         self.setAcceptHoverEvents(True)
         self._apply_flags()
 
@@ -129,14 +132,25 @@ class BoardImageItem(QGraphicsPixmapItem):
         if pixmap.isNull():
             return
         width = max(self.MIN_DISPLAY_WIDTH, float(width))
+        previous_width = self._display_width
+        previous_height = self._display_height
         self.prepareGeometryChange()
         self._display_width = width
         self._display_height = width / max(0.001, self._aspect_ratio)
         self.setScale(self._display_width / max(1, pixmap.width()))
+        if (
+            abs(previous_width - self._display_width) > 0.001
+            or abs(previous_height - self._display_height) > 0.001
+        ):
+            self._notify_layout_changed()
 
     def set_pinned(self, pinned: bool) -> None:
-        self._pinned = bool(pinned)
+        pinned = bool(pinned)
+        if self._pinned == pinned:
+            return
+        self._pinned = pinned
         self._apply_flags()
+        self._notify_layout_changed()
 
     def toggle_pinned(self) -> bool:
         self.set_pinned(not self._pinned)
@@ -151,6 +165,7 @@ class BoardImageItem(QGraphicsPixmapItem):
             return
         self._flipped = flipped
         self._refresh_display_pixmap()
+        self._notify_layout_changed()
 
     def toggle_flipped(self) -> None:
         self.set_flipped(not self._flipped)
@@ -164,6 +179,7 @@ class BoardImageItem(QGraphicsPixmapItem):
             return
         self._grayscale = grayscale
         self._refresh_display_pixmap()
+        self._notify_layout_changed()
 
     def toggle_grayscale(self) -> None:
         self.set_grayscale(not self._grayscale)
@@ -192,6 +208,16 @@ class BoardImageItem(QGraphicsPixmapItem):
         current_width = self._display_width
         self.setPixmap(pixmap)
         self.set_display_size(current_width)
+
+    def itemChange(self, change, value):
+        result = super().itemChange(change, value)
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            self._notify_layout_changed()
+        return result
+
+    def _notify_layout_changed(self) -> None:
+        if self._on_layout_changed is not None:
+            self._on_layout_changed()
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         super().paint(painter, option, widget)
@@ -318,6 +344,27 @@ class BoardImageItem(QGraphicsPixmapItem):
         return ""
 
 
+class BoardPlaceholderItem(QGraphicsRectItem):
+    def __init__(
+        self,
+        rect: QRectF,
+        *,
+        on_layout_changed: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(rect)
+        self._on_layout_changed = on_layout_changed
+
+    def itemChange(self, change, value):
+        result = super().itemChange(change, value)
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            self._notify_layout_changed()
+        return result
+
+    def _notify_layout_changed(self) -> None:
+        if self._on_layout_changed is not None:
+            self._on_layout_changed()
+
+
 class ProjectBoardView(QGraphicsView):
     imageDoubleClicked = Signal(int)
     selectionChanged = Signal(list)
@@ -354,10 +401,13 @@ class ProjectBoardView(QGraphicsView):
         self._last_fit_selection_ids: tuple[int, ...] = ()
         self._refit_timer_pending = False
         self._suppress_layout_changed = False
-        self._layout_changed_pending = False
+        self._layout_change_pending = False
+        self._layout_change_timer = QTimer(self)
+        self._layout_change_timer.setSingleShot(True)
+        self._layout_change_timer.setInterval(LAYOUT_CHANGED_IDLE_MS)
+        self._layout_change_timer.timeout.connect(self._emit_pending_layout_changed)
         self._scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
         self._scene.selectionChanged.connect(self._emit_selection_changed)
-        self._scene.changed.connect(self._schedule_layout_changed)
 
     def set_images(
         self,
@@ -372,6 +422,7 @@ class ProjectBoardView(QGraphicsView):
             for image_id, badges in (badges_by_image_id or {}).items()
         }
         self.setUpdatesEnabled(False)
+        previous_scene_signal_state = self._scene.blockSignals(True)
         self._suppress_layout_changed = True
         try:
             self._scene.clear()
@@ -476,8 +527,10 @@ class ProjectBoardView(QGraphicsView):
                 text.setPos(80, 110)
         finally:
             self.setUpdatesEnabled(True)
-            QTimer.singleShot(0, self._finish_layout_reset)
+            self._scene.blockSignals(previous_scene_signal_state)
+            self._finish_layout_reset()
 
+        self.selectionChanged.emit([])
         if images:
             self._schedule_refit_current_view_mode()
 
@@ -491,11 +544,16 @@ class ProjectBoardView(QGraphicsView):
         for item in items:
             item.setVisible(False)
             item.setSelected(False)
+        if items:
+            self._schedule_layout_changed()
         return len(items)
 
     def show_all_items(self) -> None:
+        changed = any(not item.isVisible() for item in self._image_items.values())
         for item in self._image_items.values():
             item.setVisible(True)
+        if changed:
+            self._schedule_layout_changed()
         self.fit_all_images()
 
     def toggle_selected_pinned(self) -> int:
@@ -527,6 +585,7 @@ class ProjectBoardView(QGraphicsView):
             self._title_item.setVisible(visible)
 
     def layout_payload(self) -> dict[str, Any]:
+        self.flush_pending_layout_change()
         items: dict[str, dict[str, float]] = {}
         for image_id, item in self._image_items.items():
             if isinstance(item, BoardImageItem):
@@ -785,19 +844,27 @@ class ProjectBoardView(QGraphicsView):
         self._refit_current_view_mode()
 
     def _finish_layout_reset(self) -> None:
-        self._layout_changed_pending = False
         self._suppress_layout_changed = False
+        self._layout_change_pending = False
+        self._layout_change_timer.stop()
 
     def _schedule_layout_changed(self) -> None:
         if self._suppress_layout_changed or not self._image_items:
             return
-        if self._layout_changed_pending:
-            return
-        self._layout_changed_pending = True
-        QTimer.singleShot(300, self._emit_layout_changed)
+        self._layout_change_pending = True
+        self._layout_change_timer.start()
 
-    def _emit_layout_changed(self) -> None:
-        self._layout_changed_pending = False
+    def flush_pending_layout_change(self) -> bool:
+        if not self._layout_change_pending:
+            return False
+        self._layout_change_timer.stop()
+        self._emit_pending_layout_changed()
+        return True
+
+    def _emit_pending_layout_changed(self) -> None:
+        if not self._layout_change_pending:
+            return
+        self._layout_change_pending = False
         if self._suppress_layout_changed or not self._image_items:
             return
         self.layoutChanged.emit()
@@ -813,7 +880,10 @@ class ProjectBoardView(QGraphicsView):
         badges: list[str],
     ) -> None:
         if pixmap.isNull():
-            frame = QGraphicsRectItem(QRectF(0, 0, width, height))
+            frame = BoardPlaceholderItem(
+                QRectF(0, 0, width, height),
+                on_layout_changed=self._schedule_layout_changed,
+            )
             frame.setBrush(QColor("#171b21"))
             frame.setPen(QPen(QColor("#4b5563"), 1))
             item: QGraphicsItem = frame
@@ -827,6 +897,7 @@ class ProjectBoardView(QGraphicsView):
                 pixmap=pixmap,
                 file_path=image.file_path,
                 badges=badges,
+                on_layout_changed=self._schedule_layout_changed,
             )
             item.set_display_size(width, height)
         item.setPos(x, y)
@@ -834,6 +905,7 @@ class ProjectBoardView(QGraphicsView):
             item.setFlags(
                 QGraphicsItem.GraphicsItemFlag.ItemIsMovable
                 | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+                | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
             )
         item.setData(0, int(image.id))
         item.setZValue(len(self._image_items) + 1)

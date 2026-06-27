@@ -4454,17 +4454,94 @@ class MetadataStore:
             image_ids.append(image_id)
         return image_ids
 
-    def creative_node_image_badges(self, project_id: int) -> dict[int, list[str]]:
+    def creative_node_branch_image_counts(self, project_id: int) -> dict[int, int]:
+        with self.connect() as conn:
+            node_rows = conn.execute(
+                """
+                SELECT id, parent_id
+                FROM creative_nodes
+                WHERE project_id = ?
+                ORDER BY sort_order, id
+                """,
+                (project_id,),
+            ).fetchall()
+            image_rows = conn.execute(
+                """
+                SELECT cni.node_id, cni.image_id
+                FROM creative_node_images cni
+                JOIN creative_nodes n ON n.id = cni.node_id
+                WHERE n.project_id = ?
+                """,
+                (project_id,),
+            ).fetchall()
+        node_ids = [int(row["id"]) for row in node_rows]
+        children_by_parent: dict[int | None, list[int]] = {}
+        for row in node_rows:
+            node_id = int(row["id"])
+            parent_id = row["parent_id"]
+            children_by_parent.setdefault(
+                int(parent_id) if parent_id is not None else None,
+                [],
+            ).append(node_id)
+        direct_images: dict[int, set[int]] = {node_id: set() for node_id in node_ids}
+        for row in image_rows:
+            node_id = int(row["node_id"])
+            if node_id in direct_images:
+                direct_images[node_id].add(int(row["image_id"]))
+
+        branch_images_by_node: dict[int, set[int]] = {}
+        visiting: set[int] = set()
+
+        def collect(current_id: int) -> set[int]:
+            if current_id in branch_images_by_node:
+                return set(branch_images_by_node[current_id])
+            if current_id in visiting:
+                return set(direct_images.get(current_id, set()))
+            visiting.add(current_id)
+            images = set(direct_images.get(current_id, set()))
+            for child_id in children_by_parent.get(current_id, []):
+                images.update(collect(child_id))
+            visiting.discard(current_id)
+            branch_images_by_node[current_id] = images
+            return set(images)
+
+        for node_id in node_ids:
+            collect(node_id)
+        return {node_id: len(images) for node_id, images in branch_images_by_node.items()}
+
+    def creative_node_image_badges(
+        self,
+        project_id: int,
+        image_ids: Sequence[int] | None = None,
+    ) -> dict[int, list[str]]:
+        filtered_image_ids: list[int] = []
+        if image_ids is not None:
+            seen: set[int] = set()
+            for image_id in image_ids:
+                clean_id = int(image_id)
+                if clean_id in seen:
+                    continue
+                filtered_image_ids.append(clean_id)
+                seen.add(clean_id)
+            if not filtered_image_ids:
+                return {}
+        image_filter_sql = ""
+        params: list[object] = [project_id]
+        if filtered_image_ids:
+            placeholders = ",".join("?" for _ in filtered_image_ids)
+            image_filter_sql = f" AND cni.image_id IN ({placeholders})"
+            params.extend(filtered_image_ids)
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT cni.image_id, COALESCE(NULLIF(TRIM(cni.intent_label), ''), n.title) AS badge
                 FROM creative_node_images cni
                 JOIN creative_nodes n ON n.id = cni.node_id
                 WHERE n.project_id = ?
+                {image_filter_sql}
                 ORDER BY n.sort_order, cni.sort_order, cni.image_id
                 """,
-                (project_id,),
+                params,
             ).fetchall()
         badges: dict[int, list[str]] = {}
         for row in rows:
@@ -5193,6 +5270,7 @@ class MetadataStore:
                 SELECT r.collection_id, r.mode, r.include_descendants, c.name
                 FROM ai_vision_collection_rules r
                 JOIN collections c ON c.id = r.collection_id
+                WHERE r.mode = 'include'
                 ORDER BY r.mode DESC, c.name COLLATE NOCASE
                 """
             ).fetchall()
@@ -5575,22 +5653,19 @@ class MetadataStore:
             """
             SELECT collection_id, mode, include_descendants
             FROM ai_vision_collection_rules
+            WHERE mode = 'include'
             ORDER BY mode
             """
         ).fetchall()
         include_ids: set[int] = set()
-        exclude_ids: set[int] = set()
         for row in rule_rows:
             ids = cls._ai_vision_rule_image_ids(
                 conn,
                 int(row["collection_id"]),
                 include_descendants=bool(row["include_descendants"]),
             )
-            if str(row["mode"]) == "exclude":
-                exclude_ids.update(ids)
-            else:
-                include_ids.update(ids)
-        return include_ids - exclude_ids
+            include_ids.update(ids)
+        return include_ids
 
     @staticmethod
     def _ai_vision_stats_for_image_ids(

@@ -101,6 +101,81 @@ class InspirationTest(unittest.TestCase):
         self.assertEqual(terms[0].title, "环境氛围")
         self.assertEqual(terms[0].axis, "environment")
 
+    def test_generate_inspiration_terms_accepts_json_from_reasoning_content(self) -> None:
+        class FakeProvider(LMStudioProvider):
+            def __init__(self) -> None:
+                super().__init__(model_name="fake-model")
+                self.calls: list[dict[str, object]] = []
+
+            def _chat_completion(self, **kwargs: object) -> str:  # type: ignore[override]
+                self.calls.append(kwargs)
+                return """
+分析：先把主题拆成空间、人物、光线和材质。
+{
+  "questions": ["自然光从哪一侧进入？"],
+  "terms": [
+    {"title":"热带集市","query":"tropical market crowded noon realistic modern"},
+    {"title":"拥挤人群","query":"dense crowd shopping in market midday"},
+    {"title":"摊位遮棚","query":"market stall canvas awning tropical sunlight"},
+    {"title":"自然顶光","query":"harsh noon sunlight market shadows"},
+    {"title":"现实主义色彩","query":"realistic documentary market scene natural colors"}
+  ]
+}
+                """
+
+        provider = FakeProvider()
+        proposal = provider.generate_inspiration_terms(
+            brief="来自欧洲的顾客在热带拥挤的集市里采购",
+            answers="热带，集市，正午，人群密集，现实主义的现代",
+            language="zh",
+        )
+
+        self.assertEqual(proposal.model_name, "fake-model")
+        self.assertEqual(proposal.questions, ["自然光从哪一侧进入？"])
+        self.assertEqual(len(proposal.terms), 5)
+        self.assertEqual(proposal.terms[0].title, "热带集市")
+        self.assertTrue(provider.calls[0]["allow_reasoning_content"])
+        self.assertEqual(provider.calls[0]["reasoning_effort"], "none")
+
+    def test_generate_search_plan_accepts_json_from_reasoning_content(self) -> None:
+        class FakeProvider(LMStudioProvider):
+            def __init__(self) -> None:
+                super().__init__(model_name="fake-model")
+                self.calls: list[dict[str, object]] = []
+
+            def _chat_completion(self, **kwargs: object) -> str:  # type: ignore[override]
+                self.calls.append(kwargs)
+                return """
+分析：先生成探针，再补充 AI 场景条件。
+{
+  "questions": [],
+  "terms": [
+    {"title":"热带集市","query":"tropical market crowded noon realistic modern"},
+    {"title":"拥挤人群","query":"dense crowd shopping in market midday"},
+    {"title":"摊位遮棚","query":"market stall canvas awning tropical sunlight"},
+    {"title":"自然顶光","query":"harsh noon sunlight market shadows"},
+    {"title":"现实主义色彩","query":"realistic documentary market scene natural colors"}
+  ],
+  "filters": [
+    {"field":"scene_location","value":"outdoor","optional":false,"reason":"集市通常在室外或半室外"},
+    {"field":"time_of_day","value":"day","optional":false,"reason":"用户指定正午"}
+  ]
+}
+                """
+
+        provider = FakeProvider()
+        proposal = provider.generate_search_plan(
+            brief="来自欧洲的顾客在热带拥挤的集市里采购",
+            answers="热带，集市，正午，人群密集，现实主义的现代",
+            language="zh",
+        )
+
+        self.assertEqual(proposal.model_name, "fake-model")
+        self.assertEqual(len(proposal.terms), 5)
+        self.assertEqual([item.field for item in proposal.filters], ["scene_location", "time_of_day"])
+        self.assertTrue(provider.calls[0]["allow_reasoning_content"])
+        self.assertEqual(provider.calls[0]["reasoning_effort"], "none")
+
     def test_parse_project_suggestion(self) -> None:
         name, summary = parse_project_suggestion(
             '{"name":"潮湿机械住处","summary":"用于寻找落魄工程师住处和机械细节的参考。"}'

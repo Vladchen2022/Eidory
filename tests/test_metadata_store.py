@@ -954,6 +954,18 @@ class MetadataStoreTest(unittest.TestCase):
                 {first_id: ["工作台", "摩托车"], second_id: ["工作台"]},
             )
             self.assertEqual(
+                reopened.creative_node_image_badges(project_id, image_ids=[first_id]),
+                {first_id: ["工作台", "摩托车"]},
+            )
+            self.assertEqual(
+                reopened.creative_node_image_badges(project_id, image_ids=[]),
+                {},
+            )
+            self.assertEqual(
+                reopened.creative_node_branch_image_counts(project_id),
+                {int(root_id): 2, workshop_id: 2, vehicle_id: 1},
+            )
+            self.assertEqual(
                 reopened.get_creative_board_layout(project_id),
                 '{"version":1,"items":{"1":{"x":10}}}',
             )
@@ -1652,6 +1664,14 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(store.ai_vision_tags_for_image(first)["status"], "stale")
 
             store.set_ai_vision_collection_rule(global_ref, mode="exclude")
+            stats = store.ai_vision_stats(
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=AI_VISION_PROMPT_VERSION,
+            )
+            self.assertEqual(stats["total"], 2)
+
+            self.assertTrue(store.remove_ai_vision_collection_rule(references))
             stats = store.ai_vision_stats(
                 provider_name="LM Studio",
                 model_name="vision-model",

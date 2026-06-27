@@ -159,19 +159,75 @@ class ProjectBoardViewTest(unittest.TestCase):
 
         self.assertEqual(emitted, [[2]])
 
-    def test_item_position_change_emits_debounced_layout_changed(self) -> None:
+    def test_select_image_does_not_emit_layout_changed(self) -> None:
         board = ProjectBoardView()
-        board.set_images([self._image(1)])
+        board.set_images([self._image(1), self._image(2)])
         self.app.processEvents()
         emitted: list[bool] = []
         board.layoutChanged.connect(lambda: emitted.append(True))
 
-        board._image_items[1].setPos(123, 234)
-        self.app.processEvents()
-        time.sleep(0.35)
+        board._select_image_id(2)
         self.app.processEvents()
 
-        self.assertEqual(emitted, [True])
+        self.assertEqual(emitted, [])
+
+    def test_item_position_change_emits_layout_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "first.jpg"
+            pixmap = QPixmap(320, 180)
+            pixmap.fill(QColor("#334455"))
+            self.assertTrue(pixmap.save(str(image_path)))
+            board = ProjectBoardView()
+            board.set_images([self._image(1, file_path=str(image_path), width=320, height=180)])
+            self.app.processEvents()
+            emitted: list[bool] = []
+            board.layoutChanged.connect(lambda: emitted.append(True))
+
+            board._image_items[1].setPos(123, 234)
+            self.app.processEvents()
+            time.sleep(0.55)
+            self.app.processEvents()
+
+            self.assertEqual(emitted, [True])
+
+    def test_repeated_position_changes_emit_one_layout_changed_after_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "first.jpg"
+            pixmap = QPixmap(320, 180)
+            pixmap.fill(QColor("#334455"))
+            self.assertTrue(pixmap.save(str(image_path)))
+            board = ProjectBoardView()
+            board.set_images([self._image(1, file_path=str(image_path), width=320, height=180)])
+            self.app.processEvents()
+            emitted: list[bool] = []
+            board.layoutChanged.connect(lambda: emitted.append(True))
+
+            for index in range(40):
+                board._image_items[1].setPos(123 + index, 234 + index)
+                self.app.processEvents()
+            time.sleep(0.55)
+            self.app.processEvents()
+
+            self.assertEqual(emitted, [True])
+
+    def test_flush_pending_layout_change_emits_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "first.jpg"
+            pixmap = QPixmap(320, 180)
+            pixmap.fill(QColor("#334455"))
+            self.assertTrue(pixmap.save(str(image_path)))
+            board = ProjectBoardView()
+            board.set_images([self._image(1, file_path=str(image_path), width=320, height=180)])
+            self.app.processEvents()
+            emitted: list[bool] = []
+            board.layoutChanged.connect(lambda: emitted.append(True))
+
+            board._image_items[1].setPos(123, 234)
+            self.app.processEvents()
+
+            self.assertTrue(board.flush_pending_layout_change())
+            self.assertEqual(emitted, [True])
+            self.assertFalse(board.flush_pending_layout_change())
 
     def test_undo_shortcut_requests_board_removal_undo(self) -> None:
         board = ProjectBoardView()

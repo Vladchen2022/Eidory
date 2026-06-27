@@ -314,6 +314,36 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.ai_vision_worker = None
             window.close()
 
+    def test_ai_vision_index_panel_uses_folder_list_inclusion_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            included = store.create_collection("需要识别")
+            excluded = store.create_collection("旧排除项")
+            store.set_ai_vision_collection_rule(included, mode="include")
+            store.set_ai_vision_collection_rule(excluded, mode="exclude")
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._refresh_ai_vision_stats()
+
+            self.assertEqual(window.ai_vision_rule_tree.columnCount(), 5)
+            self.assertEqual(window.ai_vision_rule_tree.headerItem().text(0), "文件夹")
+            self.assertEqual(window.add_ai_vision_include_rule_button.text(), "添加选中文件夹")
+            self.assertEqual(window.remove_ai_vision_rule_button.text(), "移除选中文件夹")
+            self.assertFalse(hasattr(window, "add_ai_vision_exclude_rule_button"))
+            self.assertEqual(window.ai_vision_rule_tree.topLevelItemCount(), 1)
+            self.assertEqual(window.ai_vision_rule_tree.topLevelItem(0).text(0), "需要识别")
+            window.close()
+
     def test_database_restore_maintenance_does_not_restart_stopped_index_workers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -4965,8 +4995,52 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.creative_template_label.text(), "新建项目模板")
             self.assertEqual(window.creative_new_project_button.text(), "按当前内容新建项目")
             self.assertEqual(window.creative_ai_project_button.text(), "AI 生成完整项目")
+            self.assertEqual(window.open_creative_copy_button.text(), "文案")
+            self.assertEqual(window.back_creative_nodes_button.text(), "返回节点树")
+            self.assertFalse(hasattr(window, "open_creative_board_button"))
             self.assertTrue(window.generate_all_creative_nodes_button.isEnabled())
             self.assertTrue(window.creative_ai_project_button.isEnabled())
+            self.assertFalse(window.open_creative_copy_button.isEnabled())
+            window.close()
+
+    def test_creative_copy_page_opens_from_bottom_node_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="故事项目",
+                brief="一个室内场景",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=int(root_id), show_board=False)
+
+            self.assertEqual(window.creative_content_tabs.currentIndex(), 0)
+            self.assertTrue(window.open_creative_copy_button.isEnabled())
+
+            window.open_creative_copy_button.click()
+            self.app.processEvents()
+
+            self.assertEqual(window.creative_content_tabs.currentIndex(), 1)
+
+            window.back_creative_nodes_button.click()
+            self.app.processEvents()
+
+            self.assertEqual(window.creative_content_tabs.currentIndex(), 0)
             window.close()
 
     def test_creative_template_preview_is_separate_from_selected_project(self) -> None:
@@ -5811,6 +5885,25 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertNotEqual((first_pos.x(), first_pos.y()), (second_pos.x(), second_pos.y()))
             self.assertGreater(second_pos.y(), first_pos.y())
             window.close()
+
+    def test_board_layout_save_prunes_stale_items(self) -> None:
+        current_payload = {
+            "version": 1,
+            "items": {
+                "2": {"x": 240.0, "y": 120.0, "width": 160.0, "height": 90.0, "visible": True}
+            },
+        }
+        existing_payload = {
+            "version": 1,
+            "items": {
+                "1": {"x": 80.0, "y": 110.0, "width": 160.0, "height": 90.0, "visible": True},
+                "2": {"x": 120.0, "y": 110.0, "width": 160.0, "height": 90.0, "visible": True},
+            },
+        }
+
+        payload = MainWindow._merged_board_layout_payload(current_payload, existing_payload)
+
+        self.assertEqual(payload["items"], current_payload["items"])
 
     def test_selecting_creative_node_opens_node_board_not_gallery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

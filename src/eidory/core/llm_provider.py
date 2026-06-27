@@ -124,7 +124,13 @@ class LMStudioProvider:
                 "content": _build_inspiration_prompt(clean_brief, answers.strip(), language=language),
             },
         ]
-        content = self._chat_completion(model_name=model_name, messages=messages, prefer_json=True)
+        content = self._chat_completion(
+            model_name=model_name,
+            messages=messages,
+            prefer_json=True,
+            reasoning_effort="none",
+            allow_reasoning_content=True,
+        )
         try:
             return parse_inspiration_proposal(content, model_name=model_name)
         except LLMProviderError as first_error:
@@ -172,8 +178,10 @@ class LMStudioProvider:
             messages=messages,
             prefer_json=True,
             response_format=_search_plan_response_format(),
+            reasoning_effort="none",
             temperature=0.55,
             max_tokens=2600,
+            allow_reasoning_content=True,
         )
         try:
             return parse_search_plan_proposal(content, model_name=model_name)

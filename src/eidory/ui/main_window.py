@@ -1878,6 +1878,8 @@ class MainWindow(QMainWindow):
         self.save_creative_node_button.hide()
         self.generate_creative_children_button = QPushButton("当前节点信息补全")
         self.generate_all_creative_nodes_button = QPushButton("补全所有节点信息")
+        self.open_creative_copy_button = QPushButton("文案")
+        self.back_creative_nodes_button = QPushButton("返回节点树")
         self.generate_creative_copy_button = QPushButton("生成文案")
         self.generate_creative_copy_tab_button = QPushButton("生成文案")
         self.creative_project_copy_input = QTextEdit()
@@ -1886,17 +1888,17 @@ class MainWindow(QMainWindow):
         self.creative_project_copy_input.setMinimumHeight(220)
         self.search_creative_node_button = QPushButton("搜索当前节点")
         self.save_selection_to_creative_node_button = QPushButton("存入当前节点")
-        self.open_creative_board_button = QPushButton("看板")
         for creative_button in [
             self.save_creative_node_button,
             self.generate_creative_children_button,
             self.generate_all_creative_nodes_button,
             self.creative_ai_project_button,
+            self.open_creative_copy_button,
+            self.back_creative_nodes_button,
             self.generate_creative_copy_button,
             self.generate_creative_copy_tab_button,
             self.search_creative_node_button,
             self.save_selection_to_creative_node_button,
-            self.open_creative_board_button,
         ]:
             creative_button.setEnabled(False)
 
@@ -1950,17 +1952,19 @@ class MainWindow(QMainWindow):
         self.ai_vision_virtual_filter_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.ai_vision_virtual_filter_list.setToolTip("按 AI 场景标签状态筛选图库。")
         self.ai_vision_rule_tree = QTreeWidget()
-        self.ai_vision_rule_tree.setColumnCount(6)
-        self.ai_vision_rule_tree.setHeaderLabels(["规则", "文件夹", "完成", "失败", "未处理", "总数"])
+        self.ai_vision_rule_tree.setColumnCount(5)
+        self.ai_vision_rule_tree.setHeaderLabels(["文件夹", "完成", "失败", "未处理", "总数"])
         self.ai_vision_rule_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.ai_vision_rule_tree.setMaximumHeight(180)
-        self.add_ai_vision_include_rule_button = QPushButton("识别选中文件夹")
-        self.add_ai_vision_exclude_rule_button = QPushButton("排除选中文件夹")
-        self.remove_ai_vision_rule_button = QPushButton("移除规则")
+        self.ai_vision_rule_tree.setToolTip("列表中的文件夹及其子文件夹会进行 AI 场景视觉识别。")
+        self.add_ai_vision_include_rule_button = QPushButton("添加选中文件夹")
+        self.remove_ai_vision_rule_button = QPushButton("移除选中文件夹")
         self.start_ai_vision_button = QPushButton("开始AI识别")
         self.pause_ai_vision_button = QPushButton("暂停AI识别")
         self.retry_failed_ai_vision_button = QPushButton("重试AI失败")
         self.refresh_ai_vision_button = QPushButton("刷新AI统计")
+        self.add_ai_vision_include_rule_button.setToolTip("把左侧当前选中的文件夹加入 AI 识别列表；子文件夹也会被识别。")
+        self.remove_ai_vision_rule_button.setToolTip("从 AI 识别列表移除右侧表格中选中的文件夹；不删除图片或已有 AI 标签。")
 
         form = QFormLayout()
         self.detail_form = form
@@ -2071,9 +2075,8 @@ class MainWindow(QMainWindow):
         self.creative_project_list.hide()
         project_mode_layout.addWidget(self.creative_project_combo)
 
-        self.creative_content_tabs = QTabWidget()
-        self.creative_content_tabs.setObjectName("creativeContentTabs")
-        self.creative_content_tabs.setTabBar(EqualWidthTabBar())
+        self.creative_content_tabs = QStackedWidget()
+        self.creative_content_tabs.setObjectName("creativeContentStack")
         node_tab = QWidget()
         node_tab_layout = QVBoxLayout(node_tab)
         node_tab_layout.setContentsMargins(0, 0, 0, 0)
@@ -2093,16 +2096,20 @@ class MainWindow(QMainWindow):
         creative_node_action_row.addWidget(self.search_creative_node_button)
         creative_node_action_row.addWidget(self.save_selection_to_creative_node_button)
         node_tab_layout.addLayout(creative_node_action_row)
-        node_tab_layout.addWidget(self.open_creative_board_button)
+        node_tab_layout.addWidget(self.open_creative_copy_button)
         copy_tab = QWidget()
         copy_tab_layout = QVBoxLayout(copy_tab)
         copy_tab_layout.setContentsMargins(0, 0, 0, 0)
         copy_tab_layout.setSpacing(7)
         copy_tab_layout.addWidget(QLabel("项目文案"))
         copy_tab_layout.addWidget(self.creative_project_copy_input, 1)
-        copy_tab_layout.addWidget(self.generate_creative_copy_tab_button)
-        self.creative_content_tabs.addTab(node_tab, "节点树")
-        self.creative_content_tabs.addTab(copy_tab, "文案")
+        creative_copy_action_row = QHBoxLayout()
+        creative_copy_action_row.setContentsMargins(0, 0, 0, 0)
+        creative_copy_action_row.addWidget(self.back_creative_nodes_button)
+        creative_copy_action_row.addWidget(self.generate_creative_copy_tab_button)
+        copy_tab_layout.addLayout(creative_copy_action_row)
+        self.creative_content_tabs.addWidget(node_tab)
+        self.creative_content_tabs.addWidget(copy_tab)
         project_mode_layout.addWidget(self.creative_content_tabs, 1)
         project_mode_layout.addStretch(1)
 
@@ -2182,19 +2189,15 @@ class MainWindow(QMainWindow):
         ai_rule_row = QHBoxLayout()
         ai_rule_row.setContentsMargins(0, 0, 0, 0)
         ai_rule_row.addWidget(self.add_ai_vision_include_rule_button)
-        ai_rule_row.addWidget(self.add_ai_vision_exclude_rule_button)
+        ai_rule_row.addWidget(self.remove_ai_vision_rule_button)
         index_layout.addLayout(ai_rule_row)
-        ai_rule_action_row = QHBoxLayout()
-        ai_rule_action_row.setContentsMargins(0, 0, 0, 0)
-        ai_rule_action_row.addWidget(self.remove_ai_vision_rule_button)
-        ai_rule_action_row.addWidget(self.refresh_ai_vision_button)
-        index_layout.addLayout(ai_rule_action_row)
         ai_worker_row = QHBoxLayout()
         ai_worker_row.setContentsMargins(0, 0, 0, 0)
         ai_worker_row.addWidget(self.start_ai_vision_button)
         ai_worker_row.addWidget(self.pause_ai_vision_button)
         ai_worker_row.addWidget(self.retry_failed_ai_vision_button)
         index_layout.addLayout(ai_worker_row)
+        index_layout.addWidget(self.refresh_ai_vision_button)
         index_layout.addStretch(1)
 
         settings_tab = QWidget()
@@ -2467,11 +2470,12 @@ class MainWindow(QMainWindow):
         self.save_creative_node_button.clicked.connect(self._save_current_creative_node_details)
         self.generate_creative_children_button.clicked.connect(self._generate_creative_children_for_selected_node)
         self.generate_all_creative_nodes_button.clicked.connect(self._generate_all_creative_node_notes)
+        self.open_creative_copy_button.clicked.connect(lambda: self.creative_content_tabs.setCurrentIndex(1))
+        self.back_creative_nodes_button.clicked.connect(lambda: self.creative_content_tabs.setCurrentIndex(0))
         self.generate_creative_copy_button.clicked.connect(self._generate_creative_project_copy)
         self.generate_creative_copy_tab_button.clicked.connect(self._generate_creative_project_copy)
         self.search_creative_node_button.clicked.connect(self._search_selected_creative_node)
         self.save_selection_to_creative_node_button.clicked.connect(self._save_selection_to_current_creative_node)
-        self.open_creative_board_button.clicked.connect(self._show_current_creative_board)
         self.search_inspiration_button.clicked.connect(self._save_and_search_inspiration)
         self.inspiration_history_list.itemClicked.connect(self._load_selected_inspiration_history)
         self.inspiration_history_list.customContextMenuRequested.connect(self._show_inspiration_history_context_menu)
@@ -2487,8 +2491,7 @@ class MainWindow(QMainWindow):
         self.start_embedding_button.clicked.connect(self._start_embedding)
         self.pause_embedding_button.clicked.connect(self._pause_embedding)
         self.retry_failed_button.clicked.connect(self._retry_failed_embeddings)
-        self.add_ai_vision_include_rule_button.clicked.connect(lambda: self._set_ai_vision_rule_for_selected_collection("include"))
-        self.add_ai_vision_exclude_rule_button.clicked.connect(lambda: self._set_ai_vision_rule_for_selected_collection("exclude"))
+        self.add_ai_vision_include_rule_button.clicked.connect(self._add_selected_collection_to_ai_vision)
         self.remove_ai_vision_rule_button.clicked.connect(self._remove_selected_ai_vision_rule)
         self.start_ai_vision_button.clicked.connect(self._start_ai_vision)
         self.pause_ai_vision_button.clicked.connect(self._pause_ai_vision)
@@ -3107,11 +3110,12 @@ class MainWindow(QMainWindow):
             self.save_creative_node_button.setText("Save Node")
             self.generate_creative_children_button.setText("Complete Current Node")
             self.generate_all_creative_nodes_button.setText("Complete All Nodes")
+            self.open_creative_copy_button.setText("Copy")
+            self.back_creative_nodes_button.setText("Back to Nodes")
+            self.generate_creative_copy_button.setText("Generate Copy")
+            self.generate_creative_copy_tab_button.setText("Generate Copy")
             self.search_creative_node_button.setText("Search Node")
             self.save_selection_to_creative_node_button.setText("Save to Node")
-            self.open_creative_board_button.setText("Board")
-            self.creative_content_tabs.setTabText(0, "Node Tree")
-            self.creative_content_tabs.setTabText(1, "Copy")
             self._configure_board_icon_button(
                 self.board_pin_button,
                 "pin",
@@ -3148,9 +3152,9 @@ class MainWindow(QMainWindow):
             self.search_inspiration_button.setText("Save and Search")
             self.save_temp_project_button.setText("Save Selected")
             self.add_ai_vision_filter_button.setText("Add Scene Tag")
-            self.add_ai_vision_include_rule_button.setText("Include Folder")
-            self.add_ai_vision_exclude_rule_button.setText("Exclude Folder")
-            self.remove_ai_vision_rule_button.setText("Remove Rule")
+            self.ai_vision_rule_tree.setHeaderLabels(["Folder", "Done", "Failed", "Pending", "Total"])
+            self.add_ai_vision_include_rule_button.setText("Add Selected Folder")
+            self.remove_ai_vision_rule_button.setText("Remove Selected Folder")
             self.start_ai_vision_button.setText("Start AI Vision")
             self.pause_ai_vision_button.setText("Pause AI Vision")
             self.retry_failed_ai_vision_button.setText("Retry Failed")
@@ -3239,11 +3243,12 @@ class MainWindow(QMainWindow):
             self.save_creative_node_button.setText("保存节点")
             self.generate_creative_children_button.setText("当前节点信息补全")
             self.generate_all_creative_nodes_button.setText("补全所有节点信息")
+            self.open_creative_copy_button.setText("文案")
+            self.back_creative_nodes_button.setText("返回节点树")
+            self.generate_creative_copy_button.setText("生成文案")
+            self.generate_creative_copy_tab_button.setText("生成文案")
             self.search_creative_node_button.setText("搜索当前节点")
             self.save_selection_to_creative_node_button.setText("存入当前节点")
-            self.open_creative_board_button.setText("看板")
-            self.creative_content_tabs.setTabText(0, "节点树")
-            self.creative_content_tabs.setTabText(1, "文案")
             self._configure_board_icon_button(
                 self.board_pin_button,
                 "pin",
@@ -3280,9 +3285,9 @@ class MainWindow(QMainWindow):
             self.search_inspiration_button.setText("保存并搜索")
             self.save_temp_project_button.setText("存为语义探针项目")
             self.add_ai_vision_filter_button.setText("添加场景标签")
-            self.add_ai_vision_include_rule_button.setText("识别选中文件夹")
-            self.add_ai_vision_exclude_rule_button.setText("排除选中文件夹")
-            self.remove_ai_vision_rule_button.setText("移除规则")
+            self.ai_vision_rule_tree.setHeaderLabels(["文件夹", "完成", "失败", "未处理", "总数"])
+            self.add_ai_vision_include_rule_button.setText("添加选中文件夹")
+            self.remove_ai_vision_rule_button.setText("移除选中文件夹")
             self.start_ai_vision_button.setText("开始AI识别")
             self.pause_ai_vision_button.setText("暂停AI识别")
             self.retry_failed_ai_vision_button.setText("重试AI失败")
@@ -10889,27 +10894,26 @@ class MainWindow(QMainWindow):
         if count:
             self._start_ai_vision()
 
-    def _set_ai_vision_rule_for_selected_collection(self, mode: str) -> None:
+    def _add_selected_collection_to_ai_vision(self) -> None:
         collection_id = self._selected_collection_id()
         if collection_id is None:
             self.statusBar().showMessage("请先在左侧选择一个普通文件夹")
             return
-        self.store.set_ai_vision_collection_rule(collection_id, mode=mode, include_descendants=True)
+        self.store.set_ai_vision_collection_rule(collection_id, mode="include", include_descendants=True)
         self._refresh_ai_vision_stats()
-        label = "识别" if mode == "include" else "排除"
-        self.statusBar().showMessage(f"已设置 AI 场景标签规则：{label} {self._collection_path_text(collection_id)}")
+        self.statusBar().showMessage(f"已加入 AI 场景识别文件夹：{self._collection_path_text(collection_id)}")
 
     def _remove_selected_ai_vision_rule(self) -> None:
         item = self.ai_vision_rule_tree.currentItem()
         if item is None:
-            self.statusBar().showMessage("请先选择一条 AI 规则")
+            self.statusBar().showMessage("请先在 AI 识别文件夹列表中选择一个文件夹")
             return
         collection_id = item.data(0, Qt.ItemDataRole.UserRole)
         if collection_id is None:
             return
         removed = self.store.remove_ai_vision_collection_rule(int(collection_id))
         self._refresh_ai_vision_stats()
-        self.statusBar().showMessage("已移除 AI 规则" if removed else "AI 规则不存在")
+        self.statusBar().showMessage("已移除 AI 识别文件夹" if removed else "AI 识别文件夹不存在")
 
     def _handle_ai_vision_progress(self, progress: AIVisionProgress) -> None:
         self._refresh_ai_vision_stats()
@@ -11801,13 +11805,14 @@ class MainWindow(QMainWindow):
             self.creative_node_tree.blockSignals(False)
             return
         nodes = self.store.list_creative_nodes(self.current_creative_project_id)
+        branch_image_counts = self.store.creative_node_branch_image_counts(self.current_creative_project_id)
         items_by_id: dict[int, QTreeWidgetItem] = {}
         children_by_parent: dict[int | None, list[CreativeNodeItem]] = {}
         for node in nodes:
             children_by_parent.setdefault(node.parent_id, []).append(node)
 
         def add_node(node: CreativeNodeItem, parent_item: QTreeWidgetItem | None) -> None:
-            branch_image_count = len(self.store.creative_node_image_ids(node.id, include_descendants=True))
+            branch_image_count = branch_image_counts.get(node.id, node.image_count)
             item = QTreeWidgetItem([node.title, str(branch_image_count)])
             item.setData(0, Qt.ItemDataRole.UserRole, node.id)
             self._apply_creative_node_note_marker(item, node)
@@ -11918,6 +11923,8 @@ class MainWindow(QMainWindow):
         if not has_node:
             if self.current_creative_project_id is None:
                 self.creative_node_status_label.setText("新建项目模板预览。")
+                if hasattr(self, "creative_content_tabs"):
+                    self.creative_content_tabs.setCurrentIndex(0)
             else:
                 self.creative_node_status_label.setText("未选择创作节点。")
             self.creative_node_note_input.clear()
@@ -11950,8 +11957,9 @@ class MainWindow(QMainWindow):
         for button in [
             self.generate_creative_copy_button,
             self.generate_creative_copy_tab_button,
+            self.open_creative_copy_button,
+            self.back_creative_nodes_button,
             self.search_creative_node_button,
-            self.open_creative_board_button,
             self.creative_add_child_button,
             self.creative_delete_node_button,
         ]:
@@ -12829,7 +12837,10 @@ class MainWindow(QMainWindow):
         self.current_creative_node_images = list(result.images)
         self.current_creative_node_searchable_count = int(result.searchable_count)
         self.current_creative_node_candidate_limit = int(result.candidate_limit)
-        project_badges = self.store.creative_node_image_badges(node.project_id)
+        project_badges = self.store.creative_node_image_badges(
+            node.project_id,
+            image_ids=[image.id for image in self.current_creative_node_images],
+        )
         self.current_creative_node_badges = self._creative_node_search_badges(
             self.current_creative_node_images,
             node=node,
@@ -12929,7 +12940,10 @@ class MainWindow(QMainWindow):
             self.current_creative_node_badges = self._creative_node_search_badges(
                 self.current_creative_node_images,
                 node=node,
-                project_badges=self.store.creative_node_image_badges(node.project_id),
+                project_badges=self.store.creative_node_image_badges(
+                    node.project_id,
+                    image_ids=[image.id for image in self.current_creative_node_images],
+                ),
             )
             self.grid_view.set_images(
                 self.current_creative_node_filtered_images,
@@ -13002,7 +13016,10 @@ class MainWindow(QMainWindow):
         self.current_creative_node_images = images
         self.current_creative_node_searchable_count = 0
         self.current_creative_node_candidate_limit = 0
-        self.current_creative_node_badges = self.store.creative_node_image_badges(node.project_id)
+        self.current_creative_node_badges = self.store.creative_node_image_badges(
+            node.project_id,
+            image_ids=image_ids,
+        )
         self.current_temp_project_id = None
         self.current_temp_project_images = []
         self.current_temp_project_badges = {}
@@ -13065,7 +13082,7 @@ class MainWindow(QMainWindow):
         images = self.store.images_by_ids(image_ids)
         layout_payload = self._creative_node_board_layout_payload(node.id)
         title = self._creative_node_path_text(node.id) or node.title
-        badges = self.store.creative_node_image_badges(node.project_id)
+        badges = self.store.creative_node_image_badges(node.project_id, image_ids=image_ids)
         self.project_board_view.set_images(
             images,
             title=title,
@@ -13126,7 +13143,7 @@ class MainWindow(QMainWindow):
             self._hide_board_focus_chrome_widgets()
 
     def _save_current_creative_board_layout(self) -> None:
-        if self._save_current_board_layout_if_needed():
+        if self._save_current_board_layout_if_needed(force=True):
             self.statusBar().showMessage("看板布局已保存")
         else:
             self.statusBar().showMessage("当前没有可保存的看板布局")
@@ -13138,8 +13155,10 @@ class MainWindow(QMainWindow):
             return
         if self._current_board_temp_project_id is None and self._current_board_node_id is None:
             return
+        was_dirty = self._board_layout_dirty
         self._board_layout_dirty = True
-        self.board_autosave_timer.start()
+        if not was_dirty or not self.board_autosave_timer.isActive():
+            self.board_autosave_timer.start()
 
     def _mark_current_board_layout_clean(self) -> None:
         self._board_layout_dirty = False
@@ -13561,10 +13580,14 @@ class MainWindow(QMainWindow):
             return None
         return payload if isinstance(payload, dict) else None
 
-    def _save_current_board_layout_if_needed(self) -> bool:
+    def _save_current_board_layout_if_needed(self, *, force: bool = False) -> bool:
         if not hasattr(self, "center_result_stack"):
             return False
         if self.center_result_stack.currentWidget() is not self.project_board_view:
+            return False
+        if self.project_board_view.flush_pending_layout_change():
+            self._board_layout_dirty = True
+        if not force and not self._board_layout_dirty:
             return False
         if self._current_board_temp_project_id is not None:
             payload = self._merged_board_layout_payload(
@@ -13593,19 +13616,14 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _merged_board_layout_payload(
         current_payload: dict[str, object],
-        existing_payload: dict[str, object] | None,
+        _existing_payload: dict[str, object] | None,
     ) -> dict[str, object]:
-        if not isinstance(existing_payload, dict):
-            return current_payload
-        existing_items = existing_payload.get("items")
         current_items = current_payload.get("items")
-        if not isinstance(existing_items, dict) or not isinstance(current_items, dict):
+        if not isinstance(current_items, dict):
             return current_payload
-        merged = dict(current_payload)
-        merged_items = dict(existing_items)
-        merged_items.update(current_items)
-        merged["items"] = merged_items
-        return merged
+        compact = dict(current_payload)
+        compact["items"] = dict(current_items)
+        return compact
 
     def _refresh_temporary_projects(
         self,
@@ -13747,7 +13765,6 @@ class MainWindow(QMainWindow):
             self.creative_project_combo.blockSignals(False)
             self._load_creative_project(int(project_id), show_board=True)
             self.right_tab_widget.setCurrentIndex(1)
-            self._refresh_project_sidebar(select_kind="creative", select_id=int(project_id))
             return
         if kind == "search":
             self._load_temporary_project(int(project_id))
@@ -15411,13 +15428,9 @@ class MainWindow(QMainWindow):
         ):
             rule_stats = rule["stats"]
             assert isinstance(rule_stats, dict)
-            mode = "识别" if rule["mode"] == "include" else "排除"
-            if self.current_language == "en":
-                mode = "Include" if rule["mode"] == "include" else "Exclude"
             pending_count = int(rule_stats["pending"]) + int(rule_stats["stale"])
             item = QTreeWidgetItem(
                 [
-                    mode,
                     str(rule["path"]),
                     str(rule_stats["ready"]),
                     str(rule_stats["failed"]),

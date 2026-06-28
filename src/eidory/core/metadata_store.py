@@ -4215,6 +4215,39 @@ class MetadataStore:
             ).fetchall()
         return [self._creative_node_from_row(row) for row in rows]
 
+    def creative_nodes_with_branch_image_counts(
+        self,
+        project_id: int,
+    ) -> tuple[list[CreativeNodeItem], dict[int, int]]:
+        with self.connect() as conn:
+            node_rows = conn.execute(
+                """
+                SELECT n.*, COUNT(cni.image_id) AS image_count
+                FROM creative_nodes n
+                LEFT JOIN creative_node_images cni ON cni.node_id = n.id
+                WHERE n.project_id = ?
+                GROUP BY n.id
+                ORDER BY
+                    CASE WHEN n.parent_id IS NULL THEN 0 ELSE 1 END,
+                    n.parent_id,
+                    n.sort_order,
+                    n.id
+                """,
+                (project_id,),
+            ).fetchall()
+            image_rows = conn.execute(
+                """
+                SELECT cni.node_id, cni.image_id
+                FROM creative_node_images cni
+                JOIN creative_nodes n ON n.id = cni.node_id
+                WHERE n.project_id = ?
+                """,
+                (project_id,),
+            ).fetchall()
+        nodes = [self._creative_node_from_row(row) for row in node_rows]
+        branch_counts = self._branch_image_counts_from_rows(node_rows, image_rows)
+        return nodes, branch_counts
+
     def add_images_to_creative_node(
         self,
         node_id: int,
@@ -4454,6 +4487,97 @@ class MetadataStore:
             image_ids.append(image_id)
         return image_ids
 
+    def creative_node_branch_board_data(self, node_id: int) -> dict[str, object] | None:
+        with self.connect() as conn:
+            node_row = conn.execute(
+                """
+                SELECT n.*, COUNT(cni.image_id) AS image_count
+                FROM creative_nodes n
+                LEFT JOIN creative_node_images cni ON cni.node_id = n.id
+                WHERE n.id = ?
+                GROUP BY n.id
+                """,
+                (node_id,),
+            ).fetchone()
+            if node_row is None:
+                return None
+            project_id = int(node_row["project_id"])
+            node_rows = conn.execute(
+                """
+                SELECT n.*, COUNT(cni.image_id) AS image_count
+                FROM creative_nodes n
+                LEFT JOIN creative_node_images cni ON cni.node_id = n.id
+                WHERE n.project_id = ?
+                GROUP BY n.id
+                ORDER BY
+                    CASE WHEN n.parent_id IS NULL THEN 0 ELSE 1 END,
+                    n.parent_id,
+                    n.sort_order,
+                    n.id
+                """,
+                (project_id,),
+            ).fetchall()
+            branch_node_ids = self._ordered_descendant_ids_from_node_rows(node_rows, node_id)
+            if not branch_node_ids:
+                return {
+                    "node": self._creative_node_from_row(node_row),
+                    "nodes": [self._creative_node_from_row(row) for row in node_rows],
+                    "image_ids": [],
+                    "images": [],
+                    "badges": {},
+                }
+            node_placeholders = ",".join("?" for _ in branch_node_ids)
+            link_rows = conn.execute(
+                f"""
+                SELECT
+                    cni.node_id,
+                    cni.image_id,
+                    cni.sort_order,
+                    COALESCE(NULLIF(TRIM(cni.intent_label), ''), n.title) AS badge
+                FROM creative_node_images cni
+                JOIN creative_nodes n ON n.id = cni.node_id
+                WHERE cni.node_id IN ({node_placeholders})
+                """,
+                branch_node_ids,
+            ).fetchall()
+            node_order = {branch_id: index for index, branch_id in enumerate(branch_node_ids)}
+            ordered_links = sorted(
+                link_rows,
+                key=lambda row: (
+                    node_order.get(int(row["node_id"]), len(node_order)),
+                    int(row["sort_order"]),
+                    int(row["image_id"]),
+                ),
+            )
+            image_ids: list[int] = []
+            seen_image_ids: set[int] = set()
+            badges: dict[int, list[str]] = {}
+            for row in ordered_links:
+                image_id = int(row["image_id"])
+                if image_id not in seen_image_ids:
+                    seen_image_ids.add(image_id)
+                    image_ids.append(image_id)
+                badge = str(row["badge"] or "").strip()
+                if badge:
+                    badges.setdefault(image_id, [])
+                    if badge not in badges[image_id]:
+                        badges[image_id].append(badge)
+            image_rows = []
+            if image_ids:
+                image_placeholders = ",".join("?" for _ in image_ids)
+                image_rows = conn.execute(
+                    f"SELECT * FROM images WHERE id IN ({image_placeholders})",
+                    image_ids,
+                ).fetchall()
+        images_by_id = {int(row["id"]): self._image_from_row(row) for row in image_rows}
+        return {
+            "node": self._creative_node_from_row(node_row),
+            "nodes": [self._creative_node_from_row(row) for row in node_rows],
+            "image_ids": [image_id for image_id in image_ids if image_id in images_by_id],
+            "images": [images_by_id[image_id] for image_id in image_ids if image_id in images_by_id],
+            "badges": badges,
+        }
+
     def creative_node_branch_image_counts(self, project_id: int) -> dict[int, int]:
         with self.connect() as conn:
             node_rows = conn.execute(
@@ -4474,6 +4598,13 @@ class MetadataStore:
                 """,
                 (project_id,),
             ).fetchall()
+        return self._branch_image_counts_from_rows(node_rows, image_rows)
+
+    @staticmethod
+    def _branch_image_counts_from_rows(
+        node_rows: Sequence[sqlite3.Row],
+        image_rows: Sequence[sqlite3.Row],
+    ) -> dict[int, int]:
         node_ids = [int(row["id"]) for row in node_rows]
         children_by_parent: dict[int | None, list[int]] = {}
         for row in node_rows:
@@ -4623,6 +4754,10 @@ class MetadataStore:
                 """,
                 (project_id,),
             ).fetchall()
+        return self._ordered_descendant_ids_from_node_rows(rows, node_id)
+
+    @staticmethod
+    def _ordered_descendant_ids_from_node_rows(rows: Sequence[sqlite3.Row], node_id: int) -> list[int]:
         children_by_parent: dict[int | None, list[int]] = {}
         existing_ids: set[int] = set()
         for row in rows:

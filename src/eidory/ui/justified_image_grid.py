@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QThreadPool,
+    QTimer,
     QUrl,
     Signal,
 )
@@ -77,6 +78,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._drag_start_index = -1
         self._pixmap_cache: OrderedDict[PixmapCacheKey, QPixmap] = OrderedDict()
         self._pending_pixmap_loads: set[PixmapCacheKey] = set()
+        self._current_pixmap_keys: set[PixmapCacheKey] = set()
+        self._viewport_update_pending = False
         self._pixmap_load_signals = _PixmapLoadSignals()
         self._pixmap_load_signals.loaded.connect(self._handle_async_pixmap_loaded)
         self._thread_pool = QThreadPool.globalInstance()
@@ -151,6 +154,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         new_images = list(images)
         should_rebuild_layout = self._layout_keys(self._images) != self._layout_keys(new_images)
         self._images = new_images
+        self._current_pixmap_keys = self._pixmap_keys_for_images(self._images)
         self._badges_by_image_id = dict(badges_by_image_id or {})
         indexes_by_id = {image.id: index for index, image in enumerate(self._images)}
         self._selected_indexes = {
@@ -174,6 +178,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         if not images:
             return
         self._images.extend(images)
+        self._current_pixmap_keys = self._pixmap_keys_for_images(self._images)
         self._rebuild_layout()
         self.viewport().update()
 
@@ -194,6 +199,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
 
     def set_thumbnail_size(self, size: int) -> None:
         self._target_height = max(80, min(420, size))
+        self._current_pixmap_keys = self._pixmap_keys_for_images(self._images)
         self._rebuild_layout()
         self.viewport().update()
 
@@ -604,7 +610,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         if image.is_missing:
             return QPixmap()
         source = image.thumbnail_path or image.file_path
-        key = self._pixmap_cache_key(source)
+        key = self._pixmap_cache_key(image, source)
         if key is None:
             return QPixmap()
         cached = self._pixmap_cache.get(key)
@@ -639,13 +645,21 @@ class JustifiedImageGridView(QAbstractScrollArea):
             reader.setScaledSize(scaled_size)
         return reader.read()
 
-    def _pixmap_cache_key(self, source: str) -> PixmapCacheKey | None:
-        try:
-            stat = Path(source).stat()
-        except OSError:
+    def _pixmap_cache_key(self, image: ImageItem, source: str | None) -> PixmapCacheKey | None:
+        if not source:
             return None
         max_side = max(256, int(self._target_height * 3))
-        return (source, int(stat.st_mtime_ns), int(stat.st_size), max_side)
+        return (source, int(image.modified_time_ns or 0), int(image.file_size or 0), max_side)
+
+    def _pixmap_keys_for_images(self, images: list[ImageItem]) -> set[PixmapCacheKey]:
+        keys: set[PixmapCacheKey] = set()
+        for image in images:
+            if image.is_missing:
+                continue
+            key = self._pixmap_cache_key(image, image.thumbnail_path or image.file_path)
+            if key is not None:
+                keys.add(key)
+        return keys
 
     def _schedule_pixmap_load(self, key: PixmapCacheKey) -> None:
         if key in self._pending_pixmap_loads:
@@ -665,6 +679,17 @@ class JustifiedImageGridView(QAbstractScrollArea):
             return
         pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
         self._cache_pixmap(cache_key, pixmap)
+        if cache_key in self._current_pixmap_keys:
+            self._schedule_viewport_update()
+
+    def _schedule_viewport_update(self) -> None:
+        if self._viewport_update_pending:
+            return
+        self._viewport_update_pending = True
+        QTimer.singleShot(0, self._run_scheduled_viewport_update)
+
+    def _run_scheduled_viewport_update(self) -> None:
+        self._viewport_update_pending = False
         self.viewport().update()
 
     def _cache_pixmap(self, key: PixmapCacheKey, pixmap: QPixmap) -> None:

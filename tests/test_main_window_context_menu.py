@@ -344,6 +344,163 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.ai_vision_rule_tree.topLevelItem(0).text(0), "需要识别")
             window.close()
 
+    def test_result_status_reuses_short_lived_count_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._invalidate_result_status_count_cache()
+
+            with (
+                patch.object(store, "count_images", wraps=store.count_images) as count_images,
+                patch.object(store, "count_missing_images", wraps=store.count_missing_images) as count_missing,
+            ):
+                window._set_result_status("第一次刷新")
+                window._set_result_status("第二次刷新")
+
+            self.assertEqual(count_images.call_count, 1)
+            self.assertEqual(count_missing.call_count, 1)
+            window.close()
+
+    def test_refresh_collections_reuses_virtual_filter_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            with patch.object(store, "virtual_image_filter_counts", wraps=store.virtual_image_filter_counts) as counts:
+                window._refresh_collections()
+
+            self.assertEqual(counts.call_count, 1)
+            window.close()
+
+    def test_refresh_tags_reuses_tag_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=100,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            store.set_image_tags(image_id, ["室内"])
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            with patch.object(store, "list_tags_with_counts", wraps=store.list_tags_with_counts) as tag_counts:
+                window._refresh_tags()
+
+            self.assertEqual(tag_counts.call_count, 1)
+            window.close()
+
+    def test_detail_preview_reuses_decoded_pixmap_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            image_path = Path(tmp) / "first.jpg"
+            preview = QPixmap(80, 50)
+            preview.fill(QColor("#223344"))
+            self.assertTrue(preview.save(str(image_path)))
+            image = self._image(1, file_path=str(image_path), width=80, height=50)
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            decoded = QPixmap(40, 25)
+            decoded.fill(QColor("#556677"))
+            with patch("eidory.ui.main_window._load_scaled_qt_pixmap", return_value=decoded) as load_pixmap:
+                first = window._load_detail_preview_pixmap(image)
+                second = window._load_detail_preview_pixmap(image)
+
+            self.assertFalse(first.isNull())
+            self.assertFalse(second.isNull())
+            self.assertEqual(load_pixmap.call_count, 1)
+            window.close()
+
+    def test_creative_selection_panel_reuses_current_node_image_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            image = store.get_image(image_id)
+            self.assertIsNotNone(image)
+            project_id = store.create_creative_project(
+                title="测试项目",
+                brief="测试",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            node_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(node_id)
+            store.add_images_to_creative_node(int(node_id), [image_id], intent_label="世界观")
+
+            window = MainWindow(paths=paths, store=store)
+            window.current_creative_project_id = project_id
+            window.current_creative_node_id = int(node_id)
+            window.show()
+            self.app.processEvents()
+            with patch.object(store, "creative_node_image_ids", wraps=store.creative_node_image_ids) as image_ids:
+                window._refresh_creative_selection_panel([image])
+                window._refresh_creative_selection_panel([image])
+
+            self.assertEqual(image_ids.call_count, 1)
+            window.close()
+
     def test_database_restore_maintenance_does_not_restart_stopped_index_workers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(

@@ -38,13 +38,22 @@ DEFAULT_LAYOUT_GAP_Y = 64.0
 _BOARD_PIXMAP_CACHE: OrderedDict[tuple[str, int, int, int], QPixmap] = OrderedDict()
 
 
-def _cached_pixmap(path: Path, *, max_side: int = MAX_SOURCE_PIXMAP_SIDE) -> QPixmap:
-    try:
-        stat = path.stat()
-    except OSError:
-        return QPixmap()
+def _cached_pixmap(
+    path: Path,
+    *,
+    max_side: int = MAX_SOURCE_PIXMAP_SIDE,
+    modified_time_ns: int | None = None,
+    file_size: int | None = None,
+) -> QPixmap:
     max_side = max(128, int(max_side))
-    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size), max_side)
+    if modified_time_ns is None or file_size is None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return QPixmap()
+        modified_time_ns = int(stat.st_mtime_ns)
+        file_size = int(stat.st_size)
+    key = (str(path), int(modified_time_ns), int(file_size), max_side)
     cached = _BOARD_PIXMAP_CACHE.get(key)
     if cached is not None:
         _BOARD_PIXMAP_CACHE.move_to_end(key)
@@ -945,8 +954,11 @@ class ProjectBoardView(QGraphicsView):
         previous_ids = self.selected_image_ids()
         self._scene.blockSignals(True)
         try:
-            for current_id, item in self._image_items.items():
-                item.setSelected(current_id == image_id)
+            for item in self._scene.selectedItems():
+                item.setSelected(False)
+            target = self._image_items.get(image_id)
+            if target is not None:
+                target.setSelected(True)
         finally:
             self._scene.blockSignals(False)
         selected_ids = self.selected_image_ids()
@@ -1012,9 +1024,15 @@ class ProjectBoardView(QGraphicsView):
             if not candidate:
                 continue
             path = Path(candidate)
-            if not path.exists():
-                continue
-            pixmap = _cached_pixmap(path, max_side=max_side)
+            if candidate == image.file_path:
+                pixmap = _cached_pixmap(
+                    path,
+                    max_side=max_side,
+                    modified_time_ns=image.modified_time_ns,
+                    file_size=image.file_size,
+                )
+            else:
+                pixmap = _cached_pixmap(path, max_side=max_side)
             if not pixmap.isNull():
                 return pixmap
         return QPixmap()

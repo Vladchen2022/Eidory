@@ -965,6 +965,27 @@ class MetadataStoreTest(unittest.TestCase):
                 reopened.creative_node_branch_image_counts(project_id),
                 {int(root_id): 2, workshop_id: 2, vehicle_id: 1},
             )
+            nodes_with_counts, combined_branch_counts = reopened.creative_nodes_with_branch_image_counts(project_id)
+            self.assertEqual(
+                [node.title for node in nodes_with_counts],
+                ["落魄工程师", "凌乱工作台", "特殊摩托车"],
+            )
+            self.assertEqual(combined_branch_counts, {int(root_id): 2, workshop_id: 2, vehicle_id: 1})
+            branch_data = reopened.creative_node_branch_board_data(int(root_id))
+            self.assertIsNotNone(branch_data)
+            self.assertEqual(branch_data["image_ids"], [second_id, first_id])
+            self.assertEqual(
+                [image.id for image in branch_data["images"]],
+                [second_id, first_id],
+            )
+            self.assertEqual(
+                {image_id: badges for image_id, badges in branch_data["badges"].items()},
+                {first_id: ["工作台", "摩托车"], second_id: ["工作台"]},
+            )
+            self.assertEqual(
+                [node.title for node in branch_data["nodes"]],
+                ["落魄工程师", "凌乱工作台", "特殊摩托车"],
+            )
             self.assertEqual(
                 reopened.get_creative_board_layout(project_id),
                 '{"version":1,"items":{"1":{"x":10}}}',

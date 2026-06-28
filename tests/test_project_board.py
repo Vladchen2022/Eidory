@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -255,6 +256,23 @@ class ProjectBoardViewTest(unittest.TestCase):
 
             self.assertFalse(cached.isNull())
             self.assertLessEqual(max(cached.width(), cached.height()), 160)
+
+    def test_cached_pixmap_can_use_image_metadata_without_filesystem_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "large.jpg"
+            pixmap = QPixmap(300, 180)
+            pixmap.fill(QColor("#445566"))
+            self.assertTrue(pixmap.save(str(image_path)))
+
+            with patch.object(Path, "stat", side_effect=AssertionError("stat should not run")):
+                cached = _cached_pixmap(
+                    image_path,
+                    max_side=160,
+                    modified_time_ns=123,
+                    file_size=456,
+                )
+
+            self.assertFalse(cached.isNull())
 
     @staticmethod
     def _image(

@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -147,6 +148,25 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
         grid.set_images([image], badges_by_image_id={1: ["重复候选"]})
 
         self.assertEqual(calls, [])
+
+    def test_pixmap_cache_key_uses_image_metadata_without_filesystem_stat(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        image = self._image(1, file_path="/definitely/missing.jpg")
+
+        with patch.object(Path, "stat", side_effect=AssertionError("stat should not run")):
+            key = grid._pixmap_cache_key(image, image.file_path)
+
+        self.assertEqual(key, (image.file_path, image.modified_time_ns, image.file_size, 270))
+
+    def test_async_pixmap_loaded_coalesces_viewport_updates(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+
+        with patch.object(grid.viewport(), "update") as update:
+            grid._schedule_viewport_update()
+            grid._schedule_viewport_update()
+            self.app.processEvents()
+
+        self.assertEqual(update.call_count, 1)
 
     @staticmethod
     def _image(

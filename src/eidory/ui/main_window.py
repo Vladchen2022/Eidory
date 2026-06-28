@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -791,6 +792,12 @@ class MainWindow(QMainWindow):
         self.result_exclusion_filter_matches: dict[SearchFilter, list[ImageItem]] = {}
         self.semantic_search_revision = 0
         self.selected_image: ImageItem | None = None
+        self._detail_preview_cache: OrderedDict[tuple[str, int, int, int, int], QPixmap] = OrderedDict()
+        self._detail_preview_cache_limit = 64
+        self._creative_direct_image_ids_cache: dict[int, set[int]] = {}
+        self._result_status_counts_cache: tuple[float, int, int] | None = None
+        self._collection_image_counts_status_cache: tuple[float, dict[int, int]] | None = None
+        self._result_status_cache_ttl_seconds = 2.0
         self._applying_view_payload = False
         self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
         self.error_log_messages: list[str] = []
@@ -6623,6 +6630,7 @@ class MainWindow(QMainWindow):
         return entries
 
     def _reload_images(self) -> None:
+        self._invalidate_result_status_count_cache()
         self.current_offset = 0
         self._clear_manual_result_order()
         self._clear_result_management_state()
@@ -6949,8 +6957,7 @@ class MainWindow(QMainWindow):
 
     def _format_unified_result_status(self, context: str) -> str:
         try:
-            total = self.store.count_images()
-            missing = self.store.count_missing_images()
+            total, missing = self._result_status_counts()
             scope_count = self._current_scope_count_for_status(total=total, missing=missing)
         except Exception:
             total = 0
@@ -6973,8 +6980,31 @@ class MainWindow(QMainWindow):
     def _current_scope_count_for_status(self, *, total: int, missing: int) -> int:
         collection_id = self._selected_collection_id()
         if collection_id is not None:
-            return self.store.collection_image_counts().get(collection_id, 0)
+            return self._collection_image_counts_for_status().get(collection_id, 0)
         return max(0, total - missing)
+
+    def _invalidate_result_status_count_cache(self) -> None:
+        self._result_status_counts_cache = None
+        self._collection_image_counts_status_cache = None
+
+    def _result_status_counts(self) -> tuple[int, int]:
+        now = time.monotonic()
+        cached = self._result_status_counts_cache
+        if cached is not None and now - cached[0] <= self._result_status_cache_ttl_seconds:
+            return cached[1], cached[2]
+        total = self.store.count_images()
+        missing = self.store.count_missing_images()
+        self._result_status_counts_cache = (now, total, missing)
+        return total, missing
+
+    def _collection_image_counts_for_status(self) -> dict[int, int]:
+        now = time.monotonic()
+        cached = self._collection_image_counts_status_cache
+        if cached is not None and now - cached[0] <= self._result_status_cache_ttl_seconds:
+            return cached[1]
+        counts = self.store.collection_image_counts()
+        self._collection_image_counts_status_cache = (now, counts)
+        return counts
 
     @staticmethod
     def _compact_status_context(context: str) -> str:
@@ -8362,8 +8392,7 @@ class MainWindow(QMainWindow):
         self._stop_video_preview()
         self.preview_stack.setCurrentWidget(self.preview_label)
         self.play_pause_button.setEnabled(False)
-        preview_path = image.thumbnail_path if image.thumbnail_path and Path(image.thumbnail_path).exists() else image.file_path
-        pixmap = self._load_detail_preview_pixmap(preview_path) if not image.is_missing else QPixmap()
+        pixmap = self._load_detail_preview_pixmap(image)
         if pixmap.isNull():
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText("无法预览")
@@ -8377,11 +8406,32 @@ class MainWindow(QMainWindow):
             )
         )
 
-    def _load_detail_preview_pixmap(self, image_path: str) -> QPixmap:
+    def _load_detail_preview_pixmap(self, image: ImageItem) -> QPixmap:
+        if image.is_missing:
+            return QPixmap()
         target_size = self.preview_label.size()
         max_width = max(1, target_size.width() * 2)
         max_height = max(1, target_size.height() * 2)
-        return _load_scaled_qt_pixmap(image_path, max_width, max_height)
+        source_metadata = (int(image.modified_time_ns), int(image.file_size))
+        candidates: list[tuple[str, tuple[int, int]]] = []
+        if image.thumbnail_path:
+            candidates.append((image.thumbnail_path, source_metadata))
+        candidates.append((image.file_path, source_metadata))
+        for image_path, metadata in candidates:
+            key = (image_path, metadata[0], metadata[1], max_width, max_height)
+            cached = self._detail_preview_cache.get(key)
+            if cached is not None:
+                self._detail_preview_cache.move_to_end(key)
+                return QPixmap(cached)
+            pixmap = _load_scaled_qt_pixmap(image_path, max_width, max_height)
+            if pixmap.isNull():
+                continue
+            self._detail_preview_cache[key] = QPixmap(pixmap)
+            self._detail_preview_cache.move_to_end(key)
+            while len(self._detail_preview_cache) > self._detail_preview_cache_limit:
+                self._detail_preview_cache.popitem(last=False)
+            return pixmap
+        return QPixmap()
 
     def _ensure_detail_video_preview(self) -> tuple[QVideoWidget, QMediaPlayer]:
         if self.video_widget is None:
@@ -8426,8 +8476,7 @@ class MainWindow(QMainWindow):
             return
 
         if collection_id is None:
-            total = self.store.count_images()
-            missing = self.store.count_missing_images()
+            total, missing = self._result_status_counts()
             available = max(0, total - missing)
             self.collection_detail_name_label.setText("全部文件夹")
             self.collection_detail_path_label.setText("全部文件夹")
@@ -8453,7 +8502,7 @@ class MainWindow(QMainWindow):
             self.ai_vision_detail_label.setText("-")
             return
 
-        counts = self.store.collection_image_counts()
+        counts = self._collection_image_counts_for_status()
         import_dir = self._collection_import_directory(collection_id)
         self.collection_detail_name_label.setText(collection.name)
         self.collection_detail_path_label.setText(self._collection_path_text(collection_id))
@@ -8552,7 +8601,7 @@ class MainWindow(QMainWindow):
             self._set_creative_selection_controls_visible(False)
             return
         selected_ids = [image.id for image in images]
-        node_image_ids = set(self.store.creative_node_image_ids(node.id, include_descendants=False))
+        node_image_ids = self._creative_node_direct_image_id_set(node.id)
         already_count = sum(1 for image_id in selected_ids if image_id in node_image_ids)
         can_add = already_count < len(selected_ids)
         can_remove = already_count > 0
@@ -8562,6 +8611,20 @@ class MainWindow(QMainWindow):
         self.creative_selection_add_button.setEnabled(can_add)
         self.creative_selection_remove_button.setEnabled(can_remove)
         self._set_creative_selection_controls_visible(True)
+
+    def _creative_node_direct_image_id_set(self, node_id: int) -> set[int]:
+        cached = self._creative_direct_image_ids_cache.get(node_id)
+        if cached is not None:
+            return cached
+        image_ids = set(self.store.creative_node_image_ids(node_id, include_descendants=False))
+        self._creative_direct_image_ids_cache[node_id] = image_ids
+        return image_ids
+
+    def _invalidate_creative_node_direct_image_cache(self, node_id: int | None = None) -> None:
+        if node_id is None:
+            self._creative_direct_image_ids_cache.clear()
+            return
+        self._creative_direct_image_ids_cache.pop(node_id, None)
 
     def _refresh_batch_tag_panel(self, images: list[ImageItem]) -> None:
         image_ids = [image.id for image in images]
@@ -11542,14 +11605,23 @@ class MainWindow(QMainWindow):
         if select_collection_id is not None:
             self._expand_folder_tree_parents(self.collection_tree.currentItem())
         self.collection_tree.blockSignals(False)
-        self._refresh_virtual_collection_filters(select_virtual_filter=current_virtual_filter)
+        self._refresh_virtual_collection_filters(
+            select_virtual_filter=current_virtual_filter,
+            counts=counts,
+        )
         if hasattr(self, "collection_detail_widget") and self.selected_image is None:
             self._show_collection_details(self._selected_collection_id())
 
-    def _refresh_virtual_collection_filters(self, select_virtual_filter: str | None = None) -> None:
+    def _refresh_virtual_collection_filters(
+        self,
+        select_virtual_filter: str | None = None,
+        *,
+        counts: Mapping[str, int] | None = None,
+    ) -> None:
         if select_virtual_filter is not None:
             self.current_virtual_filter = select_virtual_filter
-        counts = self.store.virtual_image_filter_counts()
+        if counts is None:
+            counts = self.store.virtual_image_filter_counts()
         self._refresh_collection_virtual_filter_entry(counts)
         self._refresh_tag_virtual_filter_entry(counts)
         self._refresh_ai_vision_virtual_filter_entry(counts)
@@ -11804,8 +11876,9 @@ class MainWindow(QMainWindow):
         if self.current_creative_project_id is None:
             self.creative_node_tree.blockSignals(False)
             return
-        nodes = self.store.list_creative_nodes(self.current_creative_project_id)
-        branch_image_counts = self.store.creative_node_branch_image_counts(self.current_creative_project_id)
+        nodes, branch_image_counts = self.store.creative_nodes_with_branch_image_counts(
+            self.current_creative_project_id
+        )
         items_by_id: dict[int, QTreeWidgetItem] = {}
         children_by_parent: dict[int | None, list[CreativeNodeItem]] = {}
         for node in nodes:
@@ -11897,6 +11970,10 @@ class MainWindow(QMainWindow):
             node = self.store.get_creative_node(node_id)
             return node.title if node is not None else ""
         nodes = self.store.list_creative_nodes(self.current_creative_project_id)
+        return self._creative_node_path_text_from_nodes(node_id, nodes)
+
+    @staticmethod
+    def _creative_node_path_text_from_nodes(node_id: int, nodes: Sequence[CreativeNodeItem]) -> str:
         by_id = {node.id: node for node in nodes}
         parts: list[str] = []
         current = by_id.get(node_id)
@@ -12955,6 +13032,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已存入 {changed} 张到节点“{node.title}”")
 
     def _refresh_after_creative_node_images_changed(self, node: CreativeNodeItem) -> None:
+        self._invalidate_creative_node_direct_image_cache(node.id)
         if self.current_creative_project_id == node.project_id:
             self._refresh_creative_node_tree(select_node_id=self.current_creative_node_id or node.id)
             self._sync_creative_node_panel()
@@ -12993,6 +13071,7 @@ class MainWindow(QMainWindow):
             [image.id for image in selected_images],
         )
         if removed:
+            self._invalidate_creative_node_direct_image_cache(node.id)
             self.current_creative_node_images = [
                 image for image in self.current_creative_node_images
                 if image.id not in {selected.id for selected in selected_images}
@@ -13060,11 +13139,18 @@ class MainWindow(QMainWindow):
         self._show_creative_board_for_node(node.id)
 
     def _show_creative_board_for_node(self, node_id: int, *, force: bool = False) -> None:
-        node = self.store.get_creative_node(node_id)
-        if node is None:
+        board_data = self.store.creative_node_branch_board_data(node_id)
+        if board_data is None:
             self.statusBar().showMessage("当前创作节点不存在")
             return
-        image_ids = self.store.creative_node_image_ids(node.id, include_descendants=True)
+        node = board_data["node"]
+        if not isinstance(node, CreativeNodeItem):
+            self.statusBar().showMessage("当前创作节点不存在")
+            return
+        image_ids = [
+            int(image_id)
+            for image_id in board_data.get("image_ids", [])
+        ]
         image_id_tuple = tuple(image_ids)
         self._save_current_board_layout_if_needed()
         if (
@@ -13079,10 +13165,20 @@ class MainWindow(QMainWindow):
             self._set_result_status(f"项目看板：{node.title} ｜ {len(image_ids)} 张")
             self.project_board_view.setFocus(Qt.FocusReason.OtherFocusReason)
             return
-        images = self.store.images_by_ids(image_ids)
+        images = [
+            image
+            for image in board_data.get("images", [])
+            if isinstance(image, ImageItem)
+        ]
         layout_payload = self._creative_node_board_layout_payload(node.id)
-        title = self._creative_node_path_text(node.id) or node.title
-        badges = self.store.creative_node_image_badges(node.project_id, image_ids=image_ids)
+        nodes = [
+            item
+            for item in board_data.get("nodes", [])
+            if isinstance(item, CreativeNodeItem)
+        ]
+        title = self._creative_node_path_text_from_nodes(node.id, nodes) or node.title
+        raw_badges = board_data.get("badges", {})
+        badges = raw_badges if isinstance(raw_badges, dict) else {}
         self.project_board_view.set_images(
             images,
             title=title,
@@ -13441,6 +13537,7 @@ class MainWindow(QMainWindow):
             return
         removed = self.store.remove_images_from_creative_node_branch(node.id, image_ids)
         if removed:
+            self._invalidate_creative_node_direct_image_cache()
             self._push_board_removal_undo(
                 {
                     "kind": "creative",
@@ -13510,6 +13607,7 @@ class MainWindow(QMainWindow):
                 return
             restored = self.store.restore_creative_node_image_links(links)
             self._board_removal_undo_stack.pop()
+            self._invalidate_creative_node_direct_image_cache()
             self.current_creative_node_id = node.id
             self._refresh_creative_node_tree(select_node_id=node.id)
             self._sync_creative_node_panel()
@@ -14307,6 +14405,7 @@ class MainWindow(QMainWindow):
         current_ids = set(self._selected_tag_ids())
         if not current_ids and self._pending_tag_restore_ids is not None:
             current_ids = set(self._pending_tag_restore_ids)
+        tags_with_counts = self.store.list_tags_with_counts()
         self.tag_list.blockSignals(True)
         self.tag_list.clear()
         selected_item: QListWidgetItem | None = None
@@ -14318,10 +14417,8 @@ class MainWindow(QMainWindow):
         if not current_ids:
             selected_item = all_item
             all_item.setSelected(True)
-        tag_names: list[str] = []
-        visible_tags = self._visible_tags_with_counts()
-        for tag, _count in self.store.list_tags_with_counts():
-            tag_names.append(tag.tag_name)
+        tag_names = [tag.tag_name for tag, _count in tags_with_counts]
+        visible_tags = self._visible_tags_with_counts(tags_with_counts)
         for tag, count in visible_tags:
             item = QListWidgetItem(f"{tag.tag_name}    {count}")
             item.setData(Qt.ItemDataRole.UserRole, tag.id)
@@ -14358,11 +14455,16 @@ class MainWindow(QMainWindow):
         self._refresh_tag_action_buttons()
         self._save_selected_tag_filter()
 
-    def _visible_tags_with_counts(self) -> list[tuple[object, int]]:
+    def _visible_tags_with_counts(
+        self,
+        tags_with_counts: list[tuple[object, int]] | None = None,
+    ) -> list[tuple[object, int]]:
         filter_text = self.tag_search_input.text().strip().casefold()
+        if tags_with_counts is None:
+            tags_with_counts = self.store.list_tags_with_counts()
         tags = [
             (tag, count)
-            for tag, count in self.store.list_tags_with_counts()
+            for tag, count in tags_with_counts
             if not filter_text or filter_text in tag.tag_name.casefold()
         ]
         sort_mode = self.tag_sort_combo.currentData() if hasattr(self, "tag_sort_combo") else "name"

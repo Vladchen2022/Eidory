@@ -5,9 +5,11 @@ import json
 import re
 import sqlite3
 import threading
+from itertools import islice
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
+from urllib.parse import quote
 
 import numpy as np
 
@@ -25,6 +27,7 @@ from eidory.models import (
     ImageItem,
     InspirationProjectItem,
     SavedViewItem,
+    TagGroupItem,
     TagItem,
     TemporaryProjectItem,
 )
@@ -36,6 +39,9 @@ def _clean_optional_text(value: object, *, max_length: int) -> str | None:
     clean = " ".join(value.strip().split())[:max_length]
     return clean or None
 
+
+SEARCH_EXCLUDED_FOLDER_PREFIXES_SETTING = "search.excluded_folder_prefixes"
+SEARCH_EXCLUDED_COLLECTION_IDS_SETTING = "search.excluded_collection_ids"
 
 TEMPORARY_PROJECT_COLORS = (
     "#7A4E56",
@@ -80,6 +86,7 @@ class MetadataStore:
     _busy_timeout_ms = 30_000
     _cache_size_kib = 64 * 1024
     _mmap_size_bytes = 256 * 1024 * 1024
+    _sqlite_chunk_size = 900
 
     def __init__(self, database_path: Path | str):
         self.database_path = Path(database_path)
@@ -126,6 +133,7 @@ class MetadataStore:
             if "sort_order" not in columns:
                 conn.execute("ALTER TABLE creative_projects ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
                 MetadataStore._backfill_creative_project_sort_order(conn)
+        MetadataStore._ensure_tag_group_schema(conn)
 
     @staticmethod
     def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
@@ -146,7 +154,34 @@ class MetadataStore:
             )
             """
         )
+        MetadataStore._ensure_tag_group_schema(conn)
         MetadataStore._ensure_remaining_schema_migrations(conn)
+
+    @staticmethod
+    def _ensure_tag_group_schema(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tag_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        tag_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tags'"
+        ).fetchone()
+        if tag_table is None:
+            return
+        tag_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(tags)").fetchall()
+        }
+        if "group_id" not in tag_columns:
+            conn.execute("ALTER TABLE tags ADD COLUMN group_id INTEGER REFERENCES tag_groups(id) ON DELETE SET NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_group_id ON tags(group_id)")
 
     @staticmethod
     def _ensure_remaining_schema_migrations(conn: sqlite3.Connection) -> None:
@@ -529,22 +564,32 @@ class MetadataStore:
         )
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
+    def connect(self, *, readonly: bool = False) -> Iterator[sqlite3.Connection]:
         with self._connection_lock:
-            conn = sqlite3.connect(
-                self.database_path,
-                timeout=self._busy_timeout_ms / 1000,
-            )
+            if readonly:
+                database = f"file:{quote(str(self.database_path.resolve()))}?mode=ro"
+                conn = sqlite3.connect(
+                    database,
+                    timeout=self._busy_timeout_ms / 1000,
+                    uri=True,
+                )
+            else:
+                conn = sqlite3.connect(
+                    self.database_path,
+                    timeout=self._busy_timeout_ms / 1000,
+                )
             conn.row_factory = sqlite3.Row
-            self.configure_connection(conn)
-            try:
-                yield conn
+            self.configure_connection(conn, readonly=readonly)
+        try:
+            yield conn
+            if not readonly:
                 conn.commit()
-            except Exception:
+        except Exception:
+            if not readonly:
                 conn.rollback()
-                raise
-            finally:
-                conn.close()
+            raise
+        finally:
+            conn.close()
 
     @classmethod
     def configure_connection(cls, conn: sqlite3.Connection, *, readonly: bool = False) -> None:
@@ -580,11 +625,11 @@ class MetadataStore:
         if not include_inactive:
             sql += " WHERE is_active = 1"
         sql += " ORDER BY folder_path"
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             return [self._folder_from_row(row) for row in conn.execute(sql, params)]
 
     def list_folders_with_collection_images(self) -> list[FolderItem]:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 """
                 SELECT DISTINCT f.*
@@ -599,7 +644,7 @@ class MetadataStore:
         return [self._folder_from_row(row) for row in rows]
 
     def folder_subtree_counts(self) -> list[tuple[FolderItem, dict[str, int]]]:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             folder_rows = conn.execute(
                 "SELECT * FROM folders WHERE is_active = 1 ORDER BY folder_path"
             ).fetchall()
@@ -907,7 +952,7 @@ class MetadataStore:
         return counts
 
     def list_collections(self) -> list[CollectionItem]:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 """
                 SELECT *
@@ -937,7 +982,7 @@ class MetadataStore:
         return [(collection, path_for(collection.id)) for collection in collections]
 
     def list_images_for_collection_direct(self, collection_id: int) -> list[ImageItem]:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 """
                 SELECT i.*
@@ -952,7 +997,7 @@ class MetadataStore:
         return [self._image_from_row(row) for row in rows]
 
     def list_images_without_collections(self) -> list[ImageItem]:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 """
                 SELECT i.*
@@ -975,31 +1020,32 @@ class MetadataStore:
 
     def collection_image_counts(self) -> dict[int, int]:
         collections = self.list_collections()
-        parent_by_id = {collection.id: collection.parent_id for collection in collections}
-        image_ids_by_collection = {collection.id: set() for collection in collections}
-        with self.connect() as conn:
+        counts = {collection.id: 0 for collection in collections}
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 """
-                SELECT ic.collection_id, ic.image_id
-                FROM image_collections ic
+                WITH RECURSIVE collection_ancestors(collection_id, ancestor_id) AS (
+                    SELECT id, id
+                    FROM collections
+                    UNION ALL
+                    SELECT ca.collection_id, c.parent_id
+                    FROM collection_ancestors ca
+                    JOIN collections c ON c.id = ca.ancestor_id
+                    WHERE c.parent_id IS NOT NULL
+                )
+                SELECT ca.ancestor_id AS collection_id, COUNT(DISTINCT ic.image_id) AS count
+                FROM collection_ancestors ca
+                JOIN image_collections ic ON ic.collection_id = ca.collection_id
                 JOIN images i ON i.id = ic.image_id
                 WHERE i.is_missing = 0
+                GROUP BY ca.ancestor_id
                 """
             ).fetchall()
-
         for row in rows:
             collection_id = int(row["collection_id"])
-            image_id = int(row["image_id"])
-            current: int | None = collection_id
-            seen: set[int] = set()
-            while current is not None and current in image_ids_by_collection and current not in seen:
-                seen.add(current)
-                image_ids_by_collection[current].add(image_id)
-                current = parent_by_id.get(current)
-        return {
-            collection_id: len(image_ids)
-            for collection_id, image_ids in image_ids_by_collection.items()
-        }
+            if collection_id in counts:
+                counts[collection_id] = int(row["count"])
+        return counts
 
     def collection_paths_for_image(self, image_id: int) -> list[str]:
         collections = self.list_collections()
@@ -1062,7 +1108,7 @@ class MetadataStore:
         ]
 
     def collection_descendant_ids(self, collection_id: int) -> list[int]:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 """
                 WITH RECURSIVE subtree(id) AS (
@@ -1480,37 +1526,41 @@ class MetadataStore:
         modified_at = timestamp_ns_to_iso(modified_time_ns)
 
         with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO images(
+                    folder_id, file_path, file_name, file_ext, file_size, width, height,
+                    duration_ms,
+                    created_at, modified_at, modified_time_ns, imported_at, last_seen_at,
+                    thumbnail_status, embedding_status, is_missing
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', 0)
+                ON CONFLICT(file_path) DO NOTHING
+                """,
+                (
+                    folder_id,
+                    file_path,
+                    file_name,
+                    file_ext,
+                    file_size,
+                    width,
+                    height,
+                    duration_ms,
+                    created_at,
+                    modified_at,
+                    modified_time_ns,
+                    now,
+                    now,
+                ),
+            )
+            if int(cur.rowcount) > 0:
+                return int(cur.lastrowid), "new"
+
             existing = conn.execute(
                 "SELECT * FROM images WHERE file_path = ?", (file_path,)
             ).fetchone()
             if existing is None:
-                cur = conn.execute(
-                    """
-                    INSERT INTO images(
-                        folder_id, file_path, file_name, file_ext, file_size, width, height,
-                        duration_ms,
-                        created_at, modified_at, modified_time_ns, imported_at, last_seen_at,
-                        thumbnail_status, embedding_status, is_missing
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', 0)
-                    """,
-                    (
-                        folder_id,
-                        file_path,
-                        file_name,
-                        file_ext,
-                        file_size,
-                        width,
-                        height,
-                        duration_ms,
-                        created_at,
-                        modified_at,
-                        modified_time_ns,
-                        now,
-                        now,
-                    ),
-                )
-                return int(cur.lastrowid), "new"
+                raise RuntimeError("image upsert conflict could not be resolved")
 
             changed = (
                 int(existing["file_size"]) != file_size
@@ -1693,21 +1743,36 @@ class MetadataStore:
             )
 
     def thumbnail_needs_generation(self, image_id: int) -> bool:
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT thumbnail_status, thumbnail_path
-                FROM images
-                WHERE id = ?
-                """,
-                (image_id,),
-            ).fetchone()
-        if row is None:
-            return False
-        if str(row["thumbnail_status"]) != "ready":
-            return True
-        thumbnail_path = row["thumbnail_path"]
-        return not thumbnail_path or not Path(str(thumbnail_path)).exists()
+        return image_id in self.thumbnail_ids_needing_generation([image_id])
+
+    def thumbnail_ids_needing_generation(self, image_ids: Sequence[int]) -> set[int]:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return set()
+        rows: list[sqlite3.Row] = []
+        with self.connect(readonly=True) as conn:
+            for chunk in self._chunks(clean_ids, self._sqlite_chunk_size):
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    conn.execute(
+                        f"""
+                        SELECT id, thumbnail_status, thumbnail_path
+                        FROM images
+                        WHERE id IN ({placeholders})
+                        """,
+                        tuple(chunk),
+                    ).fetchall()
+                )
+        needed: set[int] = set()
+        for row in rows:
+            image_id = int(row["id"])
+            if str(row["thumbnail_status"]) != "ready":
+                needed.add(image_id)
+                continue
+            thumbnail_path = row["thumbnail_path"]
+            if not thumbnail_path or not Path(str(thumbnail_path)).exists():
+                needed.add(image_id)
+        return needed
 
     def mark_missing_for_folder(self, folder_id: int, seen_paths: Iterable[str]) -> int:
         now = utc_now_iso()
@@ -1810,6 +1875,8 @@ class MetadataStore:
         virtual_filter: str | None = None,
         sort_key: str = "default",
         sort_desc: bool = True,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
     ) -> list[ImageItem]:
         clauses: list[str] = []
         params: list[object] = []
@@ -1854,6 +1921,18 @@ class MetadataStore:
         if virtual_clause:
             clauses.append(virtual_clause)
             params.extend(virtual_params)
+        self._append_excluded_folder_path_clauses(
+            clauses,
+            params,
+            "images.file_path",
+            excluded_folder_path_prefixes,
+        )
+        self._append_excluded_collection_clauses(
+            clauses,
+            params,
+            "images.id",
+            excluded_collection_ids,
+        )
         if status_filter == "favorite":
             clauses.append("images.is_favorite = 1")
         elif status_filter == "unindexed":
@@ -1889,7 +1968,7 @@ class MetadataStore:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_by = self._image_order_by(sort_key, sort_desc)
         params.extend([limit, offset])
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 f"""
                 SELECT images.*
@@ -2010,7 +2089,7 @@ class MetadataStore:
         )
 
     def count_images(self) -> int:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM images").fetchone()
             return int(row["c"])
 
@@ -2060,7 +2139,7 @@ class MetadataStore:
             source_area,
             max(1, int(limit)),
         ])
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 f"""
                 SELECT *
@@ -2078,7 +2157,7 @@ class MetadataStore:
         return [self._image_from_row(row) for row in rows]
 
     def count_missing_images(self) -> int:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS c FROM images WHERE is_missing = 1"
             ).fetchone()
@@ -2095,7 +2174,7 @@ class MetadataStore:
         if virtual_clause:
             clauses.append(virtual_clause)
             params.extend(virtual_params)
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             row = conn.execute(
                 f"""
                 SELECT COUNT(*) AS c
@@ -2123,7 +2202,7 @@ class MetadataStore:
         if virtual_clause:
             clauses.append(virtual_clause)
             params.extend(virtual_params)
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 f"""
                 SELECT images.id
@@ -2135,13 +2214,13 @@ class MetadataStore:
         return {int(row["id"]) for row in rows}
 
     def get_image(self, image_id: int) -> ImageItem | None:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
             return self._image_from_row(row) if row else None
 
     def get_image_by_path(self, file_path: str | Path) -> ImageItem | None:
         normalized = os.path.abspath(os.path.expanduser(str(file_path)))
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             row = conn.execute(
                 "SELECT * FROM images WHERE file_path = ? AND is_missing = 0",
                 (normalized,),
@@ -2151,11 +2230,17 @@ class MetadataStore:
     def images_by_ids(self, image_ids: Sequence[int], scores: dict[int, float] | None = None) -> list[ImageItem]:
         if not image_ids:
             return []
-        placeholders = ",".join("?" for _ in image_ids)
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM images WHERE id IN ({placeholders})", tuple(image_ids)
-            ).fetchall()
+        unique_ids = list(dict.fromkeys(int(image_id) for image_id in image_ids))
+        rows: list[sqlite3.Row] = []
+        with self.connect(readonly=True) as conn:
+            for chunk in self._chunks(unique_ids, self._sqlite_chunk_size):
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    conn.execute(
+                        f"SELECT * FROM images WHERE id IN ({placeholders})",
+                        tuple(chunk),
+                    ).fetchall()
+                )
         by_id = {int(row["id"]): self._image_from_row(row, scores.get(int(row["id"])) if scores else None) for row in rows}
         return [by_id[image_id] for image_id in image_ids if image_id in by_id]
 
@@ -2163,16 +2248,20 @@ class MetadataStore:
         clean_ids = sorted({int(image_id) for image_id in image_ids})
         if not clean_ids:
             return {}
-        placeholders = ",".join("?" for _ in clean_ids)
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT *
-                FROM image_hashes
-                WHERE image_id IN ({placeholders})
-                """,
-                tuple(clean_ids),
-            ).fetchall()
+        rows: list[sqlite3.Row] = []
+        with self.connect(readonly=True) as conn:
+            for chunk in self._chunks(clean_ids, self._sqlite_chunk_size):
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    conn.execute(
+                        f"""
+                        SELECT *
+                        FROM image_hashes
+                        WHERE image_id IN ({placeholders})
+                        """,
+                        tuple(chunk),
+                    ).fetchall()
+                )
         records: dict[int, ImageHashCacheRecord] = {}
         for row in rows:
             try:
@@ -2250,6 +2339,8 @@ class MetadataStore:
         tag_match_mode: str = "any",
         status_filter: str | None = None,
         virtual_filter: str | None = None,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
     ) -> list[ImageItem]:
         if status_filter == "missing":
             return []
@@ -2300,12 +2391,24 @@ class MetadataStore:
         if virtual_clause:
             clauses.append(virtual_clause)
             params.extend(virtual_params)
+        self._append_excluded_folder_path_clauses(
+            clauses,
+            params,
+            "images.file_path",
+            excluded_folder_path_prefixes,
+        )
+        self._append_excluded_collection_clauses(
+            clauses,
+            params,
+            "images.id",
+            excluded_collection_ids,
+        )
         if status_filter == "favorite":
             clauses.append("images.is_favorite = 1")
         elif status_filter == "unindexed":
             clauses.append("images.embedding_status != 'ready'")
 
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 f"""
                 SELECT images.*
@@ -2324,23 +2427,51 @@ class MetadataStore:
         vector_version: str = COLOR_VECTOR_VERSION,
         vector_dim: int = COLOR_VECTOR_DIM,
     ) -> bool:
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT vector_version, vector_dim, hist_blob, status
-                FROM color_features
-                WHERE image_id = ?
-                """,
-                (image_id,),
-            ).fetchone()
-        if row is None:
-            return True
-        return (
-            str(row["vector_version"]) != vector_version
-            or int(row["vector_dim"]) != vector_dim
-            or str(row["status"]) != "ready"
-            or row["hist_blob"] is None
+        return image_id in self.color_feature_ids_needing_generation(
+            [image_id],
+            vector_version=vector_version,
+            vector_dim=vector_dim,
         )
+
+    def color_feature_ids_needing_generation(
+        self,
+        image_ids: Sequence[int],
+        *,
+        vector_version: str = COLOR_VECTOR_VERSION,
+        vector_dim: int = COLOR_VECTOR_DIM,
+    ) -> set[int]:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return set()
+        rows: list[sqlite3.Row] = []
+        with self.connect(readonly=True) as conn:
+            for chunk in self._chunks(clean_ids, self._sqlite_chunk_size):
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    conn.execute(
+                        f"""
+                        SELECT image_id, vector_version, vector_dim, hist_blob, status
+                        FROM color_features
+                        WHERE image_id IN ({placeholders})
+                        """,
+                        tuple(chunk),
+                    ).fetchall()
+                )
+        rows_by_id = {int(row["image_id"]): row for row in rows}
+        needed: set[int] = set()
+        for image_id in clean_ids:
+            row = rows_by_id.get(image_id)
+            if row is None:
+                needed.add(image_id)
+                continue
+            if (
+                str(row["vector_version"]) != vector_version
+                or int(row["vector_dim"]) != vector_dim
+                or str(row["status"]) != "ready"
+                or row["hist_blob"] is None
+            ):
+                needed.add(image_id)
+        return needed
 
     def upsert_color_feature_success(
         self,
@@ -2412,20 +2543,24 @@ class MetadataStore:
         clean_ids = self._clean_ids(image_ids)
         if not clean_ids:
             return {}
-        placeholders = ",".join("?" for _ in clean_ids)
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT image_id, hist_blob
-                FROM color_features
-                WHERE image_id IN ({placeholders})
-                  AND vector_version = ?
-                  AND vector_dim = ?
-                  AND status = 'ready'
-                  AND hist_blob IS NOT NULL
-                """,
-                (*clean_ids, vector_version, vector_dim),
-            ).fetchall()
+        rows: list[sqlite3.Row] = []
+        with self.connect(readonly=True) as conn:
+            for chunk in self._chunks(clean_ids, self._sqlite_chunk_size):
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    conn.execute(
+                        f"""
+                        SELECT image_id, hist_blob
+                        FROM color_features
+                        WHERE image_id IN ({placeholders})
+                          AND vector_version = ?
+                          AND vector_dim = ?
+                          AND status = 'ready'
+                          AND hist_blob IS NOT NULL
+                        """,
+                        (*chunk, vector_version, vector_dim),
+                    ).fetchall()
+                )
         features: dict[int, np.ndarray] = {}
         for row in rows:
             vector = np.frombuffer(row["hist_blob"], dtype=np.float32)
@@ -2445,20 +2580,24 @@ class MetadataStore:
         clean_statuses = [status for status in statuses if status]
         if not clean_ids or not clean_statuses:
             return set()
-        id_placeholders = ",".join("?" for _ in clean_ids)
         status_placeholders = ",".join("?" for _ in clean_statuses)
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT image_id
-                FROM color_features
-                WHERE image_id IN ({id_placeholders})
-                  AND status IN ({status_placeholders})
-                  AND vector_version = ?
-                  AND vector_dim = ?
-                """,
-                (*clean_ids, *clean_statuses, vector_version, vector_dim),
-            ).fetchall()
+        rows: list[sqlite3.Row] = []
+        with self.connect(readonly=True) as conn:
+            for chunk in self._chunks(clean_ids, self._sqlite_chunk_size):
+                id_placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    conn.execute(
+                        f"""
+                        SELECT image_id
+                        FROM color_features
+                        WHERE image_id IN ({id_placeholders})
+                          AND status IN ({status_placeholders})
+                          AND vector_version = ?
+                          AND vector_dim = ?
+                        """,
+                        (*chunk, *clean_statuses, vector_version, vector_dim),
+                    ).fetchall()
+                )
         return {int(row["image_id"]) for row in rows}
 
     def update_note(self, image_id: int, note: str) -> None:
@@ -2484,22 +2623,145 @@ class MetadataStore:
             )
             return int(cur.rowcount)
 
+    def list_tag_groups(self) -> list[TagGroupItem]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM tag_groups
+                ORDER BY sort_order, name COLLATE NOCASE
+                """
+            ).fetchall()
+        return [self._tag_group_from_row(row) for row in rows]
+
+    def create_tag_group(self, name: str) -> int:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("tag group name must not be empty")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM tag_groups WHERE name = ?", (clean_name,)
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("tag group name already exists")
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM tag_groups"
+            ).fetchone()
+            sort_order = int(row["next_order"] or 0)
+            cur = conn.execute(
+                """
+                INSERT INTO tag_groups(name, sort_order, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (clean_name, sort_order, now, now),
+            )
+            return int(cur.lastrowid)
+
+    def rename_tag_group(self, group_id: int, new_name: str) -> bool:
+        clean_name = new_name.strip()
+        if not clean_name:
+            raise ValueError("tag group name must not be empty")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM tag_groups WHERE name = ?", (clean_name,)
+            ).fetchone()
+            if existing is not None and int(existing["id"]) != group_id:
+                raise ValueError("tag group name already exists")
+            cur = conn.execute(
+                """
+                UPDATE tag_groups
+                SET name = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (clean_name, now, group_id),
+            )
+            return int(cur.rowcount) > 0
+
+    def delete_tag_group(self, group_id: int) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE tags SET group_id = NULL WHERE group_id = ?",
+                (group_id,),
+            )
+            conn.execute("DELETE FROM tag_groups WHERE id = ?", (group_id,))
+            return int(cur.rowcount)
+
+    def move_tags_to_group(self, tag_ids: Sequence[int], group_id: int | None) -> int:
+        clean_ids = self._clean_ids(tag_ids)
+        if not clean_ids:
+            return 0
+        placeholders = ",".join("?" for _ in clean_ids)
+        with self.connect() as conn:
+            if group_id is not None:
+                group = conn.execute(
+                    "SELECT id FROM tag_groups WHERE id = ?", (group_id,)
+                ).fetchone()
+                if group is None:
+                    raise ValueError("tag group not found")
+            cur = conn.execute(
+                f"UPDATE tags SET group_id = ? WHERE id IN ({placeholders})",
+                (group_id, *clean_ids),
+            )
+            return int(cur.rowcount)
+
+    def create_tag(self, tag_name: str, group_id: int | None = None) -> int:
+        clean_name = tag_name.strip()
+        if not clean_name:
+            raise ValueError("tag name must not be empty")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            if group_id is not None:
+                group = conn.execute(
+                    "SELECT id FROM tag_groups WHERE id = ?", (group_id,)
+                ).fetchone()
+                if group is None:
+                    raise ValueError("tag group not found")
+            existing = conn.execute(
+                "SELECT id FROM tags WHERE tag_name = ?", (clean_name,)
+            ).fetchone()
+            if existing is not None:
+                tag_id = int(existing["id"])
+                if group_id is not None:
+                    conn.execute(
+                        "UPDATE tags SET group_id = ? WHERE id = ?",
+                        (group_id, tag_id),
+                    )
+                return tag_id
+            cur = conn.execute(
+                """
+                INSERT INTO tags(tag_name, tag_type, group_id, created_at)
+                VALUES (?, 'user', ?, ?)
+                """,
+                (clean_name, group_id, now),
+            )
+            return int(cur.lastrowid)
+
     def list_tags(self) -> list[TagItem]:
         with self.connect() as conn:
             return [
                 self._tag_from_row(row)
-                for row in conn.execute("SELECT * FROM tags ORDER BY tag_name COLLATE NOCASE")
+                for row in conn.execute(
+                    """
+                    SELECT t.*, g.name AS group_name
+                    FROM tags t
+                    LEFT JOIN tag_groups g ON g.id = t.group_id
+                    ORDER BY g.sort_order, g.name COLLATE NOCASE, t.tag_name COLLATE NOCASE
+                    """
+                )
             ]
 
     def list_tags_with_counts(self) -> list[tuple[TagItem, int]]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT t.*, COUNT(it.image_id) AS image_count
+                SELECT t.*, g.name AS group_name, COUNT(it.image_id) AS image_count
                 FROM tags t
+                LEFT JOIN tag_groups g ON g.id = t.group_id
                 LEFT JOIN image_tags it ON it.tag_id = t.id
                 GROUP BY t.id
-                ORDER BY t.tag_name COLLATE NOCASE
+                ORDER BY g.sort_order, g.name COLLATE NOCASE, t.tag_name COLLATE NOCASE
                 """
             ).fetchall()
         return [(self._tag_from_row(row), int(row["image_count"])) for row in rows]
@@ -5168,6 +5430,8 @@ class MetadataStore:
         tag_match_mode: str = "any",
         status_filter: str | None = None,
         virtual_filter: str | None = None,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
     ) -> list[int]:
         if status_filter in {"missing", "unindexed"}:
             return []
@@ -5224,6 +5488,18 @@ class MetadataStore:
         if virtual_clause:
             clauses.append(virtual_clause)
             params.extend(virtual_params)
+        self._append_excluded_folder_path_clauses(
+            clauses,
+            params,
+            "i.file_path",
+            excluded_folder_path_prefixes,
+        )
+        self._append_excluded_collection_clauses(
+            clauses,
+            params,
+            "i.id",
+            excluded_collection_ids,
+        )
         if status_filter == "favorite":
             clauses.append("i.is_favorite = 1")
 
@@ -5247,7 +5523,7 @@ class MetadataStore:
         model_revision: str,
         embedding_dim: int,
     ) -> dict[str, int]:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             total_row = conn.execute(
                 f"""
                 SELECT COUNT(*) AS count
@@ -5479,30 +5755,37 @@ class MetadataStore:
         prompt_version: str,
         limit: int,
     ) -> list[ImageItem]:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             image_ids = sorted(self._ai_vision_effective_image_ids(conn))
             if not image_ids:
                 return []
-            placeholders = ",".join("?" for _ in image_ids)
-            rows = conn.execute(
-                f"""
-                SELECT i.*
-                FROM images i
-                LEFT JOIN ai_vision_tags t ON t.image_id = i.id
-                WHERE i.id IN ({placeholders})
-                  AND (
-                    t.image_id IS NULL
-                    OR t.status IN ('pending', 'stale')
-                    OR t.provider_name != ?
-                    OR t.model_name != ?
-                    OR t.prompt_version != ?
-                  )
-                ORDER BY i.id
-                LIMIT ?
-                """,
-                (*image_ids, provider_name, model_name, prompt_version, limit),
-            ).fetchall()
-            return [self._image_from_row(row) for row in rows]
+            rows: list[sqlite3.Row] = []
+            remaining = max(0, int(limit))
+            for chunk in self._chunks(image_ids, self._sqlite_chunk_size):
+                if remaining <= 0:
+                    break
+                placeholders = ",".join("?" for _ in chunk)
+                chunk_rows = conn.execute(
+                    f"""
+                    SELECT i.*
+                    FROM images i
+                    LEFT JOIN ai_vision_tags t ON t.image_id = i.id
+                    WHERE i.id IN ({placeholders})
+                      AND (
+                        t.image_id IS NULL
+                        OR t.status IN ('pending', 'stale')
+                        OR t.provider_name != ?
+                        OR t.model_name != ?
+                        OR t.prompt_version != ?
+                      )
+                    ORDER BY i.id
+                    LIMIT ?
+                    """,
+                    (*chunk, provider_name, model_name, prompt_version, remaining),
+                ).fetchall()
+                rows.extend(chunk_rows)
+                remaining = max(0, int(limit) - len(rows))
+            return [self._image_from_row(row) for row in rows[: max(0, int(limit))]]
 
     def mark_ai_vision_processing(
         self,
@@ -5740,6 +6023,93 @@ class MetadataStore:
             row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
             return str(row["value"]) if row else default
 
+    def list_search_excluded_folder_prefixes(self) -> list[str]:
+        raw = self.get_setting(SEARCH_EXCLUDED_FOLDER_PREFIXES_SETTING, "[]")
+        try:
+            payload = json.loads(raw or "[]")
+        except json.JSONDecodeError:
+            payload = []
+        if not isinstance(payload, list):
+            payload = []
+        return self._compact_folder_prefixes(
+            str(value)
+            for value in payload
+            if isinstance(value, str) and value.strip()
+        )
+
+    def set_search_excluded_folder_prefixes(self, prefixes: Iterable[str]) -> None:
+        compacted = self._compact_folder_prefixes(prefixes)
+        self.set_setting(
+            SEARCH_EXCLUDED_FOLDER_PREFIXES_SETTING,
+            json.dumps(compacted, ensure_ascii=False),
+        )
+
+    def add_search_excluded_folder_prefix(self, folder_path_prefix: str) -> bool:
+        normalized = self._normalize_folder_prefix(folder_path_prefix)
+        prefixes = self.list_search_excluded_folder_prefixes()
+        if any(
+            self._path_is_under_prefix(normalized, prefix, include_self=True)
+            for prefix in prefixes
+        ):
+            return False
+        prefixes.append(normalized)
+        self.set_search_excluded_folder_prefixes(prefixes)
+        return True
+
+    def remove_search_excluded_folder_prefix(self, folder_path_prefix: str) -> bool:
+        normalized = self._normalize_folder_prefix(folder_path_prefix)
+        prefixes = self.list_search_excluded_folder_prefixes()
+        remaining = [prefix for prefix in prefixes if prefix != normalized]
+        if len(remaining) == len(prefixes):
+            return False
+        self.set_search_excluded_folder_prefixes(remaining)
+        return True
+
+    def list_search_excluded_collection_ids(self) -> list[int]:
+        raw = self.get_setting(SEARCH_EXCLUDED_COLLECTION_IDS_SETTING, "[]")
+        try:
+            payload = json.loads(raw or "[]")
+        except json.JSONDecodeError:
+            payload = []
+        if not isinstance(payload, list):
+            payload = []
+        ids: list[int] = []
+        for value in payload:
+            try:
+                collection_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if collection_id > 0:
+                ids.append(collection_id)
+        return self._compact_collection_ids(ids)
+
+    def set_search_excluded_collection_ids(self, collection_ids: Iterable[int]) -> None:
+        compacted = self._compact_collection_ids(collection_ids)
+        self.set_setting(
+            SEARCH_EXCLUDED_COLLECTION_IDS_SETTING,
+            json.dumps(compacted, ensure_ascii=False),
+        )
+
+    def add_search_excluded_collection_id(self, collection_id: int) -> bool:
+        collection_id = int(collection_id)
+        if collection_id <= 0:
+            return False
+        ids = self.list_search_excluded_collection_ids()
+        if self._collection_is_under_any(collection_id, ids, include_self=True):
+            return False
+        ids.append(collection_id)
+        self.set_search_excluded_collection_ids(ids)
+        return True
+
+    def remove_search_excluded_collection_id(self, collection_id: int) -> bool:
+        collection_id = int(collection_id)
+        ids = self.list_search_excluded_collection_ids()
+        remaining = [existing_id for existing_id in ids if existing_id != collection_id]
+        if len(remaining) == len(ids):
+            return False
+        self.set_search_excluded_collection_ids(remaining)
+        return True
+
     def thumbnail_paths_in_use(self) -> set[str]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -5822,15 +6192,19 @@ class MetadataStore:
         }
         if not image_ids:
             return stats
-        placeholders = ",".join("?" for _ in image_ids)
-        rows = conn.execute(
-            f"""
-            SELECT image_id, provider_name, model_name, prompt_version, status
-            FROM ai_vision_tags
-            WHERE image_id IN ({placeholders})
-            """,
-            tuple(sorted(image_ids)),
-        ).fetchall()
+        rows: list[sqlite3.Row] = []
+        for chunk in MetadataStore._chunks(sorted(image_ids), MetadataStore._sqlite_chunk_size):
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                conn.execute(
+                    f"""
+                    SELECT image_id, provider_name, model_name, prompt_version, status
+                    FROM ai_vision_tags
+                    WHERE image_id IN ({placeholders})
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+            )
         seen: set[int] = set()
         for row in rows:
             image_id = int(row["image_id"])
@@ -5900,11 +6274,26 @@ class MetadataStore:
 
     @staticmethod
     def _tag_from_row(row: sqlite3.Row) -> TagItem:
+        keys = set(row.keys())
+        group_id = row["group_id"] if "group_id" in keys else None
+        group_name = row["group_name"] if "group_name" in keys else ""
         return TagItem(
             id=int(row["id"]),
             tag_name=str(row["tag_name"]),
             tag_type=str(row["tag_type"]),
             created_at=str(row["created_at"]),
+            group_id=int(group_id) if group_id is not None else None,
+            group_name=str(group_name or ""),
+        )
+
+    @staticmethod
+    def _tag_group_from_row(row: sqlite3.Row) -> TagGroupItem:
+        return TagGroupItem(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            sort_order=int(row["sort_order"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
         )
 
     @staticmethod
@@ -5996,6 +6385,124 @@ class MetadataStore:
         normalized = os.path.abspath(os.path.expanduser(folder_path))
         return normalized.rstrip(os.sep) or os.sep
 
+    @classmethod
+    def _compact_folder_prefixes(cls, prefixes: Iterable[str]) -> list[str]:
+        normalized_prefixes: list[str] = []
+        seen: set[str] = set()
+        for prefix in prefixes:
+            normalized = cls._normalize_folder_prefix(prefix)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            normalized_prefixes.append(normalized)
+        compacted: list[str] = []
+        for prefix in sorted(normalized_prefixes, key=lambda value: (value.count(os.sep), value.casefold())):
+            if any(cls._path_is_under_prefix(prefix, parent, include_self=True) for parent in compacted):
+                continue
+            compacted.append(prefix)
+        return compacted
+
+    @classmethod
+    def _append_excluded_folder_path_clauses(
+        cls,
+        clauses: list[str],
+        params: list[object],
+        path_column: str,
+        excluded_folder_path_prefixes: Sequence[str] | None,
+    ) -> None:
+        for prefix in cls._compact_folder_prefixes(excluded_folder_path_prefixes or []):
+            clauses.append(f"{path_column} NOT LIKE ? ESCAPE '\\'")
+            params.append(cls._folder_path_like(prefix))
+
+    def _compact_collection_ids(self, collection_ids: Iterable[int]) -> list[int]:
+        parent_by_id = {
+            collection.id: collection.parent_id
+            for collection in self.list_collections()
+        }
+        valid_ids: list[int] = []
+        seen: set[int] = set()
+        for value in collection_ids:
+            try:
+                collection_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if collection_id <= 0 or collection_id not in parent_by_id or collection_id in seen:
+                continue
+            seen.add(collection_id)
+            valid_ids.append(collection_id)
+        compacted: list[int] = []
+        for collection_id in sorted(
+            valid_ids,
+            key=lambda value: (self._collection_depth(value, parent_by_id), value),
+        ):
+            if self._collection_is_under_any(
+                collection_id,
+                compacted,
+                parent_by_id=parent_by_id,
+                include_self=True,
+            ):
+                continue
+            compacted.append(collection_id)
+        return compacted
+
+    @staticmethod
+    def _collection_depth(collection_id: int, parent_by_id: Mapping[int, int | None]) -> int:
+        depth = 0
+        seen: set[int] = set()
+        parent_id = parent_by_id.get(collection_id)
+        while parent_id is not None and parent_id not in seen:
+            seen.add(parent_id)
+            depth += 1
+            parent_id = parent_by_id.get(parent_id)
+        return depth
+
+    def _collection_is_under_any(
+        self,
+        collection_id: int,
+        ancestor_ids: Iterable[int],
+        *,
+        parent_by_id: Mapping[int, int | None] | None = None,
+        include_self: bool,
+    ) -> bool:
+        parent_by_id = parent_by_id or {
+            collection.id: collection.parent_id
+            for collection in self.list_collections()
+        }
+        ancestor_set = {int(ancestor_id) for ancestor_id in ancestor_ids}
+        current_id: int | None = int(collection_id)
+        seen: set[int] = set()
+        while current_id is not None and current_id not in seen:
+            seen.add(current_id)
+            if (include_self or current_id != collection_id) and current_id in ancestor_set:
+                return True
+            current_id = parent_by_id.get(current_id)
+        return False
+
+    def _append_excluded_collection_clauses(
+        self,
+        clauses: list[str],
+        params: list[object],
+        image_id_column: str,
+        excluded_collection_ids: Sequence[int] | None,
+    ) -> None:
+        collection_ids: set[int] = set()
+        for collection_id in self._compact_collection_ids(excluded_collection_ids or []):
+            collection_ids.update(self.collection_descendant_ids(collection_id))
+        if not collection_ids:
+            return
+        placeholders = ",".join("?" for _ in collection_ids)
+        clauses.append(
+            f"""
+            NOT EXISTS (
+                SELECT 1
+                FROM image_collections excluded_ic
+                WHERE excluded_ic.image_id = {image_id_column}
+                  AND excluded_ic.collection_id IN ({placeholders})
+            )
+            """
+        )
+        params.extend(sorted(collection_ids))
+
     @staticmethod
     def _path_is_under_prefix(path: str, folder_path_prefix: str, *, include_self: bool) -> bool:
         normalized_path = os.path.abspath(os.path.expanduser(path)).rstrip(os.sep) or os.sep
@@ -6038,6 +6545,15 @@ class MetadataStore:
                 clean_ids.append(clean)
                 seen.add(clean)
         return clean_ids
+
+    @staticmethod
+    def _chunks(values: Sequence[int], size: int) -> Iterator[list[int]]:
+        iterator = iter(values)
+        while True:
+            chunk = list(islice(iterator, max(1, int(size))))
+            if not chunk:
+                return
+            yield chunk
 
     @staticmethod
     def _delete_unused_tags(conn: sqlite3.Connection) -> None:

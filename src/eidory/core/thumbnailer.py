@@ -30,13 +30,19 @@ class Thumbnailer:
             image.save(output_path, "WEBP", quality=82, method=4)
         return output_path
 
-    def generate_video(self, image_id: int, video_path: str) -> Path:
+    def generate_video(
+        self,
+        image_id: int,
+        video_path: str,
+        *,
+        duration_ms: int | None = None,
+    ) -> Path:
         ffmpeg = find_media_tool("ffmpeg")
         if ffmpeg is None:
             raise RuntimeError("ffmpeg not found; cannot generate video thumbnail")
 
         output_path = self.thumbnail_path_for(image_id)
-        timestamp = self._video_thumbnail_timestamp(video_path)
+        timestamp = self._video_thumbnail_timestamp(video_path, duration_ms=duration_ms)
         command = [
             ffmpeg,
             "-loglevel",
@@ -60,8 +66,10 @@ class Thumbnailer:
         return output_path
 
     @staticmethod
-    def _video_thumbnail_timestamp(video_path: str) -> float:
-        duration = Thumbnailer._video_duration(video_path)
+    def _video_thumbnail_timestamp(video_path: str, *, duration_ms: int | None = None) -> float:
+        duration = (duration_ms / 1000) if duration_ms and duration_ms > 0 else None
+        if duration is None:
+            duration = Thumbnailer._video_duration(video_path)
         if duration is None or duration <= 0:
             return 5.0
         return max(0.1, min(duration * 0.65, max(0.1, duration - 0.1)))

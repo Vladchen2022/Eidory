@@ -6,7 +6,10 @@ import unittest
 import sqlite3
 from pathlib import Path
 
+import numpy as np
+
 from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
+from eidory.core.color_features import COLOR_VECTOR_DIM
 from eidory.core.duplicate_detection import ImageHashCacheRecord
 from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
 
@@ -122,6 +125,71 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(store.count_images(), 1)
             self.assertEqual(states.count("new"), 1)
             self.assertEqual(states.count("unchanged"), 7)
+
+    def test_chunked_image_lookup_preserves_requested_order_and_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+            store._sqlite_chunk_size = 2
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids: list[int] = []
+            for index in range(5):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"image-{index}.jpg"),
+                    file_size=100 + index,
+                    width=10,
+                    height=20,
+                    created_time_ns=None,
+                    modified_time_ns=1_700_000_000_000_000_000 + index,
+                )
+                image_ids.append(image_id)
+
+            requested = [image_ids[3], image_ids[0], image_ids[3], image_ids[4]]
+            images = store.images_by_ids(
+                requested,
+                scores={image_ids[3]: 0.75, image_ids[0]: 0.25},
+            )
+
+            self.assertEqual([image.id for image in images], requested)
+            self.assertEqual(images[0].score, 0.75)
+            self.assertEqual(images[1].score, 0.25)
+
+    def test_chunked_derivative_checks_return_only_missing_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+            store._sqlite_chunk_size = 2
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_ids: list[int] = []
+            for index in range(5):
+                image_id, _state = store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"image-{index}.jpg"),
+                    file_size=100 + index,
+                    width=10,
+                    height=20,
+                    created_time_ns=None,
+                    modified_time_ns=1_700_000_000_000_000_000 + index,
+                )
+                image_ids.append(image_id)
+
+            thumbnail_path = Path(tmp) / "ready-thumb.webp"
+            thumbnail_path.write_bytes(b"ready")
+            store.update_thumbnail(image_ids[0], str(thumbnail_path), "ready")
+            store.upsert_color_feature_success(
+                image_id=image_ids[0],
+                vector=np.ones((COLOR_VECTOR_DIM,), dtype=np.float32),
+            )
+
+            self.assertEqual(
+                store.thumbnail_ids_needing_generation(image_ids),
+                set(image_ids[1:]),
+            )
+            self.assertEqual(
+                store.color_feature_ids_needing_generation(image_ids),
+                set(image_ids[1:]),
+            )
 
     def test_tags_note_and_favorite_persist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1150,6 +1218,50 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(nature_ids, [scene_image])
             self.assertNotIn(root_image, scene_ids)
 
+            self.assertTrue(store.add_search_excluded_folder_prefix(str(root / "场景")))
+            self.assertFalse(store.add_search_excluded_folder_prefix(str(root / "场景" / "自然场景")))
+            self.assertEqual(store.list_search_excluded_folder_prefixes(), [str(root / "场景")])
+            visible_ids = [
+                image.id
+                for image in store.list_images(
+                    excluded_folder_path_prefixes=store.list_search_excluded_folder_prefixes(),
+                    limit=10,
+                )
+            ]
+            self.assertEqual(visible_ids, [root_image])
+            self.assertTrue(store.remove_search_excluded_folder_prefix(str(root / "场景")))
+            self.assertEqual(store.list_search_excluded_folder_prefixes(), [])
+
+    def test_collection_exclusion_filters_descendant_collection_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            root = Path(tmp) / "library"
+            folder_id = store.add_folder(str(root))
+            keep_id = self._insert_image(store, folder_id, root / "keep.jpg", 1)
+            parent_id = store.create_collection("ML-09 线稿")
+            child_id = store.create_collection("线稿子类", parent_id=parent_id)
+            parent_image_id = self._insert_image(store, folder_id, root / "parent.jpg", 2)
+            child_image_id = self._insert_image(store, folder_id, root / "child.jpg", 3)
+            store.assign_images_to_collection([parent_image_id], parent_id)
+            store.assign_images_to_collection([child_image_id], child_id)
+
+            self.assertTrue(store.add_search_excluded_collection_id(parent_id))
+            self.assertFalse(store.add_search_excluded_collection_id(child_id))
+            self.assertEqual(store.list_search_excluded_collection_ids(), [parent_id])
+
+            visible_ids = [
+                image.id
+                for image in store.list_images(
+                    excluded_collection_ids=store.list_search_excluded_collection_ids(),
+                    limit=10,
+                )
+            ]
+            self.assertEqual(visible_ids, [keep_id])
+            self.assertTrue(store.remove_search_excluded_collection_id(parent_id))
+            self.assertEqual(store.list_search_excluded_collection_ids(), [])
+
     def test_batch_favorite_tags_and_remove_from_library(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"
@@ -1304,6 +1416,62 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(store.delete_tag(reference_id), 1)
             self.assertEqual(store.get_image_tags(first), ["室内场景"])
             self.assertNotIn("参考", [tag.tag_name for tag in store.list_tags()])
+
+    def test_tag_groups_create_rename_move_and_delete_without_deleting_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+
+            group_id = store.create_tag_group("风格")
+            tag_id = store.create_tag("置换质感")
+            self.assertEqual(store.move_tags_to_group([tag_id], group_id), 1)
+            tag = next(tag for tag in store.list_tags() if tag.id == tag_id)
+            self.assertEqual(tag.group_id, group_id)
+            self.assertEqual(tag.group_name, "风格")
+
+            self.assertTrue(store.rename_tag_group(group_id, "画面风格"))
+            tag = next(tag for tag in store.list_tags() if tag.id == tag_id)
+            self.assertEqual(tag.group_name, "画面风格")
+
+            self.assertEqual(store.delete_tag_group(group_id), 1)
+            tag = next(tag for tag in store.list_tags() if tag.id == tag_id)
+            self.assertIsNone(tag.group_id)
+            self.assertEqual(tag.group_name, "")
+            self.assertEqual(store.list_tag_groups(), [])
+
+    def test_tag_group_migration_keeps_existing_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tag_name TEXT NOT NULL UNIQUE,
+                    tag_type TEXT NOT NULL DEFAULT 'user',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO tags(tag_name, tag_type, created_at)
+                VALUES ('旧标签', 'user', '2026-01-01T00:00:00Z')
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            store = MetadataStore(db_path)
+            store.initialize()
+            tag = store.list_tags()[0]
+            self.assertEqual(tag.tag_name, "旧标签")
+            self.assertIsNone(tag.group_id)
+
+            group_id = store.create_tag_group("迁移后分组")
+            self.assertEqual(store.move_tags_to_group([tag.id], group_id), 1)
+            self.assertEqual(store.list_tags()[0].group_name, "迁移后分组")
 
     def test_remove_folder_index_removes_root_or_subtree_without_source_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

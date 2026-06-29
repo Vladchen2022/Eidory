@@ -6,6 +6,7 @@ from .image_item import (
     ImageItem,
     InspirationProjectItem,
     SavedViewItem,
+    TagGroupItem,
     TagItem,
     TemporaryProjectItem,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "ImageItem",
     "InspirationProjectItem",
     "SavedViewItem",
+    "TagGroupItem",
     "TagItem",
     "TemporaryProjectItem",
 ]

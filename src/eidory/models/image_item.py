@@ -54,6 +54,17 @@ class TagItem:
     tag_name: str
     tag_type: str
     created_at: str
+    group_id: int | None = None
+    group_name: str = ""
+
+
+@dataclass(frozen=True)
+class TagGroupItem:
+    id: int
+    name: str
+    sort_order: int
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)

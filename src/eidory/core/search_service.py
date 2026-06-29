@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -51,8 +52,20 @@ class SearchService:
         self.embedding_provider = embedding_provider
         self.vector_index = vector_index
 
-    def keyword_search(self, query: str, *, limit: int = 500) -> list[ImageItem]:
-        return self.store.list_images(text_query=query, limit=limit)
+    def keyword_search(
+        self,
+        query: str,
+        *,
+        limit: int = 500,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
+    ) -> list[ImageItem]:
+        return self.store.list_images(
+            text_query=query,
+            limit=limit,
+            excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+            excluded_collection_ids=excluded_collection_ids,
+        )
 
     def semantic_search(
         self,
@@ -67,6 +80,8 @@ class SearchService:
         status_filter: str | None = None,
         virtual_filter: str | None = None,
         allowed_image_ids: set[int] | None = None,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
     ) -> SemanticSearchResult:
         if not query.strip():
             images = self.store.list_images(
@@ -78,6 +93,8 @@ class SearchService:
                 tag_match_mode=tag_match_mode,
                 status_filter=status_filter,
                 virtual_filter=virtual_filter,
+                excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                excluded_collection_ids=excluded_collection_ids,
                 limit=500,
             )
             if allowed_image_ids is not None:
@@ -100,6 +117,8 @@ class SearchService:
             tag_match_mode=tag_match_mode,
             status_filter=status_filter,
             virtual_filter=virtual_filter,
+            excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+            excluded_collection_ids=excluded_collection_ids,
         )
         if allowed_image_ids is not None:
             candidate_ids = [image_id for image_id in candidate_ids if image_id in allowed_image_ids]
@@ -138,6 +157,8 @@ class SearchService:
         status_filter: str | None = None,
         virtual_filter: str | None = None,
         allowed_image_ids: set[int] | None = None,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
     ) -> SemanticSearchResult:
         query_vector = self.store.embedding_vector_for_image(
             image_id,
@@ -160,6 +181,8 @@ class SearchService:
             tag_match_mode=tag_match_mode,
             status_filter=status_filter,
             virtual_filter=virtual_filter,
+            excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+            excluded_collection_ids=excluded_collection_ids,
         )
         candidate_ids = [candidate_id for candidate_id in candidate_ids if candidate_id != image_id]
         if allowed_image_ids is not None:
@@ -200,6 +223,8 @@ class SearchService:
         virtual_filter: str | None = None,
         allowed_image_ids: set[int] | None = None,
         limit: int = 5_000,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
     ) -> ColorSearchResult:
         candidates = self.store.color_search_candidates(
             folder_id=folder_id,
@@ -210,6 +235,8 @@ class SearchService:
             tag_match_mode=tag_match_mode,
             status_filter=status_filter,
             virtual_filter=virtual_filter,
+            excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+            excluded_collection_ids=excluded_collection_ids,
         )
         if allowed_image_ids is not None:
             candidates = [image for image in candidates if image.id in allowed_image_ids]
@@ -228,16 +255,25 @@ class SearchService:
             )
 
         query_vector = encode_query_color(rgb)
-        scored: list[tuple[int, float]] = []
-        for image_id in candidate_ids:
-            vector = features.get(image_id)
-            if vector is None:
-                continue
-            score = float(np.dot(vector, query_vector))
-            if score > 0:
-                scored.append((image_id, score))
-
-        scored.sort(key=lambda item: item[1], reverse=True)
+        feature_ids = [image_id for image_id in candidate_ids if image_id in features]
+        if not feature_ids:
+            return ColorSearchResult(
+                images=[],
+                searchable_count=len(candidates),
+                indexed_count=len(features),
+                candidate_limit=0,
+            )
+        matrix = np.vstack([features[image_id] for image_id in feature_ids]).astype(np.float32, copy=False)
+        scores_array = matrix @ query_vector
+        positive_indexes = np.flatnonzero(scores_array > 0)
+        if positive_indexes.shape[0] == 0:
+            scored: list[tuple[int, float]] = []
+        else:
+            ordered_indexes = positive_indexes[np.argsort(-scores_array[positive_indexes])]
+            scored = [
+                (feature_ids[int(index)], float(scores_array[int(index)]))
+                for index in ordered_indexes
+            ]
         limited = scored[: max(0, limit)]
         image_ids = [image_id for image_id, _score in limited]
         scores = {image_id: score for image_id, score in limited}

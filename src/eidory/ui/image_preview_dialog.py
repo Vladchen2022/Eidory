@@ -636,11 +636,6 @@ class ImagePreviewDialog(QDialog):
         controls.addWidget(self.favorite_checkbox)
         controls.addSpacing(12)
         controls.addStretch(1)
-        controls.addWidget(self.open_original_button)
-        controls.addWidget(self.reveal_button)
-        controls.addWidget(self.copy_image_button)
-        controls.addWidget(self.copy_path_button)
-        controls.addWidget(self.remove_index_button)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.preview_stack, 1)

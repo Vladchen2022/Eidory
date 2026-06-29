@@ -67,7 +67,7 @@ class AIVisionWorker(threading.Thread):
             )
             if not jobs:
                 self._emit(None, None, "idle", "no pending AI vision jobs")
-                time.sleep(self.idle_sleep_seconds)
+                self._stop_event.wait(self.idle_sleep_seconds)
                 continue
             for image in jobs:
                 if self._stop_event.is_set():
@@ -133,7 +133,8 @@ class AIVisionWorker(threading.Thread):
                     "retrying",
                     f"AI vision retrying after transient error: {exc}",
                 )
-                time.sleep(delay)
+                if self._stop_event.wait(delay):
+                    break
         if last_error is None:
             raise RuntimeError("AI vision failed without an error")
         raise last_error

@@ -70,7 +70,7 @@ class EmbeddingWorker(threading.Thread):
             )
             if not jobs:
                 self._emit(None, None, "idle", "no pending embedding jobs")
-                time.sleep(self.idle_sleep_seconds)
+                self._stop_event.wait(self.idle_sleep_seconds)
                 continue
             for image in jobs:
                 if self._stop_event.is_set():
@@ -95,7 +95,7 @@ class EmbeddingWorker(threading.Thread):
                 model_revision=self.provider.model_revision,
                 vector=vector,
             )
-            self.vector_index.invalidate()
+            self.vector_index.upsert(image.id, vector)
             self._emit(image.id, image.file_name, "ready", "embedding ready")
         except Exception as exc:
             self.store.mark_embedding_failed(
@@ -105,6 +105,7 @@ class EmbeddingWorker(threading.Thread):
                 embedding_dim=self.provider.dim,
                 error_message=str(exc),
             )
+            self.vector_index.remove(image.id)
             self._emit(image.id, image.file_name, "failed", str(exc))
 
     def _emit(

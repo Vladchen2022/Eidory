@@ -29,9 +29,11 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QLineEdit, QTextEdit, QListWidget, QTreeWidget, QScrollArea {
             background-color: #2d3138;
-            color: #e6e8eb;
             border: 1px solid #555b65;
             border-radius: 4px;
+        }
+        QLineEdit, QTextEdit, QListWidget, QScrollArea {
+            color: #e6e8eb;
         }
         QLineEdit:focus, QTextEdit:focus, QListWidget:focus, QTreeWidget:focus {
             border: 1px solid #5b8cff;

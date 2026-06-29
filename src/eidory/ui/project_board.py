@@ -36,6 +36,9 @@ DEFAULT_LAYOUT_GAP_Y = 64.0
 
 
 _BOARD_PIXMAP_CACHE: OrderedDict[tuple[str, int, int, int], QPixmap] = OrderedDict()
+_BOARD_PIXMAP_CACHE_BYTES: dict[tuple[str, int, int, int], int] = {}
+_BOARD_PIXMAP_CACHE_TOTAL_BYTES = 0
+_BOARD_PIXMAP_CACHE_BYTE_LIMIT = 220 * 1024 * 1024
 
 
 def _cached_pixmap(
@@ -45,6 +48,7 @@ def _cached_pixmap(
     modified_time_ns: int | None = None,
     file_size: int | None = None,
 ) -> QPixmap:
+    global _BOARD_PIXMAP_CACHE_TOTAL_BYTES
     max_side = max(128, int(max_side))
     if modified_time_ns is None or file_size is None:
         try:
@@ -70,11 +74,27 @@ def _cached_pixmap(
     pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
     if pixmap.isNull():
         return pixmap
+    existing_bytes = _BOARD_PIXMAP_CACHE_BYTES.pop(key, 0)
+    _BOARD_PIXMAP_CACHE_TOTAL_BYTES = max(0, _BOARD_PIXMAP_CACHE_TOTAL_BYTES - existing_bytes)
     _BOARD_PIXMAP_CACHE[key] = QPixmap(pixmap)
     _BOARD_PIXMAP_CACHE.move_to_end(key)
-    while len(_BOARD_PIXMAP_CACHE) > PIXMAP_CACHE_LIMIT:
-        _BOARD_PIXMAP_CACHE.popitem(last=False)
+    pixmap_bytes = _estimated_pixmap_bytes(pixmap)
+    _BOARD_PIXMAP_CACHE_BYTES[key] = pixmap_bytes
+    _BOARD_PIXMAP_CACHE_TOTAL_BYTES += pixmap_bytes
+    while (
+        len(_BOARD_PIXMAP_CACHE) > PIXMAP_CACHE_LIMIT
+        or _BOARD_PIXMAP_CACHE_TOTAL_BYTES > _BOARD_PIXMAP_CACHE_BYTE_LIMIT
+    ):
+        old_key, _old_pixmap = _BOARD_PIXMAP_CACHE.popitem(last=False)
+        old_bytes = _BOARD_PIXMAP_CACHE_BYTES.pop(old_key, 0)
+        _BOARD_PIXMAP_CACHE_TOTAL_BYTES = max(0, _BOARD_PIXMAP_CACHE_TOTAL_BYTES - old_bytes)
     return pixmap
+
+
+def _estimated_pixmap_bytes(pixmap: QPixmap) -> int:
+    if pixmap.isNull():
+        return 0
+    return max(0, pixmap.width()) * max(0, pixmap.height()) * 4
 
 
 class BoardImageItem(QGraphicsPixmapItem):

@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PIL import Image
 from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QPixmap
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from eidory.core.metadata_store import MetadataStore
 from eidory.ui.image_preview_dialog import ImagePreviewDialog
@@ -80,6 +80,47 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 ),
                 "relevant",
             )
+
+    def test_preview_bottom_bar_hides_file_action_buttons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="blue").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+
+            button_texts = {button.text() for button in dialog.findChildren(QPushButton)}
+            self.assertFalse(
+                {
+                    "打开源文件",
+                    "Finder 中显示",
+                    "复制图片",
+                    "复制路径",
+                    "移除索引",
+                }
+                & button_texts
+            )
+            dialog.close()
 
     def test_preview_zoom_and_fit_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

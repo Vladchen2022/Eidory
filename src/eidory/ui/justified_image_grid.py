@@ -77,13 +77,17 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._drag_start_position: QPoint | None = None
         self._drag_start_index = -1
         self._pixmap_cache: OrderedDict[PixmapCacheKey, QPixmap] = OrderedDict()
+        self._pixmap_cache_bytes: dict[PixmapCacheKey, int] = {}
+        self._pixmap_cache_total_bytes = 0
         self._pending_pixmap_loads: set[PixmapCacheKey] = set()
-        self._current_pixmap_keys: set[PixmapCacheKey] = set()
+        self._layout_signature: tuple[tuple[object, ...], ...] = ()
         self._viewport_update_pending = False
         self._pixmap_load_signals = _PixmapLoadSignals()
         self._pixmap_load_signals.loaded.connect(self._handle_async_pixmap_loaded)
         self._thread_pool = QThreadPool.globalInstance()
         self._cache_limit = 700
+        self._cache_byte_limit = 180 * 1024 * 1024
+        self._pending_load_limit = 96
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAcceptDrops(True)
@@ -152,9 +156,10 @@ class JustifiedImageGridView(QAbstractScrollArea):
             current_image_id = current.id if current is not None else None
 
         new_images = list(images)
-        should_rebuild_layout = self._layout_keys(self._images) != self._layout_keys(new_images)
+        new_layout_signature = self._layout_keys(new_images)
+        should_rebuild_layout = self._layout_signature != new_layout_signature
         self._images = new_images
-        self._current_pixmap_keys = self._pixmap_keys_for_images(self._images)
+        self._layout_signature = new_layout_signature
         self._badges_by_image_id = dict(badges_by_image_id or {})
         indexes_by_id = {image.id: index for index, image in enumerate(self._images)}
         self._selected_indexes = {
@@ -178,7 +183,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         if not images:
             return
         self._images.extend(images)
-        self._current_pixmap_keys = self._pixmap_keys_for_images(self._images)
+        self._layout_signature = self._layout_keys(self._images)
         self._rebuild_layout()
         self.viewport().update()
 
@@ -199,7 +204,6 @@ class JustifiedImageGridView(QAbstractScrollArea):
 
     def set_thumbnail_size(self, size: int) -> None:
         self._target_height = max(80, min(420, size))
-        self._current_pixmap_keys = self._pixmap_keys_for_images(self._images)
         self._rebuild_layout()
         self.viewport().update()
 
@@ -664,6 +668,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
     def _schedule_pixmap_load(self, key: PixmapCacheKey) -> None:
         if key in self._pending_pixmap_loads:
             return
+        if len(self._pending_pixmap_loads) >= self._pending_load_limit:
+            return
         self._pending_pixmap_loads.add(key)
         source, _mtime, _size, max_side = key
         self._thread_pool.start(
@@ -679,8 +685,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
             return
         pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
         self._cache_pixmap(cache_key, pixmap)
-        if cache_key in self._current_pixmap_keys:
-            self._schedule_viewport_update()
+        self._schedule_viewport_update()
 
     def _schedule_viewport_update(self) -> None:
         if self._viewport_update_pending:
@@ -693,10 +698,26 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self.viewport().update()
 
     def _cache_pixmap(self, key: PixmapCacheKey, pixmap: QPixmap) -> None:
+        existing_bytes = self._pixmap_cache_bytes.pop(key, 0)
+        self._pixmap_cache_total_bytes = max(0, self._pixmap_cache_total_bytes - existing_bytes)
         self._pixmap_cache[key] = pixmap
         self._pixmap_cache.move_to_end(key)
-        while len(self._pixmap_cache) > self._cache_limit:
-            self._pixmap_cache.popitem(last=False)
+        pixmap_bytes = self._estimated_pixmap_bytes(pixmap)
+        self._pixmap_cache_bytes[key] = pixmap_bytes
+        self._pixmap_cache_total_bytes += pixmap_bytes
+        while (
+            len(self._pixmap_cache) > self._cache_limit
+            or self._pixmap_cache_total_bytes > self._cache_byte_limit
+        ):
+            old_key, _old_pixmap = self._pixmap_cache.popitem(last=False)
+            old_bytes = self._pixmap_cache_bytes.pop(old_key, 0)
+            self._pixmap_cache_total_bytes = max(0, self._pixmap_cache_total_bytes - old_bytes)
+
+    @staticmethod
+    def _estimated_pixmap_bytes(pixmap: QPixmap) -> int:
+        if pixmap.isNull():
+            return 0
+        return max(0, pixmap.width()) * max(0, pixmap.height()) * 4
 
     def _draw_placeholder(self, painter: QPainter, rect: QRect, image: ImageItem) -> None:
         painter.fillRect(rect, QColor("#2d3138"))

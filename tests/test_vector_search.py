@@ -46,6 +46,8 @@ class VectorSearchTest(unittest.TestCase):
             blue_id = self._insert_image(store, folder_id, Path(tmp) / "library" / "blue.jpg", 2)
             other_id = self._insert_image(store, other_folder_id, Path(tmp) / "other" / "other.jpg", 3)
             video_id = self._insert_image(store, folder_id, Path(tmp) / "library" / "clip.mp4", 4)
+            excluded_collection_id = store.create_collection("排除分类")
+            store.assign_images_to_collection([red_id, blue_id], excluded_collection_id)
 
             provider = FakeEmbeddingProvider()
             store.upsert_embedding_success(
@@ -126,6 +128,20 @@ class VectorSearchTest(unittest.TestCase):
             self.assertEqual(nested_results.searchable_count, 2)
             self.assertEqual(nested_results.images[0].id, red_id)
 
+            excluded_results = service.semantic_search(
+                "red subject",
+                excluded_folder_path_prefixes=[str(Path(tmp) / "library")],
+            )
+            self.assertEqual(excluded_results.searchable_count, 1)
+            self.assertEqual([image.id for image in excluded_results.images], [other_id])
+
+            excluded_collection_results = service.semantic_search(
+                "red subject",
+                excluded_collection_ids=[excluded_collection_id],
+            )
+            self.assertEqual(excluded_collection_results.searchable_count, 1)
+            self.assertEqual([image.id for image in excluded_collection_results.images], [other_id])
+
             scoped_to_blue = service.semantic_search(
                 "red subject",
                 allowed_image_ids={blue_id},
@@ -192,6 +208,8 @@ class VectorSearchTest(unittest.TestCase):
             red_id = self._insert_image(store, folder_id, red_path, 1)
             blue_id = self._insert_image(store, folder_id, blue_path, 2)
             video_id = self._insert_image(store, folder_id, video_path, 3)
+            excluded_collection_id = store.create_collection("排除分类")
+            store.assign_images_to_collection([red_id], excluded_collection_id)
 
             provider = FakeEmbeddingProvider()
             service = SearchService(
@@ -216,6 +234,86 @@ class VectorSearchTest(unittest.TestCase):
             scoped_result = service.color_search((255, 0, 0), allowed_image_ids={blue_id})
             self.assertEqual(scoped_result.searchable_count, 1)
             self.assertEqual([image.id for image in scoped_result.images], [blue_id])
+
+            excluded_result = service.color_search(
+                (255, 0, 0),
+                excluded_folder_path_prefixes=[str(root)],
+            )
+            self.assertEqual(excluded_result.searchable_count, 0)
+            self.assertEqual(excluded_result.images, [])
+
+            excluded_collection_result = service.color_search(
+                (255, 0, 0),
+                excluded_collection_ids=[excluded_collection_id],
+            )
+            self.assertEqual(excluded_collection_result.searchable_count, 1)
+            self.assertEqual([image.id for image in excluded_collection_result.images], [blue_id])
+
+    def test_vector_index_upsert_and_remove_keep_loaded_index_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            first_id = self._insert_image(store, folder_id, Path(tmp) / "library" / "first.jpg", 1)
+            second_id = self._insert_image(store, folder_id, Path(tmp) / "library" / "second.jpg", 2)
+            third_id = self._insert_image(store, folder_id, Path(tmp) / "library" / "third.jpg", 3)
+            provider = FakeEmbeddingProvider()
+            for image_id, vector in (
+                (first_id, np.asarray([1.0, 0.0], dtype=np.float32)),
+                (second_id, np.asarray([0.0, 1.0], dtype=np.float32)),
+            ):
+                store.upsert_embedding_success(
+                    image_id=image_id,
+                    model_name=provider.model_name,
+                    model_revision=provider.model_revision,
+                    vector=vector,
+                )
+            index = VectorIndex(
+                store,
+                model_name=provider.model_name,
+                model_revision=provider.model_revision,
+                embedding_dim=provider.dim,
+            )
+
+            initial_scores = dict(index.search(np.asarray([1.0, 0.0], dtype=np.float32), top_k=2))
+            self.assertAlmostEqual(initial_scores[first_id], 1.0, places=6)
+
+            updated_vector = np.asarray([0.0, 1.0], dtype=np.float32)
+            store.upsert_embedding_success(
+                image_id=first_id,
+                model_name=provider.model_name,
+                model_revision=provider.model_revision,
+                vector=updated_vector,
+            )
+            index.upsert(first_id, updated_vector)
+            updated_scores = dict(index.search(np.asarray([1.0, 0.0], dtype=np.float32), top_k=2))
+            self.assertAlmostEqual(updated_scores[first_id], 0.0, places=6)
+
+            third_vector = np.asarray([1.0, 0.0], dtype=np.float32)
+            store.upsert_embedding_success(
+                image_id=third_id,
+                model_name=provider.model_name,
+                model_revision=provider.model_revision,
+                vector=third_vector,
+            )
+            index.upsert(third_id, third_vector)
+            self.assertIn(
+                third_id,
+                [image_id for image_id, _score in index.search(third_vector, top_k=3)],
+            )
+
+            store.mark_embedding_failed(
+                image_id=third_id,
+                model_name=provider.model_name,
+                model_revision=provider.model_revision,
+                embedding_dim=provider.dim,
+                error_message="boom",
+            )
+            index.remove(third_id)
+            self.assertNotIn(
+                third_id,
+                [image_id for image_id, _score in index.search(third_vector, top_k=3)],
+            )
 
     def test_adaptive_candidate_limit(self) -> None:
         self.assertEqual(adaptive_candidate_limit(0), 0)

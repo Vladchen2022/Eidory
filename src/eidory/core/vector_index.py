@@ -22,6 +22,7 @@ class VectorIndex:
         self.embedding_dim = embedding_dim
         self._image_ids = np.empty((0,), dtype=np.int64)
         self._matrix = np.empty((0, embedding_dim), dtype=np.float32)
+        self._id_to_index: dict[int, int] = {}
         self._dirty = True
         self._lock = threading.RLock()
 
@@ -39,7 +40,29 @@ class VectorIndex:
         with self._lock:
             self._image_ids = image_ids
             self._matrix = matrix
+            self._id_to_index = {
+                int(image_id): index
+                for index, image_id in enumerate(image_ids)
+            }
             self._dirty = False
+
+    def upsert(self, image_id: int, vector: np.ndarray) -> None:
+        vector = _normalize_vector(vector, self.embedding_dim)
+        with self._lock:
+            if self._dirty:
+                return
+            existing_index = self._id_to_index.get(int(image_id))
+            if existing_index is None:
+                self._dirty = True
+            else:
+                self._matrix[existing_index] = vector
+
+    def remove(self, image_id: int) -> None:
+        with self._lock:
+            index = self._id_to_index.get(int(image_id))
+            if index is None:
+                return
+            self._dirty = True
 
     def search(
         self,
@@ -67,32 +90,41 @@ class VectorIndex:
         query = query / query_norm
 
         with self._lock:
-            if self._matrix.shape[0] == 0:
+            image_ids = self._image_ids
+            matrix = self._matrix
+            id_to_index = dict(self._id_to_index)
+        if matrix.shape[0] == 0:
+            return []
+        scores = matrix @ query
+
+        if allowed_image_ids is None:
+            candidate_indexes = np.arange(matrix.shape[0])
+        else:
+            if not allowed_image_ids:
                 return []
-            scores = self._matrix @ query
+            candidate_indexes = np.fromiter(
+                (
+                    index
+                    for image_id in allowed_image_ids
+                    if (index := id_to_index.get(int(image_id))) is not None
+                ),
+                dtype=np.int64,
+            )
+            if candidate_indexes.shape[0] == 0:
+                return []
 
-            if allowed_image_ids is None:
-                candidate_indexes = np.arange(self._matrix.shape[0])
-            else:
-                if not allowed_image_ids:
-                    return []
-                mask = np.isin(self._image_ids, np.fromiter(allowed_image_ids, dtype=np.int64))
-                candidate_indexes = np.flatnonzero(mask)
-                if candidate_indexes.shape[0] == 0:
-                    return []
-
-            k = min(top_k, candidate_indexes.shape[0])
-            candidate_scores = scores[candidate_indexes]
-            if k == candidate_scores.shape[0]:
-                order = candidate_indexes[np.argsort(-candidate_scores)]
-            else:
-                local_candidates = np.argpartition(-candidate_scores, k - 1)[:k]
-                ordered_local = local_candidates[np.argsort(-candidate_scores[local_candidates])]
-                order = candidate_indexes[ordered_local]
-            return [
-                (int(self._image_ids[index]), float(scores[index]))
-                for index in order
-            ]
+        k = min(top_k, candidate_indexes.shape[0])
+        candidate_scores = scores[candidate_indexes]
+        if k == candidate_scores.shape[0]:
+            order = candidate_indexes[np.argsort(-candidate_scores)]
+        else:
+            local_candidates = np.argpartition(-candidate_scores, k - 1)[:k]
+            ordered_local = local_candidates[np.argsort(-candidate_scores[local_candidates])]
+            order = candidate_indexes[ordered_local]
+        return [
+            (int(image_ids[index]), float(scores[index]))
+            for index in order
+        ]
 
 
 def _normalize_matrix(matrix: np.ndarray) -> np.ndarray:
@@ -102,3 +134,17 @@ def _normalize_matrix(matrix: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms[norms == 0] = 1
     return matrix / norms
+
+
+def _normalize_vector(vector: np.ndarray, embedding_dim: int) -> np.ndarray:
+    query = np.asarray(vector, dtype=np.float32)
+    if query.ndim != 1:
+        raise ValueError("embedding vector must be one-dimensional")
+    if query.shape[0] != embedding_dim:
+        raise ValueError(
+            f"embedding vector dim {query.shape[0]} does not match index dim {embedding_dim}"
+        )
+    norm = np.linalg.norm(query)
+    if norm == 0:
+        raise ValueError("embedding vector must not be zero")
+    return query / norm

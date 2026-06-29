@@ -153,13 +153,25 @@ ON ai_vision_tags(status);
 CREATE INDEX IF NOT EXISTS idx_ai_vision_tags_fields
 ON ai_vision_tags(scene_location, environment_type, time_of_day, weather, shot_scale, view_angle);
 
+CREATE TABLE IF NOT EXISTS tag_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tag_name TEXT NOT NULL UNIQUE,
     tag_type TEXT NOT NULL DEFAULT 'user',
+    group_id INTEGER,
     created_at TEXT NOT NULL,
+    FOREIGN KEY(group_id) REFERENCES tag_groups(id) ON DELETE SET NULL,
     CHECK(tag_type IN ('user', 'project', 'style', 'usage'))
 );
+
+CREATE INDEX IF NOT EXISTS idx_tags_group_id ON tags(group_id);
 
 CREATE TABLE IF NOT EXISTS image_tags (
     image_id INTEGER NOT NULL,

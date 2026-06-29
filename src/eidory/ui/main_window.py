@@ -35,6 +35,7 @@ from PySide6.QtGui import (
     QImageReader,
     QKeySequence,
     QPainter,
+    QPalette,
     QPixmap,
     QPen,
     QShortcut,
@@ -60,6 +61,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -188,7 +190,13 @@ PROJECT_LIST_PINNED_ROLE = Qt.ItemDataRole.UserRole + 15
 PROJECT_LIST_SECTION_ID_ROLE = Qt.ItemDataRole.UserRole + 16
 PROJECT_LIST_SECTION_EXPANDED_ROLE = Qt.ItemDataRole.UserRole + 17
 PROJECT_LIST_SECTION_KIND = "section"
+FOLDER_SEARCH_EXCLUDED_DIRECT_ROLE = Qt.ItemDataRole.UserRole + 18
+FOLDER_SEARCH_EXCLUDED_MATCH_ROLE = Qt.ItemDataRole.UserRole + 19
+COLLECTION_SEARCH_EXCLUDED_DIRECT_ROLE = Qt.ItemDataRole.UserRole + 20
+COLLECTION_SEARCH_EXCLUDED_MATCH_ROLE = Qt.ItemDataRole.UserRole + 21
 CREATIVE_NODE_HAS_NOTE_ROLE = Qt.ItemDataRole.UserRole + 30
+TAG_GROUP_ID_ROLE = Qt.ItemDataRole.UserRole + 40
+TAG_GROUP_HEADER_ROLE = Qt.ItemDataRole.UserRole + 41
 SAVED_VIEW_SAVE_ACTION = "__eidory_save_current_filter_preset__"
 SAVED_VIEW_RENAME_ACTION = "__eidory_rename_current_filter_preset__"
 SAVED_VIEW_DELETE_ACTION = "__eidory_delete_current_filter_preset__"
@@ -296,6 +304,60 @@ class ProjectListItemDelegate(QStyledItemDelegate):
         return size
 
 
+class FolderTreeItemDelegate(QStyledItemDelegate):
+    EXCLUDED_NAME_COLOR = QColor("#965c5f")
+
+    @staticmethod
+    def _is_excluded_index(index, text: str | None = None) -> bool:
+        source_index = index.siblingAtColumn(0)
+        if source_index.data(FOLDER_SEARCH_EXCLUDED_MATCH_ROLE) is not None:
+            return True
+        if text is None:
+            text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        return "⊘" in text
+
+    def initStyleOption(self, option: QStyleOptionViewItem, index) -> None:
+        super().initStyleOption(option, index)
+        if not self._is_excluded_index(index, option.text):
+            return
+        if option.state & QStyle.StateFlag.State_Selected:
+            return
+        if index.column() == 0:
+            option.palette.setColor(QPalette.ColorRole.Text, self.EXCLUDED_NAME_COLOR)
+            option.palette.setColor(QPalette.ColorRole.WindowText, self.EXCLUDED_NAME_COLOR)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        if (
+            not self._is_excluded_index(index)
+            or index.column() != 0
+            or option.state & QStyle.StateFlag.State_Selected
+        ):
+            super().paint(painter, option, index)
+            return
+
+        item_option = QStyleOptionViewItem(option)
+        self.initStyleOption(item_option, index)
+        original_text = item_option.text
+        item_option.text = ""
+        super().paint(painter, item_option, index)
+
+        widget = item_option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        item_option.text = original_text
+        text_rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemText, item_option, widget)
+        alignment = Qt.AlignmentFlag.AlignVCenter
+        alignment |= Qt.AlignmentFlag.AlignRight if index.column() == 1 else Qt.AlignmentFlag.AlignLeft
+        text = item_option.fontMetrics.elidedText(
+            item_option.text,
+            Qt.TextElideMode.ElideRight,
+            max(1, text_rect.width()),
+        )
+        painter.save()
+        painter.setPen(self.EXCLUDED_NAME_COLOR)
+        painter.drawText(text_rect, alignment, text)
+        painter.restore()
+
+
 TOOL_BUTTON_MIN_WIDTH = EqualWidthTabBar.MIN_TAB_WIDTH
 BOARD_ICON_BUTTON_SIZE = QSize(32, 26)
 BOARD_ICON_SIZE = QSize(18, 18)
@@ -331,6 +393,18 @@ def _creative_node_note_marker_icon() -> QIcon:
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(QColor("#4f83ff"))
     painter.drawEllipse(3, 3, 6, 6)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _folder_search_excluded_marker_icon() -> QIcon:
+    pixmap = QPixmap(12, 12)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(FolderTreeItemDelegate.EXCLUDED_NAME_COLOR)
+    painter.drawEllipse(2, 2, 8, 8)
     painter.end()
     return QIcon(pixmap)
 
@@ -582,6 +656,145 @@ class DuplicateResultsDialog(QDialog):
         self.groupLoadRequested.emit(list(self.selected_group_image_ids))
 
 
+class TagPickerDialog(QDialog):
+    def __init__(
+        self,
+        tags_with_counts: Sequence[tuple[TagItem, int]],
+        *,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("选择标签")
+        self.resize(420, 520)
+        self._tags_with_counts = list(tags_with_counts)
+        self._created_tags: list[str] = []
+        self._checked_tags: set[str] = set()
+        self._refreshing_tag_list = False
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜索已有标签，或输入新标签名")
+        self.tag_list = QListWidget()
+        self.tag_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.create_button = QPushButton("新建并选中")
+        self.create_button.setEnabled(False)
+        self.status_label = QLabel("-")
+        self.status_label.setWordWrap(True)
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_button is not None:
+            ok_button.setText("添加选中标签")
+        cancel_button = self.button_box.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_button is not None:
+            cancel_button.setText("取消")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        help_label = QLabel("勾选已有标签；如果没有合适标签，输入名称后新建。")
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+        layout.addWidget(self.search_input)
+        layout.addWidget(self.tag_list, 1)
+        layout.addWidget(self.create_button)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.button_box)
+
+        self.search_input.textChanged.connect(self._refresh_tag_list)
+        self.tag_list.itemChanged.connect(self._on_tag_item_changed)
+        self.create_button.clicked.connect(self._create_current_tag)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        self._refresh_tag_list()
+
+    def selected_tags(self) -> list[str]:
+        selected: list[str] = []
+        seen: set[str] = set()
+        for tag, _count in self._tags_with_counts:
+            tag_name = tag.tag_name
+            if tag_name in self._checked_tags and tag_name not in seen:
+                seen.add(tag_name)
+                selected.append(tag_name)
+        for tag_name in self._created_tags:
+            if tag_name in self._checked_tags and tag_name not in seen:
+                seen.add(tag_name)
+                selected.append(tag_name)
+        return selected
+
+    def _refresh_tag_list(self) -> None:
+        query = self.search_input.text().strip()
+        needle = query.casefold()
+        checked = set(self._checked_tags)
+        self._refreshing_tag_list = True
+        self.tag_list.clear()
+        try:
+            matched = 0
+            for tag, count in self._tags_with_counts:
+                tag_name = tag.tag_name
+                if needle and needle not in tag_name.casefold():
+                    continue
+                matched += 1
+                item = QListWidgetItem(f"{tag_name}    {count}")
+                item.setData(Qt.ItemDataRole.UserRole, tag_name)
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                item.setCheckState(Qt.CheckState.Checked if tag_name in checked else Qt.CheckState.Unchecked)
+                self.tag_list.addItem(item)
+            for tag_name in self._created_tags:
+                if needle and needle not in tag_name.casefold():
+                    continue
+                item = QListWidgetItem(f"{tag_name}    新建")
+                item.setData(Qt.ItemDataRole.UserRole, tag_name)
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                item.setCheckState(Qt.CheckState.Checked if tag_name in checked else Qt.CheckState.Unchecked)
+                self.tag_list.addItem(item)
+        finally:
+            self._refreshing_tag_list = False
+        normalized_query = " ".join(query.split())
+        existing_names = {tag.tag_name for tag, _count in self._tags_with_counts}
+        can_create = (
+            bool(normalized_query)
+            and normalized_query not in existing_names
+            and normalized_query not in self._created_tags
+        )
+        self.create_button.setEnabled(can_create)
+        if query:
+            self.status_label.setText(f"找到 {matched} 个已有标签" if matched else "没有匹配的已有标签")
+        else:
+            self.status_label.setText(f"已有标签 {len(self._tags_with_counts)} 个")
+
+    def _on_tag_item_changed(self, item: QListWidgetItem) -> None:
+        if self._refreshing_tag_list:
+            return
+        tag_name = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not tag_name:
+            return
+        if item.checkState() == Qt.CheckState.Checked:
+            self._checked_tags.add(tag_name)
+        else:
+            self._checked_tags.discard(tag_name)
+
+    def _create_current_tag(self) -> None:
+        tag_name = " ".join(self.search_input.text().strip().split())
+        if not tag_name or tag_name in self._created_tags:
+            return
+        existing_names = {tag.tag_name for tag, _count in self._tags_with_counts}
+        if tag_name in existing_names:
+            return
+        self._created_tags.append(tag_name)
+        self._checked_tags.add(tag_name)
+        self.search_input.clear()
+        self._refresh_tag_list()
+
+
 def _load_scaled_qt_pixmap(image_path: str, max_width: int, max_height: int) -> QPixmap:
     if max_width <= 0 or max_height <= 0:
         return QPixmap()
@@ -790,6 +1003,8 @@ class MainWindow(QMainWindow):
         self.result_excluded_collection_image_ids: set[int] = set()
         self.result_exclusion_filters: list[SearchFilter] = []
         self.result_exclusion_filter_matches: dict[SearchFilter, list[ImageItem]] = {}
+        self.search_excluded_folder_prefixes: list[str] = self.store.list_search_excluded_folder_prefixes()
+        self.search_excluded_collection_ids: list[int] = self.store.list_search_excluded_collection_ids()
         self.semantic_search_revision = 0
         self.selected_image: ImageItem | None = None
         self._detail_preview_cache: OrderedDict[tuple[str, int, int, int, int], QPixmap] = OrderedDict()
@@ -830,6 +1045,14 @@ class MainWindow(QMainWindow):
         self.board_autosave_timer.setSingleShot(True)
         self.board_autosave_timer.setInterval(900)
         self.board_autosave_timer.timeout.connect(self._autosave_current_board_layout)
+        self.embedding_stats_refresh_timer = QTimer(self)
+        self.embedding_stats_refresh_timer.setSingleShot(True)
+        self.embedding_stats_refresh_timer.setInterval(650)
+        self.embedding_stats_refresh_timer.timeout.connect(self._refresh_embedding_stats)
+        self.ai_vision_stats_refresh_timer = QTimer(self)
+        self.ai_vision_stats_refresh_timer.setSingleShot(True)
+        self.ai_vision_stats_refresh_timer.setInterval(900)
+        self.ai_vision_stats_refresh_timer.timeout.connect(self._refresh_ai_vision_stats)
 
         self.setWindowTitle("Eidory")
         self._configure_native_titlebar()
@@ -1202,7 +1425,10 @@ class MainWindow(QMainWindow):
         self.folder_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.folder_tree.setIndentation(14)
         self.folder_tree.setMinimumWidth(0)
+        self.folder_tree.setIconSize(QSize(12, 12))
         self._configure_sidebar_count_tree(self.folder_tree)
+        self.folder_tree_item_delegate = FolderTreeItemDelegate(self.folder_tree)
+        self.folder_tree.setItemDelegateForColumn(0, self.folder_tree_item_delegate)
         self.folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         self.add_collection_button = QPushButton("新建文件夹")
@@ -1286,9 +1512,16 @@ class MainWindow(QMainWindow):
         self.tag_match_combo.addItem("匹配全部", "all")
         self.tag_match_combo.addItem("匹配任一", "any")
         self._set_combo_to_data(self.tag_match_combo, self.initial_tag_match_mode)
+        self.new_tag_button = QPushButton("新建空标签")
         self.rename_tag_button = QPushButton("重命名")
         self.delete_tag_button = QPushButton("删除")
         self.merge_tag_button = QPushButton("合并")
+        self.tag_group_combo = QComboBox()
+        self.tag_group_combo.addItem("未分组", None)
+        self.new_tag_group_button = QPushButton("新建分组")
+        self.rename_tag_group_button = QPushButton("重命名分组")
+        self.delete_tag_group_button = QPushButton("删除分组")
+        self.move_tag_group_button = QPushButton("移动到分组")
 
         self.start_embedding_button = QPushButton("开始索引")
         self.pause_embedding_button = QPushButton("暂停索引")
@@ -1384,7 +1617,7 @@ class MainWindow(QMainWindow):
         self.reverse_exclusion_button.setToolTip("打开后，颜色/关键词/语义/标签会从当前结果中反向扣除")
         self.advanced_search_toggle_button = QPushButton("▾")
         self.advanced_search_toggle_button.setCheckable(True)
-        self.advanced_search_toggle_button.setToolTip("展开结果范围、筛选条件和排序方式")
+        self.advanced_search_toggle_button.setToolTip("展开更多筛选条件和排序方式")
         self.advanced_search_toggle_button.setFixedWidth(36)
         for search_action_button in [
             self.reverse_exclusion_button,
@@ -1693,7 +1926,6 @@ class MainWindow(QMainWindow):
         advanced_layout = QVBoxLayout(self.advanced_search_widget)
         advanced_layout.setContentsMargins(0, 0, 0, 0)
         advanced_layout.setSpacing(4)
-        advanced_layout.addLayout(search_operation_row)
         advanced_layout.addLayout(metadata_filter_row)
         advanced_layout.addLayout(ai_scene_filter_row)
         advanced_layout.addLayout(sort_filter_row)
@@ -1780,15 +2012,20 @@ class MainWindow(QMainWindow):
             feedback_layout.addWidget(button)
         self.favorite_checkbox = QCheckBox("收藏")
         self.tag_completion_model = QStringListModel(self)
-        self.tags_display = QTextEdit()
-        self.tags_display.setReadOnly(True)
-        self.tags_display.setAcceptRichText(False)
-        self.tags_display.setPlaceholderText("无标签")
+        self.tags_display = QListWidget()
+        self.tags_display.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.tags_display.setViewMode(QListView.ViewMode.IconMode)
+        self.tags_display.setFlow(QListView.Flow.LeftToRight)
+        self.tags_display.setWrapping(True)
+        self.tags_display.setResizeMode(QListView.ResizeMode.Adjust)
+        self.tags_display.setMovement(QListView.Movement.Static)
+        self.tags_display.setSpacing(6)
         self.tags_display.setMinimumHeight(58)
-        self.tags_display.setMaximumHeight(86)
-        self.tags_display.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.tags_display.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.tags_display.setStyleSheet("QTextEdit { background: transparent; border: 0; padding: 0; }")
+        self.tags_display.setMaximumHeight(96)
+        self.tags_display.setStyleSheet(
+            "QListWidget { background: transparent; border: 0; padding: 0; }"
+            "QListWidget::item { border: 1px solid #59616d; border-radius: 6px; padding: 4px 8px; }"
+        )
 
         self.batch_tag_summary_label = QLabel("-")
         self.batch_tag_summary_label.setWordWrap(True)
@@ -1832,14 +2069,7 @@ class MainWindow(QMainWindow):
 
         self.tag_panel_selection_label = QLabel("先在图片墙选择 1 张或多张图片。")
         self.tag_panel_selection_label.setWordWrap(True)
-        self.tag_panel_input = QTextEdit()
-        self.tag_panel_input.setPlaceholderText("给选中图片添加标签，每行一个")
-        self.tag_panel_input.setAcceptRichText(False)
-        self.tag_panel_input.setTabChangesFocus(True)
-        self.tag_panel_input.setMinimumHeight(150)
-        self.tag_panel_input.setMaximumHeight(180)
-        self.tag_panel_input.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.tag_panel_add_button = QPushButton("添加到选中")
+        self.tag_panel_pick_button = QPushButton("给选中图片添加标签")
         self.tag_panel_remove_combo = QComboBox()
         self.tag_panel_remove_button = QPushButton("移除标签")
         self.tag_panel_clear_button = QPushButton("清空标签")
@@ -2152,9 +2382,8 @@ class MainWindow(QMainWindow):
         filter_layout.addWidget(self.tag_panel_selection_label)
         tag_panel_add_row = QHBoxLayout()
         tag_panel_add_row.setContentsMargins(0, 0, 0, 0)
-        filter_layout.addWidget(self.tag_panel_input)
+        tag_panel_add_row.addWidget(self.tag_panel_pick_button)
         tag_panel_add_row.addStretch(1)
-        tag_panel_add_row.addWidget(self.tag_panel_add_button)
         filter_layout.addLayout(tag_panel_add_row)
         tag_panel_remove_row = QHBoxLayout()
         tag_panel_remove_row.setContentsMargins(0, 0, 0, 0)
@@ -2169,9 +2398,21 @@ class MainWindow(QMainWindow):
         tag_tools_row.addWidget(self.tag_search_input, 1)
         tag_tools_row.addWidget(self.tag_sort_combo)
         filter_layout.addLayout(tag_tools_row)
+        tag_group_tools_row = QHBoxLayout()
+        tag_group_tools_row.setContentsMargins(0, 0, 0, 0)
+        tag_group_tools_row.addWidget(self.tag_group_combo, 1)
+        tag_group_tools_row.addWidget(self.move_tag_group_button)
+        filter_layout.addLayout(tag_group_tools_row)
+        tag_group_action_row = QHBoxLayout()
+        tag_group_action_row.setContentsMargins(0, 0, 0, 0)
+        tag_group_action_row.addWidget(self.new_tag_group_button)
+        tag_group_action_row.addWidget(self.rename_tag_group_button)
+        tag_group_action_row.addWidget(self.delete_tag_group_button)
+        filter_layout.addLayout(tag_group_action_row)
         filter_layout.addWidget(self.tag_list, 1)
         tag_action_row = QHBoxLayout()
         tag_action_row.setContentsMargins(0, 0, 0, 0)
+        tag_action_row.addWidget(self.new_tag_button)
         tag_action_row.addWidget(self.rename_tag_button)
         tag_action_row.addWidget(self.delete_tag_button)
         tag_action_row.addWidget(self.merge_tag_button)
@@ -2400,6 +2641,7 @@ class MainWindow(QMainWindow):
         self.clear_search_button.clicked.connect(self._clear_search)
         self.save_result_set_button.clicked.connect(self._save_current_visible_results_as_search_result_set)
         self.search_input.returnPressed.connect(self._run_search)
+        self.search_input.textEdited.connect(self._switch_to_semantic_search_for_typed_query)
         self.similar_image_button.clicked.connect(self._find_similar_to_selected_image)
         self.color_mode_button.clicked.connect(self._choose_search_color)
         self.collection_filter_button.clicked.connect(self._choose_collection_filter)
@@ -2469,7 +2711,7 @@ class MainWindow(QMainWindow):
         self.batch_clear_tags_button.clicked.connect(self._batch_clear_tags)
         self.creative_selection_add_button.clicked.connect(self._save_selection_to_current_creative_node)
         self.creative_selection_remove_button.clicked.connect(self._remove_selection_from_current_creative_node)
-        self.tag_panel_add_button.clicked.connect(self._tag_panel_add_tags)
+        self.tag_panel_pick_button.clicked.connect(self._tag_panel_pick_tags)
         self.tag_panel_remove_button.clicked.connect(self._tag_panel_remove_selected_tag)
         self.tag_panel_clear_button.clicked.connect(self._tag_panel_clear_tags)
         self.ai_workflow_mode_group.idClicked.connect(self._on_ai_workflow_mode_clicked)
@@ -2531,9 +2773,15 @@ class MainWindow(QMainWindow):
         self.tag_search_input.textChanged.connect(self._on_tag_search_changed)
         self.tag_sort_combo.currentIndexChanged.connect(self._on_tag_sort_changed)
         self.tag_match_combo.currentIndexChanged.connect(self._on_tag_match_changed)
+        self.tag_group_combo.currentIndexChanged.connect(lambda _index: self._refresh_tag_action_buttons())
+        self.new_tag_button.clicked.connect(self._create_tag_from_panel)
         self.rename_tag_button.clicked.connect(self._rename_selected_tag)
         self.delete_tag_button.clicked.connect(self._delete_selected_tag)
         self.merge_tag_button.clicked.connect(self._merge_selected_tag)
+        self.new_tag_group_button.clicked.connect(self._create_tag_group_from_panel)
+        self.rename_tag_group_button.clicked.connect(self._rename_selected_tag_group)
+        self.delete_tag_group_button.clicked.connect(self._delete_selected_tag_group)
+        self.move_tag_group_button.clicked.connect(self._move_selected_tags_to_group)
         self.folder_tree.customContextMenuRequested.connect(self._show_folder_context_menu)
         self.collection_tree.customContextMenuRequested.connect(self._show_collection_context_menu)
         self.temp_project_list.itemClicked.connect(self._handle_project_sidebar_item_clicked)
@@ -3050,7 +3298,7 @@ class MainWindow(QMainWindow):
             (self.tags_display, "Selected item tags", "Read-only tags for the selected image"),
             (self.use_ai_scene_tags_checkbox, "Use AI scene tags", "Generate scene tag filters together with semantic probes"),
             (self.tag_panel_selection_label, "Tag page selection status", "Shows which selected images can be tagged"),
-            (self.tag_panel_input, "Add tags to selection", "One tag per line to add to selected images"),
+            (self.tag_panel_pick_button, "Choose or create tags", "Search existing tags or create new tags for selected images"),
             (self.tag_list, "Tag management list", "Existing user tags for filtering and management"),
             (self.settings_status_label, "Settings status", "Settings, self-check and error status output"),
         ]
@@ -3096,10 +3344,17 @@ class MainWindow(QMainWindow):
             self.rename_file_button.setToolTip("Rename the source file on disk")
             self.delete_source_button.setText("Delete / Remove")
             self.delete_source_button.setToolTip("Delete source files, or only remove them from Eidory")
-            self.tag_panel_input.setPlaceholderText("Add tags to selected items, one per line")
-            self.tag_panel_add_button.setText("Add to Selected")
+            self.tag_panel_pick_button.setText("Add Tags to Selection")
             self.tag_panel_remove_button.setText("Remove Tag")
             self.tag_panel_clear_button.setText("Clear Tags")
+            self.new_tag_button.setText("New Empty Tag")
+            self.rename_tag_button.setText("Rename")
+            self.delete_tag_button.setText("Delete")
+            self.merge_tag_button.setText("Merge")
+            self.new_tag_group_button.setText("New Group")
+            self.rename_tag_group_button.setText("Rename Group")
+            self.delete_tag_group_button.setText("Delete Group")
+            self.move_tag_group_button.setText("Move to Group")
             self.creative_selection_add_button.setText("Save to Node")
             self.creative_selection_remove_button.setText("Remove from Node")
             self.inspiration_brief_input.setPlaceholderText("Describe the image concept in one sentence")
@@ -3229,10 +3484,17 @@ class MainWindow(QMainWindow):
             self.rename_file_button.setToolTip("重命名硬盘上的源文件")
             self.delete_source_button.setText("删除/移除图片")
             self.delete_source_button.setToolTip("选择删除源文件，或只从 Eidory 移除索引")
-            self.tag_panel_input.setPlaceholderText("给选中图片添加标签，每行一个")
-            self.tag_panel_add_button.setText("添加到选中")
+            self.tag_panel_pick_button.setText("给选中图片添加标签")
             self.tag_panel_remove_button.setText("移除标签")
             self.tag_panel_clear_button.setText("清空标签")
+            self.new_tag_button.setText("新建空标签")
+            self.rename_tag_button.setText("重命名")
+            self.delete_tag_button.setText("删除")
+            self.merge_tag_button.setText("合并")
+            self.new_tag_group_button.setText("新建分组")
+            self.rename_tag_group_button.setText("重命名分组")
+            self.delete_tag_group_button.setText("删除分组")
+            self.move_tag_group_button.setText("移动到分组")
             self.creative_selection_add_button.setText("存入当前节点")
             self.creative_selection_remove_button.setText("移出当前节点")
             self.inspiration_brief_input.setPlaceholderText("用一句话描述画面的创作主题")
@@ -4781,6 +5043,8 @@ class MainWindow(QMainWindow):
         )
         self._set_result_status(f"灵感项目搜索中：{len(selected_terms)} 个语义探针{filter_text}")
         self.search_diagnostics_label.setText("搜索诊断：-")
+        excluded_folder_path_prefixes = tuple(self._search_excluded_folder_prefixes())
+        excluded_collection_ids = tuple(self._search_excluded_collection_ids())
 
         def run() -> None:
             try:
@@ -4794,6 +5058,8 @@ class MainWindow(QMainWindow):
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
+                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                        excluded_collection_ids=excluded_collection_ids,
                     )
                     term_results.append((term, list(result.images)))
                 self.events.put((
@@ -5075,6 +5341,10 @@ class MainWindow(QMainWindow):
             return SearchFilter("semantic", query)
         return SearchFilter("keyword", query)
 
+    def _switch_to_semantic_search_for_typed_query(self, text: str) -> None:
+        if text.strip() and self.color_mode_button.isChecked():
+            self.semantic_mode_button.setChecked(True)
+
     def _selected_search_operation_mode(self) -> str:
         if not self._has_visible_result_context():
             return "replace"
@@ -5127,12 +5397,7 @@ class MainWindow(QMainWindow):
     def _should_prompt_search_operation(self, search_filter: SearchFilter) -> bool:
         if not self._has_visible_result_context():
             return False
-        if not self.grid_view.images():
-            return False
-        active_kinds = self._active_positive_filter_kinds()
-        if not active_kinds:
-            return False
-        return search_filter.kind not in active_kinds
+        return bool(self.grid_view.images())
 
     def _active_positive_filter_kinds(self) -> set[str]:
         if self.search_filters:
@@ -5407,6 +5672,8 @@ class MainWindow(QMainWindow):
         tag_ids: list[int] = []
         tag_match_mode = "any"
         status_filter = self._selected_status_filter()
+        excluded_folder_path_prefixes = tuple(self._search_excluded_folder_prefixes())
+        excluded_collection_ids = tuple(self._search_excluded_collection_ids())
         base_image_ids, base_label, merge_base_images = self._search_operation_context(
             operation_mode,
             operation_context=operation_context,
@@ -5438,6 +5705,8 @@ class MainWindow(QMainWindow):
                     tag_ids=tag_ids,
                     tag_match_mode=tag_match_mode,
                     status_filter=status_filter,
+                    excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                    excluded_collection_ids=excluded_collection_ids,
                     base_image_ids=base_image_ids,
                     merge_base_images=merge_base_images,
                 )
@@ -5507,9 +5776,17 @@ class MainWindow(QMainWindow):
         tag_match_mode: str,
         status_filter: str | None,
         virtual_filter: str | None = None,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
         base_image_ids: set[int] | None = None,
         merge_base_images: list[ImageItem] | None = None,
     ) -> SearchChainResult:
+        if base_image_ids is not None:
+            base_image_ids = self._filter_search_excluded_image_ids(
+                base_image_ids,
+                excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                excluded_collection_ids=excluded_collection_ids,
+            )
         images: list[ImageItem] = (
             self.store.images_by_ids(sorted(base_image_ids))
             if base_image_ids is not None
@@ -5536,6 +5813,8 @@ class MainWindow(QMainWindow):
                     tag_match_mode=tag_match_mode,
                     status_filter=status_filter,
                     allowed_image_ids=allowed_image_ids,
+                    excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                    excluded_collection_ids=excluded_collection_ids,
                 )
                 images = result.images
                 semantic_searchable_count = result.searchable_count
@@ -5550,6 +5829,8 @@ class MainWindow(QMainWindow):
                     tag_match_mode=tag_match_mode,
                     status_filter=status_filter,
                     allowed_image_ids=allowed_image_ids,
+                    excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                    excluded_collection_ids=excluded_collection_ids,
                 )
                 images = result.images
                 similar_searchable_count = result.searchable_count
@@ -5564,6 +5845,8 @@ class MainWindow(QMainWindow):
                     tag_match_mode=tag_match_mode,
                     status_filter=status_filter,
                     allowed_image_ids=allowed_image_ids,
+                    excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                    excluded_collection_ids=excluded_collection_ids,
                 )
                 images = result.images
                 color_searchable_count = result.searchable_count
@@ -5580,6 +5863,8 @@ class MainWindow(QMainWindow):
                         folder_path_prefix=folder_path_prefix,
                         collection_id=collection_id,
                         virtual_filter=virtual_filter,
+                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                        excluded_collection_ids=excluded_collection_ids,
                         limit=5_000,
                     )
                 else:
@@ -5597,6 +5882,8 @@ class MainWindow(QMainWindow):
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
+                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                        excluded_collection_ids=excluded_collection_ids,
                     )
                 images = [
                     image
@@ -5612,6 +5899,8 @@ class MainWindow(QMainWindow):
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
+                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                        excluded_collection_ids=excluded_collection_ids,
                     )
                 images = [
                     image
@@ -5627,6 +5916,8 @@ class MainWindow(QMainWindow):
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
+                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                        excluded_collection_ids=excluded_collection_ids,
                     )
                 images = [
                     image
@@ -5642,6 +5933,8 @@ class MainWindow(QMainWindow):
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
+                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                        excluded_collection_ids=excluded_collection_ids,
                     )
                 field, value = ai_vision_filter_parts(str(search_filter.value))
                 matching_ids = self.store.image_ids_matching_ai_vision(field, value)
@@ -5660,6 +5953,8 @@ class MainWindow(QMainWindow):
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
+                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                        excluded_collection_ids=excluded_collection_ids,
                     )
                 matching_ids = self._image_ids_for_collections(selected_ids)
                 images = [
@@ -5677,6 +5972,8 @@ class MainWindow(QMainWindow):
                         tag_ids=tag_ids,
                         tag_match_mode=tag_match_mode,
                         status_filter=status_filter,
+                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                        excluded_collection_ids=excluded_collection_ids,
                     )
                 matching_ids = self._image_ids_for_tags(selected_ids, match_mode)
                 images = [
@@ -5694,7 +5991,14 @@ class MainWindow(QMainWindow):
                 break
 
         if merge_base_images:
-            images = self._merge_search_result_images(merge_base_images, images)
+            images = self._merge_search_result_images(
+                self._filter_search_excluded_images(
+                    merge_base_images,
+                    excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                    excluded_collection_ids=excluded_collection_ids,
+                ),
+                images,
+            )
 
         return SearchChainResult(
             images=images,
@@ -5706,6 +6010,58 @@ class MainWindow(QMainWindow):
             color_indexed_count=color_indexed_count,
             color_candidate_limit=color_candidate_limit,
         )
+
+    def _filter_search_excluded_image_ids(
+        self,
+        image_ids: set[int],
+        *,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
+    ) -> set[int]:
+        if not image_ids:
+            return set()
+        images = self.store.images_by_ids(sorted(image_ids))
+        return {
+            image.id
+            for image in self._filter_search_excluded_images(
+                images,
+                excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                excluded_collection_ids=excluded_collection_ids,
+            )
+        }
+
+    def _filter_search_excluded_images(
+        self,
+        images: list[ImageItem],
+        *,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
+    ) -> list[ImageItem]:
+        if not images:
+            return []
+        prefixes = [
+            self._normalize_folder_path(prefix)
+            for prefix in (excluded_folder_path_prefixes or [])
+            if str(prefix).strip()
+        ]
+        excluded_ids: set[int] = set()
+        for collection_id in excluded_collection_ids or []:
+            try:
+                root_collection_id = int(collection_id)
+            except (TypeError, ValueError):
+                continue
+            for descendant_id in self.store.collection_descendant_ids(root_collection_id):
+                excluded_ids.update(self.store.image_ids_for_collection(descendant_id))
+
+        filtered: list[ImageItem] = []
+        for image in images:
+            if image.id in excluded_ids:
+                continue
+            image_path = self._normalize_folder_path(image.file_path)
+            if any(self._path_is_same_or_in_folder(image_path, prefix) for prefix in prefixes):
+                continue
+            filtered.append(image)
+        return filtered
 
     @staticmethod
     def _merge_search_result_images(
@@ -5730,6 +6086,8 @@ class MainWindow(QMainWindow):
         tag_ids: list[int],
         tag_match_mode: str,
         status_filter: str | None,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
     ) -> list[ImageItem]:
         return self.store.list_images(
             status_filter=status_filter,
@@ -5738,6 +6096,8 @@ class MainWindow(QMainWindow):
             folder_path_prefix=folder_path_prefix,
             collection_id=collection_id,
             virtual_filter=virtual_filter,
+            excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+            excluded_collection_ids=excluded_collection_ids,
             limit=50_000,
         )
 
@@ -6229,6 +6589,8 @@ class MainWindow(QMainWindow):
         images = self.store.list_images(
             tag_ids=sorted(set(tag_ids)),
             tag_match_mode="any" if match_mode == "any" else "all",
+            excluded_folder_path_prefixes=self._search_excluded_folder_prefixes(),
+            excluded_collection_ids=self._search_excluded_collection_ids(),
             limit=50_000,
         )
         return {image.id for image in images}
@@ -6816,6 +7178,8 @@ class MainWindow(QMainWindow):
                 offset=0,
                 sort_key=self._database_sort_key(),
                 sort_desc=self.current_sort_desc,
+                excluded_folder_path_prefixes=self._search_excluded_folder_prefixes(),
+                excluded_collection_ids=self._search_excluded_collection_ids(),
             )
             self.current_offset = 0
             images = self._apply_result_management_filters(images)
@@ -8065,10 +8429,21 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         rescan_action = menu.addAction("重新扫描所在根目录")
         import_collections_action = menu.addAction("从磁盘目录生成分类树")
+        self._reload_search_excluded_folder_prefixes()
+        direct_excluded, matched_exclusion_prefix = (
+            self._folder_search_exclusion_state(str(filter_path)) if filter_path else (False, None)
+        )
+        exclude_from_search_action = menu.addAction("排除出搜索结果")
+        include_in_search_action = menu.addAction("取消排除出搜索结果")
         remove_action = menu.addAction("从图库移除该文件夹索引")
         has_folder = bool(scan_path and folder_id and filter_path)
         rescan_action.setEnabled(has_folder)
         import_collections_action.setEnabled(has_folder)
+        exclude_from_search_action.setEnabled(has_folder and matched_exclusion_prefix is None)
+        include_in_search_action.setEnabled(has_folder and direct_excluded)
+        if matched_exclusion_prefix is not None and not direct_excluded:
+            exclude_from_search_action.setText("已被上级文件夹排除")
+            exclude_from_search_action.setEnabled(False)
         remove_action.setEnabled(has_folder)
 
         action = menu.exec(self.folder_tree.viewport().mapToGlobal(position))
@@ -8078,12 +8453,40 @@ class MainWindow(QMainWindow):
             self._start_scan(str(scan_path))
         elif action == import_collections_action:
             self._create_collections_from_disk_folder(str(filter_path))
+        elif action == exclude_from_search_action:
+            self._set_folder_search_excluded(str(filter_path), excluded=True)
+        elif action == include_in_search_action:
+            self._set_folder_search_excluded(str(filter_path), excluded=False)
         elif action == remove_action:
             self._remove_folder_index(
                 scan_path=str(scan_path),
                 folder_id=int(folder_id),
                 filter_path=str(filter_path),
             )
+
+    def _set_folder_search_excluded(self, folder_path: str, *, excluded: bool) -> None:
+        normalized = self._normalize_folder_path(folder_path)
+        changed = (
+            self.store.add_search_excluded_folder_prefix(normalized)
+            if excluded
+            else self.store.remove_search_excluded_folder_prefix(normalized)
+        )
+        self._reload_search_excluded_folder_prefixes()
+        self._refresh_folders()
+        self._refresh_current_results_for_filters()
+        if changed:
+            message = (
+                f"已排除出搜索结果：{normalized}"
+                if excluded
+                else f"已取消搜索排除：{normalized}"
+            )
+        else:
+            message = (
+                f"文件夹已在排除范围内：{normalized}"
+                if excluded
+                else f"该文件夹没有搜索排除规则：{normalized}"
+            )
+        self.statusBar().showMessage(message)
 
     def _show_tag_context_menu(self, position) -> None:
         item = self.tag_list.itemAt(position)
@@ -8094,22 +8497,36 @@ class MainWindow(QMainWindow):
         tag_name = item.data(Qt.ItemDataRole.UserRole + 1)
 
         menu = QMenu(self)
+        search_action = menu.addAction("搜索带有此标签的图片")
+        menu.addSeparator()
         rename_action = menu.addAction("重命名标签")
         delete_action = menu.addAction("删除标签")
         merge_action = menu.addAction("合并到其他标签")
+        move_menu = menu.addMenu("移动到分组")
+        move_actions: dict[QAction, int | None] = {}
+        ungrouped_action = move_menu.addAction("未分组")
+        move_actions[ungrouped_action] = None
+        for group in self.store.list_tag_groups():
+            group_action = move_menu.addAction(group.name)
+            move_actions[group_action] = group.id
         has_tag = tag_id is not None and tag_name is not None
-        for action in [rename_action, delete_action, merge_action]:
+        for action in [search_action, rename_action, delete_action, merge_action]:
             action.setEnabled(has_tag)
+        move_menu.setEnabled(has_tag)
 
         action = menu.exec(self.tag_list.viewport().mapToGlobal(position))
         if not has_tag:
             return
-        if action == rename_action:
+        if action == search_action:
+            self._search_tag_from_management(int(tag_id), str(tag_name))
+        elif action == rename_action:
             self._rename_tag(int(tag_id), str(tag_name))
         elif action == delete_action:
             self._delete_tag(int(tag_id), str(tag_name))
         elif action == merge_action:
             self._merge_tag(int(tag_id), str(tag_name))
+        elif action in move_actions:
+            self._move_tags_to_group([int(tag_id)], move_actions[action])
 
     def _rename_selected_tag(self) -> None:
         tag_id, tag_name = self._selected_tag_context()
@@ -8132,6 +8549,113 @@ class MainWindow(QMainWindow):
             return
         self._merge_tag(tag_id, tag_name)
 
+    def _create_tag_from_panel(self) -> None:
+        name, ok = QInputDialog.getText(self, "新建标签", "标签名称")
+        if not ok:
+            return
+        clean_name = name.strip()
+        if not clean_name:
+            self.statusBar().showMessage("标签名称不能为空")
+            return
+        try:
+            tag_id = self.store.create_tag(clean_name, self._selected_tag_group_id())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Eidory", str(exc))
+            return
+        self._refresh_tags()
+        self._select_only_tag_id(tag_id)
+        self.statusBar().showMessage(f"已新建标签：{clean_name}")
+
+    def _create_tag_group_from_panel(self) -> None:
+        name, ok = QInputDialog.getText(self, "新建标签分组", "分组名称")
+        if not ok:
+            return
+        clean_name = name.strip()
+        if not clean_name:
+            self.statusBar().showMessage("分组名称不能为空")
+            return
+        try:
+            group_id = self.store.create_tag_group(clean_name)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Eidory", str(exc))
+            return
+        self._refresh_tag_group_combo(group_id)
+        self._refresh_tags()
+        self.statusBar().showMessage(f"已新建标签分组：{clean_name}")
+
+    def _rename_selected_tag_group(self) -> None:
+        group_id = self._selected_tag_group_id()
+        if group_id is None:
+            self.statusBar().showMessage("未分组不能重命名")
+            return
+        current_name = self.tag_group_combo.currentText()
+        name, ok = QInputDialog.getText(self, "重命名标签分组", "分组名称", text=current_name)
+        if not ok:
+            return
+        try:
+            self.store.rename_tag_group(group_id, name)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Eidory", str(exc))
+            return
+        self._refresh_tag_group_combo(group_id)
+        self._refresh_tags()
+        self.statusBar().showMessage(f"已重命名标签分组：{name.strip()}")
+
+    def _delete_selected_tag_group(self) -> None:
+        group_id = self._selected_tag_group_id()
+        if group_id is None:
+            self.statusBar().showMessage("未分组不能删除")
+            return
+        group_name = self.tag_group_combo.currentText()
+        answer = QMessageBox.question(
+            self,
+            "删除标签分组",
+            f"删除分组“{group_name}”？\n分组里的标签会保留，并移动到未分组。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        moved_count = self.store.delete_tag_group(group_id)
+        self._refresh_tag_group_combo(None)
+        self._refresh_tags()
+        self.statusBar().showMessage(f"已删除分组，{moved_count} 个标签移到未分组")
+
+    def _move_selected_tags_to_group(self) -> None:
+        tag_ids = self._selected_tag_ids()
+        if not tag_ids:
+            self.statusBar().showMessage("请先选择一个或多个标签")
+            return
+        self._move_tags_to_group(tag_ids, self._selected_tag_group_id())
+
+    def _move_tags_to_group(self, tag_ids: Sequence[int], group_id: int | None) -> None:
+        try:
+            moved = self.store.move_tags_to_group(tag_ids, group_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Eidory", str(exc))
+            return
+        group_name = "未分组"
+        if group_id is not None:
+            group_name = next(
+                (group.name for group in self.store.list_tag_groups() if group.id == group_id),
+                self.tag_group_combo.currentText(),
+            )
+        self._refresh_tags()
+        self.tag_list.blockSignals(True)
+        self.tag_list.clearSelection()
+        for tag_id in tag_ids:
+            self._select_tag_id(tag_id, additive=True)
+        self.tag_list.blockSignals(False)
+        self._save_selected_tag_filter()
+        self._refresh_tag_action_buttons()
+        self.statusBar().showMessage(f"已移动 {moved} 个标签到：{group_name}")
+
+    def _search_tag_from_management(self, tag_id: int, tag_name: str) -> None:
+        self._select_only_tag_id(tag_id)
+        self.current_virtual_filter = None
+        self._clear_collection_selection()
+        self._clear_ai_vision_virtual_filter_selection()
+        self._refresh_current_results_for_filters()
+        self.statusBar().showMessage(f"正在显示标签：{tag_name}")
+
     def _selected_tag_context(self) -> tuple[int | None, str | None]:
         item = self.tag_list.currentItem()
         if item is None:
@@ -8141,6 +8665,12 @@ class MainWindow(QMainWindow):
         if tag_id is None or tag_name is None:
             return None, None
         return int(tag_id), str(tag_name)
+
+    def _selected_tag_group_id(self) -> int | None:
+        if not hasattr(self, "tag_group_combo"):
+            return None
+        group_id = self.tag_group_combo.currentData()
+        return int(group_id) if group_id is not None else None
 
     def _show_collection_context_menu(self, position) -> None:
         item = self.collection_tree.itemAt(position)
@@ -8163,6 +8693,10 @@ class MainWindow(QMainWindow):
             self._delete_collection(int(collection_id), str(collection_name))
         elif action == actions["add_selected"] and has_collection:
             self._assign_selected_images_to_collection(int(collection_id), str(collection_name))
+        elif action == actions["exclude_from_search"] and has_collection:
+            self._set_collection_search_excluded(int(collection_id), excluded=True)
+        elif action == actions["include_in_search"] and has_collection:
+            self._set_collection_search_excluded(int(collection_id), excluded=False)
         elif action == actions["import_flat"] and has_collection:
             self._choose_import_folder_for_collection(int(collection_id), preserve_structure=False)
         elif action == actions["import_tree"]:
@@ -8173,6 +8707,11 @@ class MainWindow(QMainWindow):
         collection_id = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
         has_collection = collection_id is not None
         is_virtual = item is not None and item.data(0, COLLECTION_VIRTUAL_FILTER_ROLE) is not None
+        direct_excluded, matched_exclusion_id = (
+            self._collection_search_exclusion_state(int(collection_id))
+            if has_collection and not is_virtual
+            else (False, None)
+        )
         menu = QMenu(self)
         actions = {
             "new_root": menu.addAction("新建文件夹"),
@@ -8180,13 +8719,51 @@ class MainWindow(QMainWindow):
             "rename": menu.addAction("重命名"),
             "delete": menu.addAction("删除文件夹"),
             "add_selected": menu.addAction("把选中图片加入此文件夹"),
+            "exclude_from_search": menu.addAction("排除出搜索结果"),
+            "include_in_search": menu.addAction("取消排除出搜索结果"),
             "import_flat": menu.addAction("导入图片"),
             "import_tree": menu.addAction("导入文件夹"),
         }
         for key in ["new_child", "rename", "delete", "add_selected", "import_flat"]:
             actions[key].setEnabled(has_collection)
+        actions["exclude_from_search"].setEnabled(has_collection and not is_virtual and matched_exclusion_id is None)
+        actions["include_in_search"].setEnabled(has_collection and not is_virtual and direct_excluded)
+        if matched_exclusion_id is not None and not direct_excluded:
+            actions["exclude_from_search"].setText("已被上级文件夹排除")
+            actions["exclude_from_search"].setEnabled(False)
         actions["import_tree"].setEnabled(not is_virtual)
         return menu, actions
+
+    def _set_collection_search_excluded(self, collection_id: int, *, excluded: bool) -> None:
+        changed = (
+            self.store.add_search_excluded_collection_id(collection_id)
+            if excluded
+            else self.store.remove_search_excluded_collection_id(collection_id)
+        )
+        self._reload_search_excluded_collection_ids()
+        self._refresh_collections(select_collection_id=collection_id)
+        self._refresh_current_results_for_filters()
+        collection_name = next(
+            (
+                collection.name
+                for collection in self.store.list_collections()
+                if collection.id == collection_id
+            ),
+            f"#{collection_id}",
+        )
+        if changed:
+            message = (
+                f"已排除出搜索结果：{collection_name}"
+                if excluded
+                else f"已取消搜索排除：{collection_name}"
+            )
+        else:
+            message = (
+                f"文件夹已在排除范围内：{collection_name}"
+                if excluded
+                else f"该文件夹没有搜索排除规则：{collection_name}"
+            )
+        self.statusBar().showMessage(message)
 
     def _on_grid_image_selected(self, image: ImageItem | None) -> None:
         self.selected_image = image
@@ -8310,6 +8887,25 @@ class MainWindow(QMainWindow):
         ]:
             widget.setEnabled(enabled)
 
+    def _set_tags_display(self, tags: Sequence[str], empty_text: str = "无标签") -> None:
+        self.tags_display.clear()
+        clean_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
+        if not clean_tags:
+            item = QListWidgetItem(empty_text)
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            item.setForeground(QBrush(QColor("#9aa3ad")))
+            item.setSizeHint(QSize(max(86, min(240, len(empty_text) * 10 + 24)), 28))
+            self.tags_display.addItem(item)
+            return
+        for tag in clean_tags:
+            item = QListWidgetItem(tag)
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            item.setForeground(QBrush(QColor("#e6ebf2")))
+            item.setBackground(QBrush(QColor("#39414c")))
+            item.setToolTip(tag)
+            item.setSizeHint(QSize(max(64, min(180, len(tag) * 12 + 26)), 28))
+            self.tags_display.addItem(item)
+
     def _show_multi_selection_details(self, images: list[ImageItem]) -> None:
         self._save_pending_note()
         count = len(images)
@@ -8333,14 +8929,14 @@ class MainWindow(QMainWindow):
         self.ai_vision_detail_label.setText("-")
         self.score_label.setText("-")
         self.favorite_checkbox.setChecked(favorite_count == count)
-        self.tags_display.setPlainText("多选标签请到“标签”页编辑。")
+        self._set_tags_display([], "多选标签请到“标签”页编辑。")
         self.note_input.clear()
         self._suppress_detail_auto_save = False
         self._refresh_feedback_buttons(None)
         self._set_detail_controls_enabled(False)
         self.delete_source_button.setEnabled(True)
         if self.current_result_mode == "creative_node":
-            self.tags_display.setPlainText("创作节点结果：使用下方按钮存入或移出当前节点。")
+            self._set_tags_display([], "创作节点结果：使用下方按钮存入或移出当前节点。")
             self._set_batch_tag_controls_visible(False)
             self._refresh_creative_selection_panel(images)
         else:
@@ -8378,7 +8974,7 @@ class MainWindow(QMainWindow):
             self.score_label.setText("-" if image.score is None else f"{image.score:.4f}")
         self.favorite_checkbox.setChecked(image.is_favorite)
         tags = self.store.get_image_tags(image.id)
-        self.tags_display.setPlainText("\n".join(tags) if tags else "无标签")
+        self._set_tags_display(tags)
         self.note_input.setPlainText(image.note or "")
         self._suppress_detail_auto_save = False
         self._refresh_feedback_buttons(image)
@@ -8704,8 +9300,7 @@ class MainWindow(QMainWindow):
         self.tag_panel_remove_combo.blockSignals(False)
         has_selection = count > 0
         has_tags = bool(tag_counts)
-        self.tag_panel_input.setEnabled(has_selection)
-        self.tag_panel_add_button.setEnabled(has_selection)
+        self.tag_panel_pick_button.setEnabled(has_selection)
         self.tag_panel_remove_combo.setEnabled(has_tags)
         self.tag_panel_remove_button.setEnabled(has_tags)
         self.tag_panel_clear_button.setEnabled(has_tags)
@@ -8890,7 +9485,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("没有选中图片")
             return
         removed = self.store.clear_tags_for_images([image.id])
-        self.tags_display.clear()
+        self._set_tags_display([])
         self._refresh_tags()
         self._refresh_virtual_collection_counts()
         self._refresh_current_results_for_filters()
@@ -9823,25 +10418,21 @@ class MainWindow(QMainWindow):
         self._record_operation_history(f"{action} {count} 张")
         self.statusBar().showMessage(f"已{action} {count} 张")
 
-    def _tag_panel_add_tags(self) -> None:
+    def _tag_panel_pick_tags(self) -> None:
         images = self._selected_grid_images()
         if not images:
             self.statusBar().showMessage("没有选中图片")
             return
-        tags = self._parse_tag_panel_input(self.tag_panel_input.toPlainText())
-        if not tags:
-            self.statusBar().showMessage("没有输入标签")
+        dialog = TagPickerDialog(self.store.list_tags_with_counts(), parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        if len(images) > 1 and not self._confirm_batch_operation(
-            "批量添加标签",
-            f"添加标签：{', '.join(tags)}",
-            images,
-        ):
+        tags = dialog.selected_tags()
+        if not tags:
+            self.statusBar().showMessage("没有选择标签")
             return
         inserted = self.store.add_tags_to_images([image.id for image in images], tags)
-        self.tag_panel_input.clear()
         self._refresh_after_tag_assignment(images)
-        self._record_operation_history(f"添加标签 {tags} 到 {len(images)} 张，新增关联 {inserted}")
+        self._record_operation_history(f"选择标签 {tags} 到 {len(images)} 张，新增关联 {inserted}")
         self.statusBar().showMessage(f"已添加 {inserted} 个标签关联")
 
     def _tag_panel_remove_selected_tag(self) -> None:
@@ -10056,18 +10647,6 @@ class MainWindow(QMainWindow):
         tags: list[str] = []
         for part in re.split(r"[,，\n]", text):
             tag = part.strip()
-            if not tag or tag in seen:
-                continue
-            seen.add(tag)
-            tags.append(tag)
-        return tags
-
-    @staticmethod
-    def _parse_tag_panel_input(text: str) -> list[str]:
-        seen: set[str] = set()
-        tags: list[str] = []
-        for line in text.splitlines():
-            tag = line.strip()
             if not tag or tag in seen:
                 continue
             seen.add(tag)
@@ -10979,7 +11558,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已移除 AI 识别文件夹" if removed else "AI 识别文件夹不存在")
 
     def _handle_ai_vision_progress(self, progress: AIVisionProgress) -> None:
-        self._refresh_ai_vision_stats()
+        self._queue_ai_vision_stats_refresh()
         if progress.status in {"ready", "failed", "stale", "pending"}:
             self._refresh_virtual_collection_counts()
         if progress.image_id is None:
@@ -10992,12 +11571,19 @@ class MainWindow(QMainWindow):
                     self.selected_image = image
                     self._show_image_details(image)
 
+    def _queue_ai_vision_stats_refresh(self) -> None:
+        if not self.ai_vision_stats_refresh_timer.isActive():
+            self.ai_vision_stats_refresh_timer.start()
+
     def _poll_events(self) -> None:
-        while True:
+        processed = 0
+        max_events_per_tick = 80
+        while processed < max_events_per_tick:
             try:
                 kind, payload = self.events.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             if kind == "scan_done":
                 self._handle_scan_done(payload)
             elif kind == "scan_all_done":
@@ -11242,6 +11828,8 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "export_library_button"):
                     self._set_export_controls_enabled(True)
                 QMessageBox.critical(self, "Eidory", str(payload))
+        if processed >= max_events_per_tick and not self.events.empty():
+            QTimer.singleShot(0, self._poll_events)
 
     def _handle_scan_done(self, result: ScanResult) -> None:
         self._set_import_controls_enabled(True)
@@ -11480,14 +12068,19 @@ class MainWindow(QMainWindow):
         self.search_diagnostics_label.setText("搜索诊断：-")
 
     def _handle_embedding_progress(self, progress: EmbeddingProgress) -> None:
-        self._refresh_embedding_stats()
+        self._queue_embedding_stats_refresh()
         if progress.image_id is None:
             self.statusBar().showMessage(progress.message)
         else:
             self.statusBar().showMessage(f"{progress.file_name}: {progress.status}")
 
+    def _queue_embedding_stats_refresh(self) -> None:
+        if not self.embedding_stats_refresh_timer.isActive():
+            self.embedding_stats_refresh_timer.start()
+
     def _refresh_folders(self) -> None:
         current_prefix = self._selected_folder_path_prefix()
+        excluded_prefixes = self._search_excluded_folder_prefixes()
         self.folder_tree.blockSignals(True)
         self.folder_tree.clear()
 
@@ -11509,8 +12102,8 @@ class MainWindow(QMainWindow):
                 scan_path=root_path,
                 folder_id=folder.id,
                 filter_path=root_path,
+                excluded_prefixes=excluded_prefixes,
             )
-            root_item.setToolTip(0, root_path)
             root_item.setExpanded(True)
             self.folder_tree.addTopLevelItem(root_item)
             path_items = {root_path: root_item}
@@ -11529,8 +12122,8 @@ class MainWindow(QMainWindow):
                     scan_path=root_path,
                     folder_id=folder.id,
                     filter_path=path,
+                    excluded_prefixes=excluded_prefixes,
                 )
-                item.setToolTip(0, path)
                 parent_item.addChild(item)
                 path_items[path] = item
                 if current_prefix == path:
@@ -11556,6 +12149,8 @@ class MainWindow(QMainWindow):
         all_item = QTreeWidgetItem(["全部文件夹", ""])
         all_item.setData(0, Qt.ItemDataRole.UserRole, None)
         all_item.setData(0, Qt.ItemDataRole.UserRole + 1, None)
+        all_item.setData(0, COLLECTION_SEARCH_EXCLUDED_DIRECT_ROLE, False)
+        all_item.setData(0, COLLECTION_SEARCH_EXCLUDED_MATCH_ROLE, None)
         self._apply_collection_tree_level_style(all_item, -1)
         all_item.setFlags(all_item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled & ~Qt.ItemFlag.ItemIsDropEnabled)
         self.collection_tree.addTopLevelItem(all_item)
@@ -11566,14 +12161,24 @@ class MainWindow(QMainWindow):
         children_by_parent: dict[int | None, list[tuple[object, int]]] = {}
         for collection, count in collections_with_counts:
             children_by_parent.setdefault(collection.parent_id, []).append((collection, count))
+        excluded_collection_ids = set(self._search_excluded_collection_ids())
 
-        def add_children(parent_item: QTreeWidgetItem | None, parent_id: int | None, depth: int) -> None:
+        def add_children(
+            parent_item: QTreeWidgetItem | None,
+            parent_id: int | None,
+            depth: int,
+            inherited_exclusion_id: int | None = None,
+        ) -> None:
             for collection, count in children_by_parent.get(parent_id, []):
+                direct_excluded = collection.id in excluded_collection_ids
+                matched_exclusion_id = collection.id if direct_excluded else inherited_exclusion_id
                 item = self._make_collection_tree_item(
                     collection_id=collection.id,
                     name=collection.name,
                     count=count,
                     depth=depth,
+                    search_excluded_direct=direct_excluded,
+                    search_excluded_match_id=matched_exclusion_id,
                 )
                 if parent_item is None:
                     self.collection_tree.addTopLevelItem(item)
@@ -11582,7 +12187,7 @@ class MainWindow(QMainWindow):
                 item.setExpanded(collection.id in expanded_ids)
                 if current == collection.id:
                     nonlocal_selected[0] = item
-                add_children(item, collection.id, depth + 1)
+                add_children(item, collection.id, depth + 1, matched_exclusion_id)
 
         nonlocal_selected: list[QTreeWidgetItem | None] = [selected_item]
         add_children(None, None, 0)
@@ -11640,6 +12245,8 @@ class MainWindow(QMainWindow):
         item.setData(0, Qt.ItemDataRole.UserRole, None)
         item.setData(0, Qt.ItemDataRole.UserRole + 1, None)
         item.setData(0, COLLECTION_VIRTUAL_FILTER_ROLE, virtual_filter)
+        item.setData(0, COLLECTION_SEARCH_EXCLUDED_DIRECT_ROLE, False)
+        item.setData(0, COLLECTION_SEARCH_EXCLUDED_MATCH_ROLE, None)
         item.setToolTip(0, self._virtual_filter_help(virtual_filter))
         item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         for column in range(item.columnCount()):
@@ -12889,10 +13496,16 @@ class MainWindow(QMainWindow):
         self._show_gallery_view()
         self.search_creative_node_button.setEnabled(False)
         self._set_result_status(f"创作节点搜索中：{node.title}")
+        excluded_folder_path_prefixes = tuple(self._search_excluded_folder_prefixes())
+        excluded_collection_ids = tuple(self._search_excluded_collection_ids())
 
         def run() -> None:
             try:
-                result = self.search_service.semantic_search(query)
+                result = self.search_service.semantic_search(
+                    query,
+                    excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                    excluded_collection_ids=excluded_collection_ids,
+                )
                 self.events.put(("creative_node_search_done", (revision, node.id, query, result)))
             except Exception as exc:
                 self.events.put(("creative_node_search_error", (revision, exc)))
@@ -14358,13 +14971,27 @@ class MainWindow(QMainWindow):
         name: str,
         count: int,
         depth: int,
+        search_excluded_direct: bool = False,
+        search_excluded_match_id: int | None = None,
     ) -> QTreeWidgetItem:
-        item = QTreeWidgetItem([name, str(count)])
+        display_name = f"{name} ⊘" if search_excluded_match_id is not None else name
+        item = QTreeWidgetItem([display_name, str(count)])
         item.setData(0, Qt.ItemDataRole.UserRole, collection_id)
         item.setData(0, Qt.ItemDataRole.UserRole + 1, name)
         item.setData(0, COLLECTION_VIRTUAL_FILTER_ROLE, None)
+        item.setData(0, COLLECTION_SEARCH_EXCLUDED_DIRECT_ROLE, search_excluded_direct)
+        item.setData(0, COLLECTION_SEARCH_EXCLUDED_MATCH_ROLE, search_excluded_match_id)
         item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._apply_collection_tree_level_style(item, depth)
+        if search_excluded_match_id is not None:
+            item.setForeground(0, QBrush(FolderTreeItemDelegate.EXCLUDED_NAME_COLOR))
+            item.setIcon(0, _folder_search_excluded_marker_icon())
+            item.setToolTip(
+                0,
+                f"{name}\n已排除出搜索结果"
+                if search_excluded_direct
+                else f"{name}\n已被上级文件夹排除出搜索结果",
+            )
         item.setFlags(
             item.flags()
             | Qt.ItemFlag.ItemIsDragEnabled
@@ -14405,6 +15032,7 @@ class MainWindow(QMainWindow):
         current_ids = set(self._selected_tag_ids())
         if not current_ids and self._pending_tag_restore_ids is not None:
             current_ids = set(self._pending_tag_restore_ids)
+        self._refresh_tag_group_combo()
         tags_with_counts = self.store.list_tags_with_counts()
         self.tag_list.blockSignals(True)
         self.tag_list.clear()
@@ -14413,22 +15041,51 @@ class MainWindow(QMainWindow):
         all_item.setData(Qt.ItemDataRole.UserRole, None)
         all_item.setData(Qt.ItemDataRole.UserRole + 1, None)
         all_item.setData(Qt.ItemDataRole.UserRole + 2, 0)
+        all_item.setData(TAG_GROUP_HEADER_ROLE, False)
         self.tag_list.addItem(all_item)
         if not current_ids:
             selected_item = all_item
             all_item.setSelected(True)
         tag_names = [tag.tag_name for tag, _count in tags_with_counts]
         visible_tags = self._visible_tags_with_counts(tags_with_counts)
+        groups = self.store.list_tag_groups()
+        group_names = {group.id: group.name for group in groups}
+        grouped_tags: dict[int | None, list[tuple[object, int]]] = {}
         for tag, count in visible_tags:
-            item = QListWidgetItem(f"{tag.tag_name}    {count}")
-            item.setData(Qt.ItemDataRole.UserRole, tag.id)
-            item.setData(Qt.ItemDataRole.UserRole + 1, tag.tag_name)
-            item.setData(Qt.ItemDataRole.UserRole + 2, count)
-            item.setToolTip(tag.tag_name)
-            self.tag_list.addItem(item)
-            if tag.id in current_ids:
-                item.setSelected(True)
-                selected_item = item
+            grouped_tags.setdefault(tag.group_id, []).append((tag, count))
+        ordered_group_ids: list[int | None] = [
+            group.id for group in groups if group.id in grouped_tags or not self.tag_search_input.text().strip()
+        ]
+        if None in grouped_tags:
+            ordered_group_ids.insert(0, None)
+        for group_id in ordered_group_ids:
+            tag_rows = grouped_tags.get(group_id, [])
+            if not tag_rows and self.tag_search_input.text().strip():
+                continue
+            group_label = "未分组" if group_id is None else group_names.get(group_id, "未命名分组")
+            header = QListWidgetItem(group_label)
+            header.setData(Qt.ItemDataRole.UserRole, None)
+            header.setData(Qt.ItemDataRole.UserRole + 1, None)
+            header.setData(Qt.ItemDataRole.UserRole + 2, 0)
+            header.setData(TAG_GROUP_ID_ROLE, group_id)
+            header.setData(TAG_GROUP_HEADER_ROLE, True)
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            header.setForeground(QBrush(QColor("#d5dbe4")))
+            header.setBackground(QBrush(QColor("#303943")))
+            self.tag_list.addItem(header)
+            for tag, count in tag_rows:
+                item = QListWidgetItem(f"  {tag.tag_name}    {count}")
+                item.setData(Qt.ItemDataRole.UserRole, tag.id)
+                item.setData(Qt.ItemDataRole.UserRole + 1, tag.tag_name)
+                item.setData(Qt.ItemDataRole.UserRole + 2, count)
+                item.setData(TAG_GROUP_ID_ROLE, tag.group_id)
+                item.setData(TAG_GROUP_HEADER_ROLE, False)
+                item.setToolTip(tag.tag_name)
+                item.setBackground(QBrush(QColor("#39414c")))
+                self.tag_list.addItem(item)
+                if tag.id in current_ids:
+                    item.setSelected(True)
+                    selected_item = item
         tag_filter_text = self.tag_search_input.text().strip().casefold()
         show_untagged = (
             not tag_filter_text
@@ -14442,6 +15099,7 @@ class MainWindow(QMainWindow):
             untagged_item.setData(Qt.ItemDataRole.UserRole + 1, None)
             untagged_item.setData(Qt.ItemDataRole.UserRole + 2, counts.get("untagged", 0))
             untagged_item.setData(COLLECTION_VIRTUAL_FILTER_ROLE, "untagged")
+            untagged_item.setData(TAG_GROUP_HEADER_ROLE, False)
             untagged_item.setToolTip(self._virtual_filter_help("untagged"))
             self.tag_list.addItem(untagged_item)
             if self.current_virtual_filter == "untagged":
@@ -14454,6 +15112,25 @@ class MainWindow(QMainWindow):
         self._pending_tag_restore_ids = None
         self._refresh_tag_action_buttons()
         self._save_selected_tag_filter()
+
+    def _refresh_tag_group_combo(self, select_group_id: int | None = None) -> None:
+        if not hasattr(self, "tag_group_combo"):
+            return
+        current_group_id = select_group_id
+        if current_group_id is None:
+            current_data = self.tag_group_combo.currentData()
+            current_group_id = int(current_data) if current_data is not None else None
+        groups = self.store.list_tag_groups()
+        self.tag_group_combo.blockSignals(True)
+        self.tag_group_combo.clear()
+        self.tag_group_combo.addItem("未分组", None)
+        selected_index = 0
+        for index, group in enumerate(groups, start=1):
+            self.tag_group_combo.addItem(group.name, group.id)
+            if current_group_id == group.id:
+                selected_index = index
+        self.tag_group_combo.setCurrentIndex(selected_index)
+        self.tag_group_combo.blockSignals(False)
 
     def _visible_tags_with_counts(
         self,
@@ -14500,9 +15177,16 @@ class MainWindow(QMainWindow):
     def _refresh_tag_action_buttons(self) -> None:
         tag_id, _tag_name = self._selected_tag_context()
         enabled = tag_id is not None
+        has_selected_tags = bool(self._selected_tag_ids())
+        group_selected = self._selected_tag_group_id() is not None
+        self.new_tag_button.setEnabled(True)
         self.rename_tag_button.setEnabled(enabled)
         self.delete_tag_button.setEnabled(enabled)
         self.merge_tag_button.setEnabled(enabled)
+        self.move_tag_group_button.setEnabled(has_selected_tags)
+        self.new_tag_group_button.setEnabled(True)
+        self.rename_tag_group_button.setEnabled(group_selected)
+        self.delete_tag_group_button.setEnabled(group_selected)
 
     def _selected_folder_path_prefix(self) -> str | None:
         item = self.folder_tree.currentItem()
@@ -14602,13 +15286,86 @@ class MainWindow(QMainWindow):
         scan_path: str,
         folder_id: int,
         filter_path: str,
+        excluded_prefixes: Sequence[str] | None = None,
     ) -> QTreeWidgetItem:
-        item = QTreeWidgetItem([label, str(count)])
+        direct, matched_prefix = self._folder_search_exclusion_state(filter_path, excluded_prefixes or [])
+        display_label = f"{label} ⊘" if matched_prefix is not None else label
+        item = QTreeWidgetItem([display_label, str(count)])
         item.setData(0, Qt.ItemDataRole.UserRole, scan_path)
         item.setData(0, Qt.ItemDataRole.UserRole + 1, folder_id)
         item.setData(0, Qt.ItemDataRole.UserRole + 2, filter_path)
+        item.setData(0, FOLDER_SEARCH_EXCLUDED_DIRECT_ROLE, direct)
+        item.setData(0, FOLDER_SEARCH_EXCLUDED_MATCH_ROLE, matched_prefix)
+        item.setData(1, FOLDER_SEARCH_EXCLUDED_DIRECT_ROLE, direct)
+        item.setData(1, FOLDER_SEARCH_EXCLUDED_MATCH_ROLE, matched_prefix)
         item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if matched_prefix is not None:
+            excluded_foreground = QBrush(FolderTreeItemDelegate.EXCLUDED_NAME_COLOR)
+            item.setForeground(0, excluded_foreground)
+            item.setIcon(0, _folder_search_excluded_marker_icon())
+            item.setToolTip(
+                0,
+                f"{filter_path}\n已排除出搜索结果"
+                if direct
+                else f"{filter_path}\n已被上级文件夹排除出搜索结果：{matched_prefix}",
+            )
+        else:
+            item.setToolTip(0, filter_path)
         return item
+
+    def _search_excluded_folder_prefixes(self) -> list[str]:
+        return list(getattr(self, "search_excluded_folder_prefixes", []))
+
+    def _reload_search_excluded_folder_prefixes(self) -> None:
+        self.search_excluded_folder_prefixes = self.store.list_search_excluded_folder_prefixes()
+
+    def _search_excluded_collection_ids(self) -> list[int]:
+        return list(getattr(self, "search_excluded_collection_ids", []))
+
+    def _reload_search_excluded_collection_ids(self) -> None:
+        self.search_excluded_collection_ids = self.store.list_search_excluded_collection_ids()
+
+    def _collection_search_exclusion_state(self, collection_id: int) -> tuple[bool, int | None]:
+        self._reload_search_excluded_collection_ids()
+        excluded_ids = set(self._search_excluded_collection_ids())
+        if collection_id in excluded_ids:
+            return True, collection_id
+        collections = self.store.list_collections()
+        by_id = {collection.id: collection for collection in collections}
+        current = by_id.get(collection_id)
+        seen: set[int] = set()
+        while current is not None and current.id not in seen:
+            seen.add(current.id)
+            parent_id = current.parent_id
+            if parent_id is None:
+                break
+            if parent_id in excluded_ids:
+                return False, parent_id
+            current = by_id.get(parent_id)
+        return False, None
+
+    def _folder_search_exclusion_state(
+        self,
+        folder_path: str,
+        excluded_prefixes: Sequence[str] | None = None,
+    ) -> tuple[bool, str | None]:
+        normalized = self._normalize_folder_path(folder_path)
+        prefixes = excluded_prefixes if excluded_prefixes is not None else self._search_excluded_folder_prefixes()
+        for prefix in prefixes:
+            normalized_prefix = self._normalize_folder_path(prefix)
+            if self._path_is_same_or_in_folder(normalized, normalized_prefix):
+                return normalized == normalized_prefix, normalized_prefix
+        return False, None
+
+    @staticmethod
+    def _path_is_same_or_in_folder(path: str, folder_path_prefix: str) -> bool:
+        normalized_path = os.path.abspath(os.path.expanduser(path)).rstrip(os.sep) or os.sep
+        normalized_folder = os.path.abspath(os.path.expanduser(folder_path_prefix)).rstrip(os.sep) or os.sep
+        if normalized_path == normalized_folder:
+            return True
+        if normalized_folder == os.sep:
+            return normalized_path.startswith(os.sep)
+        return normalized_path.startswith(f"{normalized_folder}{os.sep}")
 
     @staticmethod
     def _expand_folder_tree_parents(item: QTreeWidgetItem | None) -> None:
@@ -15057,6 +15814,32 @@ class MainWindow(QMainWindow):
         self._save_selected_tag_filter()
         self._refresh_tag_action_buttons()
 
+    def _select_only_tag_id(self, tag_id: int) -> bool:
+        self.tag_list.blockSignals(True)
+        self.tag_list.clearSelection()
+        found = self._select_tag_id(tag_id, additive=True)
+        if not found:
+            fallback_item = self.tag_list.item(0)
+            if fallback_item is not None:
+                fallback_item.setSelected(True)
+                self.tag_list.setCurrentItem(fallback_item)
+        self.tag_list.blockSignals(False)
+        self._save_selected_tag_filter()
+        self._refresh_tag_action_buttons()
+        return found
+
+    def _select_tag_id(self, tag_id: int, *, additive: bool = False) -> bool:
+        if not additive:
+            self.tag_list.clearSelection()
+        for row in range(self.tag_list.count()):
+            item = self.tag_list.item(row)
+            item_tag_id = item.data(Qt.ItemDataRole.UserRole)
+            if item_tag_id is not None and int(item_tag_id) == int(tag_id):
+                item.setSelected(True)
+                self.tag_list.setCurrentItem(item)
+                return True
+        return False
+
     def _suggest_saved_view_name(self) -> str:
         parts: list[str] = []
         collection_id = self._selected_collection_id()
@@ -15221,7 +16004,11 @@ class MainWindow(QMainWindow):
         self.store.set_setting("ui.search_color", self._format_color_hex(self.current_color_rgb))
         self._update_color_swatch()
         self.color_mode_button.setChecked(True)
-        self._run_search()
+        color_filter = SearchFilter("color", self.current_color_rgb)
+        if self.reverse_exclusion_button.isChecked():
+            self._start_reverse_exclusion_with_filter(color_filter)
+        else:
+            self._start_search_with_filter(color_filter)
 
     def _apply_result_management_filters(self, images: list[ImageItem]) -> list[ImageItem]:
         excluded_image_ids = (

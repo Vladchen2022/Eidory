@@ -34,6 +34,14 @@ class ScanResult:
 ScanProgressCallback = Callable[[int, str, str], None]
 
 
+@dataclass(frozen=True)
+class _ScannedMedia:
+    image_id: int
+    file_path: str
+    state: str
+    duration_ms: int | None
+
+
 class ImageScanner:
     def __init__(self, store: MetadataStore, thumbnailer: Thumbnailer):
         self.store = store
@@ -99,8 +107,8 @@ class ImageScanner:
         new_files = 0
         changed_files = 0
         unchanged_files = 0
-        thumbnail_failures = 0
         image_ids: list[int] = []
+        scanned_media: list[_ScannedMedia] = []
         normalized_skip_paths = {
             os.path.abspath(os.path.expanduser(path))
             for path in (skip_paths or set())
@@ -125,6 +133,14 @@ class ImageScanner:
                 duration_ms=duration_ms,
             )
             image_ids.append(image_id)
+            scanned_media.append(
+                _ScannedMedia(
+                    image_id=image_id,
+                    file_path=file_path,
+                    state=state,
+                    duration_ms=duration_ms,
+                )
+            )
 
             if state == "new":
                 new_files += 1
@@ -135,18 +151,11 @@ class ImageScanner:
 
             if is_supported_video(file_path):
                 self.store.mark_embedding_not_required(image_id)
-            if state in {"new", "changed"} or self.store.thumbnail_needs_generation(image_id):
-                try:
-                    thumbnail_path = self._generate_thumbnail(image_id, file_path)
-                    self.store.update_thumbnail(image_id, str(thumbnail_path), "ready")
-                except Exception:
-                    thumbnail_failures += 1
-                    self.store.update_thumbnail(image_id, None, "failed")
-            if is_supported_image(file_path):
-                self._update_color_feature(image_id, file_path)
 
             if on_progress is not None:
                 on_progress(image_id, state, file_path)
+
+        thumbnail_failures = self._refresh_media_derivatives(scanned_media)
 
         removed_thumbnail_paths: list[str] = []
         missing_marked = 0
@@ -193,8 +202,8 @@ class ImageScanner:
         new_files = 0
         changed_files = 0
         unchanged_files = 0
-        thumbnail_failures = 0
         image_ids: list[int] = []
+        scanned_media: list[_ScannedMedia] = []
 
         for file_path in normalized_paths:
             scanned += 1
@@ -212,6 +221,14 @@ class ImageScanner:
                 duration_ms=duration_ms,
             )
             image_ids.append(image_id)
+            scanned_media.append(
+                _ScannedMedia(
+                    image_id=image_id,
+                    file_path=file_path,
+                    state=state,
+                    duration_ms=duration_ms,
+                )
+            )
 
             if state == "new":
                 new_files += 1
@@ -222,18 +239,11 @@ class ImageScanner:
 
             if is_supported_video(file_path):
                 self.store.mark_embedding_not_required(image_id)
-            if state in {"new", "changed"} or self.store.thumbnail_needs_generation(image_id):
-                try:
-                    thumbnail_path = self._generate_thumbnail(image_id, file_path)
-                    self.store.update_thumbnail(image_id, str(thumbnail_path), "ready")
-                except Exception:
-                    thumbnail_failures += 1
-                    self.store.update_thumbnail(image_id, None, "failed")
-            if is_supported_image(file_path):
-                self._update_color_feature(image_id, file_path)
 
             if on_progress is not None:
                 on_progress(image_id, state, file_path)
+
+        thumbnail_failures = self._refresh_media_derivatives(scanned_media)
 
         return ScanResult(
             folder_id=folder_id,
@@ -284,13 +294,68 @@ class ImageScanner:
             return metadata.width, metadata.height, metadata.duration_ms
         return None, None, None
 
-    def _generate_thumbnail(self, image_id: int, file_path: str) -> Path:
+    def _generate_thumbnail(
+        self,
+        image_id: int,
+        file_path: str,
+        *,
+        duration_ms: int | None = None,
+    ) -> Path:
         if is_supported_video(file_path):
-            return self.thumbnailer.generate_video(image_id, file_path)
+            try:
+                return self.thumbnailer.generate_video(
+                    image_id,
+                    file_path,
+                    duration_ms=duration_ms,
+                )
+            except TypeError:
+                return self.thumbnailer.generate_video(image_id, file_path)
         return self.thumbnailer.generate(image_id, file_path)
 
-    def _update_color_feature(self, image_id: int, file_path: str) -> None:
-        if not self.store.color_feature_needs_generation(image_id):
+    def _refresh_media_derivatives(self, scanned_media: list[_ScannedMedia]) -> int:
+        if not scanned_media:
+            return 0
+
+        changed_thumbnail_ids = {
+            item.image_id for item in scanned_media if item.state in {"new", "changed"}
+        }
+        thumbnail_ids = changed_thumbnail_ids | self.store.thumbnail_ids_needing_generation(
+            [item.image_id for item in scanned_media]
+        )
+        thumbnail_failures = 0
+        for item in scanned_media:
+            if item.image_id not in thumbnail_ids:
+                continue
+            try:
+                thumbnail_path = self._generate_thumbnail(
+                    item.image_id,
+                    item.file_path,
+                    duration_ms=item.duration_ms,
+                )
+                self.store.update_thumbnail(item.image_id, str(thumbnail_path), "ready")
+            except Exception:
+                thumbnail_failures += 1
+                self.store.update_thumbnail(item.image_id, None, "failed")
+
+        image_items = [
+            item for item in scanned_media if is_supported_image(item.file_path)
+        ]
+        color_ids = self.store.color_feature_ids_needing_generation(
+            [item.image_id for item in image_items]
+        )
+        for item in image_items:
+            if item.image_id in color_ids:
+                self._update_color_feature(item.image_id, item.file_path, already_needed=True)
+        return thumbnail_failures
+
+    def _update_color_feature(
+        self,
+        image_id: int,
+        file_path: str,
+        *,
+        already_needed: bool = False,
+    ) -> None:
+        if not already_needed and not self.store.color_feature_needs_generation(image_id):
             return
         try:
             self.store.upsert_color_feature_success(

@@ -9,7 +9,6 @@ from itertools import islice
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
-from urllib.parse import quote
 
 import numpy as np
 
@@ -567,7 +566,7 @@ class MetadataStore:
     def connect(self, *, readonly: bool = False) -> Iterator[sqlite3.Connection]:
         with self._connection_lock:
             if readonly:
-                database = f"file:{quote(str(self.database_path.resolve()))}?mode=ro"
+                database = f"{self.database_path.resolve().as_uri()}?mode=ro"
                 conn = sqlite3.connect(
                     database,
                     timeout=self._busy_timeout_ms / 1000,
@@ -1061,7 +1060,7 @@ class MetadataStore:
                 current = by_id.get(current.parent_id) if current.parent_id is not None else None
             return " / ".join(reversed(parts))
 
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 """
                 SELECT collection_id
@@ -2820,7 +2819,7 @@ class MetadataStore:
             return int(source_count["count"])
 
     def get_image_tags(self, image_id: int) -> list[str]:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 """
                 SELECT t.tag_name
@@ -2838,7 +2837,7 @@ class MetadataStore:
         if not clean_ids:
             return {}
         placeholders = ",".join("?" for _ in clean_ids)
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 f"""
                 SELECT t.tag_name, COUNT(DISTINCT it.image_id) AS image_count
@@ -2857,7 +2856,7 @@ class MetadataStore:
         if not clean_ids:
             return 0
         placeholders = ",".join("?" for _ in clean_ids)
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             row = conn.execute(
                 f"""
                 SELECT COUNT(DISTINCT image_id) AS image_count
@@ -5938,7 +5937,7 @@ class MetadataStore:
             return int(cur.rowcount)
 
     def ai_vision_tags_for_image(self, image_id: int) -> dict[str, object] | None:
-        with self.connect() as conn:
+        with self.connect(readonly=True) as conn:
             row = conn.execute(
                 "SELECT * FROM ai_vision_tags WHERE image_id = ?",
                 (image_id,),

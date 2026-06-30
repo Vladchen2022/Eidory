@@ -24,7 +24,22 @@ from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
 
 import numpy as np
-from PySide6.QtCore import QFile, QBuffer, QFileSystemWatcher, QIODevice, QRect, QSize, QStringListModel, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QFile,
+    QBuffer,
+    QFileSystemWatcher,
+    QIODevice,
+    QObject,
+    QRect,
+    QRunnable,
+    QSize,
+    QStringListModel,
+    Qt,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -205,12 +220,17 @@ VIRTUAL_COLLECTION_FILTERS = (
     ("un_ai_tagged", "未AI标签", "还没有可用 AI 场景视觉标签的图片。"),
     ("uncategorized", "未分类", "没有放入任何 Eidory 文件夹的图片/视频。"),
 )
+RIGHT_TAB_DETAIL = 0
+RIGHT_TAB_AI = 1
+RIGHT_TAB_TAGS = 2
+RIGHT_TAB_INDEX = 3
+RIGHT_TAB_SETTINGS = 4
 
 
 class EqualWidthTabBar(QTabBar):
     BUTTON_MATCH_HEIGHT = 26
     BOTTOM_GAP = 8
-    MIN_TAB_WIDTH = 72
+    MIN_TAB_WIDTH = 68
 
     @classmethod
     def minimum_width_for_tab_count(cls, count: int) -> int:
@@ -358,7 +378,9 @@ class FolderTreeItemDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-TOOL_BUTTON_MIN_WIDTH = EqualWidthTabBar.MIN_TAB_WIDTH
+TOOL_BUTTON_MIN_WIDTH = 72
+TOP_TOOL_BUTTON_SPACING = 5
+TOP_TOOL_BUTTON_MIN_WIDTH = 68
 BOARD_ICON_BUTTON_SIZE = QSize(32, 26)
 BOARD_ICON_SIZE = QSize(18, 18)
 LEFT_SIDEBAR_WIDTH = 300
@@ -795,12 +817,12 @@ class TagPickerDialog(QDialog):
         self._refresh_tag_list()
 
 
-def _load_scaled_qt_pixmap(image_path: str, max_width: int, max_height: int) -> QPixmap:
+def _load_scaled_qt_image(image_path: str, max_width: int, max_height: int) -> QImage:
     if max_width <= 0 or max_height <= 0:
-        return QPixmap()
+        return QImage()
     path = Path(image_path)
     if not path.exists():
-        return QPixmap()
+        return QImage()
     reader = QImageReader(str(path))
     reader.setAutoTransform(True)
     source_size = reader.size()
@@ -810,8 +832,49 @@ def _load_scaled_qt_pixmap(image_path: str, max_width: int, max_height: int) -> 
         scaled_size = QSize(source_size.width(), source_size.height())
         scaled_size.scale(max_width, max_height, Qt.AspectRatioMode.KeepAspectRatio)
         reader.setScaledSize(scaled_size)
-    image = reader.read()
+    return reader.read()
+
+
+def _load_scaled_qt_pixmap(image_path: str, max_width: int, max_height: int) -> QPixmap:
+    image = _load_scaled_qt_image(image_path, max_width, max_height)
     return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+
+
+class _DetailPreviewLoadSignals(QObject):
+    loaded = Signal(object, object, object)
+
+
+class _DetailPreviewLoadTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        request_token: tuple[int, int, int, int, int],
+        candidates: list[tuple[str, tuple[int, int]]],
+        max_width: int,
+        max_height: int,
+        signals: _DetailPreviewLoadSignals,
+    ) -> None:
+        super().__init__()
+        self.request_token = request_token
+        self.candidates = list(candidates)
+        self.max_width = max_width
+        self.max_height = max_height
+        self.signals = signals
+
+    def run(self) -> None:
+        for image_path, metadata in self.candidates:
+            cache_key = (
+                image_path,
+                int(metadata[0]),
+                int(metadata[1]),
+                self.max_width,
+                self.max_height,
+            )
+            image = _load_scaled_qt_image(image_path, self.max_width, self.max_height)
+            if not image.isNull():
+                self.signals.loaded.emit(self.request_token, cache_key, image)
+                return
+        self.signals.loaded.emit(self.request_token, None, QImage())
 
 
 class ImageCompareDialog(QDialog):
@@ -1009,6 +1072,18 @@ class MainWindow(QMainWindow):
         self.selected_image: ImageItem | None = None
         self._detail_preview_cache: OrderedDict[tuple[str, int, int, int, int], QPixmap] = OrderedDict()
         self._detail_preview_cache_limit = 64
+        self._detail_preview_pending_token: tuple[int, int, int, int, int] | None = None
+        self._detail_preview_signals = _DetailPreviewLoadSignals()
+        self._detail_preview_signals.loaded.connect(self._handle_detail_preview_loaded)
+        self._detail_preview_thread_pool = QThreadPool.globalInstance()
+        self._pending_selection_images: list[ImageItem] | None = None
+        self._last_selection_image_ids: tuple[int, ...] = ()
+        self._detail_panel_dirty = False
+        self._tag_assignment_dirty = False
+        self._board_image_by_id: dict[int, ImageItem] = {}
+        self._image_collection_paths_cache: dict[int, list[str]] = {}
+        self._image_tags_cache: dict[int, list[str]] = {}
+        self._ai_vision_detail_cache: dict[int, str] = {}
         self._creative_direct_image_ids_cache: dict[int, set[int]] = {}
         self._result_status_counts_cache: tuple[float, int, int] | None = None
         self._collection_image_counts_status_cache: tuple[float, dict[int, int]] | None = None
@@ -1053,6 +1128,10 @@ class MainWindow(QMainWindow):
         self.ai_vision_stats_refresh_timer.setSingleShot(True)
         self.ai_vision_stats_refresh_timer.setInterval(900)
         self.ai_vision_stats_refresh_timer.timeout.connect(self._refresh_ai_vision_stats)
+        self.selection_detail_timer = QTimer(self)
+        self.selection_detail_timer.setSingleShot(True)
+        self.selection_detail_timer.setInterval(0)
+        self.selection_detail_timer.timeout.connect(self._apply_pending_selection_detail_state)
 
         self.setWindowTitle("Eidory")
         self._configure_native_titlebar()
@@ -1201,6 +1280,10 @@ class MainWindow(QMainWindow):
         return True
 
     def closeEvent(self, event) -> None:
+        if hasattr(self, "selection_detail_timer"):
+            self.selection_detail_timer.stop()
+            self._pending_selection_images = None
+        self._detail_preview_pending_token = None
         self._save_current_board_layout_if_needed()
         self._clear_last_removal_undo(cleanup_backups=True)
         self._database_maintenance_active = True
@@ -1589,7 +1672,7 @@ class MainWindow(QMainWindow):
 
         search_row = QHBoxLayout()
         self.search_row = search_row
-        search_row.setSpacing(0)
+        search_row.setSpacing(TOP_TOOL_BUTTON_SPACING)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("文件名、标签、备注，或语义搜索文本")
         self.search_mode_group = QButtonGroup(self)
@@ -1618,7 +1701,7 @@ class MainWindow(QMainWindow):
         self.advanced_search_toggle_button = QPushButton("▾")
         self.advanced_search_toggle_button.setCheckable(True)
         self.advanced_search_toggle_button.setToolTip("展开更多筛选条件和排序方式")
-        self.advanced_search_toggle_button.setFixedWidth(36)
+        self.advanced_search_toggle_button.setFixedWidth(32)
         for search_action_button in [
             self.reverse_exclusion_button,
             self.color_mode_button,
@@ -1632,7 +1715,7 @@ class MainWindow(QMainWindow):
             self.advanced_search_toggle_button,
         ]:
             if search_action_button is not self.advanced_search_toggle_button:
-                search_action_button.setMinimumWidth(TOOL_BUTTON_MIN_WIDTH)
+                search_action_button.setMinimumWidth(TOP_TOOL_BUTTON_MIN_WIDTH)
         self._update_color_swatch()
         search_row.addWidget(self.search_input, 1)
         search_row.addSpacing(8)
@@ -2067,7 +2150,9 @@ class MainWindow(QMainWindow):
         creative_selection_layout.addWidget(self.creative_selection_summary_label)
         creative_selection_layout.addLayout(creative_selection_actions)
 
-        self.tag_panel_selection_label = QLabel("先在图片墙选择 1 张或多张图片。")
+        self.tag_panel_selection_label = QLabel(
+            "先在图片墙选择 1 张或多张图片，然后在这里添加、移除或清空标签。顶栏“标签”用于筛选；这里用于编辑标签。"
+        )
         self.tag_panel_selection_label.setWordWrap(True)
         self.tag_panel_pick_button = QPushButton("给选中图片添加标签")
         self.tag_panel_remove_combo = QComboBox()
@@ -2788,7 +2873,7 @@ class MainWindow(QMainWindow):
         self.temp_project_list.itemSelectionChanged.connect(self._load_selected_temporary_project)
         self.temp_project_list.customContextMenuRequested.connect(self._show_temporary_project_context_menu)
         self.tag_list.customContextMenuRequested.connect(self._show_tag_context_menu)
-        self.right_tab_widget.currentChanged.connect(self._save_right_tab_index)
+        self.right_tab_widget.currentChanged.connect(self._on_right_tab_changed)
         self.llm_service_combo.currentIndexChanged.connect(self._on_llm_service_changed)
         self.save_settings_button.clicked.connect(self._save_settings)
         self.open_data_dir_button.clicked.connect(self._open_data_directory)
@@ -3123,6 +3208,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_after_database_change(self) -> None:
         self._invalidate_near_duplicate_hash_cache()
+        self._clear_selection_detail_caches()
         self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
         self._load_settings_controls()
         self._apply_runtime_language_settings()
@@ -8066,7 +8152,17 @@ class MainWindow(QMainWindow):
     def _sync_preview_selection(self, image: ImageItem) -> None:
         self.selected_image = image
         self.grid_view.select_image_id(image.id)
-        self._show_image_details(image)
+        if self._detail_tab_is_visible():
+            self._show_image_details(image)
+            self._detail_panel_dirty = False
+        else:
+            self._detail_panel_dirty = True
+        if self.current_result_mode != "creative_node":
+            if self._tag_assignment_tab_is_visible():
+                self._refresh_tag_panel_assignment([image])
+                self._tag_assignment_dirty = False
+            else:
+                self._tag_assignment_dirty = True
 
     def _handle_preview_favorite_changed(self, image: ImageItem) -> None:
         self.selected_image = image
@@ -8769,19 +8865,97 @@ class MainWindow(QMainWindow):
         self.selected_image = image
 
     def _on_grid_selection_changed(self, images: list[ImageItem]) -> None:
-        self._apply_selection_detail_state(images)
+        self._refresh_temp_project_save_button()
+        self._queue_selection_detail_state(images)
 
     def _on_project_board_selection_changed(self, image_ids: list[int]) -> None:
         if self.center_result_stack.currentWidget() is not self.project_board_view:
             return
-        images: list[ImageItem] = []
-        for image_id in image_ids:
-            image = self.store.get_image(int(image_id))
-            if image is not None:
-                images.append(image)
+        images = [
+            image
+            for image_id in image_ids
+            if (image := self._board_image_by_id.get(int(image_id))) is not None
+        ]
+        self.selected_image = images[-1] if images else None
+        self._refresh_temp_project_save_button()
+        self._queue_selection_detail_state(images)
+
+    def _queue_selection_detail_state(self, images: Sequence[ImageItem]) -> None:
+        self._pending_selection_images = list(images)
+        self.selection_detail_timer.start()
+
+    def _apply_pending_selection_detail_state(self) -> None:
+        images = self._pending_selection_images
+        self._pending_selection_images = None
+        if images is None:
+            return
         self._apply_selection_detail_state(images)
 
     def _apply_selection_detail_state(self, images: list[ImageItem]) -> None:
+        image_ids = tuple(image.id for image in images)
+        self._last_selection_image_ids = image_ids
+        detail_visible = self._detail_tab_is_visible()
+        if not detail_visible:
+            self._detail_preview_pending_token = None
+        if len(images) > 1:
+            self.selected_image = images[-1]
+            if detail_visible:
+                self._show_multi_selection_details(images)
+                self._detail_panel_dirty = False
+            else:
+                self._detail_panel_dirty = True
+        elif images:
+            self.selected_image = images[0]
+            if detail_visible:
+                self._show_image_details(images[0])
+                self._detail_panel_dirty = False
+            else:
+                self._detail_panel_dirty = True
+        else:
+            self.selected_image = None
+            if detail_visible:
+                self._show_collection_details(self._selected_collection_id())
+                self._detail_panel_dirty = False
+            else:
+                self._detail_panel_dirty = True
+        if self.current_result_mode == "creative_node":
+            if detail_visible:
+                self._refresh_creative_selection_panel(images)
+        else:
+            if self._tag_assignment_tab_is_visible():
+                self._refresh_tag_panel_assignment(images)
+                self._tag_assignment_dirty = False
+            else:
+                self._tag_assignment_dirty = True
+        self._refresh_temp_project_save_button()
+
+    def _detail_tab_is_visible(self) -> bool:
+        return (
+            hasattr(self, "right_tab_widget")
+            and self.right_tab_widget.currentIndex() == RIGHT_TAB_DETAIL
+        )
+
+    def _tag_assignment_tab_is_visible(self) -> bool:
+        return (
+            hasattr(self, "right_tab_widget")
+            and self.right_tab_widget.currentIndex() == RIGHT_TAB_TAGS
+        )
+
+    def _current_selection_images(self) -> list[ImageItem]:
+        if (
+            hasattr(self, "center_result_stack")
+            and self.center_result_stack.currentWidget() is self.project_board_view
+        ):
+            return [
+                image
+                for image_id in self.project_board_view.selected_image_ids()
+                if (image := self._board_image_by_id.get(int(image_id))) is not None
+            ]
+        return self._selected_grid_images()
+
+    def _refresh_detail_panel_for_current_selection(self) -> None:
+        images = self._current_selection_images()
+        self._last_selection_image_ids = tuple(image.id for image in images)
         if len(images) > 1:
             self.selected_image = images[-1]
             self._show_multi_selection_details(images)
@@ -8791,11 +8965,18 @@ class MainWindow(QMainWindow):
         else:
             self.selected_image = None
             self._show_collection_details(self._selected_collection_id())
-        if self.current_result_mode == "creative_node":
-            self._refresh_creative_selection_panel(images)
-        else:
+        self._detail_panel_dirty = False
+
+    def _on_right_tab_changed(self, index: int) -> None:
+        self._save_right_tab_index(index)
+        if index != RIGHT_TAB_DETAIL:
+            self._detail_preview_pending_token = None
+        if index == RIGHT_TAB_DETAIL:
+            self._refresh_detail_panel_for_current_selection()
+        elif index == RIGHT_TAB_TAGS:
+            images = self._current_selection_images()
             self._refresh_tag_panel_assignment(images)
-        self._refresh_temp_project_save_button()
+            self._tag_assignment_dirty = False
 
     def _on_collection_selection_changed(self) -> None:
         item = self.collection_tree.currentItem()
@@ -8809,8 +8990,16 @@ class MainWindow(QMainWindow):
             self._refresh_virtual_collection_filters()
         self.selected_image = None
         self._refresh_current_results_for_filters()
-        self._show_collection_details(self._selected_collection_id())
-        self._refresh_tag_panel_assignment([])
+        if self._detail_tab_is_visible():
+            self._show_collection_details(self._selected_collection_id())
+            self._detail_panel_dirty = False
+        else:
+            self._detail_panel_dirty = True
+        if self._tag_assignment_tab_is_visible():
+            self._refresh_tag_panel_assignment([])
+            self._tag_assignment_dirty = False
+        else:
+            self._tag_assignment_dirty = True
         self._refresh_temp_project_save_button()
 
     def _on_tag_list_selection_changed(self) -> None:
@@ -8822,8 +9011,16 @@ class MainWindow(QMainWindow):
             self._clear_ai_vision_virtual_filter_selection()
             self.selected_image = None
             self._refresh_current_results_for_filters()
-            self._show_collection_details(None)
-            self._refresh_tag_panel_assignment([])
+            if self._detail_tab_is_visible():
+                self._show_collection_details(None)
+                self._detail_panel_dirty = False
+            else:
+                self._detail_panel_dirty = True
+            if self._tag_assignment_tab_is_visible():
+                self._refresh_tag_panel_assignment([])
+                self._tag_assignment_dirty = False
+            else:
+                self._tag_assignment_dirty = True
             self._refresh_temp_project_save_button()
         elif previous_virtual_filter == "untagged":
             self.current_virtual_filter = None
@@ -8841,8 +9038,16 @@ class MainWindow(QMainWindow):
             self._clear_tag_virtual_filter_selection()
             self.selected_image = None
             self._refresh_current_results_for_filters()
-            self._show_collection_details(None)
-            self._refresh_tag_panel_assignment([])
+            if self._detail_tab_is_visible():
+                self._show_collection_details(None)
+                self._detail_panel_dirty = False
+            else:
+                self._detail_panel_dirty = True
+            if self._tag_assignment_tab_is_visible():
+                self._refresh_tag_panel_assignment([])
+                self._tag_assignment_dirty = False
+            else:
+                self._tag_assignment_dirty = True
             self._refresh_temp_project_save_button()
         elif previous_virtual_filter == "un_ai_tagged":
             self.current_virtual_filter = None
@@ -8959,12 +9164,12 @@ class MainWindow(QMainWindow):
         self._suppress_detail_auto_save = True
         self.file_name_input.setText(image.file_name)
         self._set_path_text(image.file_path)
-        collection_paths = self.store.collection_paths_for_image(image.id)
+        collection_paths = self._collection_paths_for_image_cached(image.id)
         self.image_collections_label.setText("；".join(collection_paths) if collection_paths else "未归类")
         self.size_label.setText(self._format_media_dimensions(image))
         self.modified_label.setText(image.modified_at or "-")
         self.embedding_label.setText(image.embedding_status)
-        self.ai_vision_detail_label.setText(self._format_ai_vision_details(image.id))
+        self.ai_vision_detail_label.setText(self._format_ai_vision_details_cached(image.id))
         if self.current_result_mode == "inspiration" and image.id in self.current_inspiration_matches:
             matches = self.current_inspiration_matches[image.id]
             titles = "、".join(match.term_title for match in matches[:3])
@@ -8973,7 +9178,7 @@ class MainWindow(QMainWindow):
         else:
             self.score_label.setText("-" if image.score is None else f"{image.score:.4f}")
         self.favorite_checkbox.setChecked(image.is_favorite)
-        tags = self.store.get_image_tags(image.id)
+        tags = self._image_tags_cached(image.id)
         self._set_tags_display(tags)
         self.note_input.setPlainText(image.note or "")
         self._suppress_detail_auto_save = False
@@ -8988,19 +9193,7 @@ class MainWindow(QMainWindow):
         self._stop_video_preview()
         self.preview_stack.setCurrentWidget(self.preview_label)
         self.play_pause_button.setEnabled(False)
-        pixmap = self._load_detail_preview_pixmap(image)
-        if pixmap.isNull():
-            self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("无法预览")
-            return
-        self.preview_label.setText("")
-        self.preview_label.setPixmap(
-            pixmap.scaled(
-                self.preview_label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+        self._request_detail_preview(image)
 
     def _load_detail_preview_pixmap(self, image: ImageItem) -> QPixmap:
         if image.is_missing:
@@ -9028,6 +9221,71 @@ class MainWindow(QMainWindow):
                 self._detail_preview_cache.popitem(last=False)
             return pixmap
         return QPixmap()
+
+    def _request_detail_preview(self, image: ImageItem) -> None:
+        if image.is_missing:
+            self._detail_preview_pending_token = None
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("无法预览")
+            return
+        target_size = self.preview_label.size()
+        max_width = max(1, target_size.width() * 2)
+        max_height = max(1, target_size.height() * 2)
+        source_metadata = (int(image.modified_time_ns), int(image.file_size))
+        request_token = (image.id, source_metadata[0], source_metadata[1], max_width, max_height)
+        candidates: list[tuple[str, tuple[int, int]]] = []
+        if image.thumbnail_path:
+            candidates.append((image.thumbnail_path, source_metadata))
+        candidates.append((image.file_path, source_metadata))
+        self._detail_preview_pending_token = request_token
+        for image_path, metadata in candidates:
+            key = (image_path, metadata[0], metadata[1], max_width, max_height)
+            cached = self._detail_preview_cache.get(key)
+            if cached is None:
+                continue
+            self._detail_preview_cache.move_to_end(key)
+            self._apply_detail_preview_pixmap(QPixmap(cached))
+            return
+        self.preview_label.setPixmap(QPixmap())
+        self.preview_label.setText("加载预览...")
+        task = _DetailPreviewLoadTask(
+            request_token=request_token,
+            candidates=candidates,
+            max_width=max_width,
+            max_height=max_height,
+            signals=self._detail_preview_signals,
+        )
+        self._detail_preview_thread_pool.start(task)
+
+    def _handle_detail_preview_loaded(
+        self,
+        request_token: tuple[int, int, int, int, int],
+        cache_key: tuple[str, int, int, int, int] | None,
+        image: QImage,
+    ) -> None:
+        if request_token != self._detail_preview_pending_token:
+            return
+        pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+        if pixmap.isNull():
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("无法预览")
+            return
+        if cache_key is not None:
+            self._detail_preview_cache[cache_key] = QPixmap(pixmap)
+            self._detail_preview_cache.move_to_end(cache_key)
+            while len(self._detail_preview_cache) > self._detail_preview_cache_limit:
+                self._detail_preview_cache.popitem(last=False)
+        self._apply_detail_preview_pixmap(pixmap)
+
+    def _apply_detail_preview_pixmap(self, pixmap: QPixmap) -> None:
+        self.preview_label.setText("")
+        self.preview_label.setPixmap(
+            pixmap.scaled(
+                self.preview_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
     def _ensure_detail_video_preview(self) -> tuple[QVideoWidget, QMediaPlayer]:
         if self.video_widget is None:
@@ -9110,6 +9368,7 @@ class MainWindow(QMainWindow):
         self.open_collection_import_dir_button.setEnabled(True)
 
     def _show_video_details(self, image: ImageItem) -> None:
+        self._detail_preview_pending_token = None
         video_widget, video_player = self._ensure_detail_video_preview()
         self.preview_label.setPixmap(QPixmap())
         self.preview_label.setText("")
@@ -9124,6 +9383,42 @@ class MainWindow(QMainWindow):
             self.preview_label.setText("视频文件不存在")
             return
         video_player.setSource(QUrl.fromLocalFile(image.file_path))
+
+    def _collection_paths_for_image_cached(self, image_id: int) -> list[str]:
+        cached = self._image_collection_paths_cache.get(image_id)
+        if cached is not None:
+            return list(cached)
+        paths = self.store.collection_paths_for_image(image_id)
+        self._image_collection_paths_cache[image_id] = list(paths)
+        return paths
+
+    def _image_tags_cached(self, image_id: int) -> list[str]:
+        cached = self._image_tags_cache.get(image_id)
+        if cached is not None:
+            return list(cached)
+        tags = self.store.get_image_tags(image_id)
+        self._image_tags_cache[image_id] = list(tags)
+        return tags
+
+    def _format_ai_vision_details_cached(self, image_id: int) -> str:
+        cached = self._ai_vision_detail_cache.get(image_id)
+        if cached is not None:
+            return cached
+        text = self._format_ai_vision_details(image_id)
+        self._ai_vision_detail_cache[image_id] = text
+        return text
+
+    def _clear_selection_detail_caches(self, image_ids: Sequence[int] | None = None) -> None:
+        if image_ids is None:
+            self._image_collection_paths_cache.clear()
+            self._image_tags_cache.clear()
+            self._ai_vision_detail_cache.clear()
+            return
+        for image_id in image_ids:
+            clean_id = int(image_id)
+            self._image_collection_paths_cache.pop(clean_id, None)
+            self._image_tags_cache.pop(clean_id, None)
+            self._ai_vision_detail_cache.pop(clean_id, None)
 
     def _format_ai_vision_details(self, image_id: int) -> str:
         tags = self.store.ai_vision_tags_for_image(image_id)
@@ -9377,7 +9672,9 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._enforce_fixed_sidebar_widths)
         if hasattr(self, "path_label"):
             self._fit_path_label_height()
-        selected_images = self.grid_view.selected_images()
+        if not self._detail_tab_is_visible():
+            return
+        selected_images = self._current_selection_images()
         if len(selected_images) > 1:
             self._show_multi_selection_details(selected_images)
         elif self.selected_image is not None:
@@ -10478,6 +10775,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已清除 {removed} 个标签关联")
 
     def _refresh_after_tag_assignment(self, previous_selection: list[ImageItem]) -> None:
+        self._clear_selection_detail_caches([image.id for image in previous_selection])
         self._refresh_tags()
         self._refresh_virtual_collection_counts()
         self._refresh_current_results_for_filters()
@@ -10486,10 +10784,19 @@ class MainWindow(QMainWindow):
         )
         if len(refreshed) == 1:
             self.selected_image = refreshed[0]
-            self._show_image_details(refreshed[0])
+            if self._detail_tab_is_visible():
+                self._show_image_details(refreshed[0])
+                self._detail_panel_dirty = False
+            else:
+                self._detail_panel_dirty = True
         elif len(refreshed) > 1:
-            self._show_multi_selection_details(refreshed)
+            if self._detail_tab_is_visible():
+                self._show_multi_selection_details(refreshed)
+                self._detail_panel_dirty = False
+            else:
+                self._detail_panel_dirty = True
         self._refresh_tag_panel_assignment(refreshed)
+        self._tag_assignment_dirty = False
 
     def _batch_add_tags_from_panel(self) -> None:
         images = self._selected_grid_images()
@@ -11104,6 +11411,7 @@ class MainWindow(QMainWindow):
         preserve_current_view: bool = False,
     ) -> None:
         self._invalidate_near_duplicate_hash_cache()
+        self._clear_selection_detail_caches()
         self._refresh_folders()
         self._refresh_collections(select_collection_id=select_collection_id)
         self.store.seed_default_ai_vision_collection_rules()
@@ -11564,12 +11872,16 @@ class MainWindow(QMainWindow):
         if progress.image_id is None:
             self.statusBar().showMessage(progress.message)
         else:
+            self._clear_selection_detail_caches([progress.image_id])
             self.statusBar().showMessage(f"{progress.file_name}: {progress.status}")
             if self.selected_image is not None and self.selected_image.id == progress.image_id:
                 image = self.store.get_image(progress.image_id)
                 if image is not None:
                     self.selected_image = image
-                    self._show_image_details(image)
+                    if self._detail_tab_is_visible():
+                        self._show_image_details(image)
+                    else:
+                        self._detail_panel_dirty = True
 
     def _queue_ai_vision_stats_refresh(self) -> None:
         if not self.ai_vision_stats_refresh_timer.isActive():
@@ -12134,6 +12446,7 @@ class MainWindow(QMainWindow):
         self.folder_tree.blockSignals(False)
 
     def _refresh_collections(self, select_collection_id: int | None = None) -> None:
+        self._image_collection_paths_cache.clear()
         current = select_collection_id
         current_virtual_filter = self.current_virtual_filter
         if current is None:
@@ -13734,6 +14047,7 @@ class MainWindow(QMainWindow):
         self._current_board_node_id = None
         self._current_board_temp_project_id = None
         self._current_board_image_ids = ()
+        self._board_image_by_id = {}
         self._set_board_focus_mode(False)
         self._set_board_window_pinned(False)
         if hasattr(self, "center_result_stack"):
@@ -13792,6 +14106,7 @@ class MainWindow(QMainWindow):
         title = self._creative_node_path_text_from_nodes(node.id, nodes) or node.title
         raw_badges = board_data.get("badges", {})
         badges = raw_badges if isinstance(raw_badges, dict) else {}
+        self._board_image_by_id = {image.id: image for image in images}
         self.project_board_view.set_images(
             images,
             title=title,
@@ -14593,6 +14908,7 @@ class MainWindow(QMainWindow):
             return
         title = f"{label}：{project.name}"
         layout_payload = self._temporary_project_board_layout_payload(project_id)
+        self._board_image_by_id = {image.id: image for image in images}
         self.project_board_view.set_images(
             images,
             title=title,
@@ -15029,6 +15345,7 @@ class MainWindow(QMainWindow):
             item.setBackground(column, brush)
 
     def _refresh_tags(self) -> None:
+        self._image_tags_cache.clear()
         current_ids = set(self._selected_tag_ids())
         if not current_ids and self._pending_tag_restore_ids is not None:
             current_ids = set(self._pending_tag_restore_ids)

@@ -50,6 +50,7 @@ from eidory.models import ImageItem
 
 PREVIEW_ICON_BUTTON_SIZE = QSize(32, 26)
 PREVIEW_ICON_SIZE = QSize(18, 18)
+INLINE_SOURCE_PREVIEW_MAX_BYTES = 512 * 1024
 
 
 def _preview_transform_icon(kind: str) -> QIcon:
@@ -535,7 +536,7 @@ class ImagePreviewDialog(QDialog):
         self._zoom_refine_timer.timeout.connect(self._render_current_image)
         self._preview_refine_timer = QTimer(self)
         self._preview_refine_timer.setSingleShot(True)
-        self._preview_refine_timer.setInterval(35)
+        self._preview_refine_timer.setInterval(180)
         self._preview_refine_timer.timeout.connect(self._render_current_image)
 
         self.setWindowTitle("Eidory 预览")
@@ -697,7 +698,8 @@ class ImagePreviewDialog(QDialog):
         super().resizeEvent(event)
         image = self.current_image()
         if self.fit_to_window and (image is None or not is_supported_video(image.file_path)):
-            self._render_current_image()
+            self._render_current_image(use_thumbnail_first=True)
+            self._preview_refine_timer.start()
 
     def eventFilter(self, watched, event) -> bool:
         if (
@@ -757,6 +759,7 @@ class ImagePreviewDialog(QDialog):
         self._refresh()
 
     def _refresh(self) -> None:
+        self._preview_refine_timer.stop()
         image = self.current_image()
         if image is None:
             self.info_label.setText("-")
@@ -783,7 +786,8 @@ class ImagePreviewDialog(QDialog):
         if is_supported_video(image.file_path):
             self._render_current_video(image)
         else:
-            self._render_current_image(use_thumbnail_first=not self.isVisible())
+            self._render_current_image(use_thumbnail_first=True)
+            self._preview_refine_timer.start()
         self.imageChanged.emit(image)
 
     def _handle_space_pressed(self) -> None:
@@ -852,12 +856,18 @@ class ImagePreviewDialog(QDialog):
         self.mirror_button.setEnabled(True)
         self.copy_image_button.setEnabled(True)
         max_width, max_height = self._render_bounds()
-        pixmap = (
-            self._load_quick_preview_pixmap(image, max_width, max_height)
-            if use_thumbnail_first
-            else QPixmap()
-        )
-        if pixmap.isNull():
+        pixmap = QPixmap()
+        if use_thumbnail_first:
+            pixmap = self._cached_preview_base_pixmap(image)
+            if pixmap.isNull():
+                pixmap = self._load_quick_preview_pixmap(image, max_width, max_height)
+            if pixmap.isNull() and image.file_size <= INLINE_SOURCE_PREVIEW_MAX_BYTES:
+                pixmap = self._load_preview_source_pixmap(image, max_width, max_height)
+            if pixmap.isNull():
+                self.image_view.set_message("加载预览...")
+                self._update_info(image)
+                return
+        else:
             pixmap = self._load_preview_source_pixmap(image, max_width, max_height)
         if pixmap.isNull():
             self.image_view.set_message("无法预览")
@@ -1095,12 +1105,7 @@ class ImagePreviewDialog(QDialog):
         target_width: int,
         target_height: int,
     ) -> QPixmap:
-        base_key = (
-            image.id,
-            image.file_path,
-            image.file_size,
-            image.modified_time_ns,
-        )
+        base_key = self._preview_base_key_for(image)
         if base_key != self._preview_base_key:
             self._clear_preview_pixmap_cache()
             self._preview_base_key = base_key
@@ -1137,6 +1142,32 @@ class ImagePreviewDialog(QDialog):
         if cached is not None and not cached.isNull():
             return cached
 
+        pixmap = self._apply_preview_transforms(
+            self._preview_base_pixmap,
+            grayscale=self.grayscale_preview,
+            mirror_horizontal=self.mirrored_preview,
+        )
+        self._preview_variant_cache[variant_key] = pixmap
+        return pixmap
+
+    @staticmethod
+    def _preview_base_key_for(image: ImageItem) -> tuple[int, str, int, int]:
+        return (
+            image.id,
+            image.file_path,
+            image.file_size,
+            image.modified_time_ns,
+        )
+
+    def _cached_preview_base_pixmap(self, image: ImageItem) -> QPixmap:
+        if self._preview_base_key != self._preview_base_key_for(image):
+            return QPixmap()
+        if self._preview_base_pixmap.isNull():
+            return QPixmap()
+        variant_key = (self.grayscale_preview, self.mirrored_preview)
+        cached = self._preview_variant_cache.get(variant_key)
+        if cached is not None and not cached.isNull():
+            return cached
         pixmap = self._apply_preview_transforms(
             self._preview_base_pixmap,
             grayscale=self.grayscale_preview,

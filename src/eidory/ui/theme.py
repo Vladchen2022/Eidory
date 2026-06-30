@@ -149,8 +149,8 @@ def apply_dark_theme(app: QApplication) -> None:
             border-radius: 4px;
             min-height: 0;
             min-width: 0;
-            padding: 4px 10px;
-            margin-right: 0;
+            padding: 4px 6px;
+            margin-right: 5px;
             margin-bottom: 8px;
         }
         QTabWidget#rightSidebarTabs QTabBar::tab:hover {

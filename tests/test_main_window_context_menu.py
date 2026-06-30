@@ -56,6 +56,8 @@ from eidory.ui.main_window import (
     SIDEBAR_COUNT_COLUMN_WIDTH,
     TAG_GROUP_HEADER_ROLE,
     TagPickerDialog,
+    TOP_TOOL_BUTTON_MIN_WIDTH,
+    TOP_TOOL_BUTTON_SPACING,
     TOOL_BUTTON_MIN_WIDTH,
 )
 
@@ -1653,6 +1655,60 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window._apply_selection_detail_state([])
             self.assertIsNone(window.selected_image)
             self.assertTrue(window.collection_detail_widget.isVisible())
+            window.close()
+
+    def test_hidden_detail_tab_does_not_refresh_image_details_on_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            image = self._image(1)
+            window.right_tab_widget.setCurrentIndex(1)
+            self.app.processEvents()
+
+            with patch.object(window, "_show_image_details") as show_image_details:
+                window.grid_view.set_images([image], selected_image_ids=[image.id])
+                self.app.processEvents()
+
+            show_image_details.assert_not_called()
+            self.assertEqual(window.selected_image, image)
+            self.assertTrue(window._detail_panel_dirty)
+            window.close()
+
+    def test_project_board_selection_uses_loaded_images_without_store_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            image = self._image(1)
+            window._board_image_by_id = {image.id: image}
+            window.center_result_stack.setCurrentWidget(window.project_board_view)
+
+            with patch.object(store, "get_image", side_effect=AssertionError("unexpected database lookup")):
+                window._on_project_board_selection_changed([image.id])
+                self.app.processEvents()
+
+            self.assertEqual(window.selected_image, image)
             window.close()
 
     def test_detail_note_and_favorite_auto_save_without_renaming_file(self) -> None:
@@ -3732,7 +3788,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 window.right_tab_widget.tabBar().tabSizeHint(0).width(),
                 EqualWidthTabBar.MIN_TAB_WIDTH,
             )
-            self.assertEqual(window.search_row.spacing(), 0)
+            self.assertEqual(window.search_row.spacing(), TOP_TOOL_BUTTON_SPACING)
             self.assertEqual(window.right_tab_widget.parentWidget().minimumWidth(), 0)
             self.assertEqual(window.right_tab_widget.parentWidget().maximumWidth(), RIGHT_SIDEBAR_WIDTH)
             self.assertGreaterEqual(
@@ -3749,7 +3805,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 window.search_button,
                 window.clear_search_button,
             ]:
-                self.assertEqual(button.minimumWidth(), TOOL_BUTTON_MIN_WIDTH)
+                self.assertEqual(button.minimumWidth(), TOP_TOOL_BUTTON_MIN_WIDTH)
             self.assertEqual(window.color_mode_button.text(), "颜色")
             self.assertIn("background:", window.color_mode_button.styleSheet())
             parent = window.preview_stack.parentWidget()

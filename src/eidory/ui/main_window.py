@@ -171,7 +171,7 @@ from eidory.core.search_service import SearchService
 from eidory.core.thumbnailer import Thumbnailer
 from eidory.core.vector_index import VectorIndex
 from eidory.models import CreativeNodeItem, ImageItem
-from eidory.ui.accessibility import disable_qt_accessibility
+from eidory.ui.accessibility import disable_qt_accessibility, hide_macos_accessibility_tree
 from eidory.ui.collection_tree import CollectionTreeWidget
 from eidory.ui.image_preview_dialog import ImagePreviewDialog
 from eidory.ui.justified_image_grid import JustifiedImageGridView
@@ -1094,6 +1094,7 @@ class MainWindow(QMainWindow):
         self.operation_history_messages: list[str] = []
         self._last_removal_undo: dict[str, object] | None = None
         self._macos_titlebar_applied = False
+        self._macos_accessibility_guard_applied = False
         self._database_maintenance_active = False
         self._creative_all_nodes_in_progress = False
         self._background_threads: set[threading.Thread] = set()
@@ -1170,6 +1171,7 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._apply_macos_titlebar()
+        self._apply_macos_accessibility_guard()
 
     def _configure_native_titlebar(self) -> None:
         if sys.platform != "darwin":
@@ -1180,6 +1182,18 @@ class MainWindow(QMainWindow):
             self.setUnifiedTitleAndToolBarOnMac(True)
         QTimer.singleShot(0, self._apply_macos_titlebar)
         QTimer.singleShot(250, self._apply_macos_titlebar)
+        QTimer.singleShot(0, self._apply_macos_accessibility_guard)
+        QTimer.singleShot(250, self._apply_macos_accessibility_guard)
+        QTimer.singleShot(1000, self._apply_macos_accessibility_guard)
+
+    def _apply_macos_accessibility_guard(self) -> None:
+        if self._macos_accessibility_guard_applied or sys.platform != "darwin":
+            return
+        app = QApplication.instance()
+        if app is None or app.platformName().lower() != "cocoa":
+            return
+        if hide_macos_accessibility_tree(self, self._record_error):
+            self._macos_accessibility_guard_applied = True
 
     def _apply_macos_titlebar(self) -> None:
         if self._macos_titlebar_applied or sys.platform != "darwin":

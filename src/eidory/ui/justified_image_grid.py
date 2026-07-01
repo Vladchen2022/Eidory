@@ -158,6 +158,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         new_images = list(images)
         new_layout_signature = self._layout_keys(new_images)
         should_rebuild_layout = self._layout_signature != new_layout_signature
+        if should_rebuild_layout:
+            self._pending_pixmap_loads.clear()
         self._images = new_images
         self._layout_signature = new_layout_signature
         self._badges_by_image_id = dict(badges_by_image_id or {})
@@ -204,6 +206,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
 
     def set_thumbnail_size(self, size: int) -> None:
         self._target_height = max(80, min(420, size))
+        self._pending_pixmap_loads.clear()
         self._rebuild_layout()
         self.viewport().update()
 
@@ -277,9 +280,10 @@ class JustifiedImageGridView(QAbstractScrollArea):
             if index not in self._selected_indexes:
                 self._select_single(index)
             else:
+                previous_index = self._selected_index
                 self._selected_index = index
                 self._selection_anchor = index
-                self.viewport().update()
+                self._update_selection_indexes({previous_index, index})
                 self._emit_selection()
             self.imageContextMenuRequested.emit(self._images[index], event.globalPos())
 
@@ -438,15 +442,19 @@ class JustifiedImageGridView(QAbstractScrollArea):
             return
         if self._selected_indexes == {index} and self._selected_index == index:
             return
+        previous_indexes = set(self._selected_indexes)
+        previous_index = self._selected_index
         self._selected_indexes = {index}
         self._selected_index = index
         self._selection_anchor = index
-        self.viewport().update()
+        self._update_selection_change(previous_indexes, previous_index)
         self._emit_selection()
 
     def _toggle_index(self, index: int) -> None:
         if index < 0 or index >= len(self._images):
             return
+        previous_indexes = set(self._selected_indexes)
+        previous_index = self._selected_index
         if index in self._selected_indexes:
             self._selected_indexes.remove(index)
             if self._selected_index == index:
@@ -455,12 +463,14 @@ class JustifiedImageGridView(QAbstractScrollArea):
             self._selected_indexes.add(index)
             self._selected_index = index
         self._selection_anchor = index
-        self.viewport().update()
+        self._update_selection_change(previous_indexes, previous_index)
         self._emit_selection()
 
     def _select_range(self, index: int, *, additive: bool) -> None:
         if index < 0 or index >= len(self._images):
             return
+        previous_indexes = set(self._selected_indexes)
+        previous_index = self._selected_index
         start = min(self._selection_anchor, index)
         end = max(self._selection_anchor, index)
         indexes = set(range(start, end + 1))
@@ -469,17 +479,42 @@ class JustifiedImageGridView(QAbstractScrollArea):
         else:
             self._selected_indexes = indexes
         self._selected_index = index
-        self.viewport().update()
+        self._update_selection_change(previous_indexes, previous_index)
         self._emit_selection()
 
     def _clear_selection(self) -> None:
         if not self._selected_indexes and self._selected_index == -1:
             return
+        previous_indexes = set(self._selected_indexes)
+        previous_index = self._selected_index
         self._selected_indexes.clear()
         self._selected_index = -1
         self._selection_anchor = -1
-        self.viewport().update()
+        self._update_selection_change(previous_indexes, previous_index)
         self._emit_selection()
+
+    def _update_selection_change(self, previous_indexes: set[int], previous_index: int) -> None:
+        changed_indexes = previous_indexes ^ self._selected_indexes
+        if previous_index != self._selected_index:
+            changed_indexes.add(previous_index)
+            changed_indexes.add(self._selected_index)
+        self._update_selection_indexes(changed_indexes)
+
+    def _update_selection_indexes(self, indexes: set[int]) -> None:
+        clean_indexes = {index for index in indexes if 0 <= index < len(self._rects)}
+        if not clean_indexes:
+            return
+        if len(clean_indexes) > 160:
+            self.viewport().update()
+            return
+        offset_y = self.verticalScrollBar().value()
+        dirty_rect: QRect | None = None
+        for index in clean_indexes:
+            rect = self._rects[index].translated(0, -offset_y).adjusted(-6, -6, 6, 6)
+            dirty_rect = rect if dirty_rect is None else dirty_rect.united(rect)
+        if dirty_rect is None:
+            return
+        self.viewport().update(dirty_rect.intersected(self.viewport().rect()))
 
     def _emit_selection(self) -> None:
         self.selectionChanged.emit(self.current_image())

@@ -396,6 +396,7 @@ class BoardPlaceholderItem(QGraphicsRectItem):
 
 class ProjectBoardView(QGraphicsView):
     imageDoubleClicked = Signal(int)
+    imagePreviewRequested = Signal(int)
     selectionChanged = Signal(list)
     layoutChanged = Signal()
     removeImagesRequested = Signal(list)
@@ -812,9 +813,15 @@ class ProjectBoardView(QGraphicsView):
         if image_id not in self.selected_image_ids():
             self._select_image_id(image_id)
         menu = QMenu(self)
+        preview_action = menu.addAction("通过预览显示图片")
+        menu.addSeparator()
         remove_action = menu.addAction("从当前项目移除")
         remove_action.setEnabled(bool(self.selected_image_ids()))
         chosen = menu.exec(event.globalPos())
+        if chosen == preview_action:
+            self.imagePreviewRequested.emit(image_id)
+            event.accept()
+            return
         if chosen == remove_action:
             image_ids = self.selected_image_ids()
             if image_ids:
@@ -837,6 +844,9 @@ class ProjectBoardView(QGraphicsView):
                 image_ids.append(image_id)
                 seen.add(image_id)
         return image_ids
+
+    def select_image_id(self, image_id: int) -> None:
+        self._select_image_id(image_id)
 
     def _zoom_by(self, factor: float) -> None:
         next_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
@@ -972,6 +982,8 @@ class ProjectBoardView(QGraphicsView):
 
     def _select_image_id(self, image_id: int) -> None:
         previous_ids = self.selected_image_ids()
+        if previous_ids == [image_id]:
+            return
         self._scene.blockSignals(True)
         try:
             for item in self._scene.selectedItems():
@@ -1052,7 +1064,12 @@ class ProjectBoardView(QGraphicsView):
                     file_size=image.file_size,
                 )
             else:
-                pixmap = _cached_pixmap(path, max_side=max_side)
+                pixmap = _cached_pixmap(
+                    path,
+                    max_side=max_side,
+                    modified_time_ns=image.modified_time_ns,
+                    file_size=image.file_size,
+                )
             if not pixmap.isNull():
                 return pixmap
         return QPixmap()

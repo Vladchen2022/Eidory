@@ -150,6 +150,62 @@ class ProjectBoardViewTest(unittest.TestCase):
         self.assertEqual(emitted, [[1]])
         self.assertTrue(event.isAccepted())
 
+    def test_context_menu_can_request_preview_for_board_image(self) -> None:
+        board = ProjectBoardView()
+        board.resize(900, 700)
+        board.set_images([self._image(1)])
+        board.show()
+        self.app.processEvents()
+        emitted: list[int] = []
+        board.imagePreviewRequested.connect(lambda image_id: emitted.append(int(image_id)))
+        item_center = board._image_items[1].sceneBoundingRect().center()
+        viewport_pos = board.mapFromScene(item_center)
+
+        class FakeContextMenuEvent:
+            def __init__(self, pos):
+                self._pos = pos
+                self.accepted = False
+
+            def pos(self):
+                return self._pos
+
+            def globalPos(self):
+                return board.viewport().mapToGlobal(self._pos)
+
+            def accept(self):
+                self.accepted = True
+
+        fake_event = FakeContextMenuEvent(viewport_pos)
+
+        class FakeAction:
+            def __init__(self, text: str) -> None:
+                self.text = text
+                self.enabled = True
+
+            def setEnabled(self, enabled: bool) -> None:
+                self.enabled = enabled
+
+        class FakeMenu:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.actions: list[FakeAction] = []
+
+            def addAction(self, text: str) -> FakeAction:
+                action = FakeAction(text)
+                self.actions.append(action)
+                return action
+
+            def addSeparator(self) -> None:
+                return
+
+            def exec(self, *_args, **_kwargs):
+                return self.actions[0]
+
+        with patch("eidory.ui.project_board.QMenu", FakeMenu):
+            board.contextMenuEvent(fake_event)
+
+        self.assertEqual(emitted, [1])
+        self.assertTrue(fake_event.accepted)
+
     def test_select_image_emits_selection_changed(self) -> None:
         board = ProjectBoardView()
         board.set_images([self._image(1), self._image(2)])
@@ -274,11 +330,29 @@ class ProjectBoardViewTest(unittest.TestCase):
 
             self.assertFalse(cached.isNull())
 
+    def test_board_thumbnail_pixmap_uses_image_metadata_without_filesystem_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            thumbnail_path = Path(tmp) / "thumb.jpg"
+            pixmap = QPixmap(300, 180)
+            pixmap.fill(QColor("#445566"))
+            self.assertTrue(pixmap.save(str(thumbnail_path)))
+            image = self._image(1, file_path=str(Path(tmp) / "source.jpg"), thumbnail_path=str(thumbnail_path))
+
+            with patch.object(Path, "stat", side_effect=AssertionError("stat should not run")):
+                loaded = ProjectBoardView._pixmap_for(
+                    image,
+                    prefer_source=False,
+                    max_side=160,
+                )
+
+            self.assertFalse(loaded.isNull())
+
     @staticmethod
     def _image(
         image_id: int,
         *,
         file_path: str | None = None,
+        thumbnail_path: str | None = None,
         width: int = 800,
         height: int = 450,
     ) -> ImageItem:
@@ -297,7 +371,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             modified_time_ns=image_id,
             imported_at="2026-01-01T00:00:00+00:00",
             last_seen_at="2026-01-01T00:00:00+00:00",
-            thumbnail_path=None,
+            thumbnail_path=thumbnail_path,
             thumbnail_status="ready",
             embedding_status="ready",
             is_missing=False,

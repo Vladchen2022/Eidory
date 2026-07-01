@@ -39,6 +39,7 @@ from eidory.ui.main_window import (
     COLLECTION_SEARCH_EXCLUDED_DIRECT_ROLE,
     COLLECTION_SEARCH_EXCLUDED_MATCH_ROLE,
     CREATIVE_NODE_HAS_NOTE_ROLE,
+    DETAIL_PREVIEW_LOAD_DEBOUNCE_MS,
     DuplicateResultsDialog,
     EqualWidthTabBar,
     FolderTreeItemDelegate,
@@ -56,6 +57,7 @@ from eidory.ui.main_window import (
     SIDEBAR_COUNT_COLUMN_WIDTH,
     TAG_GROUP_HEADER_ROLE,
     TagPickerDialog,
+    THUMBNAIL_SIZE_SETTING_DEBOUNCE_MS,
     TOP_TOOL_BUTTON_MIN_WIDTH,
     TOP_TOOL_BUTTON_SPACING,
     TOOL_BUTTON_MIN_WIDTH,
@@ -1683,6 +1685,136 @@ class MainWindowContextMenuTest(unittest.TestCase):
             show_image_details.assert_not_called()
             self.assertEqual(window.selected_image, image)
             self.assertTrue(window._detail_panel_dirty)
+            window.close()
+
+    def test_selection_detail_refresh_is_debounced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            first = self._image(1)
+            second = self._image(2)
+            with patch.object(window, "_show_image_details") as show_image_details:
+                window._queue_selection_detail_state([first])
+                window._queue_selection_detail_state([second])
+                self.app.processEvents()
+
+                show_image_details.assert_not_called()
+                self.assertTrue(window.selection_detail_timer.isActive())
+                window.selection_detail_timer.stop()
+                window._apply_pending_selection_detail_state()
+
+            show_image_details.assert_called_once_with(second)
+            window.close()
+
+    def test_preview_selection_sync_uses_debounced_detail_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            image = self._image(1)
+            with patch.object(window, "_show_image_details") as show_image_details:
+                window._sync_preview_selection(image)
+                self.app.processEvents()
+
+            show_image_details.assert_not_called()
+            self.assertEqual(window.selected_image, image)
+            self.assertTrue(window._detail_panel_dirty)
+            self.assertTrue(window.selection_detail_timer.isActive())
+            window.selection_detail_timer.stop()
+            window.close()
+
+    def test_detail_preview_decode_is_debounced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            first = self._image(1, file_path=str(Path(tmp) / "first.jpg"))
+            second = self._image(2, file_path=str(Path(tmp) / "second.jpg"))
+            with patch.object(window._detail_preview_thread_pool, "start") as start_task:
+                window._request_detail_preview(first)
+                self.app.processEvents()
+                self.assertTrue(window.detail_preview_load_timer.isActive())
+                self.assertEqual(
+                    window.detail_preview_load_timer.interval(),
+                    DETAIL_PREVIEW_LOAD_DEBOUNCE_MS,
+                )
+                start_task.assert_not_called()
+
+                window._request_detail_preview(second)
+                self.assertTrue(window.detail_preview_load_timer.isActive())
+                start_task.assert_not_called()
+
+                window.detail_preview_load_timer.stop()
+                window._start_pending_detail_preview_load()
+
+            start_task.assert_called_once()
+            task = start_task.call_args.args[0]
+            self.assertEqual(task.request_token[0], second.id)
+            window.close()
+
+    def test_thumbnail_size_setting_write_is_debounced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            with patch.object(store, "set_setting", wraps=store.set_setting) as set_setting:
+                window.thumbnail_size_slider.setValue(window.thumbnail_size_slider.value() + 12)
+                self.app.processEvents()
+
+                self.assertTrue(window.thumbnail_size_setting_timer.isActive())
+                self.assertEqual(
+                    window.thumbnail_size_setting_timer.interval(),
+                    THUMBNAIL_SIZE_SETTING_DEBOUNCE_MS,
+                )
+                self.assertFalse(
+                    any(call.args[:1] == ("ui.thumbnail_size",) for call in set_setting.call_args_list)
+                )
+
+                window.thumbnail_size_setting_timer.stop()
+                window._persist_thumbnail_size_setting()
+
+            self.assertEqual(store.get_setting("ui.thumbnail_size"), str(window.thumbnail_size_slider.value()))
             window.close()
 
     def test_project_board_selection_uses_loaded_images_without_store_lookup(self) -> None:
@@ -6053,6 +6185,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             window.project_board_view._select_image_id(image_id)
             self.app.processEvents()
+            window.selection_detail_timer.stop()
+            window._apply_pending_selection_detail_state()
 
             self.assertIsNotNone(window.selected_image)
             self.assertEqual(window.selected_image.id, image_id)

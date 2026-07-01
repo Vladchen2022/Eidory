@@ -86,6 +86,7 @@ class MetadataStore:
     _cache_size_kib = 64 * 1024
     _mmap_size_bytes = 256 * 1024 * 1024
     _sqlite_chunk_size = 900
+    _wal_configured_databases: set[str] = set()
 
     def __init__(self, database_path: Path | str):
         self.database_path = Path(database_path)
@@ -565,6 +566,7 @@ class MetadataStore:
     @contextmanager
     def connect(self, *, readonly: bool = False) -> Iterator[sqlite3.Connection]:
         with self._connection_lock:
+            database_key = str(self.database_path.resolve())
             if readonly:
                 database = f"{self.database_path.resolve().as_uri()}?mode=ro"
                 conn = sqlite3.connect(
@@ -578,7 +580,9 @@ class MetadataStore:
                     timeout=self._busy_timeout_ms / 1000,
                 )
             conn.row_factory = sqlite3.Row
-            self.configure_connection(conn, readonly=readonly)
+            self.configure_connection(conn, readonly=readonly, configure_wal=False)
+            if not readonly:
+                self._ensure_wal_configured(conn, database_key)
         try:
             yield conn
             if not readonly:
@@ -591,15 +595,29 @@ class MetadataStore:
             conn.close()
 
     @classmethod
-    def configure_connection(cls, conn: sqlite3.Connection, *, readonly: bool = False) -> None:
+    def configure_connection(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        readonly: bool = False,
+        configure_wal: bool = True,
+    ) -> None:
         conn.execute(f"PRAGMA busy_timeout = {cls._busy_timeout_ms}")
         conn.execute("PRAGMA foreign_keys = ON")
-        if not readonly:
+        if not readonly and configure_wal:
             conn.execute("PRAGMA journal_mode = WAL")
+        if not readonly:
             conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA temp_store = MEMORY")
         conn.execute(f"PRAGMA cache_size = -{cls._cache_size_kib}")
         conn.execute(f"PRAGMA mmap_size = {cls._mmap_size_bytes}")
+
+    @classmethod
+    def _ensure_wal_configured(cls, conn: sqlite3.Connection, database_key: str) -> None:
+        if database_key in cls._wal_configured_databases:
+            return
+        conn.execute("PRAGMA journal_mode = WAL")
+        cls._wal_configured_databases.add(database_key)
 
     def add_folder(self, folder_path: str) -> int:
         normalized = os.path.abspath(os.path.expanduser(folder_path))
@@ -1519,80 +1537,130 @@ class MetadataStore:
         duration_ms: int | None = None,
     ) -> tuple[int, str]:
         now = utc_now_iso()
+        with self.connect() as conn:
+            return self._upsert_image_on_connection(
+                conn,
+                now=now,
+                folder_id=folder_id,
+                file_path=file_path,
+                file_size=file_size,
+                width=width,
+                height=height,
+                created_time_ns=created_time_ns,
+                modified_time_ns=modified_time_ns,
+                duration_ms=duration_ms,
+            )
+
+    def upsert_images(self, records: Sequence[Mapping[str, object]]) -> list[tuple[int, str]]:
+        if not records:
+            return []
+        now = utc_now_iso()
+        results: list[tuple[int, str]] = []
+        with self.connect() as conn:
+            for record in records:
+                results.append(
+                    self._upsert_image_on_connection(
+                        conn,
+                        now=now,
+                        folder_id=int(record["folder_id"]),
+                        file_path=str(record["file_path"]),
+                        file_size=int(record["file_size"]),
+                        width=self._optional_int(record.get("width")),
+                        height=self._optional_int(record.get("height")),
+                        created_time_ns=self._optional_int(record.get("created_time_ns")),
+                        modified_time_ns=int(record["modified_time_ns"]),
+                        duration_ms=self._optional_int(record.get("duration_ms")),
+                    )
+                )
+        return results
+
+    def _upsert_image_on_connection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        now: str,
+        folder_id: int,
+        file_path: str,
+        file_size: int,
+        width: int | None,
+        height: int | None,
+        created_time_ns: int | None,
+        modified_time_ns: int,
+        duration_ms: int | None,
+    ) -> tuple[int, str]:
         file_name = os.path.basename(file_path)
         file_ext = Path(file_name).suffix.lower()
         created_at = timestamp_ns_to_iso(created_time_ns) if created_time_ns else None
         modified_at = timestamp_ns_to_iso(modified_time_ns)
 
-        with self.connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO images(
-                    folder_id, file_path, file_name, file_ext, file_size, width, height,
-                    duration_ms,
-                    created_at, modified_at, modified_time_ns, imported_at, last_seen_at,
-                    thumbnail_status, embedding_status, is_missing
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', 0)
-                ON CONFLICT(file_path) DO NOTHING
-                """,
-                (
-                    folder_id,
-                    file_path,
-                    file_name,
-                    file_ext,
-                    file_size,
-                    width,
-                    height,
-                    duration_ms,
-                    created_at,
-                    modified_at,
-                    modified_time_ns,
-                    now,
-                    now,
-                ),
+        cur = conn.execute(
+            """
+            INSERT INTO images(
+                folder_id, file_path, file_name, file_ext, file_size, width, height,
+                duration_ms,
+                created_at, modified_at, modified_time_ns, imported_at, last_seen_at,
+                thumbnail_status, embedding_status, is_missing
             )
-            if int(cur.rowcount) > 0:
-                return int(cur.lastrowid), "new"
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', 0)
+            ON CONFLICT(file_path) DO NOTHING
+            """,
+            (
+                folder_id,
+                file_path,
+                file_name,
+                file_ext,
+                file_size,
+                width,
+                height,
+                duration_ms,
+                created_at,
+                modified_at,
+                modified_time_ns,
+                now,
+                now,
+            ),
+        )
+        if int(cur.rowcount) > 0:
+            return int(cur.lastrowid), "new"
 
-            existing = conn.execute(
-                "SELECT * FROM images WHERE file_path = ?", (file_path,)
-            ).fetchone()
-            if existing is None:
-                raise RuntimeError("image upsert conflict could not be resolved")
+        existing = conn.execute(
+            "SELECT * FROM images WHERE file_path = ?", (file_path,)
+        ).fetchone()
+        if existing is None:
+            raise RuntimeError("image upsert conflict could not be resolved")
 
-            changed = (
-                int(existing["file_size"]) != file_size
-                or int(existing["modified_time_ns"]) != modified_time_ns
-                or bool(existing["is_missing"])
-            )
-            conn.execute(
-                """
-                UPDATE images
-                SET folder_id = ?, file_name = ?, file_ext = ?, file_size = ?, width = ?,
-                    height = ?, duration_ms = ?, created_at = ?, modified_at = ?, modified_time_ns = ?,
-                    last_seen_at = ?, is_missing = 0
-                WHERE id = ?
-                """,
-                (
-                    folder_id,
-                    file_name,
-                    file_ext,
-                    file_size,
-                    width,
-                    height,
-                    duration_ms,
-                    created_at,
-                    modified_at,
-                    modified_time_ns,
-                    now,
-                    existing["id"],
-                ),
-            )
-            if changed:
-                self._mark_image_media_stale(conn, int(existing["id"]), now)
-                return int(existing["id"]), "changed"
-            return int(existing["id"]), "unchanged"
+        changed = (
+            int(existing["file_size"]) != file_size
+            or int(existing["modified_time_ns"]) != modified_time_ns
+            or bool(existing["is_missing"])
+        )
+        conn.execute(
+            """
+            UPDATE images
+            SET folder_id = ?, file_name = ?, file_ext = ?, file_size = ?, width = ?,
+                height = ?, duration_ms = ?, created_at = ?, modified_at = ?, modified_time_ns = ?,
+                last_seen_at = ?, is_missing = 0
+            WHERE id = ?
+            """,
+            (
+                folder_id,
+                file_name,
+                file_ext,
+                file_size,
+                width,
+                height,
+                duration_ms,
+                created_at,
+                modified_at,
+                modified_time_ns,
+                now,
+                existing["id"],
+            ),
+        )
+        if changed:
+            self._mark_image_media_stale(conn, int(existing["id"]), now)
+            return int(existing["id"]), "changed"
+        return int(existing["id"]), "unchanged"
 
     def update_thumbnail(self, image_id: int, thumbnail_path: str | None, status: str) -> None:
         with self.connect() as conn:
@@ -1603,6 +1671,19 @@ class MetadataStore:
                 WHERE id = ?
                 """,
                 (thumbnail_path, status, image_id),
+            )
+
+    def update_thumbnails(self, records: Sequence[tuple[int, str | None, str]]) -> None:
+        if not records:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                UPDATE images
+                SET thumbnail_path = ?, thumbnail_status = ?
+                WHERE id = ?
+                """,
+                ((thumbnail_path, status, image_id) for image_id, thumbnail_path, status in records),
             )
 
     def update_image_path_after_rename(
@@ -1739,6 +1820,16 @@ class MetadataStore:
             conn.execute(
                 "UPDATE images SET embedding_status = 'ready' WHERE id = ?",
                 (image_id,),
+            )
+
+    def mark_embeddings_not_required(self, image_ids: Sequence[int]) -> None:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                "UPDATE images SET embedding_status = 'ready' WHERE id = ?",
+                ((image_id,) for image_id in clean_ids),
             )
 
     def thumbnail_needs_generation(self, image_id: int) -> bool:
@@ -2479,13 +2570,29 @@ class MetadataStore:
         vector: np.ndarray,
         vector_version: str = COLOR_VECTOR_VERSION,
     ) -> None:
-        normalized = np.asarray(vector, dtype=np.float32)
-        if normalized.ndim != 1:
-            raise ValueError("color vector must be one-dimensional")
-        dim = int(normalized.shape[0])
+        self.upsert_color_feature_successes(
+            [(image_id, vector)],
+            vector_version=vector_version,
+        )
+
+    def upsert_color_feature_successes(
+        self,
+        records: Sequence[tuple[int, np.ndarray]],
+        *,
+        vector_version: str = COLOR_VECTOR_VERSION,
+    ) -> None:
+        if not records:
+            return
+        rows: list[tuple[int, str, int, bytes, str]] = []
         now = utc_now_iso()
+        for image_id, vector in records:
+            normalized = np.asarray(vector, dtype=np.float32)
+            if normalized.ndim != 1:
+                raise ValueError("color vector must be one-dimensional")
+            dim = int(normalized.shape[0])
+            rows.append((int(image_id), vector_version, dim, normalized.tobytes(), now))
         with self.connect() as conn:
-            conn.execute(
+            conn.executemany(
                 """
                 INSERT INTO color_features(
                     image_id, vector_version, vector_dim, hist_blob,
@@ -2501,13 +2608,15 @@ class MetadataStore:
                     error_message = NULL,
                     updated_at = excluded.updated_at
                 """,
-                (image_id, vector_version, dim, normalized.tobytes(), now),
+                rows,
             )
 
-    def mark_color_feature_failed(self, image_id: int, error_message: str) -> None:
+    def mark_color_features_failed(self, records: Sequence[tuple[int, str]]) -> None:
+        if not records:
+            return
         now = utc_now_iso()
         with self.connect() as conn:
-            conn.execute(
+            conn.executemany(
                 """
                 INSERT INTO color_features(
                     image_id, vector_version, vector_dim, hist_blob,
@@ -2524,13 +2633,19 @@ class MetadataStore:
                     updated_at = excluded.updated_at
                 """,
                 (
-                    image_id,
-                    COLOR_VECTOR_VERSION,
-                    COLOR_VECTOR_DIM,
-                    error_message[:2000],
-                    now,
+                    (
+                        int(image_id),
+                        COLOR_VECTOR_VERSION,
+                        COLOR_VECTOR_DIM,
+                        str(error_message)[:2000],
+                        now,
+                    )
+                    for image_id, error_message in records
                 ),
             )
+
+    def mark_color_feature_failed(self, image_id: int, error_message: str) -> None:
+        self.mark_color_features_failed([(image_id, error_message)])
 
     def color_features_by_image_ids(
         self,
@@ -6533,6 +6648,12 @@ class MetadataStore:
     def _image_extension_clause(column: str) -> str:
         placeholders = ",".join("?" for _ in SUPPORTED_IMAGE_EXTENSIONS)
         return f"{column} IN ({placeholders})"
+
+    @staticmethod
+    def _optional_int(value: object) -> int | None:
+        if value is None:
+            return None
+        return int(value)
 
     @staticmethod
     def _clean_ids(image_ids: Sequence[int]) -> list[int]:

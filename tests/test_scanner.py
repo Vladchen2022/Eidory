@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -20,6 +21,33 @@ class FakeVideoThumbnailer(Thumbnailer):
 
 
 class ScannerTest(unittest.TestCase):
+    def test_scan_folder_uses_batched_database_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            self._make_image(root / "a.jpg", "red")
+            self._make_image(root / "b.jpg", "blue")
+
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+            scanner = ImageScanner(store, Thumbnailer(Path(tmp) / "thumbs"))
+
+            with (
+                patch.object(store, "upsert_image", side_effect=AssertionError("single-row upsert should not run")),
+                patch.object(store, "upsert_images", wraps=store.upsert_images) as upsert_images,
+                patch.object(store, "update_thumbnail", side_effect=AssertionError("single thumbnail update should not run")),
+                patch.object(store, "update_thumbnails", wraps=store.update_thumbnails) as update_thumbnails,
+                patch.object(store, "upsert_color_feature_success", side_effect=AssertionError("single color update should not run")),
+                patch.object(store, "upsert_color_feature_successes", wraps=store.upsert_color_feature_successes) as color_successes,
+            ):
+                result = scanner.scan_folder(str(root))
+
+            self.assertEqual(result.scanned_files, 2)
+            self.assertEqual(result.new_files, 2)
+            upsert_images.assert_called_once()
+            update_thumbnails.assert_called_once()
+            color_successes.assert_called_once()
+
     def test_scan_folder_generates_thumbnails_and_removes_deleted_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "library"

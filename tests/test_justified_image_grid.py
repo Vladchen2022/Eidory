@@ -168,6 +168,45 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
 
         self.assertEqual(update.call_count, 1)
 
+    def test_set_images_clears_stale_pending_pixmap_loads_when_layout_changes(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        stale_key = ("/tmp/stale.jpg", 1, 100, 270)
+        grid._pending_pixmap_loads.add(stale_key)
+        first = self._image(1, file_path="/tmp/first.jpg")
+        second = self._image(2, file_path="/tmp/second.jpg")
+
+        grid.set_images([first])
+        self.assertNotIn(stale_key, grid._pending_pixmap_loads)
+        grid._pending_pixmap_loads.add(stale_key)
+
+        grid.set_images([first])
+        self.assertIn(stale_key, grid._pending_pixmap_loads)
+
+        grid.set_images([second])
+        self.assertNotIn(stale_key, grid._pending_pixmap_loads)
+
+    def test_thumbnail_size_change_clears_stale_pending_pixmap_loads(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        stale_key = ("/tmp/stale.jpg", 1, 100, 270)
+        grid._pending_pixmap_loads.add(stale_key)
+
+        grid.set_thumbnail_size(160)
+
+        self.assertEqual(grid._pending_pixmap_loads, set())
+
+    def test_single_selection_repaints_only_changed_indexes(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        grid.resize(360, 240)
+        grid.show()
+        self.app.processEvents()
+        grid.set_images([self._image(1), self._image(2), self._image(3)])
+        grid._select_single(0)
+
+        with patch.object(grid, "_update_selection_indexes") as update_selection_indexes:
+            grid._select_single(2)
+
+        update_selection_indexes.assert_called_once_with({0, 2})
+
     @staticmethod
     def _image(
         image_id: int,

@@ -225,6 +225,9 @@ RIGHT_TAB_AI = 1
 RIGHT_TAB_TAGS = 2
 RIGHT_TAB_INDEX = 3
 RIGHT_TAB_SETTINGS = 4
+SELECTION_DETAIL_DEBOUNCE_MS = 120
+DETAIL_PREVIEW_LOAD_DEBOUNCE_MS = 180
+THUMBNAIL_SIZE_SETTING_DEBOUNCE_MS = 450
 
 
 class EqualWidthTabBar(QTabBar):
@@ -1073,6 +1076,12 @@ class MainWindow(QMainWindow):
         self._detail_preview_cache: OrderedDict[tuple[str, int, int, int, int], QPixmap] = OrderedDict()
         self._detail_preview_cache_limit = 64
         self._detail_preview_pending_token: tuple[int, int, int, int, int] | None = None
+        self._detail_preview_pending_request: tuple[
+            tuple[int, int, int, int, int],
+            list[tuple[str, tuple[int, int]]],
+            int,
+            int,
+        ] | None = None
         self._detail_preview_signals = _DetailPreviewLoadSignals()
         self._detail_preview_signals.loaded.connect(self._handle_detail_preview_loaded)
         self._detail_preview_thread_pool = QThreadPool.globalInstance()
@@ -1131,8 +1140,16 @@ class MainWindow(QMainWindow):
         self.ai_vision_stats_refresh_timer.timeout.connect(self._refresh_ai_vision_stats)
         self.selection_detail_timer = QTimer(self)
         self.selection_detail_timer.setSingleShot(True)
-        self.selection_detail_timer.setInterval(0)
+        self.selection_detail_timer.setInterval(SELECTION_DETAIL_DEBOUNCE_MS)
         self.selection_detail_timer.timeout.connect(self._apply_pending_selection_detail_state)
+        self.detail_preview_load_timer = QTimer(self)
+        self.detail_preview_load_timer.setSingleShot(True)
+        self.detail_preview_load_timer.setInterval(DETAIL_PREVIEW_LOAD_DEBOUNCE_MS)
+        self.detail_preview_load_timer.timeout.connect(self._start_pending_detail_preview_load)
+        self.thumbnail_size_setting_timer = QTimer(self)
+        self.thumbnail_size_setting_timer.setSingleShot(True)
+        self.thumbnail_size_setting_timer.setInterval(THUMBNAIL_SIZE_SETTING_DEBOUNCE_MS)
+        self.thumbnail_size_setting_timer.timeout.connect(self._persist_thumbnail_size_setting)
 
         self.setWindowTitle("Eidory")
         self._configure_native_titlebar()
@@ -1297,6 +1314,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "selection_detail_timer"):
             self.selection_detail_timer.stop()
             self._pending_selection_images = None
+        if hasattr(self, "detail_preview_load_timer"):
+            self.detail_preview_load_timer.stop()
+            self._detail_preview_pending_request = None
+        if hasattr(self, "thumbnail_size_setting_timer") and self.thumbnail_size_setting_timer.isActive():
+            self.thumbnail_size_setting_timer.stop()
+            self._persist_thumbnail_size_setting()
+        self._save_pending_note()
         self._detail_preview_pending_token = None
         self._save_current_board_layout_if_needed()
         self._clear_last_removal_undo(cleanup_backups=True)
@@ -2766,6 +2790,7 @@ class MainWindow(QMainWindow):
         self.board_show_all_button.clicked.connect(self._show_all_board_images)
         self.project_board_view.selectionChanged.connect(self._on_project_board_selection_changed)
         self.project_board_view.layoutChanged.connect(self._mark_current_board_layout_dirty)
+        self.project_board_view.imagePreviewRequested.connect(self._open_project_board_image_preview)
         self.project_board_view.removeImagesRequested.connect(self._remove_images_from_current_board)
         self.project_board_view.undoRemovalRequested.connect(self._undo_last_board_removal)
         self.load_more_button.clicked.connect(self._load_more)
@@ -8136,7 +8161,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("没有选中图片")
             return
         self._stop_video_preview()
-        images = self.grid_view.images()
+        images = self._preview_images_for(start_image)
         if not images:
             return
         start_index = next(
@@ -8163,20 +8188,29 @@ class MainWindow(QMainWindow):
         if current is not None and (self.selected_image is None or self.selected_image.id != current.id):
             self._sync_preview_selection(current)
 
+    def _preview_images_for(self, start_image: ImageItem) -> list[ImageItem]:
+        if (
+            self.center_result_stack.currentWidget() is self.project_board_view
+            and start_image.id in self._board_image_by_id
+        ):
+            board_images = [
+                self._board_image_by_id[image_id]
+                for image_id in self._current_board_image_ids
+                if image_id in self._board_image_by_id
+            ]
+            if board_images:
+                return board_images
+        return self.grid_view.images()
+
     def _sync_preview_selection(self, image: ImageItem) -> None:
         self.selected_image = image
         self.grid_view.select_image_id(image.id)
-        if self._detail_tab_is_visible():
-            self._show_image_details(image)
-            self._detail_panel_dirty = False
-        else:
-            self._detail_panel_dirty = True
-        if self.current_result_mode != "creative_node":
-            if self._tag_assignment_tab_is_visible():
-                self._refresh_tag_panel_assignment([image])
-                self._tag_assignment_dirty = False
-            else:
-                self._tag_assignment_dirty = True
+        if (
+            self.center_result_stack.currentWidget() is self.project_board_view
+            and image.id in self._board_image_by_id
+        ):
+            self.project_board_view.select_image_id(image.id)
+        self._queue_selection_detail_state([image])
 
     def _handle_preview_favorite_changed(self, image: ImageItem) -> None:
         self.selected_image = image
@@ -8895,7 +8929,12 @@ class MainWindow(QMainWindow):
         self._queue_selection_detail_state(images)
 
     def _queue_selection_detail_state(self, images: Sequence[ImageItem]) -> None:
-        self._pending_selection_images = list(images)
+        image_list = list(images)
+        self._save_pending_note()
+        self._pending_selection_images = image_list
+        self._detail_panel_dirty = True
+        if self.current_result_mode != "creative_node":
+            self._tag_assignment_dirty = not self._tag_assignment_tab_is_visible()
         self.selection_detail_timer.start()
 
     def _apply_pending_selection_detail_state(self) -> None:
@@ -8907,10 +8946,16 @@ class MainWindow(QMainWindow):
 
     def _apply_selection_detail_state(self, images: list[ImageItem]) -> None:
         image_ids = tuple(image.id for image in images)
+        if (
+            image_ids == self._last_selection_image_ids
+            and not self._detail_panel_dirty
+            and not self._tag_assignment_dirty
+        ):
+            return
         self._last_selection_image_ids = image_ids
         detail_visible = self._detail_tab_is_visible()
         if not detail_visible:
-            self._detail_preview_pending_token = None
+            self._cancel_pending_detail_preview_load()
         if len(images) > 1:
             self.selected_image = images[-1]
             if detail_visible:
@@ -8984,7 +9029,7 @@ class MainWindow(QMainWindow):
     def _on_right_tab_changed(self, index: int) -> None:
         self._save_right_tab_index(index)
         if index != RIGHT_TAB_DETAIL:
-            self._detail_preview_pending_token = None
+            self._cancel_pending_detail_preview_load()
         if index == RIGHT_TAB_DETAIL:
             self._refresh_detail_panel_for_current_selection()
         elif index == RIGHT_TAB_TAGS:
@@ -9238,7 +9283,7 @@ class MainWindow(QMainWindow):
 
     def _request_detail_preview(self, image: ImageItem) -> None:
         if image.is_missing:
-            self._detail_preview_pending_token = None
+            self._cancel_pending_detail_preview_load()
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText("无法预览")
             return
@@ -9258,10 +9303,34 @@ class MainWindow(QMainWindow):
             if cached is None:
                 continue
             self._detail_preview_cache.move_to_end(key)
+            self._cancel_pending_detail_preview_load()
+            self._detail_preview_pending_token = request_token
             self._apply_detail_preview_pixmap(QPixmap(cached))
             return
         self.preview_label.setPixmap(QPixmap())
         self.preview_label.setText("加载预览...")
+        self._detail_preview_pending_request = (
+            request_token,
+            candidates,
+            max_width,
+            max_height,
+        )
+        self.detail_preview_load_timer.start()
+
+    def _cancel_pending_detail_preview_load(self) -> None:
+        self._detail_preview_pending_token = None
+        self._detail_preview_pending_request = None
+        if hasattr(self, "detail_preview_load_timer"):
+            self.detail_preview_load_timer.stop()
+
+    def _start_pending_detail_preview_load(self) -> None:
+        pending = self._detail_preview_pending_request
+        self._detail_preview_pending_request = None
+        if pending is None:
+            return
+        request_token, candidates, max_width, max_height = pending
+        if request_token != self._detail_preview_pending_token:
+            return
         task = _DetailPreviewLoadTask(
             request_token=request_token,
             candidates=candidates,
@@ -16407,7 +16476,10 @@ class MainWindow(QMainWindow):
         size = self.thumbnail_size_slider.value()
         self.thumbnail_size_label.setText(f"缩略图：{size}")
         self.grid_view.set_thumbnail_size(size)
-        self.store.set_setting("ui.thumbnail_size", str(size))
+        self.thumbnail_size_setting_timer.start()
+
+    def _persist_thumbnail_size_setting(self) -> None:
+        self.store.set_setting("ui.thumbnail_size", str(self.thumbnail_size_slider.value()))
 
     def _preview_score_threshold(self, value: int) -> None:
         if (

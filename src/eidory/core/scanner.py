@@ -42,6 +42,21 @@ class _ScannedMedia:
     duration_ms: int | None
 
 
+@dataclass(frozen=True)
+class _PendingMedia:
+    folder_id: int
+    file_path: str
+    file_size: int
+    width: int | None
+    height: int | None
+    created_time_ns: int | None
+    modified_time_ns: int
+    duration_ms: int | None
+
+
+SCAN_UPSERT_BATCH_SIZE = 200
+
+
 class ImageScanner:
     def __init__(self, store: MetadataStore, thumbnailer: Thumbnailer):
         self.store = store
@@ -109,10 +124,26 @@ class ImageScanner:
         unchanged_files = 0
         image_ids: list[int] = []
         scanned_media: list[_ScannedMedia] = []
+        pending_media: list[_PendingMedia] = []
         normalized_skip_paths = {
             os.path.abspath(os.path.expanduser(path))
             for path in (skip_paths or set())
         }
+
+        def flush_pending_media() -> None:
+            nonlocal new_files, changed_files, unchanged_files
+            if not pending_media:
+                return
+            batch = list(pending_media)
+            pending_media.clear()
+            batch_media, batch_new, batch_changed, batch_unchanged, batch_image_ids = (
+                self._upsert_pending_media(batch, on_progress=on_progress)
+            )
+            scanned_media.extend(batch_media)
+            image_ids.extend(batch_image_ids)
+            new_files += batch_new
+            changed_files += batch_changed
+            unchanged_files += batch_unchanged
 
         for file_path in self._iter_image_files(root):
             if file_path in normalized_skip_paths:
@@ -122,38 +153,22 @@ class ImageScanner:
             seen_paths.append(file_path)
             stat = os.stat(file_path, follow_symlinks=False)
             width, height, duration_ms = self._read_media_metadata(file_path)
-            image_id, state = self.store.upsert_image(
-                folder_id=folder_id,
-                file_path=file_path,
-                file_size=stat.st_size,
-                width=width,
-                height=height,
-                created_time_ns=getattr(stat, "st_birthtime_ns", None),
-                modified_time_ns=stat.st_mtime_ns,
-                duration_ms=duration_ms,
-            )
-            image_ids.append(image_id)
-            scanned_media.append(
-                _ScannedMedia(
-                    image_id=image_id,
+            pending_media.append(
+                _PendingMedia(
+                    folder_id=folder_id,
                     file_path=file_path,
-                    state=state,
+                    file_size=stat.st_size,
+                    width=width,
+                    height=height,
+                    created_time_ns=getattr(stat, "st_birthtime_ns", None),
+                    modified_time_ns=stat.st_mtime_ns,
                     duration_ms=duration_ms,
                 )
             )
+            if len(pending_media) >= SCAN_UPSERT_BATCH_SIZE:
+                flush_pending_media()
 
-            if state == "new":
-                new_files += 1
-            elif state == "changed":
-                changed_files += 1
-            else:
-                unchanged_files += 1
-
-            if is_supported_video(file_path):
-                self.store.mark_embedding_not_required(image_id)
-
-            if on_progress is not None:
-                on_progress(image_id, state, file_path)
+        flush_pending_media()
 
         thumbnail_failures = self._refresh_media_derivatives(scanned_media)
 
@@ -176,6 +191,58 @@ class ImageScanner:
             image_ids=tuple(image_ids),
             removed_thumbnail_paths=tuple(removed_thumbnail_paths),
         )
+
+    def _upsert_pending_media(
+        self,
+        pending_media: list[_PendingMedia],
+        *,
+        on_progress: ScanProgressCallback | None,
+    ) -> tuple[list[_ScannedMedia], int, int, int, list[int]]:
+        records = [
+            {
+                "folder_id": item.folder_id,
+                "file_path": item.file_path,
+                "file_size": item.file_size,
+                "width": item.width,
+                "height": item.height,
+                "created_time_ns": item.created_time_ns,
+                "modified_time_ns": item.modified_time_ns,
+                "duration_ms": item.duration_ms,
+            }
+            for item in pending_media
+        ]
+        results = self.store.upsert_images(records)
+        scanned_media: list[_ScannedMedia] = []
+        image_ids: list[int] = []
+        video_ids: list[int] = []
+        new_files = 0
+        changed_files = 0
+        unchanged_files = 0
+        for item, (image_id, state) in zip(pending_media, results):
+            image_ids.append(image_id)
+            scanned_media.append(
+                _ScannedMedia(
+                    image_id=image_id,
+                    file_path=item.file_path,
+                    state=state,
+                    duration_ms=item.duration_ms,
+                )
+            )
+
+            if state == "new":
+                new_files += 1
+            elif state == "changed":
+                changed_files += 1
+            else:
+                unchanged_files += 1
+
+            if is_supported_video(item.file_path):
+                video_ids.append(image_id)
+
+            if on_progress is not None:
+                on_progress(image_id, state, item.file_path)
+        self.store.mark_embeddings_not_required(video_ids)
+        return scanned_media, new_files, changed_files, unchanged_files, image_ids
 
     def import_files(
         self,
@@ -203,46 +270,34 @@ class ImageScanner:
         changed_files = 0
         unchanged_files = 0
         image_ids: list[int] = []
-        scanned_media: list[_ScannedMedia] = []
+        folder_ids_by_path = {first_parent: folder_id}
+        pending_media: list[_PendingMedia] = []
 
         for file_path in normalized_paths:
             scanned += 1
-            current_folder_id = self.store.add_folder(os.path.dirname(file_path))
+            parent = os.path.dirname(file_path)
+            current_folder_id = folder_ids_by_path.get(parent)
+            if current_folder_id is None:
+                current_folder_id = self.store.add_folder(parent)
+                folder_ids_by_path[parent] = current_folder_id
             stat = os.stat(file_path, follow_symlinks=False)
             width, height, duration_ms = self._read_media_metadata(file_path)
-            image_id, state = self.store.upsert_image(
-                folder_id=current_folder_id,
-                file_path=file_path,
-                file_size=stat.st_size,
-                width=width,
-                height=height,
-                created_time_ns=getattr(stat, "st_birthtime_ns", None),
-                modified_time_ns=stat.st_mtime_ns,
-                duration_ms=duration_ms,
-            )
-            image_ids.append(image_id)
-            scanned_media.append(
-                _ScannedMedia(
-                    image_id=image_id,
+            pending_media.append(
+                _PendingMedia(
+                    folder_id=current_folder_id,
                     file_path=file_path,
-                    state=state,
+                    file_size=stat.st_size,
+                    width=width,
+                    height=height,
+                    created_time_ns=getattr(stat, "st_birthtime_ns", None),
+                    modified_time_ns=stat.st_mtime_ns,
                     duration_ms=duration_ms,
                 )
             )
 
-            if state == "new":
-                new_files += 1
-            elif state == "changed":
-                changed_files += 1
-            else:
-                unchanged_files += 1
-
-            if is_supported_video(file_path):
-                self.store.mark_embedding_not_required(image_id)
-
-            if on_progress is not None:
-                on_progress(image_id, state, file_path)
-
+        scanned_media, new_files, changed_files, unchanged_files, image_ids = (
+            self._upsert_pending_media(pending_media, on_progress=on_progress)
+        )
         thumbnail_failures = self._refresh_media_derivatives(scanned_media)
 
         return ScanResult(
@@ -323,6 +378,7 @@ class ImageScanner:
             [item.image_id for item in scanned_media]
         )
         thumbnail_failures = 0
+        thumbnail_updates: list[tuple[int, str | None, str]] = []
         for item in scanned_media:
             if item.image_id not in thumbnail_ids:
                 continue
@@ -332,10 +388,11 @@ class ImageScanner:
                     item.file_path,
                     duration_ms=item.duration_ms,
                 )
-                self.store.update_thumbnail(item.image_id, str(thumbnail_path), "ready")
+                thumbnail_updates.append((item.image_id, str(thumbnail_path), "ready"))
             except Exception:
                 thumbnail_failures += 1
-                self.store.update_thumbnail(item.image_id, None, "failed")
+                thumbnail_updates.append((item.image_id, None, "failed"))
+        self.store.update_thumbnails(thumbnail_updates)
 
         image_items = [
             item for item in scanned_media if is_supported_image(item.file_path)
@@ -343,9 +400,16 @@ class ImageScanner:
         color_ids = self.store.color_feature_ids_needing_generation(
             [item.image_id for item in image_items]
         )
+        color_successes = []
+        color_failures = []
         for item in image_items:
             if item.image_id in color_ids:
-                self._update_color_feature(item.image_id, item.file_path, already_needed=True)
+                try:
+                    color_successes.append((item.image_id, encode_image_color(item.file_path)))
+                except Exception as exc:
+                    color_failures.append((item.image_id, str(exc)))
+        self.store.upsert_color_feature_successes(color_successes)
+        self.store.mark_color_features_failed(color_failures)
         return thumbnail_failures
 
     def _update_color_feature(

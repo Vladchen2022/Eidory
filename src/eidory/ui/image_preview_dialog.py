@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image, ImageOps
-from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QDialog,
+    QFileDialog,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsTextItem,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QStackedWidget,
@@ -43,6 +45,7 @@ from PySide6.QtWidgets import (
 )
 
 from eidory.core.image_loader import open_local_image
+from eidory.core.linetop_processor import LineTopSettings, render_linetop_image
 from eidory.core.media_types import is_supported_video
 from eidory.core.metadata_store import MetadataStore
 from eidory.models import ImageItem
@@ -51,6 +54,163 @@ from eidory.models import ImageItem
 PREVIEW_ICON_BUTTON_SIZE = QSize(32, 26)
 PREVIEW_ICON_SIZE = QSize(18, 18)
 INLINE_SOURCE_PREVIEW_MAX_BYTES = 512 * 1024
+SOURCE_PREVIEW_REFINE_DELAY_MS = 320
+LINETOP_PANEL_WIDTH = 330
+LINETOP_RENDER_CACHE_LIMIT = 12
+
+
+def _load_linetop_source_image(
+    image_path: str,
+    *,
+    max_width: int | None = None,
+    max_height: int | None = None,
+    grayscale: bool = False,
+    mirror_horizontal: bool = False,
+) -> Image.Image:
+    with open_local_image(image_path) as source:
+        if max_width is not None and max_height is not None and source.format == "JPEG":
+            source.draft("RGB", (max_width, max_height))
+        loaded = ImageOps.exif_transpose(source)
+        if max_width is not None and max_height is not None:
+            loaded.thumbnail((max(1, max_width), max(1, max_height)), Image.Resampling.LANCZOS)
+        if mirror_horizontal:
+            loaded = ImageOps.mirror(loaded)
+        if grayscale:
+            loaded = ImageOps.grayscale(loaded).convert("RGBA")
+        return loaded.convert("RGBA")
+
+
+def _qimage_from_pillow(image: Image.Image) -> QImage:
+    rgba = image.convert("RGBA")
+    data = rgba.tobytes("raw", "RGBA")
+    qimage = QImage(
+        data,
+        rgba.width,
+        rgba.height,
+        rgba.width * 4,
+        QImage.Format.Format_RGBA8888,
+    )
+    return qimage.copy()
+
+
+class _LineTopRenderSignals(QObject):
+    loaded = Signal(object, object, str)
+
+
+class _LineTopRenderTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        token: object,
+        image_path: str,
+        max_width: int,
+        max_height: int,
+        settings: LineTopSettings,
+        grayscale: bool,
+        mirror_horizontal: bool,
+        signals: _LineTopRenderSignals,
+    ) -> None:
+        super().__init__()
+        self.token = token
+        self.image_path = image_path
+        self.max_width = max_width
+        self.max_height = max_height
+        self.settings = settings
+        self.grayscale = grayscale
+        self.mirror_horizontal = mirror_horizontal
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            source = _load_linetop_source_image(
+                self.image_path,
+                max_width=self.max_width,
+                max_height=self.max_height,
+                grayscale=self.grayscale,
+                mirror_horizontal=self.mirror_horizontal,
+            )
+            rendered = render_linetop_image(source, self.settings)
+            qimage = _qimage_from_pillow(rendered)
+            error = ""
+        except Exception as exc:
+            qimage = QImage()
+            error = str(exc)
+        try:
+            self.signals.loaded.emit(self.token, qimage, error)
+        except RuntimeError:
+            return
+
+
+def _load_preview_qimage(image_path: str, max_width: int, max_height: int) -> QImage:
+    if max_width <= 0 or max_height <= 0:
+        return QImage()
+    path = Path(image_path)
+    if not path.exists():
+        return QImage()
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    source_size = reader.size()
+    if source_size.isValid():
+        scaled_size = QSize(source_size.width(), source_size.height())
+        scaled_size.scale(max_width, max_height, Qt.AspectRatioMode.KeepAspectRatio)
+        if scaled_size.width() < source_size.width() or scaled_size.height() < source_size.height():
+            reader.setScaledSize(scaled_size)
+    qimage = reader.read()
+    if not qimage.isNull():
+        return qimage
+    try:
+        with open_local_image(image_path) as image:
+            if image.format == "JPEG":
+                image.draft("RGB", (max_width, max_height))
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+            image = image.convert("RGBA")
+            data = image.tobytes("raw", "RGBA")
+            qimage = QImage(
+                data,
+                image.width,
+                image.height,
+                image.width * 4,
+                QImage.Format.Format_RGBA8888,
+            )
+            return qimage.copy()
+    except Exception:
+        return QImage()
+
+
+class _PreviewSourceLoadSignals(QObject):
+    loaded = Signal(object, object, bool)
+
+
+class _PreviewSourceLoadTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        token: tuple[int, str, int, int, int, int],
+        image_path: str,
+        fallback_path: str | None,
+        max_width: int,
+        max_height: int,
+        signals: _PreviewSourceLoadSignals,
+    ) -> None:
+        super().__init__()
+        self.token = token
+        self.image_path = image_path
+        self.fallback_path = fallback_path
+        self.max_width = max_width
+        self.max_height = max_height
+        self.signals = signals
+
+    def run(self) -> None:
+        fallback_used = False
+        qimage = _load_preview_qimage(self.image_path, self.max_width, self.max_height)
+        if qimage.isNull() and self.fallback_path:
+            qimage = _load_preview_qimage(self.fallback_path, self.max_width, self.max_height)
+            fallback_used = not qimage.isNull()
+        try:
+            self.signals.loaded.emit(self.token, qimage, fallback_used)
+        except RuntimeError:
+            return
 
 
 def _preview_transform_icon(kind: str) -> QIcon:
@@ -530,13 +690,46 @@ class ImagePreviewDialog(QDialog):
         self._preview_base_pixmap = QPixmap()
         self._preview_base_is_fallback = False
         self._preview_variant_cache: dict[tuple[bool, bool], QPixmap] = {}
+        self._preview_source_pending_token: tuple[int, str, int, int, int, int] | None = None
+        self._preview_source_running_token: tuple[int, str, int, int, int, int] | None = None
+        self._preview_source_queued_request: tuple[
+            tuple[int, str, int, int, int, int],
+            str,
+            str | None,
+            int,
+            int,
+        ] | None = None
+        self._preview_source_signals = _PreviewSourceLoadSignals()
+        self._preview_source_signals.loaded.connect(self._handle_preview_source_loaded)
+        self._preview_source_thread_pool = QThreadPool.globalInstance()
+        self._linetop_settings = LineTopSettings()
+        self._linetop_show_original_compare = False
+        self._linetop_render_cache: dict[tuple[object, ...], QPixmap] = {}
+        self._linetop_render_pending_token: tuple[object, ...] | None = None
+        self._linetop_render_running_token: tuple[object, ...] | None = None
+        self._linetop_queued_render_request: tuple[
+            tuple[object, ...],
+            str,
+            int,
+            int,
+            LineTopSettings,
+            bool,
+            bool,
+        ] | None = None
+        self._linetop_render_signals = _LineTopRenderSignals()
+        self._linetop_render_signals.loaded.connect(self._handle_linetop_render_loaded)
+        self._linetop_thread_pool = QThreadPool.globalInstance()
+        self._linetop_render_timer = QTimer(self)
+        self._linetop_render_timer.setSingleShot(True)
+        self._linetop_render_timer.setInterval(120)
+        self._linetop_render_timer.timeout.connect(self._render_current_image)
         self._zoom_refine_timer = QTimer(self)
         self._zoom_refine_timer.setSingleShot(True)
         self._zoom_refine_timer.setInterval(90)
         self._zoom_refine_timer.timeout.connect(self._render_current_image)
         self._preview_refine_timer = QTimer(self)
         self._preview_refine_timer.setSingleShot(True)
-        self._preview_refine_timer.setInterval(180)
+        self._preview_refine_timer.setInterval(SOURCE_PREVIEW_REFINE_DELAY_MS)
         self._preview_refine_timer.timeout.connect(self._render_current_image)
 
         self.setWindowTitle("Eidory 预览")
@@ -557,6 +750,8 @@ class ImagePreviewDialog(QDialog):
 
         self.preview_stack = QStackedWidget()
         self.preview_stack.addWidget(self.image_view)
+        self.advanced_panel = self._build_linetop_panel()
+        self.advanced_panel.hide()
 
         self.info_label = QLabel("-")
         self.info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -586,6 +781,16 @@ class ImagePreviewDialog(QDialog):
         self.video_position_slider.setRange(0, 0)
         self.video_time_label = QLabel("00:00 / 00:00")
         self.favorite_checkbox = QCheckBox("收藏")
+        self.compare_toggle_button = QPushButton("对比切换")
+        self.compare_toggle_button.setCheckable(True)
+        self.compare_toggle_button.setToolTip("在原图和高级处理结果之间切换")
+        self.compare_toggle_button.setEnabled(False)
+        self.save_render_button = QPushButton("保存为")
+        self.save_render_button.setToolTip("把当前高级处理结果另存为 PNG，不改动图库源图")
+        self.save_render_button.setEnabled(False)
+        self.advanced_toggle_button = QPushButton("高级")
+        self.advanced_toggle_button.setCheckable(True)
+        self.advanced_toggle_button.setToolTip("显示或隐藏高级功能区（Tab）")
 
         self.feedback_group = QButtonGroup(self)
         self.feedback_group.setExclusive(True)
@@ -609,6 +814,9 @@ class ImagePreviewDialog(QDialog):
             self.actual_size_button,
             self.grayscale_button,
             self.mirror_button,
+            self.compare_toggle_button,
+            self.save_render_button,
+            self.advanced_toggle_button,
         ]
         for button in [*nav_buttons, *self.feedback_buttons.values()]:
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -637,9 +845,17 @@ class ImagePreviewDialog(QDialog):
         controls.addWidget(self.favorite_checkbox)
         controls.addSpacing(12)
         controls.addStretch(1)
+        controls.addWidget(self.compare_toggle_button)
+        controls.addWidget(self.save_render_button)
+        controls.addWidget(self.advanced_toggle_button)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self.preview_stack, 1)
+        preview_row = QHBoxLayout()
+        preview_row.setContentsMargins(0, 0, 0, 0)
+        preview_row.setSpacing(8)
+        preview_row.addWidget(self.preview_stack, 1)
+        preview_row.addWidget(self.advanced_panel)
+        layout.addLayout(preview_row, 1)
         layout.addWidget(self.video_controls_widget)
         layout.addWidget(self.info_label)
         layout.addLayout(controls)
@@ -651,6 +867,9 @@ class ImagePreviewDialog(QDialog):
         self.grayscale_button.toggled.connect(self._set_grayscale_preview)
         self.mirror_button.toggled.connect(self._set_mirrored_preview)
         self.favorite_checkbox.toggled.connect(self._save_favorite)
+        self.compare_toggle_button.toggled.connect(self._set_linetop_compare_original)
+        self.save_render_button.clicked.connect(self._save_linetop_render_as)
+        self.advanced_toggle_button.toggled.connect(self._set_linetop_panel_visible)
         self.feedback_relevant_button.clicked.connect(lambda: self._save_feedback("relevant"))
         self.feedback_irrelevant_button.clicked.connect(lambda: self._save_feedback("irrelevant"))
         self.feedback_ignored_button.clicked.connect(lambda: self._save_feedback("ignored"))
@@ -670,6 +889,11 @@ class ImagePreviewDialog(QDialog):
         self._refresh()
 
     def closeEvent(self, event) -> None:
+        self._linetop_render_timer.stop()
+        self._linetop_render_pending_token = None
+        self._linetop_queued_render_request = None
+        self._preview_source_pending_token = None
+        self._preview_source_queued_request = None
         self._zoom_refine_timer.stop()
         self._preview_refine_timer.stop()
         if self._app_event_filter_installed:
@@ -726,6 +950,11 @@ class ImagePreviewDialog(QDialog):
                         self._handle_space_pressed()
                     event.accept()
                     return True
+                if event.key() == Qt.Key.Key_Tab:
+                    if event.type() == QEvent.Type.KeyPress:
+                        self._toggle_linetop_panel()
+                    event.accept()
+                    return True
         return super().eventFilter(watched, event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
@@ -735,6 +964,10 @@ class ImagePreviewDialog(QDialog):
             return
         if event.key() == Qt.Key.Key_Space:
             self._handle_space_pressed()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Tab:
+            self._toggle_linetop_panel()
             event.accept()
             return
         if event.key() in {Qt.Key.Key_Right, Qt.Key.Key_Down}:
@@ -763,6 +996,7 @@ class ImagePreviewDialog(QDialog):
         image = self.current_image()
         if image is None:
             self.info_label.setText("-")
+            self._set_linetop_compare_original(False, rerender=False)
             self._clear_preview_pixmap_cache()
             self.image_view.set_message("未选择图片")
             self.video_controls_widget.hide()
@@ -771,6 +1005,9 @@ class ImagePreviewDialog(QDialog):
             self.grayscale_button.setEnabled(False)
             self.mirror_button.setEnabled(False)
             self.copy_image_button.setEnabled(False)
+            self.compare_toggle_button.setEnabled(False)
+            self.save_render_button.setEnabled(False)
+            self.advanced_toggle_button.setEnabled(False)
             self.remove_index_button.setEnabled(False)
             self._stop_video()
             return
@@ -784,8 +1021,12 @@ class ImagePreviewDialog(QDialog):
         self._refresh_feedback_buttons(image)
         self._update_info(image)
         if is_supported_video(image.file_path):
+            self._set_linetop_panel_visible(False)
             self._render_current_video(image)
         else:
+            self.advanced_toggle_button.setEnabled(True)
+            self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
+            self.save_render_button.setEnabled(self._linetop_preview_active(image))
             self._render_current_image(use_thumbnail_first=True)
             self._preview_refine_timer.start()
         self.imageChanged.emit(image)
@@ -855,7 +1096,13 @@ class ImagePreviewDialog(QDialog):
         self.grayscale_button.setEnabled(True)
         self.mirror_button.setEnabled(True)
         self.copy_image_button.setEnabled(True)
+        advanced_active = self._linetop_preview_active(image)
+        self.compare_toggle_button.setEnabled(advanced_active)
+        self.save_render_button.setEnabled(advanced_active)
         max_width, max_height = self._render_bounds()
+        if advanced_active and not self._linetop_show_original_compare:
+            self._request_linetop_render(image, max_width, max_height, use_thumbnail_first=use_thumbnail_first)
+            return
         pixmap = QPixmap()
         if use_thumbnail_first:
             pixmap = self._cached_preview_base_pixmap(image)
@@ -870,7 +1117,8 @@ class ImagePreviewDialog(QDialog):
         else:
             pixmap = self._load_preview_source_pixmap(image, max_width, max_height)
         if pixmap.isNull():
-            self.image_view.set_message("无法预览")
+            message = "加载预览..." if self._preview_source_pending_token is not None else "无法预览"
+            self.image_view.set_message(message)
             return
         self.image_view.set_pixmap(
             pixmap,
@@ -972,6 +1220,551 @@ class ImagePreviewDialog(QDialog):
         if mirror_horizontal:
             image = image.flipped(Qt.Orientation.Horizontal)
         return QPixmap.fromImage(image)
+
+    def _build_linetop_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setFixedWidth(LINETOP_PANEL_WIDTH)
+        panel.setObjectName("linetopAdvancedPanel")
+        panel.setStyleSheet(
+            """
+            QWidget#linetopAdvancedPanel {
+                background: #222832;
+                border-left: 1px solid #3f4854;
+            }
+            QLabel {
+                color: #e5eaf2;
+            }
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #44505d;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                width: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+                background: #f3f6fb;
+            }
+            QPushButton {
+                background: #343c47;
+                color: #e5eaf2;
+                border: 1px solid #4c5663;
+                border-radius: 5px;
+                padding: 5px 9px;
+            }
+            QPushButton:checked {
+                background: #2f7df6;
+                border-color: #4f96ff;
+                color: white;
+            }
+            QCheckBox {
+                color: #e5eaf2;
+                spacing: 8px;
+            }
+            """
+        )
+
+        root = QVBoxLayout(panel)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+        title = QLabel("高级功能区")
+        title.setStyleSheet("font-weight:600;font-size:15px;")
+        root.addWidget(title)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        root.addWidget(scroll, 1)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        mode_label = QLabel("显示模式")
+        mode_label.setStyleSheet("font-weight:600;")
+        layout.addWidget(mode_label)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        self.linetop_line_mode_button = QPushButton("细线稿")
+        self.linetop_color_limit_mode_button = QPushButton("色阶限制")
+        self.linetop_line_mode_button.setCheckable(True)
+        self.linetop_color_limit_mode_button.setCheckable(True)
+        self.linetop_mode_group = QButtonGroup(self)
+        self.linetop_mode_group.setExclusive(True)
+        self.linetop_mode_group.addButton(self.linetop_line_mode_button)
+        self.linetop_mode_group.addButton(self.linetop_color_limit_mode_button)
+        mode_row.addWidget(self.linetop_line_mode_button)
+        mode_row.addWidget(self.linetop_color_limit_mode_button)
+        layout.addLayout(mode_row)
+
+        self.linetop_color_limit_row, self.linetop_color_limit_slider, self.linetop_color_limit_value = (
+            self._add_linetop_slider(
+                layout,
+                "色阶限制",
+                0,
+                15,
+                8,
+                lambda value: f"{value:d}",
+            )
+        )
+        self.linetop_color_grayscale_checkbox = QCheckBox("黑白")
+        layout.addWidget(self.linetop_color_grayscale_checkbox)
+
+        smart_label = QLabel("智能增强")
+        smart_label.setStyleSheet("font-weight:600;")
+        layout.addWidget(smart_label)
+        self.linetop_smart_enhance_checkbox = QCheckBox("智能增强")
+        self.linetop_enhanced_line_checkbox = QCheckBox("增强线稿引擎")
+        layout.addWidget(self.linetop_smart_enhance_checkbox)
+        layout.addWidget(self.linetop_enhanced_line_checkbox)
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(6)
+        preset_row.addWidget(QLabel("预设"))
+        self.linetop_photo_preset_button = QPushButton("照片")
+        self.linetop_illustration_preset_button = QPushButton("插画")
+        self.linetop_photo_preset_button.setCheckable(True)
+        self.linetop_illustration_preset_button.setCheckable(True)
+        self.linetop_preset_group = QButtonGroup(self)
+        self.linetop_preset_group.setExclusive(True)
+        self.linetop_preset_group.addButton(self.linetop_photo_preset_button)
+        self.linetop_preset_group.addButton(self.linetop_illustration_preset_button)
+        preset_row.addWidget(self.linetop_photo_preset_button)
+        preset_row.addWidget(self.linetop_illustration_preset_button)
+        layout.addLayout(preset_row)
+
+        params_label = QLabel("参数设置")
+        params_label.setStyleSheet("font-weight:600;")
+        layout.addWidget(params_label)
+        self.linetop_contrast_row, self.linetop_contrast_slider, self.linetop_contrast_value = (
+            self._add_linetop_slider(
+                layout,
+                "对比",
+                50,
+                300,
+                100,
+                lambda value: f"{value / 100:.2f}",
+            )
+        )
+        self.linetop_brightness_row, self.linetop_brightness_slider, self.linetop_brightness_value = (
+            self._add_linetop_slider(
+                layout,
+                "亮度/阈值倾向",
+                -30,
+                30,
+                0,
+                lambda value: f"{value / 100:.2f}",
+            )
+        )
+        self.linetop_thickness_row, self.linetop_thickness_slider, self.linetop_thickness_value = (
+            self._add_linetop_slider(
+                layout,
+                "线条粗细",
+                0,
+                30,
+                0,
+                lambda value: f"{value / 10:.1f}",
+            )
+        )
+
+        reset_row = QHBoxLayout()
+        reset_row.addStretch(1)
+        self.linetop_reset_button = QPushButton("恢复默认值")
+        reset_row.addWidget(self.linetop_reset_button)
+        layout.addLayout(reset_row)
+        layout.addStretch(1)
+
+        self._linetop_color_only_widgets = [
+            self.linetop_color_limit_row,
+            self.linetop_color_grayscale_checkbox,
+        ]
+        self._linetop_line_only_widgets = [
+            self.linetop_enhanced_line_checkbox,
+            self.linetop_thickness_row,
+        ]
+        self._linetop_controls = [
+            self.linetop_line_mode_button,
+            self.linetop_color_limit_mode_button,
+            self.linetop_color_limit_slider,
+            self.linetop_color_grayscale_checkbox,
+            self.linetop_smart_enhance_checkbox,
+            self.linetop_enhanced_line_checkbox,
+            self.linetop_photo_preset_button,
+            self.linetop_illustration_preset_button,
+            self.linetop_contrast_slider,
+            self.linetop_brightness_slider,
+            self.linetop_thickness_slider,
+        ]
+        for control in self._linetop_controls:
+            if isinstance(control, QSlider):
+                control.valueChanged.connect(self._queue_linetop_settings_changed)
+            elif isinstance(control, QCheckBox):
+                control.toggled.connect(self._queue_linetop_settings_changed)
+            elif isinstance(control, QPushButton):
+                control.toggled.connect(self._queue_linetop_settings_changed)
+        self.linetop_reset_button.clicked.connect(self._reset_linetop_settings)
+        self._sync_linetop_controls_from_settings()
+        return panel
+
+    def _add_linetop_slider(
+        self,
+        parent_layout: QVBoxLayout,
+        title: str,
+        minimum: int,
+        maximum: int,
+        value: int,
+        formatter,
+    ) -> tuple[QWidget, QSlider, QLabel]:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(title)
+        value_label = QLabel(formatter(value))
+        value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(label, 1)
+        header.addWidget(value_label)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(minimum, maximum)
+        slider.setValue(value)
+        slider.valueChanged.connect(lambda slider_value, value_label=value_label: value_label.setText(formatter(slider_value)))
+        layout.addLayout(header)
+        layout.addWidget(slider)
+        parent_layout.addWidget(widget)
+        return widget, slider, value_label
+
+    def _current_linetop_settings_from_controls(self) -> LineTopSettings:
+        mode = "line" if self.linetop_line_mode_button.isChecked() else "color_limit"
+        preset = "photo" if self.linetop_photo_preset_button.isChecked() else "illustration"
+        return LineTopSettings(
+            mode=mode,
+            opacity=1.0,
+            edge_strength=self._linetop_settings.edge_strength,
+            line_thickness=self.linetop_thickness_slider.value() / 10,
+            overlay_contrast=self.linetop_contrast_slider.value() / 100,
+            overlay_brightness=self.linetop_brightness_slider.value() / 100,
+            color_limit_steps=self.linetop_color_limit_slider.value(),
+            color_limit_grayscale=self.linetop_color_grayscale_checkbox.isChecked(),
+            color_limit_shape_simplification=1,
+            smart_enhance=self.linetop_smart_enhance_checkbox.isChecked(),
+            smart_preset=preset,
+            enhanced_line_engine=self.linetop_enhanced_line_checkbox.isChecked(),
+        )
+
+    def _sync_linetop_controls_from_settings(self) -> None:
+        for control in self._linetop_controls:
+            control.blockSignals(True)
+        try:
+            self.linetop_line_mode_button.setChecked(self._linetop_settings.mode == "line")
+            self.linetop_color_limit_mode_button.setChecked(self._linetop_settings.mode == "color_limit")
+            self.linetop_color_limit_slider.setValue(int(self._linetop_settings.color_limit_steps))
+            self.linetop_color_grayscale_checkbox.setChecked(self._linetop_settings.color_limit_grayscale)
+            self.linetop_smart_enhance_checkbox.setChecked(self._linetop_settings.smart_enhance)
+            self.linetop_enhanced_line_checkbox.setChecked(self._linetop_settings.enhanced_line_engine)
+            self.linetop_photo_preset_button.setChecked(self._linetop_settings.smart_preset == "photo")
+            self.linetop_illustration_preset_button.setChecked(self._linetop_settings.smart_preset == "illustration")
+            self.linetop_contrast_slider.setValue(int(round(self._linetop_settings.overlay_contrast * 100)))
+            self.linetop_brightness_slider.setValue(int(round(self._linetop_settings.overlay_brightness * 100)))
+            self.linetop_thickness_slider.setValue(int(round(self._linetop_settings.line_thickness * 10)))
+        finally:
+            for control in self._linetop_controls:
+                control.blockSignals(False)
+        self.linetop_color_limit_value.setText(f"{self.linetop_color_limit_slider.value():d}")
+        self.linetop_contrast_value.setText(f"{self.linetop_contrast_slider.value() / 100:.2f}")
+        self.linetop_brightness_value.setText(f"{self.linetop_brightness_slider.value() / 100:.2f}")
+        self.linetop_thickness_value.setText(f"{self.linetop_thickness_slider.value() / 10:.1f}")
+        self._refresh_linetop_control_visibility()
+
+    def _refresh_linetop_control_visibility(self) -> None:
+        mode = "line" if self.linetop_line_mode_button.isChecked() else "color_limit"
+        for widget in self._linetop_line_only_widgets:
+            widget.setVisible(mode == "line")
+        for widget in self._linetop_color_only_widgets:
+            widget.setVisible(mode == "color_limit")
+        brightness_title = "亮度/阈值倾向" if mode == "line" else "亮度"
+        label = self.linetop_brightness_row.findChild(QLabel)
+        if label is not None:
+            label.setText(brightness_title)
+
+    def _queue_linetop_settings_changed(self) -> None:
+        self._linetop_settings = self._current_linetop_settings_from_controls()
+        self._refresh_linetop_control_visibility()
+        self._linetop_render_cache.clear()
+        image = self.current_image()
+        if image is not None and self._linetop_preview_active(image) and not self._linetop_show_original_compare:
+            self._linetop_render_timer.start()
+
+    def _reset_linetop_settings(self) -> None:
+        self._linetop_settings = LineTopSettings()
+        self._sync_linetop_controls_from_settings()
+        self._queue_linetop_settings_changed()
+
+    def _linetop_preview_active(self, image: ImageItem | None = None) -> bool:
+        image = image or self.current_image()
+        return bool(
+            not self.advanced_panel.isHidden()
+            and image is not None
+            and not is_supported_video(image.file_path)
+        )
+
+    def _toggle_linetop_panel(self) -> None:
+        self._set_linetop_panel_visible(self.advanced_panel.isHidden())
+
+    def _set_linetop_panel_visible(self, visible: bool) -> None:
+        image = self.current_image()
+        visible = bool(visible and image is not None and not is_supported_video(image.file_path))
+        if self.advanced_toggle_button.isChecked() != visible:
+            self.advanced_toggle_button.blockSignals(True)
+            self.advanced_toggle_button.setChecked(visible)
+            self.advanced_toggle_button.blockSignals(False)
+        if not visible:
+            self._set_linetop_compare_original(False, rerender=False)
+        panel_is_visible = not self.advanced_panel.isHidden()
+        if panel_is_visible == visible:
+            self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
+            self.save_render_button.setEnabled(self._linetop_preview_active(image))
+            return
+        self.advanced_panel.setVisible(visible)
+        self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
+        self.save_render_button.setEnabled(self._linetop_preview_active(image))
+        self._linetop_render_timer.stop()
+        self._linetop_render_pending_token = None
+        self._linetop_queued_render_request = None
+        if image is None or is_supported_video(image.file_path):
+            return
+        self._render_current_image(use_thumbnail_first=True)
+        self._preview_refine_timer.start()
+
+    def _set_linetop_compare_original(self, checked: bool, *, rerender: bool = True) -> None:
+        checked = bool(checked and self._linetop_preview_active())
+        self._linetop_show_original_compare = checked
+        if self.compare_toggle_button.isChecked() != checked:
+            self.compare_toggle_button.blockSignals(True)
+            self.compare_toggle_button.setChecked(checked)
+            self.compare_toggle_button.blockSignals(False)
+        if checked:
+            self._linetop_render_timer.stop()
+            self._linetop_queued_render_request = None
+        image = self.current_image()
+        if rerender and image is not None and not is_supported_video(image.file_path):
+            self._render_current_image(use_thumbnail_first=True)
+
+    def _linetop_cache_key(self, image: ImageItem, target_width: int, target_height: int) -> tuple[object, ...]:
+        return (
+            image.id,
+            image.file_path,
+            image.file_size,
+            image.modified_time_ns,
+            max(1, int(target_width)),
+            max(1, int(target_height)),
+            self.grayscale_preview,
+            self.mirrored_preview,
+            *self._linetop_settings.cache_key(),
+        )
+
+    def _request_linetop_render(
+        self,
+        image: ImageItem,
+        target_width: int,
+        target_height: int,
+        *,
+        use_thumbnail_first: bool,
+    ) -> None:
+        cache_key = self._linetop_cache_key(image, target_width, target_height)
+        cached = self._linetop_render_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            self.image_view.set_pixmap(
+                cached,
+                original_width=image.width,
+                original_height=image.height,
+                fit_to_window=self.fit_to_window,
+                zoom_factor=self.zoom_factor,
+            )
+            self._update_info(image)
+            return
+        if use_thumbnail_first:
+            fallback = self._cached_preview_base_pixmap(image)
+            if fallback.isNull():
+                fallback = self._load_quick_preview_pixmap(image, target_width, target_height)
+            if not fallback.isNull():
+                self.image_view.set_pixmap(
+                    fallback,
+                    original_width=image.width,
+                    original_height=image.height,
+                    fit_to_window=self.fit_to_window,
+                    zoom_factor=self.zoom_factor,
+                )
+            else:
+                self.image_view.set_message("处理中...")
+        else:
+            self.image_view.set_message("处理中...")
+        self._update_info(image)
+        if self._linetop_render_pending_token == cache_key:
+            return
+        if self._linetop_render_running_token is not None:
+            self._linetop_render_pending_token = cache_key
+            if self._linetop_render_running_token == cache_key:
+                return
+            self._linetop_queued_render_request = (
+                cache_key,
+                image.file_path,
+                target_width,
+                target_height,
+                self._linetop_settings,
+                self.grayscale_preview,
+                self.mirrored_preview,
+            )
+            return
+        self._start_linetop_render_task(
+            cache_key,
+            image.file_path,
+            target_width,
+            target_height,
+            self._linetop_settings,
+            self.grayscale_preview,
+            self.mirrored_preview,
+        )
+
+    def _start_linetop_render_task(
+        self,
+        token: tuple[object, ...],
+        image_path: str,
+        target_width: int,
+        target_height: int,
+        settings: LineTopSettings,
+        grayscale: bool,
+        mirror_horizontal: bool,
+    ) -> None:
+        self._linetop_render_pending_token = token
+        self._linetop_render_running_token = token
+        task = _LineTopRenderTask(
+            token=token,
+            image_path=image_path,
+            max_width=target_width,
+            max_height=target_height,
+            settings=settings,
+            grayscale=grayscale,
+            mirror_horizontal=mirror_horizontal,
+            signals=self._linetop_render_signals,
+        )
+        self._linetop_thread_pool.start(task)
+
+    def _start_queued_linetop_render_if_needed(self) -> None:
+        request = self._linetop_queued_render_request
+        self._linetop_queued_render_request = None
+        if request is None:
+            return
+        token, image_path, target_width, target_height, settings, grayscale, mirror_horizontal = request
+        if token != self._linetop_render_pending_token:
+            return
+        image = self.current_image()
+        if image is None or not self._linetop_preview_active(image) or self._linetop_show_original_compare:
+            return
+        if self._linetop_cache_key(image, target_width, target_height) != token:
+            return
+        cached = self._linetop_render_cache.get(token)
+        if cached is not None and not cached.isNull():
+            self._linetop_render_pending_token = None
+            self.image_view.set_pixmap(
+                cached,
+                original_width=image.width,
+                original_height=image.height,
+                fit_to_window=self.fit_to_window,
+                zoom_factor=self.zoom_factor,
+            )
+            self._update_info(image)
+            return
+        self._start_linetop_render_task(
+            token,
+            image_path,
+            target_width,
+            target_height,
+            settings,
+            grayscale,
+            mirror_horizontal,
+        )
+
+    def _handle_linetop_render_loaded(self, token: object, qimage: QImage, error: str) -> None:
+        if token == self._linetop_render_running_token:
+            self._linetop_render_running_token = None
+        if token != self._linetop_render_pending_token:
+            self._start_queued_linetop_render_if_needed()
+            return
+        self._linetop_render_pending_token = None
+        image = self.current_image()
+        if image is None or not self._linetop_preview_active(image) or self._linetop_show_original_compare:
+            self._start_queued_linetop_render_if_needed()
+            return
+        if error or qimage.isNull():
+            self.image_view.set_message("无法处理图片")
+            self._start_queued_linetop_render_if_needed()
+            return
+        pixmap = QPixmap.fromImage(qimage)
+        if pixmap.isNull():
+            self.image_view.set_message("无法处理图片")
+            self._start_queued_linetop_render_if_needed()
+            return
+        if isinstance(token, tuple):
+            self._linetop_render_cache[token] = QPixmap(pixmap)
+            while len(self._linetop_render_cache) > LINETOP_RENDER_CACHE_LIMIT:
+                oldest_key = next(iter(self._linetop_render_cache))
+                self._linetop_render_cache.pop(oldest_key, None)
+        self.image_view.set_pixmap(
+            pixmap,
+            original_width=image.width,
+            original_height=image.height,
+            fit_to_window=self.fit_to_window,
+            zoom_factor=self.zoom_factor,
+        )
+        self._update_info(image)
+        self._start_queued_linetop_render_if_needed()
+
+    def _render_linetop_export_image(self, image: ImageItem) -> Image.Image:
+        source = _load_linetop_source_image(
+            image.file_path,
+            grayscale=self.grayscale_preview,
+            mirror_horizontal=self.mirrored_preview,
+        )
+        return render_linetop_image(source, self._linetop_settings)
+
+    def _save_linetop_render_as(self) -> None:
+        image = self.current_image()
+        if image is None or not self._linetop_preview_active(image):
+            return
+        suffix = "line" if self._linetop_settings.mode == "line" else "color_limit"
+        source_path = Path(image.file_path)
+        default_path = source_path.with_name(f"{source_path.stem}_{suffix}.png")
+        output_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "保存处理结果",
+            str(default_path),
+            "PNG Image (*.png)",
+        )
+        if not output_path:
+            return
+        target_path = Path(output_path)
+        if target_path.suffix.lower() != ".png":
+            target_path = target_path.with_suffix(".png")
+        try:
+            if target_path.resolve() == source_path.resolve():
+                QMessageBox.warning(self, "Eidory", "不能覆盖图库源图片。请选择一个新的 PNG 文件名。")
+                return
+        except OSError:
+            pass
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            rendered = self._render_linetop_export_image(image)
+            rendered.save(target_path, "PNG")
+        except Exception as exc:
+            QMessageBox.warning(self, "Eidory", f"保存失败：{exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _set_grayscale_preview(self, checked: bool) -> None:
         self.grayscale_preview = checked
@@ -1122,6 +1915,20 @@ class ImagePreviewDialog(QDialog):
             previous_base = self._preview_base_pixmap
             previous_fallback = self._preview_base_is_fallback
             load_width, load_height = self._source_load_bounds(image, target_width, target_height)
+            if image.file_size > INLINE_SOURCE_PREVIEW_MAX_BYTES:
+                self._request_preview_source_load(
+                    image,
+                    max_width=load_width,
+                    max_height=load_height,
+                )
+                if previous_base.isNull():
+                    return QPixmap()
+                pixmap = previous_base
+                fallback_used = previous_fallback
+                self._preview_base_pixmap = pixmap
+                self._preview_base_is_fallback = fallback_used
+                self._preview_variant_cache.clear()
+                return self._preview_variant_from_base()
             pixmap = self._load_preview_pixmap(image.file_path, load_width, load_height)
             fallback_used = False
             if pixmap.isNull():
@@ -1137,6 +1944,9 @@ class ImagePreviewDialog(QDialog):
             self._preview_base_is_fallback = fallback_used
             self._preview_variant_cache.clear()
 
+        return self._preview_variant_from_base()
+
+    def _preview_variant_from_base(self) -> QPixmap:
         variant_key = (self.grayscale_preview, self.mirrored_preview)
         cached = self._preview_variant_cache.get(variant_key)
         if cached is not None and not cached.isNull():
@@ -1149,6 +1959,121 @@ class ImagePreviewDialog(QDialog):
         )
         self._preview_variant_cache[variant_key] = pixmap
         return pixmap
+
+    def _request_preview_source_load(
+        self,
+        image: ImageItem,
+        *,
+        max_width: int,
+        max_height: int,
+    ) -> None:
+        base_key = self._preview_base_key_for(image)
+        token = (
+            base_key[0],
+            base_key[1],
+            base_key[2],
+            base_key[3],
+            max_width,
+            max_height,
+        )
+        if token == self._preview_source_pending_token:
+            return
+        fallback_path = (
+            image.thumbnail_path
+            if image.thumbnail_path and Path(image.thumbnail_path).exists()
+            else None
+        )
+        self._preview_source_pending_token = token
+        if self._preview_source_running_token is not None:
+            if self._preview_source_running_token == token:
+                return
+            self._preview_source_queued_request = (
+                token,
+                image.file_path,
+                fallback_path,
+                max_width,
+                max_height,
+            )
+            return
+        self._start_preview_source_load_task(
+            token,
+            image.file_path,
+            fallback_path,
+            max_width,
+            max_height,
+        )
+
+    def _start_preview_source_load_task(
+        self,
+        token: tuple[int, str, int, int, int, int],
+        image_path: str,
+        fallback_path: str | None,
+        max_width: int,
+        max_height: int,
+    ) -> None:
+        self._preview_source_pending_token = token
+        self._preview_source_running_token = token
+        task = _PreviewSourceLoadTask(
+            token=token,
+            image_path=image_path,
+            fallback_path=fallback_path,
+            max_width=max_width,
+            max_height=max_height,
+            signals=self._preview_source_signals,
+        )
+        self._preview_source_thread_pool.start(task)
+
+    def _start_queued_preview_source_load_if_needed(self) -> None:
+        request = self._preview_source_queued_request
+        self._preview_source_queued_request = None
+        if request is None:
+            return
+        token, image_path, fallback_path, max_width, max_height = request
+        if token != self._preview_source_pending_token:
+            return
+        image = self.current_image()
+        if image is None or self._preview_base_key_for(image) != (token[0], token[1], token[2], token[3]):
+            return
+        self._start_preview_source_load_task(
+            token,
+            image_path,
+            fallback_path,
+            max_width,
+            max_height,
+        )
+
+    def _handle_preview_source_loaded(
+        self,
+        token: tuple[int, str, int, int, int, int],
+        qimage: QImage,
+        fallback_used: bool,
+    ) -> None:
+        if token == self._preview_source_running_token:
+            self._preview_source_running_token = None
+        if token != self._preview_source_pending_token:
+            self._start_queued_preview_source_load_if_needed()
+            return
+        self._preview_source_pending_token = None
+        image = self.current_image()
+        if image is None:
+            self._start_queued_preview_source_load_if_needed()
+            return
+        base_key = (token[0], token[1], token[2], token[3])
+        if self._preview_base_key_for(image) != base_key:
+            self._start_queued_preview_source_load_if_needed()
+            return
+        pixmap = QPixmap.fromImage(qimage) if not qimage.isNull() else QPixmap()
+        if pixmap.isNull():
+            if self._preview_base_pixmap.isNull():
+                self.image_view.set_message("无法预览")
+            self._start_queued_preview_source_load_if_needed()
+            return
+        self._preview_base_key = base_key
+        self._preview_base_pixmap = pixmap
+        self._preview_base_is_fallback = fallback_used
+        self._preview_variant_cache.clear()
+        self._render_current_image(use_thumbnail_first=True)
+        self._start_queued_preview_source_load_if_needed()
 
     @staticmethod
     def _preview_base_key_for(image: ImageItem) -> tuple[int, str, int, int]:
@@ -1199,6 +2124,8 @@ class ImagePreviewDialog(QDialog):
         return wanted_width, wanted_height
 
     def _clear_preview_pixmap_cache(self) -> None:
+        self._preview_source_pending_token = None
+        self._preview_source_queued_request = None
         self._preview_base_key = None
         self._preview_base_pixmap = QPixmap()
         self._preview_base_is_fallback = False
@@ -1383,6 +2310,13 @@ class ImagePreviewDialog(QDialog):
     def _copy_current_image(self) -> None:
         image = self.current_image()
         if image is None or is_supported_video(image.file_path):
+            return
+        if self._linetop_preview_active(image) and not self._linetop_show_original_compare:
+            try:
+                rendered = self._render_linetop_export_image(image)
+                QApplication.clipboard().setImage(_qimage_from_pillow(rendered))
+            except Exception:
+                QMessageBox.warning(self, "Eidory", "无法复制当前处理结果。")
             return
         width = image.width or self.image_view.viewport().width()
         height = image.height or self.image_view.viewport().height()

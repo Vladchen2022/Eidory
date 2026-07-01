@@ -14,8 +14,13 @@ from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QPixmap
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
+from eidory.core.linetop_processor import LineTopSettings
 from eidory.core.metadata_store import MetadataStore
-from eidory.ui.image_preview_dialog import ImagePreviewDialog
+from eidory.ui.image_preview_dialog import (
+    INLINE_SOURCE_PREVIEW_MAX_BYTES,
+    ImagePreviewDialog,
+    SOURCE_PREVIEW_REFINE_DELAY_MS,
+)
 
 
 class ImagePreviewDialogTest(unittest.TestCase):
@@ -120,6 +125,38 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 }
                 & button_texts
             )
+            dialog.close()
+
+    def test_source_preview_refine_timer_uses_fast_open_close_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="blue").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+
+            self.assertEqual(dialog._preview_refine_timer.interval(), SOURCE_PREVIEW_REFINE_DELAY_MS)
+            self.assertGreaterEqual(dialog._preview_refine_timer.interval(), 300)
             dialog.close()
 
     def test_preview_zoom_and_fit_state(self) -> None:
@@ -245,6 +282,146 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 self.assertFalse(dialog.fit_to_window)
                 dialog.close()
 
+    def test_large_preview_source_refine_runs_in_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "large.jpg"
+            Image.effect_noise((1600, 1200), 96).convert("RGB").save(image_path, quality=96)
+            self.assertGreater(image_path.stat().st_size, INLINE_SOURCE_PREVIEW_MAX_BYTES)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=1600,
+                height=1200,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            with (
+                patch.object(dialog, "_load_preview_pixmap", side_effect=AssertionError("main-thread source load")),
+                patch.object(dialog._preview_source_thread_pool, "start") as start_task,
+            ):
+                dialog._render_current_image()
+
+            start_task.assert_called_once()
+            self.assertIsNotNone(dialog._preview_source_pending_token)
+            dialog.close()
+
+    def test_large_preview_source_load_keeps_only_latest_request_while_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_path = root / "first.jpg"
+            second_path = root / "second.jpg"
+            Image.new("RGB", (64, 48), color="red").save(first_path)
+            Image.new("RGB", (64, 48), color="blue").save(second_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            first_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(first_path),
+                file_size=first_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=first_path.stat().st_mtime_ns,
+            )
+            second_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(second_path),
+                file_size=second_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=second_path.stat().st_mtime_ns,
+            )
+            first = store.get_image(first_id)
+            second = store.get_image(second_id)
+            dialog = ImagePreviewDialog(
+                images=[first, second],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+
+            with patch.object(dialog._preview_source_thread_pool, "start") as start_task:
+                dialog._request_preview_source_load(first, max_width=400, max_height=300)
+                first_token = dialog._preview_source_running_token
+                dialog.index = 1
+                dialog._request_preview_source_load(second, max_width=400, max_height=300)
+
+                self.assertEqual(start_task.call_count, 1)
+                self.assertIsNotNone(dialog._preview_source_queued_request)
+
+                dialog._handle_preview_source_loaded(first_token, QImage(), False)
+
+            self.assertEqual(start_task.call_count, 2)
+            self.assertEqual(dialog._preview_source_running_token[0], second.id)
+            dialog.close()
+
+    def test_linetop_render_keeps_only_latest_request_while_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            image = store.get_image(image_id)
+            dialog = ImagePreviewDialog(
+                images=[image],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+
+            with (
+                patch.object(dialog, "_linetop_preview_active", return_value=True),
+                patch.object(dialog._linetop_thread_pool, "start") as start_task,
+            ):
+                dialog._request_linetop_render(image, 400, 300, use_thumbnail_first=False)
+                first_token = dialog._linetop_render_running_token
+                dialog._linetop_settings = LineTopSettings(mode="color_limit")
+                dialog._request_linetop_render(image, 400, 300, use_thumbnail_first=False)
+
+                self.assertEqual(start_task.call_count, 1)
+                self.assertIsNotNone(dialog._linetop_queued_render_request)
+
+                dialog._handle_linetop_render_loaded(first_token, QImage(), "")
+
+            self.assertEqual(start_task.call_count, 2)
+            self.assertEqual(dialog._linetop_render_running_token, dialog._linetop_render_pending_token)
+            self.assertIn("color_limit", dialog._linetop_render_running_token)
+            dialog.close()
+
     def test_preview_navigator_only_shows_when_image_can_pan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -355,6 +532,208 @@ class ImagePreviewDialogTest(unittest.TestCase):
             self.assertFalse(dialog.mirror_button.icon().isNull())
             self.assertEqual(dialog.grayscale_button.accessibleName(), "黑白")
             self.assertEqual(dialog.mirror_button.accessibleName(), "左右翻转")
+            dialog.close()
+
+    def test_tab_toggles_linetop_panel_without_source_render_blocking_ui(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            dialog.show()
+            self.app.processEvents()
+
+            with patch.object(dialog, "_request_linetop_render") as request_render:
+                tab = QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_Tab,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+                dialog.keyPressEvent(tab)
+
+            self.assertFalse(dialog.advanced_panel.isHidden())
+            self.assertTrue(dialog.advanced_toggle_button.isChecked())
+            self.assertTrue(dialog.compare_toggle_button.isEnabled())
+            self.assertTrue(dialog.save_render_button.isEnabled())
+            self.assertTrue(request_render.called)
+
+            dialog.keyPressEvent(
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_Tab,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            )
+            self.assertTrue(dialog.advanced_panel.isHidden())
+            self.assertFalse(dialog.advanced_toggle_button.isChecked())
+            self.assertFalse(dialog.compare_toggle_button.isEnabled())
+            self.assertFalse(dialog.compare_toggle_button.isChecked())
+            self.assertFalse(dialog.save_render_button.isEnabled())
+            dialog.close()
+
+    def test_linetop_controls_build_expected_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+
+            dialog.linetop_color_limit_mode_button.setChecked(True)
+            dialog.linetop_contrast_slider.setValue(180)
+            dialog.linetop_brightness_slider.setValue(-12)
+            dialog.linetop_color_limit_slider.setValue(5)
+            dialog.linetop_color_grayscale_checkbox.setChecked(True)
+            dialog.linetop_illustration_preset_button.setChecked(True)
+            settings = dialog._current_linetop_settings_from_controls()
+
+            self.assertEqual(
+                settings,
+                LineTopSettings(
+                    mode="color_limit",
+                    opacity=1.0,
+                    edge_strength=2.0,
+                    line_thickness=0.0,
+                    overlay_contrast=1.8,
+                    overlay_brightness=-0.12,
+                    color_limit_steps=5,
+                    color_limit_grayscale=True,
+                    color_limit_shape_simplification=1,
+                    smart_enhance=True,
+                    smart_preset="illustration",
+                    enhanced_line_engine=True,
+                ),
+            )
+            self.assertFalse(hasattr(dialog, "linetop_opacity_slider"))
+            self.assertFalse(hasattr(dialog, "linetop_shape_slider"))
+            self.assertFalse(dialog.linetop_color_limit_row.isHidden())
+            self.assertTrue(dialog.linetop_thickness_row.isHidden())
+            dialog.close()
+
+    def test_compare_toggle_switches_between_source_and_processed_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            dialog.show()
+            self.app.processEvents()
+
+            with patch.object(dialog, "_request_linetop_render") as request_render:
+                dialog._set_linetop_panel_visible(True)
+                self.assertTrue(request_render.called)
+                request_render.reset_mock()
+                dialog.compare_toggle_button.setChecked(True)
+                self.assertFalse(request_render.called)
+                dialog.compare_toggle_button.setChecked(False)
+                self.assertTrue(request_render.called)
+
+            dialog.close()
+
+    def test_linetop_save_as_refuses_to_overwrite_source_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.png"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            before = image_path.read_bytes()
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            dialog.show()
+            self.app.processEvents()
+            with patch.object(dialog, "_request_linetop_render"):
+                dialog._set_linetop_panel_visible(True)
+
+            with (
+                patch(
+                    "eidory.ui.image_preview_dialog.QFileDialog.getSaveFileName",
+                    return_value=(str(image_path), "PNG Image (*.png)"),
+                ),
+                patch.object(QMessageBox, "warning") as warning,
+                patch.object(dialog, "_render_linetop_export_image") as render_export,
+            ):
+                dialog._save_linetop_render_as()
+
+            self.assertEqual(image_path.read_bytes(), before)
+            self.assertFalse(render_export.called)
+            self.assertTrue(warning.called)
             dialog.close()
 
     def test_preview_transform_actions_do_not_reload_source_image(self) -> None:

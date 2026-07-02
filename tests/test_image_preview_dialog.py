@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -19,7 +20,10 @@ from eidory.core.metadata_store import MetadataStore
 from eidory.ui.image_preview_dialog import (
     INLINE_SOURCE_PREVIEW_MAX_BYTES,
     ImagePreviewDialog,
+    LineTopNativeOverlayWindow,
+    LineTopOverlayWindow,
     SOURCE_PREVIEW_REFINE_DELAY_MS,
+    _DETACHED_LINETOP_OVERLAYS,
 )
 
 
@@ -27,6 +31,26 @@ class ImagePreviewDialogTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def _seed_loaded_preview(self, dialog: ImagePreviewDialog, width: int, height: int) -> None:
+        image = dialog.current_image()
+        self.assertIsNotNone(image)
+        pixmap = QPixmap(width, height)
+        pixmap.fill(QColor("#446688"))
+        dialog._preview_source_pending_token = None
+        dialog._preview_source_running_token = None
+        dialog._preview_source_queued_request = None
+        dialog._preview_base_key = dialog._preview_base_key_for(image)
+        dialog._preview_base_pixmap = pixmap
+        dialog._preview_base_is_fallback = False
+        dialog._preview_variant_cache.clear()
+        dialog.image_view.set_pixmap(
+            pixmap,
+            original_width=image.width,
+            original_height=image.height,
+            fit_to_window=dialog.fit_to_window,
+            zoom_factor=dialog.zoom_factor,
+        )
 
     def test_preview_pixmap_loads_when_pillow_pixel_limit_is_low(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,6 +210,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 model_revision="test",
                 embedding_dim=2,
             )
+            self._seed_loaded_preview(dialog, 1200, 800)
             self.assertTrue(dialog.fit_to_window)
             fit_zoom = dialog._fit_zoom_factor()
             dialog._zoom_by(120)
@@ -234,6 +259,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 model_revision="test",
                 embedding_dim=2,
             )
+            self._seed_loaded_preview(dialog, 1200, 800)
             fit_zoom = dialog._fit_zoom_factor()
             dialog._zoom_by(120)
 
@@ -274,6 +300,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
                     model_revision="test",
                     embedding_dim=2,
                 )
+                self._seed_loaded_preview(dialog, 800, 500)
                 initial_loads = load_preview.call_count
                 dialog._zoom_by(120)
 
@@ -310,11 +337,56 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 model_revision="test",
                 embedding_dim=2,
             )
+            dialog._clear_preview_pixmap_cache()
+            dialog._preview_source_running_token = None
             with (
                 patch.object(dialog, "_load_preview_pixmap", side_effect=AssertionError("main-thread source load")),
                 patch.object(dialog._preview_source_thread_pool, "start") as start_task,
             ):
-                dialog._render_current_image()
+                dialog.show()
+                self.app.processEvents()
+
+            start_task.assert_called_once()
+            self.assertIsNotNone(dialog._preview_source_pending_token)
+            dialog.close()
+
+    def test_small_preview_source_refine_runs_in_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "small.jpg"
+            Image.new("RGB", (96, 64), color="red").save(image_path)
+            self.assertLessEqual(image_path.stat().st_size, INLINE_SOURCE_PREVIEW_MAX_BYTES)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=96,
+                height=64,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            dialog._clear_preview_pixmap_cache()
+            dialog._preview_source_running_token = None
+            dialog.image_view.clear_pixmap()
+
+            with (
+                patch.object(dialog, "_load_preview_pixmap", side_effect=AssertionError("main-thread source load")),
+                patch.object(dialog._preview_source_thread_pool, "start") as start_task,
+            ):
+                dialog.show()
+                self.app.processEvents()
 
             start_task.assert_called_once()
             self.assertIsNotNone(dialog._preview_source_pending_token)
@@ -359,6 +431,8 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 model_revision="test",
                 embedding_dim=2,
             )
+            dialog._clear_preview_pixmap_cache()
+            dialog._preview_source_running_token = None
 
             with patch.object(dialog._preview_source_thread_pool, "start") as start_task:
                 dialog._request_preview_source_load(first, max_width=400, max_height=300)
@@ -451,15 +525,18 @@ class ImagePreviewDialogTest(unittest.TestCase):
             )
             dialog.show()
             self.app.processEvents()
+            self._seed_loaded_preview(dialog, 1200, 800)
 
             self.assertTrue(dialog.fit_to_window)
             self.assertFalse(dialog.image_view._navigator.isVisible())
+            self.assertTrue(dialog.image_view._navigator_thumb.isNull())
 
             dialog._actual_size_image()
             self.app.processEvents()
 
             self.assertFalse(dialog.fit_to_window)
             self.assertTrue(dialog.image_view._navigator.isVisible())
+            self.assertFalse(dialog.image_view._navigator_thumb.isNull())
             self.assertGreater(dialog.image_view._navigator._visible_rect.width(), 0)
             self.assertGreater(dialog.image_view._navigator._visible_rect.height(), 0)
 
@@ -619,6 +696,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
             )
 
             dialog.linetop_color_limit_mode_button.setChecked(True)
+            dialog.linetop_opacity_slider.setValue(47)
             dialog.linetop_contrast_slider.setValue(180)
             dialog.linetop_brightness_slider.setValue(-12)
             dialog.linetop_color_limit_slider.setValue(5)
@@ -630,7 +708,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 settings,
                 LineTopSettings(
                     mode="color_limit",
-                    opacity=1.0,
+                    opacity=0.47,
                     edge_strength=2.0,
                     line_thickness=0.0,
                     overlay_contrast=1.8,
@@ -643,8 +721,13 @@ class ImagePreviewDialogTest(unittest.TestCase):
                     enhanced_line_engine=True,
                 ),
             )
-            self.assertFalse(hasattr(dialog, "linetop_opacity_slider"))
+            self.assertTrue(hasattr(dialog, "linetop_opacity_slider"))
             self.assertFalse(hasattr(dialog, "linetop_shape_slider"))
+            self.assertEqual(dialog.linetop_opacity_value.text(), "0.47")
+            self.assertEqual(dialog.linetop_open_overlay_button.text(), "生成描图窗口")
+            self.assertTrue(dialog.linetop_overlay_on_top_checkbox.isChecked())
+            self.assertFalse(dialog.linetop_overlay_click_through_checkbox.isChecked())
+            self.assertTrue(dialog.linetop_overlay_adjustable_frame_checkbox.isChecked())
             self.assertFalse(dialog.linetop_color_limit_row.isHidden())
             self.assertTrue(dialog.linetop_thickness_row.isHidden())
             dialog.close()
@@ -688,6 +771,233 @@ class ImagePreviewDialogTest(unittest.TestCase):
                 self.assertTrue(request_render.called)
 
             dialog.close()
+
+    def test_linetop_opacity_updates_display_without_rendering(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            with patch.object(dialog, "_request_linetop_render"):
+                dialog._set_linetop_panel_visible(True)
+            dialog._linetop_render_cache[("cached",)] = QPixmap(8, 8)
+
+            with patch.object(dialog._linetop_render_timer, "start") as preview_start:
+                dialog.linetop_opacity_slider.setValue(55)
+
+            self.assertFalse(preview_start.called)
+            self.assertIn(("cached",), dialog._linetop_render_cache)
+            self.assertAlmostEqual(dialog.image_view._pixmap_item.opacity(), 0.55)
+            dialog.close()
+
+    def test_linetop_overlay_window_render_runs_in_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            with patch.object(dialog, "_request_linetop_render"):
+                dialog._set_linetop_panel_visible(True)
+
+            with patch.object(dialog._linetop_thread_pool, "start") as start_task:
+                dialog._open_linetop_overlay_window()
+
+            self.assertIsNotNone(dialog._linetop_overlay_window)
+            self.assertEqual(dialog.linetop_open_overlay_button.text(), "关闭描图窗口")
+            self.assertEqual(start_task.call_count, 1)
+            self.assertIsNotNone(dialog._linetop_overlay_pending_token)
+            self.assertIn("overlay", dialog._linetop_overlay_pending_token)
+            self.assertTrue(bool(dialog._linetop_overlay_window.windowFlags() & Qt.WindowType.FramelessWindowHint))
+            self.assertTrue(bool(dialog._linetop_overlay_window.windowFlags() & Qt.WindowType.WindowStaysOnTopHint))
+            self.assertTrue(dialog._linetop_overlay_window._adjustable_frame)
+
+            dialog.linetop_overlay_adjustable_frame_checkbox.setChecked(False)
+            self.assertTrue(bool(dialog._linetop_overlay_window.windowFlags() & Qt.WindowType.FramelessWindowHint))
+            self.assertFalse(dialog._linetop_overlay_window._adjustable_frame)
+
+            dialog.linetop_overlay_click_through_checkbox.setChecked(True)
+            self.assertTrue(
+                bool(dialog._linetop_overlay_window.windowFlags() & Qt.WindowType.WindowTransparentForInput)
+            )
+
+            with patch.object(dialog._linetop_overlay_render_timer, "start") as overlay_render_start:
+                dialog.linetop_contrast_slider.setValue(125)
+            self.assertTrue(overlay_render_start.called)
+
+            dialog.linetop_open_overlay_button.click()
+            self.assertIsNone(dialog._linetop_overlay_window)
+            self.assertEqual(dialog.linetop_open_overlay_button.text(), "生成描图窗口")
+            dialog.close()
+
+    def test_linetop_overlay_detaches_when_preview_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            with patch.object(dialog, "_request_linetop_render"):
+                dialog._set_linetop_panel_visible(True)
+            with patch.object(dialog._linetop_thread_pool, "start"):
+                dialog._open_linetop_overlay_window()
+            overlay = dialog._linetop_overlay_window
+            self.assertIsNotNone(overlay)
+
+            with patch.object(overlay, "close", wraps=overlay.close) as close_overlay:
+                dialog.close()
+                self.app.processEvents()
+
+            self.assertFalse(close_overlay.called)
+            self.assertIsNone(dialog._linetop_overlay_window)
+            self.assertIsNone(overlay.parent())
+            self.assertIn(overlay, _DETACHED_LINETOP_OVERLAYS)
+            overlay.close()
+            self.app.processEvents()
+            self.assertNotIn(overlay, _DETACHED_LINETOP_OVERLAYS)
+
+    def test_linetop_overlay_window_custom_resize_changes_geometry(self) -> None:
+        overlay = LineTopOverlayWindow()
+        overlay.setGeometry(100, 100, 240, 180)
+        overlay.set_adjustable_frame(True)
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(238, 178),
+            QPointF(338, 278),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        move = QMouseEvent(
+            QEvent.Type.MouseMove,
+            QPointF(278, 208),
+            QPointF(378, 308),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        release = QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            QPointF(278, 208),
+            QPointF(378, 308),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        overlay.mousePressEvent(press)
+        overlay.mouseMoveEvent(move)
+        overlay.mouseReleaseEvent(release)
+
+        self.assertGreaterEqual(overlay.width(), 280)
+        self.assertGreaterEqual(overlay.height(), 210)
+        overlay.close()
+
+    def test_linetop_native_overlay_is_disabled_under_offscreen_tests(self) -> None:
+        self.assertFalse(LineTopNativeOverlayWindow.is_available())
+
+    def test_linetop_native_overlay_writes_helper_state(self) -> None:
+        overlay = LineTopNativeOverlayWindow()
+        pixmap = QPixmap(16, 12)
+        pixmap.fill(QColor(0, 0, 0, 0))
+
+        overlay.set_pixmap(pixmap)
+        overlay.set_content_opacity(0.42)
+        overlay.set_always_on_top(False)
+        overlay.set_click_through(True)
+        overlay.set_adjustable_frame(False)
+        overlay.set_frame_hint_visible(False)
+
+        payload = json.loads(overlay._state_path.read_text(encoding="utf-8"))
+        self.assertTrue(Path(payload["imagePath"]).exists())
+        self.assertEqual(payload["imageRevision"], 1)
+        self.assertEqual(payload["opacity"], 0.42)
+        self.assertFalse(payload["alwaysOnTop"])
+        self.assertTrue(payload["clickThrough"])
+        self.assertFalse(payload["adjustableFrame"])
+        self.assertFalse(payload["showFrame"])
+
+        replacement = QPixmap(8, 8)
+        replacement.fill(QColor(255, 0, 0, 0))
+        overlay.set_pixmap(replacement)
+        updated_payload = json.loads(overlay._state_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated_payload["imagePath"], payload["imagePath"])
+        self.assertEqual(updated_payload["imageRevision"], 2)
+
+        updated_payload["alwaysOnTop"] = True
+        updated_payload["clickThrough"] = False
+        updated_payload["showFrame"] = True
+        overlay._state_path.write_text(json.dumps(updated_payload), encoding="utf-8")
+        overlay.set_content_opacity(0.66)
+        preserved_payload = json.loads(overlay._state_path.read_text(encoding="utf-8"))
+        self.assertTrue(preserved_payload["alwaysOnTop"])
+        self.assertFalse(preserved_payload["clickThrough"])
+        self.assertTrue(preserved_payload["showFrame"])
+        self.assertEqual(preserved_payload["opacity"], 0.66)
+
+        overlay.set_click_through(True)
+        explicit_payload = json.loads(overlay._state_path.read_text(encoding="utf-8"))
+        self.assertTrue(explicit_payload["clickThrough"])
+        overlay.close()
+        self.assertFalse(overlay._temp_dir.exists())
 
     def test_linetop_save_as_refuses_to_overwrite_source_image(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -873,6 +1183,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
             )
             dialog.show()
             self.app.processEvents()
+            self._seed_loaded_preview(dialog, 64, 48)
             dialog._actual_size_image()
             self.assertFalse(dialog.fit_to_window)
 

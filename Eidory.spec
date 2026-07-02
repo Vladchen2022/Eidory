@@ -1,16 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 datas = collect_data_files("eidory", includes=["db/*.sql"])
 hiddenimports = []
 hiddenimports += collect_submodules("transformers.models.metaclip_2")
+helper_binaries = []
+overlay_helper = Path("build/helpers/EidoryOverlayHelper")
+if overlay_helper.exists():
+    helper_binaries.append((str(overlay_helper), "."))
 
 a = Analysis(
     ["src/eidory/main.py"],
     pathex=["."],
-    binaries=[],
+    binaries=helper_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

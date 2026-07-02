@@ -80,6 +80,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._pixmap_cache_bytes: dict[PixmapCacheKey, int] = {}
         self._pixmap_cache_total_bytes = 0
         self._pending_pixmap_loads: set[PixmapCacheKey] = set()
+        self._loaded_pixmap_results: OrderedDict[PixmapCacheKey, QImage] = OrderedDict()
+        self._loaded_pixmap_flush_pending = False
         self._layout_signature: tuple[tuple[object, ...], ...] = ()
         self._viewport_update_pending = False
         self._pixmap_load_signals = _PixmapLoadSignals()
@@ -87,7 +89,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._thread_pool = QThreadPool.globalInstance()
         self._cache_limit = 700
         self._cache_byte_limit = 180 * 1024 * 1024
-        self._pending_load_limit = 96
+        self._pending_load_limit = 48
+        self._loaded_pixmap_flush_batch_size = 8
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAcceptDrops(True)
@@ -160,6 +163,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         should_rebuild_layout = self._layout_signature != new_layout_signature
         if should_rebuild_layout:
             self._pending_pixmap_loads.clear()
+            self._loaded_pixmap_results.clear()
         self._images = new_images
         self._layout_signature = new_layout_signature
         self._badges_by_image_id = dict(badges_by_image_id or {})
@@ -207,6 +211,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
     def set_thumbnail_size(self, size: int) -> None:
         self._target_height = max(80, min(420, size))
         self._pending_pixmap_loads.clear()
+        self._loaded_pixmap_results.clear()
         self._rebuild_layout()
         self.viewport().update()
 
@@ -381,7 +386,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         drag.setMimeData(mime)
         current = self.current_image()
         if current is not None:
-            pixmap = self._pixmap_for(current)
+            pixmap = self._cached_pixmap_for(current)
             if not pixmap.isNull():
                 drag.setPixmap(pixmap.scaled(
                     96,
@@ -640,10 +645,20 @@ class JustifiedImageGridView(QAbstractScrollArea):
     def _aspect_ratio(self, image: ImageItem) -> float:
         if image.width and image.height and image.height > 0:
             return max(0.2, min(6.0, image.width / image.height))
-        pixmap = self._pixmap_for(image)
-        if not pixmap.isNull() and pixmap.height() > 0:
-            return max(0.2, min(6.0, pixmap.width() / pixmap.height()))
+        # Layout must stay metadata-only; image decoding is deferred to paint.
         return 1.0
+
+    def _cached_pixmap_for(self, image: ImageItem) -> QPixmap:
+        if image.is_missing:
+            return QPixmap()
+        key = self._pixmap_cache_key(image, image.thumbnail_path or image.file_path)
+        if key is None:
+            return QPixmap()
+        cached = self._pixmap_cache.get(key)
+        if cached is None:
+            return QPixmap()
+        self._pixmap_cache.move_to_end(key)
+        return cached
 
     def _pixmap_for(self, image: ImageItem, *, schedule_load: bool = False) -> QPixmap:
         if image.is_missing:
@@ -718,9 +733,27 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._pending_pixmap_loads.discard(cache_key)
         if not isinstance(image, QImage):
             return
-        pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
-        self._cache_pixmap(cache_key, pixmap)
-        self._schedule_viewport_update()
+        self._loaded_pixmap_results[cache_key] = image
+        self._schedule_loaded_pixmap_flush()
+
+    def _schedule_loaded_pixmap_flush(self, *, delay_ms: int = 0) -> None:
+        if self._loaded_pixmap_flush_pending:
+            return
+        self._loaded_pixmap_flush_pending = True
+        QTimer.singleShot(delay_ms, self._flush_loaded_pixmap_results)
+
+    def _flush_loaded_pixmap_results(self) -> None:
+        self._loaded_pixmap_flush_pending = False
+        processed = 0
+        while self._loaded_pixmap_results and processed < self._loaded_pixmap_flush_batch_size:
+            cache_key, image = self._loaded_pixmap_results.popitem(last=False)
+            pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+            self._cache_pixmap(cache_key, pixmap)
+            processed += 1
+        if processed:
+            self._schedule_viewport_update()
+        if self._loaded_pixmap_results:
+            self._schedule_loaded_pixmap_flush(delay_ms=16)
 
     def _schedule_viewport_update(self) -> None:
         if self._viewport_update_pending:

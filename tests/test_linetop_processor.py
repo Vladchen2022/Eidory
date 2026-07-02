@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 from PIL import Image, ImageDraw
 
-from eidory.core.linetop_processor import LineTopSettings, render_linetop_image
+from eidory.core.linetop_processor import LineTopSettings, render_linetop_image, render_linetop_overlay_image
 
 
 class LineTopProcessorTest(unittest.TestCase):
@@ -44,6 +44,19 @@ class LineTopProcessorTest(unittest.TestCase):
         self.assertLessEqual(len(colors), 2)
         self.assertEqual(int(pixels[:, :60, 3].max()), 255)
         self.assertEqual(int(pixels[:, 60:, 3].max()), 128)
+
+    def test_line_overlay_mode_returns_transparent_reference_image(self) -> None:
+        image = Image.new("RGB", (160, 120), color="white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((20, 18, 140, 95), outline="black", width=4)
+
+        rendered = render_linetop_overlay_image(image, LineTopSettings(mode="line"))
+        pixels = np.array(rendered.convert("RGBA"))
+
+        self.assertEqual(rendered.size, image.size)
+        self.assertEqual(int(pixels[:, :, 3].min()), 0)
+        self.assertGreater(int(pixels[:, :, 3].max()), 0)
+        self.assertEqual(int(pixels[pixels[:, :, 3] > 0, :3].max()), 0)
 
 
 if __name__ == "__main__":

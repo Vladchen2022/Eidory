@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
+import os
+import shutil
 import subprocess
+import sys
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image, ImageOps
-from PySide6.QtCore import QEvent, QObject, QPoint, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -45,7 +50,7 @@ from PySide6.QtWidgets import (
 )
 
 from eidory.core.image_loader import open_local_image
-from eidory.core.linetop_processor import LineTopSettings, render_linetop_image
+from eidory.core.linetop_processor import LineTopSettings, render_linetop_image, render_linetop_overlay_image
 from eidory.core.media_types import is_supported_video
 from eidory.core.metadata_store import MetadataStore
 from eidory.models import ImageItem
@@ -57,6 +62,9 @@ INLINE_SOURCE_PREVIEW_MAX_BYTES = 512 * 1024
 SOURCE_PREVIEW_REFINE_DELAY_MS = 320
 LINETOP_PANEL_WIDTH = 330
 LINETOP_RENDER_CACHE_LIMIT = 12
+LINETOP_OVERLAY_RENDER_CACHE_LIMIT = 4
+LINETOP_OVERLAY_MAX_LONG_SIDE = 2400
+_DETACHED_LINETOP_OVERLAYS: set[QObject] = set()
 
 
 def _load_linetop_source_image(
@@ -109,6 +117,7 @@ class _LineTopRenderTask(QRunnable):
         grayscale: bool,
         mirror_horizontal: bool,
         signals: _LineTopRenderSignals,
+        overlay: bool = False,
     ) -> None:
         super().__init__()
         self.token = token
@@ -118,6 +127,7 @@ class _LineTopRenderTask(QRunnable):
         self.settings = settings
         self.grayscale = grayscale
         self.mirror_horizontal = mirror_horizontal
+        self.overlay = overlay
         self.signals = signals
 
     def run(self) -> None:
@@ -129,7 +139,11 @@ class _LineTopRenderTask(QRunnable):
                 grayscale=self.grayscale,
                 mirror_horizontal=self.mirror_horizontal,
             )
-            rendered = render_linetop_image(source, self.settings)
+            rendered = (
+                render_linetop_overlay_image(source, self.settings)
+                if self.overlay
+                else render_linetop_image(source, self.settings)
+            )
             qimage = _qimage_from_pillow(rendered)
             error = ""
         except Exception as exc:
@@ -404,7 +418,7 @@ class PreviewImageView(QGraphicsView):
         self._has_pixmap = False
         self._fit_to_window = True
         self._zoom_factor = 1.0
-        self._navigator_thumb = QPixmap()
+        self._clear_navigator_thumb()
         self._navigator.hide()
         self._pixmap_item.setPixmap(QPixmap())
         self._pixmap_item.hide()
@@ -420,7 +434,7 @@ class PreviewImageView(QGraphicsView):
         self._has_pixmap = False
         self._fit_to_window = True
         self._zoom_factor = 1.0
-        self._navigator_thumb = QPixmap()
+        self._clear_navigator_thumb()
         self._navigator.hide()
         self._pixmap_item.setPixmap(QPixmap())
         self._pixmap_item.hide()
@@ -450,12 +464,7 @@ class PreviewImageView(QGraphicsView):
         self._source_height = max(1, pixmap.height())
         self._original_width = max(1, int(original_width or pixmap.width()))
         self._original_height = max(1, int(original_height or pixmap.height()))
-        self._navigator_thumb = pixmap.scaled(
-            170,
-            130,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        self._clear_navigator_thumb()
         self._scene.setSceneRect(QRectF(0, 0, self._source_width, self._source_height))
         if fit_to_window:
             self.fit_image_to_window(emit=False)
@@ -464,6 +473,9 @@ class PreviewImageView(QGraphicsView):
             self._center_on_ratio(center_ratio)
         self._update_drag_mode()
         self._schedule_navigator_update()
+
+    def set_content_opacity(self, opacity: float) -> None:
+        self._pixmap_item.setOpacity(max(0.05, min(1.0, float(opacity))))
 
     def fit_image_to_window(self, *, emit: bool = True) -> None:
         if not self._has_pixmap:
@@ -633,7 +645,11 @@ class PreviewImageView(QGraphicsView):
     def _update_navigator(self) -> None:
         if not hasattr(self, "_navigator"):
             return
-        if not self.can_pan() or self._navigator_thumb.isNull():
+        if not self.can_pan():
+            self._navigator.hide()
+            return
+        self._ensure_navigator_thumb()
+        if self._navigator_thumb.isNull():
             self._navigator.hide()
             return
         self._navigator.set_state(
@@ -646,6 +662,651 @@ class PreviewImageView(QGraphicsView):
 
     def _schedule_navigator_update(self) -> None:
         QTimer.singleShot(0, self._update_navigator)
+
+    def _clear_navigator_thumb(self) -> None:
+        self._navigator_thumb = QPixmap()
+
+    def _ensure_navigator_thumb(self) -> None:
+        if not self._navigator_thumb.isNull():
+            return
+        if not self._has_pixmap:
+            return
+        pixmap = self._pixmap_item.pixmap()
+        if pixmap.isNull():
+            return
+        self._navigator_thumb = pixmap.scaled(
+            170,
+            130,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+
+
+class LineTopOverlayWindow(QWidget):
+    closed = Signal()
+
+    _RESIZE_MARGIN = 10
+    _MIN_WIDTH = 180
+    _MIN_HEIGHT = 140
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = QPixmap()
+        self._opacity = 1.0
+        self._always_on_top = True
+        self._click_through = False
+        self._show_frame = True
+        self._adjustable_frame = True
+        self._loading_message = ""
+        self._has_auto_sized = False
+        self._drag_mode = ""
+        self._drag_edge = (False, False, False, False)
+        self._drag_start_global = QPoint()
+        self._drag_start_window = QPoint()
+        self._drag_start_geometry = QRect()
+
+        self.setWindowTitle("Eidory 描图")
+        self.setMinimumSize(self._MIN_WIDTH, self._MIN_HEIGHT)
+        self.setWindowFlags(self._window_flags_for_state())
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("background: transparent;")
+        self.setMouseTracking(True)
+        self._always_on_top_button = self._create_control_button("置", "切换描图窗口置顶", self._toggle_always_on_top)
+        self._click_through_button = self._create_control_button("穿", "切换鼠标穿透", self._toggle_click_through)
+        self._frame_button = self._create_control_button("框", "显示或隐藏边框提示", self._toggle_frame_hint)
+        self._close_button = self._create_control_button("×", "关闭描图窗口", self.close, close_button=True)
+        self._control_buttons = [
+            self._always_on_top_button,
+            self._click_through_button,
+            self._frame_button,
+            self._close_button,
+        ]
+        self._refresh_control_buttons()
+
+    def set_pixmap(self, pixmap: QPixmap, *, parent_geometry: QRect | None = None) -> None:
+        self._pixmap = QPixmap(pixmap)
+        self._loading_message = ""
+        if not self._pixmap.isNull() and not self._has_auto_sized:
+            self._fit_initial_size(parent_geometry)
+            self._has_auto_sized = True
+        self.update()
+
+    def set_loading_message(self, text: str) -> None:
+        self._loading_message = text
+        self.update()
+
+    def set_content_opacity(self, opacity: float) -> None:
+        self._opacity = max(0.05, min(1.0, float(opacity)))
+        self.update()
+
+    def set_always_on_top(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._always_on_top == enabled:
+            return
+        self._always_on_top = enabled
+        self._apply_window_flags_preserving_geometry()
+        self._apply_macos_linetop_window_style()
+        self._refresh_control_buttons()
+
+    def set_click_through(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._click_through == enabled:
+            return
+        self._click_through = enabled
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, enabled)
+        self._apply_window_flags_preserving_geometry()
+        self._apply_macos_linetop_window_style()
+        self.update()
+        self._refresh_control_buttons()
+
+    def set_frame_hint_visible(self, visible: bool) -> None:
+        self._show_frame = bool(visible)
+        self.update()
+        self._refresh_control_buttons()
+
+    def set_adjustable_frame(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._adjustable_frame == enabled:
+            return
+        self._adjustable_frame = enabled
+        self._apply_window_flags_preserving_geometry()
+        self._apply_macos_linetop_window_style()
+        self.update()
+
+    def closeEvent(self, event) -> None:
+        self.closed.emit()
+        super().closeEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._position_control_buttons()
+        if self._apply_macos_linetop_window_style():
+            QTimer.singleShot(0, self._apply_macos_linetop_window_style)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_control_buttons()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        if self._adjustable_frame and not self._click_through:
+            # A nearly invisible fill keeps the transparent window mouse-addressable on macOS.
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 1))
+
+        target = self._target_rect()
+        if not self._pixmap.isNull() and not target.isEmpty():
+            painter.setOpacity(self._opacity)
+            painter.drawPixmap(target.toRect(), self._pixmap)
+            painter.setOpacity(1.0)
+        elif self._loading_message:
+            painter.setPen(QColor("#e5eaf2"))
+            painter.setBrush(QColor(24, 29, 36, 180))
+            box = QRectF(16, 16, 120, 36)
+            painter.drawRoundedRect(box, 8, 8)
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, self._loading_message)
+
+        if self._show_frame and not self._click_through:
+            frame_alpha = 150 if self._adjustable_frame else 120
+            painter.setPen(QPen(QColor(40, 40, 40, 45), 4))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(QRectF(self.rect()).adjusted(6, 6, -6, -6), 10, 10)
+            painter.setPen(QPen(QColor(255, 255, 255, frame_alpha), 2))
+            painter.drawRoundedRect(QRectF(self.rect()).adjusted(7, 7, -7, -7), 9, 9)
+
+    def mousePressEvent(self, event) -> None:
+        if not self._adjustable_frame:
+            super().mousePressEvent(event)
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        self._drag_start_global = self._event_global_pos(event)
+        self._drag_start_window = self.pos()
+        self._drag_start_geometry = self.geometry()
+        self._drag_edge = self._resize_edge(event.position().toPoint())
+        self._drag_mode = "resize" if any(self._drag_edge) else "move"
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if not self._adjustable_frame:
+            super().mouseMoveEvent(event)
+            return
+        if event.buttons() & Qt.MouseButton.LeftButton and self._drag_mode:
+            current_global = self._event_global_pos(event)
+            delta = current_global - self._drag_start_global
+            if self._drag_mode == "resize":
+                self._resize_from_delta(delta)
+            else:
+                self.move(self._drag_start_window + delta)
+            event.accept()
+            return
+        self._update_cursor(event.position().toPoint())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if not self._adjustable_frame:
+            super().mouseReleaseEvent(event)
+            return
+        self._drag_mode = ""
+        self._drag_edge = (False, False, False, False)
+        self._update_cursor(event.position().toPoint())
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _target_rect(self) -> QRectF:
+        if self._pixmap.isNull():
+            return QRectF()
+        available = QRectF(self.rect()).adjusted(12, 12, -12, -12)
+        if available.width() <= 0 or available.height() <= 0:
+            return QRectF()
+        size = QSize(self._pixmap.width(), self._pixmap.height())
+        size.scale(available.size().toSize(), Qt.AspectRatioMode.KeepAspectRatio)
+        return QRectF(
+            available.center().x() - size.width() / 2,
+            available.center().y() - size.height() / 2,
+            size.width(),
+            size.height(),
+        )
+
+    def _fit_initial_size(self, parent_geometry: QRect | None) -> None:
+        if self._pixmap.isNull():
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else QRect(80, 80, 1200, 800)
+        max_size = QSize(int(available.width() * 0.72), int(available.height() * 0.72))
+        target_size = QSize(self._pixmap.width(), self._pixmap.height())
+        if target_size.width() > max_size.width() or target_size.height() > max_size.height():
+            target_size.scale(max_size, Qt.AspectRatioMode.KeepAspectRatio)
+        target_size = QSize(
+            max(self._MIN_WIDTH, target_size.width() + 24),
+            max(self._MIN_HEIGHT, target_size.height() + 24),
+        )
+        self.resize(target_size)
+        center = parent_geometry.center() if parent_geometry is not None and parent_geometry.isValid() else available.center()
+        self.move(
+            max(available.left(), min(center.x() - self.width() // 2, available.right() - self.width())),
+            max(available.top(), min(center.y() - self.height() // 2, available.bottom() - self.height())),
+        )
+
+    def _create_control_button(self, text: str, tooltip: str, callback, *, close_button: bool = False) -> QPushButton:
+        button = QPushButton(text, self)
+        button.setFixedSize(20, 20)
+        button.setCheckable(not close_button)
+        button.setToolTip(tooltip)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.clicked.connect(lambda _checked=False, callback=callback: callback())
+        button.setStyleSheet(
+            """
+            QPushButton {
+                background: rgba(30, 35, 42, 190);
+                color: #f3f6fb;
+                border: 1px solid rgba(255, 255, 255, 110);
+                border-radius: 10px;
+                padding: 0;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:checked {
+                background: rgba(47, 125, 246, 220);
+                border-color: rgba(130, 180, 255, 200);
+            }
+            QPushButton:hover {
+                background: rgba(61, 72, 86, 220);
+            }
+            """
+        )
+        return button
+
+    def _refresh_control_buttons(self) -> None:
+        if not hasattr(self, "_always_on_top_button"):
+            return
+        self._always_on_top_button.setChecked(self._always_on_top)
+        self._click_through_button.setChecked(self._click_through)
+        self._frame_button.setChecked(not self._show_frame)
+
+    def _position_control_buttons(self) -> None:
+        if not hasattr(self, "_control_buttons"):
+            return
+        margin = 10
+        gap = 6
+        total_width = sum(button.width() for button in self._control_buttons) + gap * (len(self._control_buttons) - 1)
+        x = max(0, self.width() - total_width - margin)
+        for button in self._control_buttons:
+            button.move(x, margin)
+            button.raise_()
+            x += button.width() + gap
+
+    def _toggle_always_on_top(self) -> None:
+        self.set_always_on_top(not self._always_on_top)
+
+    def _toggle_click_through(self) -> None:
+        self.set_click_through(not self._click_through)
+
+    def _toggle_frame_hint(self) -> None:
+        self.set_frame_hint_visible(not self._show_frame)
+
+    def _resize_edge(self, pos: QPoint) -> tuple[bool, bool, bool, bool]:
+        margin = self._RESIZE_MARGIN
+        return (
+            pos.x() <= margin,
+            pos.x() >= self.width() - margin,
+            pos.y() <= margin,
+            pos.y() >= self.height() - margin,
+        )
+
+    def _resize_from_delta(self, delta: QPoint) -> None:
+        left, right, top, bottom = self._drag_edge
+        rect = QRect(self._drag_start_geometry)
+        if left:
+            rect.setLeft(min(rect.left() + delta.x(), rect.right() - self._MIN_WIDTH))
+        if right:
+            rect.setRight(max(rect.right() + delta.x(), rect.left() + self._MIN_WIDTH))
+        if top:
+            rect.setTop(min(rect.top() + delta.y(), rect.bottom() - self._MIN_HEIGHT))
+        if bottom:
+            rect.setBottom(max(rect.bottom() + delta.y(), rect.top() + self._MIN_HEIGHT))
+        self.setGeometry(rect)
+
+    def _update_cursor(self, pos: QPoint) -> None:
+        left, right, top, bottom = self._resize_edge(pos)
+        if (left and top) or (right and bottom):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif (right and top) or (left and bottom):
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif left or right:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif top or bottom:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        else:
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+
+    def _window_flags_for_state(self) -> Qt.WindowType:
+        flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+        if self._always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        if self._click_through:
+            flags |= Qt.WindowType.WindowTransparentForInput
+        return flags
+
+    def _apply_window_flags_preserving_geometry(self) -> None:
+        geometry = self.geometry()
+        was_visible = self.isVisible()
+        self.setWindowFlags(self._window_flags_for_state())
+        self.setGeometry(geometry)
+        if was_visible:
+            self.show()
+            self.raise_()
+
+    @staticmethod
+    def _should_use_macos_bridge() -> bool:
+        if sys.platform != "darwin":
+            return False
+        app = QApplication.instance()
+        return app is not None and app.platformName().lower() == "cocoa"
+
+    def _apply_macos_linetop_window_style(self) -> bool:
+        if not self._should_use_macos_bridge():
+            return False
+        try:
+            import ctypes
+            import ctypes.util
+
+            objc_path = ctypes.util.find_library("objc")
+            if not objc_path:
+                return False
+            objc = ctypes.cdll.LoadLibrary(objc_path)
+            objc.objc_getClass.restype = ctypes.c_void_p
+            objc.objc_getClass.argtypes = [ctypes.c_char_p]
+            objc.sel_registerName.restype = ctypes.c_void_p
+            objc.sel_registerName.argtypes = [ctypes.c_char_p]
+            msg_send = objc.objc_msgSend
+
+            def sel(name: str) -> int:
+                return int(objc.sel_registerName(name.encode("utf-8")) or 0)
+
+            def send_id(receiver: int, selector: str, *args) -> int:
+                if not receiver:
+                    return 0
+                msg_send.restype = ctypes.c_void_p
+                return int(msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), *args) or 0)
+
+            def send_void_bool(receiver: int, selector: str, value: bool) -> None:
+                if receiver:
+                    msg_send.restype = None
+                    msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), ctypes.c_bool(value))
+
+            def send_void_long(receiver: int, selector: str, value: int) -> None:
+                if receiver:
+                    msg_send.restype = None
+                    msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), ctypes.c_long(value))
+
+            def send_void_ulong(receiver: int, selector: str, value: int) -> None:
+                if receiver:
+                    msg_send.restype = None
+                    msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), ctypes.c_ulong(value))
+
+            def send_void_id(receiver: int, selector: str, value: int) -> None:
+                if receiver:
+                    msg_send.restype = None
+                    msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)), ctypes.c_void_p(value))
+
+            def send_void(receiver: int, selector: str) -> None:
+                if receiver:
+                    msg_send.restype = None
+                    msg_send(ctypes.c_void_p(receiver), ctypes.c_void_p(sel(selector)))
+
+            native_view = int(self.winId())
+            window = send_id(native_view, "window")
+            if not window:
+                return False
+
+            ns_color = int(objc.objc_getClass(b"NSColor") or 0)
+            clear_color = send_id(ns_color, "clearColor")
+            resizable_borderless_style = 1 << 3
+            normal_window_level = 0
+            floating_window_level = 3
+            title_hidden = 1
+            can_join_all_spaces = 1 << 0
+            full_screen_auxiliary = 1 << 8
+
+            send_void_ulong(window, "setStyleMask:", resizable_borderless_style)
+            send_void_bool(window, "setOpaque:", False)
+            if clear_color:
+                send_void_id(window, "setBackgroundColor:", clear_color)
+            send_void_bool(window, "setHasShadow:", True)
+            send_void_long(window, "setTitleVisibility:", title_hidden)
+            send_void_ulong(window, "setCollectionBehavior:", can_join_all_spaces | full_screen_auxiliary)
+            send_void_long(window, "setLevel:", floating_window_level if self._always_on_top else normal_window_level)
+            send_void_bool(window, "setMovableByWindowBackground:", self._adjustable_frame and not self._click_through)
+            send_void_bool(window, "setIgnoresMouseEvents:", self._click_through)
+
+            content_view = send_id(window, "contentView")
+            if content_view:
+                send_void_bool(content_view, "setWantsLayer:", True)
+                layer = send_id(content_view, "layer")
+                if layer and clear_color:
+                    clear_cg_color = send_id(clear_color, "CGColor")
+                    if clear_cg_color:
+                        send_void_id(layer, "setBackgroundColor:", clear_cg_color)
+            send_void(window, "invalidateShadow")
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _event_global_pos(event) -> QPoint:
+        if hasattr(event, "globalPosition"):
+            return event.globalPosition().toPoint()
+        return event.globalPos()
+
+
+class LineTopNativeOverlayWindow(QObject):
+    closed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = QPixmap()
+        self._opacity = 1.0
+        self._always_on_top = True
+        self._click_through = False
+        self._show_frame = True
+        self._adjustable_frame = True
+        self._close_requested = False
+        self._temp_dir = Path(tempfile.mkdtemp(prefix="eidory-linetop-overlay-"))
+        self._state_path = self._temp_dir / "state.json"
+        self._image_path = self._temp_dir / "overlay.png"
+        self._image_revision = 0
+        self._process: subprocess.Popen | None = None
+        self._closing = False
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(500)
+        self._poll_timer.timeout.connect(self._poll_process)
+        self._write_state()
+
+    @classmethod
+    def is_available(cls) -> bool:
+        if sys.platform != "darwin":
+            return False
+        app = QApplication.instance()
+        if app is None or app.platformName().lower() != "cocoa":
+            return False
+        helper = cls._helper_path()
+        return helper is not None and os.access(helper, os.X_OK)
+
+    @staticmethod
+    def _helper_path() -> Path | None:
+        candidates: list[Path] = []
+        executable = Path(sys.executable).resolve()
+        candidates.append(executable.parent / "EidoryOverlayHelper")
+        if executable.parent.name == "MacOS":
+            candidates.append(executable.parent.parent / "Frameworks" / "EidoryOverlayHelper")
+            candidates.append(executable.parent.parent / "Resources" / "EidoryOverlayHelper")
+            candidates.append(executable.parent.parent / "Resources" / "helpers" / "EidoryOverlayHelper")
+
+        bundle_temp = getattr(sys, "_MEIPASS", None)
+        if bundle_temp:
+            base = Path(bundle_temp).resolve()
+            candidates.append(base / "EidoryOverlayHelper")
+            candidates.append(base / "helpers" / "EidoryOverlayHelper")
+
+        source_root = Path(__file__).resolve().parents[3]
+        candidates.append(source_root / "build" / "helpers" / "EidoryOverlayHelper")
+        candidates.append(Path.cwd() / "build" / "helpers" / "EidoryOverlayHelper")
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.exists():
+                return candidate
+        return None
+
+    def set_pixmap(self, pixmap: QPixmap, *, parent_geometry: QRect | None = None) -> None:
+        self._pixmap = QPixmap(pixmap)
+        self._image_revision += 1
+        if not self._pixmap.isNull():
+            self._pixmap.save(str(self._image_path), "PNG")
+        elif self._image_path.exists():
+            self._image_path.unlink(missing_ok=True)
+        self._close_requested = False
+        self._write_state()
+
+    def set_loading_message(self, text: str) -> None:
+        return
+
+    def set_content_opacity(self, opacity: float) -> None:
+        self._opacity = max(0.05, min(1.0, float(opacity)))
+        self._write_state()
+
+    def set_always_on_top(self, enabled: bool) -> None:
+        self._always_on_top = bool(enabled)
+        self._write_state(preserve_external_controls=False)
+
+    def set_click_through(self, enabled: bool) -> None:
+        self._click_through = bool(enabled)
+        self._write_state(preserve_external_controls=False)
+
+    def set_adjustable_frame(self, enabled: bool) -> None:
+        self._adjustable_frame = bool(enabled)
+        self._write_state()
+
+    def set_frame_hint_visible(self, visible: bool) -> None:
+        self._show_frame = bool(visible)
+        self._write_state(preserve_external_controls=False)
+
+    def show(self) -> None:
+        self._close_requested = False
+        self._write_state()
+        if self._process is None or self._process.poll() is not None:
+            helper = self._helper_path()
+            if helper is None:
+                return
+            self._process = subprocess.Popen(
+                [
+                    str(helper),
+                    "--state",
+                    str(self._state_path),
+                    "--parent-pid",
+                    str(os.getpid()),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        if not self._poll_timer.isActive():
+            self._poll_timer.start()
+
+    def raise_(self) -> None:
+        self._write_state()
+
+    def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self._close_requested = True
+        self._write_state(preserve_external_controls=False)
+        self._poll_timer.stop()
+        process = self._process
+        self._process = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1.0)
+        self._cleanup()
+        self.closed.emit()
+
+    def _write_state(self, *, preserve_external_controls: bool = True) -> None:
+        if not self._temp_dir.exists():
+            return
+        if preserve_external_controls:
+            self._sync_external_control_state()
+        image_path = str(self._image_path) if not self._pixmap.isNull() and self._image_path.exists() else None
+        payload = {
+            "imagePath": image_path,
+            "imageRevision": self._image_revision,
+            "opacity": self._opacity,
+            "alwaysOnTop": self._always_on_top,
+            "clickThrough": self._click_through,
+            "adjustableFrame": self._adjustable_frame,
+            "showFrame": self._show_frame,
+            "closeRequested": self._close_requested,
+        }
+        temp_path = self._state_path.with_suffix(".json.tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(self._state_path)
+
+    def _sync_external_control_state(self) -> None:
+        if not self._state_path.exists():
+            return
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(payload.get("alwaysOnTop"), bool):
+            self._always_on_top = payload["alwaysOnTop"]
+        if isinstance(payload.get("clickThrough"), bool):
+            self._click_through = payload["clickThrough"]
+        if isinstance(payload.get("showFrame"), bool):
+            self._show_frame = payload["showFrame"]
+
+    def _poll_process(self) -> None:
+        if self._process is not None and self._process.poll() is not None:
+            self._process = None
+            self._poll_timer.stop()
+            self._cleanup()
+            if not self._closing:
+                self.closed.emit()
+
+    def _cleanup(self) -> None:
+        shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+
+def _retain_detached_linetop_overlay(overlay: QObject) -> None:
+    _DETACHED_LINETOP_OVERLAYS.add(overlay)
+
+    def discard_detached_overlay() -> None:
+        _DETACHED_LINETOP_OVERLAYS.discard(overlay)
+
+    try:
+        overlay.closed.connect(discard_detached_overlay)
+    except (AttributeError, RuntimeError, TypeError):
+        pass
 
 
 class ImagePreviewDialog(QDialog):
@@ -723,6 +1384,25 @@ class ImagePreviewDialog(QDialog):
         self._linetop_render_timer.setSingleShot(True)
         self._linetop_render_timer.setInterval(120)
         self._linetop_render_timer.timeout.connect(self._render_current_image)
+        self._linetop_overlay_window: LineTopOverlayWindow | LineTopNativeOverlayWindow | None = None
+        self._linetop_overlay_render_cache: dict[tuple[object, ...], QPixmap] = {}
+        self._linetop_overlay_pending_token: tuple[object, ...] | None = None
+        self._linetop_overlay_running_token: tuple[object, ...] | None = None
+        self._linetop_overlay_queued_request: tuple[
+            tuple[object, ...],
+            str,
+            int,
+            int,
+            LineTopSettings,
+            bool,
+            bool,
+        ] | None = None
+        self._linetop_overlay_render_signals = _LineTopRenderSignals()
+        self._linetop_overlay_render_signals.loaded.connect(self._handle_linetop_overlay_render_loaded)
+        self._linetop_overlay_render_timer = QTimer(self)
+        self._linetop_overlay_render_timer.setSingleShot(True)
+        self._linetop_overlay_render_timer.setInterval(140)
+        self._linetop_overlay_render_timer.timeout.connect(self._request_linetop_overlay_render_current)
         self._zoom_refine_timer = QTimer(self)
         self._zoom_refine_timer.setSingleShot(True)
         self._zoom_refine_timer.setInterval(90)
@@ -890,8 +1570,13 @@ class ImagePreviewDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         self._linetop_render_timer.stop()
+        self._linetop_overlay_render_timer.stop()
         self._linetop_render_pending_token = None
         self._linetop_queued_render_request = None
+        self._linetop_overlay_pending_token = None
+        self._linetop_overlay_queued_request = None
+        if self._linetop_overlay_window is not None:
+            self._detach_linetop_overlay_window()
         self._preview_source_pending_token = None
         self._preview_source_queued_request = None
         self._zoom_refine_timer.stop()
@@ -911,6 +1596,7 @@ class ImagePreviewDialog(QDialog):
         self._schedule_fit_to_window()
         image = self.current_image()
         if image is not None and not is_supported_video(image.file_path):
+            self._render_current_image(use_thumbnail_first=True)
             self._preview_refine_timer.start()
 
     def current_image(self) -> ImageItem | None:
@@ -1008,7 +1694,9 @@ class ImagePreviewDialog(QDialog):
             self.compare_toggle_button.setEnabled(False)
             self.save_render_button.setEnabled(False)
             self.advanced_toggle_button.setEnabled(False)
+            self._refresh_linetop_action_buttons(None)
             self.remove_index_button.setEnabled(False)
+            self._close_linetop_overlay_window()
             self._stop_video()
             return
 
@@ -1021,14 +1709,18 @@ class ImagePreviewDialog(QDialog):
         self._refresh_feedback_buttons(image)
         self._update_info(image)
         if is_supported_video(image.file_path):
+            self._close_linetop_overlay_window()
             self._set_linetop_panel_visible(False)
             self._render_current_video(image)
         else:
             self.advanced_toggle_button.setEnabled(True)
             self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
             self.save_render_button.setEnabled(self._linetop_preview_active(image))
+            self._refresh_linetop_action_buttons(image)
             self._render_current_image(use_thumbnail_first=True)
             self._preview_refine_timer.start()
+            if self._linetop_overlay_window is not None:
+                self._linetop_overlay_render_timer.start()
         self.imageChanged.emit(image)
 
     def _handle_space_pressed(self) -> None:
@@ -1099,26 +1791,36 @@ class ImagePreviewDialog(QDialog):
         advanced_active = self._linetop_preview_active(image)
         self.compare_toggle_button.setEnabled(advanced_active)
         self.save_render_button.setEnabled(advanced_active)
+        self._refresh_linetop_action_buttons(image)
         max_width, max_height = self._render_bounds()
         if advanced_active and not self._linetop_show_original_compare:
             self._request_linetop_render(image, max_width, max_height, use_thumbnail_first=use_thumbnail_first)
             return
+        base_key = self._preview_base_key_for(image)
+        base_changed = self._preview_base_key != base_key
+        if base_changed:
+            self._clear_preview_pixmap_cache()
+            self._preview_base_key = base_key
         pixmap = QPixmap()
         if use_thumbnail_first:
             pixmap = self._cached_preview_base_pixmap(image)
             if pixmap.isNull():
                 pixmap = self._load_quick_preview_pixmap(image, max_width, max_height)
-            if pixmap.isNull() and image.file_size <= INLINE_SOURCE_PREVIEW_MAX_BYTES:
-                pixmap = self._load_preview_source_pixmap(image, max_width, max_height)
-            if pixmap.isNull():
-                self.image_view.set_message("加载预览...")
-                self._update_info(image)
-                return
         else:
-            pixmap = self._load_preview_source_pixmap(image, max_width, max_height)
+            pixmap = self._cached_preview_base_pixmap(image)
+        source_needed = self._preview_source_needs_load(image, max_width, max_height)
+        if source_needed and self.isVisible():
+            load_width, load_height = self._source_load_bounds(image, max_width, max_height)
+            self._request_preview_source_load(image, max_width=load_width, max_height=load_height)
         if pixmap.isNull():
-            message = "加载预览..." if self._preview_source_pending_token is not None else "无法预览"
-            self.image_view.set_message(message)
+            if base_changed or not getattr(self.image_view, "_has_pixmap", False):
+                message = (
+                    "加载预览..."
+                    if source_needed or self._preview_source_pending_token is not None
+                    else "无法预览"
+                )
+                self.image_view.set_message(message)
+            self._update_info(image)
             return
         self.image_view.set_pixmap(
             pixmap,
@@ -1127,6 +1829,7 @@ class ImagePreviewDialog(QDialog):
             fit_to_window=self.fit_to_window,
             zoom_factor=self.zoom_factor,
         )
+        self.image_view.set_content_opacity(1.0)
         self._update_info(image)
 
     def _ensure_video_preview(self) -> tuple[QVideoWidget, QMediaPlayer]:
@@ -1225,18 +1928,27 @@ class ImagePreviewDialog(QDialog):
         panel = QWidget()
         panel.setFixedWidth(LINETOP_PANEL_WIDTH)
         panel.setObjectName("linetopAdvancedPanel")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         panel.setStyleSheet(
             """
             QWidget#linetopAdvancedPanel {
-                background: #222832;
-                border-left: 1px solid #3f4854;
-            }
-            QLabel {
-                color: #e5eaf2;
-            }
-            QScrollArea {
+                background: #2b3038;
                 border: none;
-                background: transparent;
+            }
+            QWidget#linetopAdvancedContent,
+            QWidget#linetopSliderRow {
+                background: #2b3038;
+            }
+            QWidget#linetopAdvancedPanel QLabel {
+                color: #e5eaf2;
+                background: #2b3038;
+            }
+            QScrollArea#linetopAdvancedScroll {
+                border: none;
+                background: #2b3038;
+            }
+            QScrollArea#linetopAdvancedScroll > QWidget {
+                background: #2b3038;
             }
             QSlider::groove:horizontal {
                 height: 6px;
@@ -1261,9 +1973,10 @@ class ImagePreviewDialog(QDialog):
                 border-color: #4f96ff;
                 color: white;
             }
-            QCheckBox {
+            QWidget#linetopAdvancedPanel QCheckBox {
                 color: #e5eaf2;
                 spacing: 8px;
+                background: #2b3038;
             }
             """
         )
@@ -1276,9 +1989,12 @@ class ImagePreviewDialog(QDialog):
         root.addWidget(title)
 
         scroll = QScrollArea()
+        scroll.setObjectName("linetopAdvancedScroll")
         scroll.setWidgetResizable(True)
+        scroll.viewport().setAutoFillBackground(False)
         root.addWidget(scroll, 1)
         inner = QWidget()
+        inner.setObjectName("linetopAdvancedContent")
         scroll.setWidget(inner)
         layout = QVBoxLayout(inner)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1340,6 +2056,16 @@ class ImagePreviewDialog(QDialog):
         params_label = QLabel("参数设置")
         params_label.setStyleSheet("font-weight:600;")
         layout.addWidget(params_label)
+        self.linetop_opacity_row, self.linetop_opacity_slider, self.linetop_opacity_value = (
+            self._add_linetop_slider(
+                layout,
+                "透明度",
+                5,
+                100,
+                100,
+                lambda value: f"{value / 100:.2f}",
+            )
+        )
         self.linetop_contrast_row, self.linetop_contrast_slider, self.linetop_contrast_value = (
             self._add_linetop_slider(
                 layout,
@@ -1376,6 +2102,24 @@ class ImagePreviewDialog(QDialog):
         self.linetop_reset_button = QPushButton("恢复默认值")
         reset_row.addWidget(self.linetop_reset_button)
         layout.addLayout(reset_row)
+
+        overlay_label = QLabel("描图窗口")
+        overlay_label.setStyleSheet("font-weight:600;")
+        layout.addWidget(overlay_label)
+        self.linetop_open_overlay_button = QPushButton("生成描图窗口")
+        self.linetop_open_overlay_button.setToolTip("用当前高级处理结果生成独立透明描图窗口")
+        layout.addWidget(self.linetop_open_overlay_button)
+        self.linetop_overlay_on_top_checkbox = QCheckBox("置顶")
+        self.linetop_overlay_on_top_checkbox.setChecked(True)
+        self.linetop_overlay_click_through_checkbox = QCheckBox("鼠标穿透")
+        self.linetop_overlay_adjustable_frame_checkbox = QCheckBox("可调窗口边框")
+        self.linetop_overlay_adjustable_frame_checkbox.setChecked(True)
+        self.linetop_overlay_frame_checkbox = QCheckBox("显示边框提示")
+        self.linetop_overlay_frame_checkbox.setChecked(True)
+        layout.addWidget(self.linetop_overlay_on_top_checkbox)
+        layout.addWidget(self.linetop_overlay_click_through_checkbox)
+        layout.addWidget(self.linetop_overlay_adjustable_frame_checkbox)
+        layout.addWidget(self.linetop_overlay_frame_checkbox)
         layout.addStretch(1)
 
         self._linetop_color_only_widgets = [
@@ -1386,7 +2130,7 @@ class ImagePreviewDialog(QDialog):
             self.linetop_enhanced_line_checkbox,
             self.linetop_thickness_row,
         ]
-        self._linetop_controls = [
+        self._linetop_render_controls = [
             self.linetop_line_mode_button,
             self.linetop_color_limit_mode_button,
             self.linetop_color_limit_slider,
@@ -1399,14 +2143,24 @@ class ImagePreviewDialog(QDialog):
             self.linetop_brightness_slider,
             self.linetop_thickness_slider,
         ]
-        for control in self._linetop_controls:
+        self._linetop_controls = [
+            self.linetop_opacity_slider,
+            *self._linetop_render_controls,
+        ]
+        for control in self._linetop_render_controls:
             if isinstance(control, QSlider):
                 control.valueChanged.connect(self._queue_linetop_settings_changed)
             elif isinstance(control, QCheckBox):
                 control.toggled.connect(self._queue_linetop_settings_changed)
             elif isinstance(control, QPushButton):
                 control.toggled.connect(self._queue_linetop_settings_changed)
+        self.linetop_opacity_slider.valueChanged.connect(self._queue_linetop_opacity_changed)
         self.linetop_reset_button.clicked.connect(self._reset_linetop_settings)
+        self.linetop_open_overlay_button.clicked.connect(self._toggle_linetop_overlay_window)
+        self.linetop_overlay_on_top_checkbox.toggled.connect(self._set_linetop_overlay_always_on_top)
+        self.linetop_overlay_click_through_checkbox.toggled.connect(self._set_linetop_overlay_click_through)
+        self.linetop_overlay_adjustable_frame_checkbox.toggled.connect(self._set_linetop_overlay_adjustable_frame)
+        self.linetop_overlay_frame_checkbox.toggled.connect(self._set_linetop_overlay_frame_visible)
         self._sync_linetop_controls_from_settings()
         return panel
 
@@ -1420,6 +2174,7 @@ class ImagePreviewDialog(QDialog):
         formatter,
     ) -> tuple[QWidget, QSlider, QLabel]:
         widget = QWidget()
+        widget.setObjectName("linetopSliderRow")
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
@@ -1444,7 +2199,7 @@ class ImagePreviewDialog(QDialog):
         preset = "photo" if self.linetop_photo_preset_button.isChecked() else "illustration"
         return LineTopSettings(
             mode=mode,
-            opacity=1.0,
+            opacity=self.linetop_opacity_slider.value() / 100,
             edge_strength=self._linetop_settings.edge_strength,
             line_thickness=self.linetop_thickness_slider.value() / 10,
             overlay_contrast=self.linetop_contrast_slider.value() / 100,
@@ -1469,6 +2224,7 @@ class ImagePreviewDialog(QDialog):
             self.linetop_enhanced_line_checkbox.setChecked(self._linetop_settings.enhanced_line_engine)
             self.linetop_photo_preset_button.setChecked(self._linetop_settings.smart_preset == "photo")
             self.linetop_illustration_preset_button.setChecked(self._linetop_settings.smart_preset == "illustration")
+            self.linetop_opacity_slider.setValue(int(round(self._linetop_settings.opacity * 100)))
             self.linetop_contrast_slider.setValue(int(round(self._linetop_settings.overlay_contrast * 100)))
             self.linetop_brightness_slider.setValue(int(round(self._linetop_settings.overlay_brightness * 100)))
             self.linetop_thickness_slider.setValue(int(round(self._linetop_settings.line_thickness * 10)))
@@ -1476,6 +2232,7 @@ class ImagePreviewDialog(QDialog):
             for control in self._linetop_controls:
                 control.blockSignals(False)
         self.linetop_color_limit_value.setText(f"{self.linetop_color_limit_slider.value():d}")
+        self.linetop_opacity_value.setText(f"{self.linetop_opacity_slider.value() / 100:.2f}")
         self.linetop_contrast_value.setText(f"{self.linetop_contrast_slider.value() / 100:.2f}")
         self.linetop_brightness_value.setText(f"{self.linetop_brightness_slider.value() / 100:.2f}")
         self.linetop_thickness_value.setText(f"{self.linetop_thickness_slider.value() / 10:.1f}")
@@ -1496,14 +2253,31 @@ class ImagePreviewDialog(QDialog):
         self._linetop_settings = self._current_linetop_settings_from_controls()
         self._refresh_linetop_control_visibility()
         self._linetop_render_cache.clear()
+        self._linetop_overlay_render_cache.clear()
         image = self.current_image()
         if image is not None and self._linetop_preview_active(image) and not self._linetop_show_original_compare:
             self._linetop_render_timer.start()
+        if self._linetop_overlay_window is not None:
+            self._linetop_overlay_render_timer.start()
+
+    def _queue_linetop_opacity_changed(self) -> None:
+        self._linetop_settings = self._current_linetop_settings_from_controls()
+        self._apply_linetop_display_opacity()
+        if self._linetop_overlay_window is not None:
+            self._linetop_overlay_window.set_content_opacity(self._linetop_settings.opacity)
 
     def _reset_linetop_settings(self) -> None:
         self._linetop_settings = LineTopSettings()
         self._sync_linetop_controls_from_settings()
         self._queue_linetop_settings_changed()
+        self._apply_linetop_display_opacity()
+
+    def _linetop_processing_settings(self) -> LineTopSettings:
+        return replace(self._linetop_settings, opacity=1.0)
+
+    def _apply_linetop_display_opacity(self) -> None:
+        if self._linetop_render_pending_token is None and self._linetop_preview_active() and not self._linetop_show_original_compare:
+            self.image_view.set_content_opacity(self._linetop_settings.opacity)
 
     def _linetop_preview_active(self, image: ImageItem | None = None) -> bool:
         image = image or self.current_image()
@@ -1512,6 +2286,11 @@ class ImagePreviewDialog(QDialog):
             and image is not None
             and not is_supported_video(image.file_path)
         )
+
+    def _refresh_linetop_action_buttons(self, image: ImageItem | None = None) -> None:
+        active = self._linetop_preview_active(image)
+        if hasattr(self, "linetop_open_overlay_button"):
+            self.linetop_open_overlay_button.setEnabled(active)
 
     def _toggle_linetop_panel(self) -> None:
         self._set_linetop_panel_visible(self.advanced_panel.isHidden())
@@ -1529,10 +2308,12 @@ class ImagePreviewDialog(QDialog):
         if panel_is_visible == visible:
             self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
             self.save_render_button.setEnabled(self._linetop_preview_active(image))
+            self._refresh_linetop_action_buttons(image)
             return
         self.advanced_panel.setVisible(visible)
         self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
         self.save_render_button.setEnabled(self._linetop_preview_active(image))
+        self._refresh_linetop_action_buttons(image)
         self._linetop_render_timer.stop()
         self._linetop_render_pending_token = None
         self._linetop_queued_render_request = None
@@ -1556,6 +2337,7 @@ class ImagePreviewDialog(QDialog):
             self._render_current_image(use_thumbnail_first=True)
 
     def _linetop_cache_key(self, image: ImageItem, target_width: int, target_height: int) -> tuple[object, ...]:
+        settings = self._linetop_processing_settings()
         return (
             image.id,
             image.file_path,
@@ -1565,7 +2347,7 @@ class ImagePreviewDialog(QDialog):
             max(1, int(target_height)),
             self.grayscale_preview,
             self.mirrored_preview,
-            *self._linetop_settings.cache_key(),
+            *settings.cache_key(),
         )
 
     def _request_linetop_render(
@@ -1586,6 +2368,7 @@ class ImagePreviewDialog(QDialog):
                 fit_to_window=self.fit_to_window,
                 zoom_factor=self.zoom_factor,
             )
+            self.image_view.set_content_opacity(self._linetop_settings.opacity)
             self._update_info(image)
             return
         if use_thumbnail_first:
@@ -1600,10 +2383,13 @@ class ImagePreviewDialog(QDialog):
                     fit_to_window=self.fit_to_window,
                     zoom_factor=self.zoom_factor,
                 )
+                self.image_view.set_content_opacity(1.0)
             else:
                 self.image_view.set_message("处理中...")
+                self.image_view.set_content_opacity(1.0)
         else:
             self.image_view.set_message("处理中...")
+            self.image_view.set_content_opacity(1.0)
         self._update_info(image)
         if self._linetop_render_pending_token == cache_key:
             return
@@ -1616,7 +2402,7 @@ class ImagePreviewDialog(QDialog):
                 image.file_path,
                 target_width,
                 target_height,
-                self._linetop_settings,
+                self._linetop_processing_settings(),
                 self.grayscale_preview,
                 self.mirrored_preview,
             )
@@ -1626,7 +2412,7 @@ class ImagePreviewDialog(QDialog):
             image.file_path,
             target_width,
             target_height,
-            self._linetop_settings,
+            self._linetop_processing_settings(),
             self.grayscale_preview,
             self.mirrored_preview,
         )
@@ -1678,6 +2464,7 @@ class ImagePreviewDialog(QDialog):
                 fit_to_window=self.fit_to_window,
                 zoom_factor=self.zoom_factor,
             )
+            self.image_view.set_content_opacity(self._linetop_settings.opacity)
             self._update_info(image)
             return
         self._start_linetop_render_task(
@@ -1722,6 +2509,7 @@ class ImagePreviewDialog(QDialog):
             fit_to_window=self.fit_to_window,
             zoom_factor=self.zoom_factor,
         )
+        self.image_view.set_content_opacity(self._linetop_settings.opacity)
         self._update_info(image)
         self._start_queued_linetop_render_if_needed()
 
@@ -1731,7 +2519,7 @@ class ImagePreviewDialog(QDialog):
             grayscale=self.grayscale_preview,
             mirror_horizontal=self.mirrored_preview,
         )
-        return render_linetop_image(source, self._linetop_settings)
+        return render_linetop_image(source, self._linetop_processing_settings())
 
     def _save_linetop_render_as(self) -> None:
         image = self.current_image()
@@ -1766,6 +2554,254 @@ class ImagePreviewDialog(QDialog):
         finally:
             QApplication.restoreOverrideCursor()
 
+    def _toggle_linetop_overlay_window(self) -> None:
+        if self._linetop_overlay_window is None:
+            self._open_linetop_overlay_window()
+        else:
+            self._close_linetop_overlay_window()
+
+    def _open_linetop_overlay_window(self) -> None:
+        image = self.current_image()
+        if image is None or not self._linetop_preview_active(image):
+            return
+        if self._linetop_overlay_window is None:
+            overlay = self._create_linetop_overlay_window()
+            overlay.closed.connect(self._handle_linetop_overlay_closed)
+            self._linetop_overlay_window = overlay
+            self.linetop_open_overlay_button.setText("关闭描图窗口")
+            self._refresh_linetop_action_buttons(image)
+        overlay = self._linetop_overlay_window
+        overlay.set_content_opacity(self._linetop_settings.opacity)
+        overlay.set_adjustable_frame(self.linetop_overlay_adjustable_frame_checkbox.isChecked())
+        overlay.set_frame_hint_visible(self.linetop_overlay_frame_checkbox.isChecked())
+        overlay.set_always_on_top(self.linetop_overlay_on_top_checkbox.isChecked())
+        overlay.set_click_through(self.linetop_overlay_click_through_checkbox.isChecked())
+        if overlay._pixmap.isNull():
+            overlay.set_loading_message("处理中...")
+        overlay.show()
+        overlay.raise_()
+        self._request_linetop_overlay_render_current()
+
+    def _create_linetop_overlay_window(self) -> LineTopOverlayWindow | LineTopNativeOverlayWindow:
+        if LineTopNativeOverlayWindow.is_available():
+            return LineTopNativeOverlayWindow(self)
+        return LineTopOverlayWindow(self)
+
+    def _handle_linetop_overlay_closed(self) -> None:
+        self._linetop_overlay_render_timer.stop()
+        self._linetop_overlay_pending_token = None
+        self._linetop_overlay_queued_request = None
+        self._linetop_overlay_window = None
+        if hasattr(self, "linetop_open_overlay_button"):
+            self.linetop_open_overlay_button.setText("生成描图窗口")
+        self._refresh_linetop_action_buttons(self.current_image())
+
+    def _close_linetop_overlay_window(self) -> None:
+        if self._linetop_overlay_window is None:
+            return
+        overlay = self._linetop_overlay_window
+        self._linetop_overlay_window = None
+        self._linetop_overlay_render_timer.stop()
+        self._linetop_overlay_pending_token = None
+        self._linetop_overlay_queued_request = None
+        overlay.close()
+        if hasattr(self, "linetop_open_overlay_button"):
+            self.linetop_open_overlay_button.setText("生成描图窗口")
+        self._refresh_linetop_action_buttons(self.current_image())
+
+    def _detach_linetop_overlay_window(self) -> None:
+        if self._linetop_overlay_window is None:
+            return
+        overlay = self._linetop_overlay_window
+        self._linetop_overlay_window = None
+        self._linetop_overlay_render_timer.stop()
+        self._linetop_overlay_pending_token = None
+        self._linetop_overlay_queued_request = None
+        try:
+            overlay.closed.disconnect(self._handle_linetop_overlay_closed)
+        except (RuntimeError, TypeError):
+            pass
+        if isinstance(overlay, QWidget):
+            geometry = overlay.geometry()
+            was_visible = overlay.isVisible()
+            overlay.setParent(None)
+            overlay.setGeometry(geometry)
+            if was_visible:
+                overlay.show()
+                overlay.raise_()
+        else:
+            overlay.setParent(None)
+        _retain_detached_linetop_overlay(overlay)
+        if hasattr(self, "linetop_open_overlay_button"):
+            self.linetop_open_overlay_button.setText("生成描图窗口")
+        self._refresh_linetop_action_buttons(self.current_image())
+
+    def _set_linetop_overlay_always_on_top(self, checked: bool) -> None:
+        if self._linetop_overlay_window is not None:
+            self._linetop_overlay_window.set_always_on_top(checked)
+
+    def _set_linetop_overlay_click_through(self, checked: bool) -> None:
+        if self._linetop_overlay_window is not None:
+            self._linetop_overlay_window.set_click_through(checked)
+
+    def _set_linetop_overlay_adjustable_frame(self, checked: bool) -> None:
+        if self._linetop_overlay_window is not None:
+            self._linetop_overlay_window.set_adjustable_frame(checked)
+
+    def _set_linetop_overlay_frame_visible(self, checked: bool) -> None:
+        if self._linetop_overlay_window is not None:
+            self._linetop_overlay_window.set_frame_hint_visible(checked)
+
+    def _linetop_overlay_render_bounds(self, image: ImageItem) -> tuple[int, int]:
+        width = max(1, int(image.width or self.image_view.viewport().width() or 1600))
+        height = max(1, int(image.height or self.image_view.viewport().height() or 1200))
+        long_side = max(width, height)
+        if long_side <= LINETOP_OVERLAY_MAX_LONG_SIDE:
+            return width, height
+        scale = LINETOP_OVERLAY_MAX_LONG_SIDE / long_side
+        return max(1, int(width * scale)), max(1, int(height * scale))
+
+    def _linetop_overlay_cache_key(self, image: ImageItem, target_width: int, target_height: int) -> tuple[object, ...]:
+        settings = self._linetop_processing_settings()
+        return (
+            "overlay",
+            image.id,
+            image.file_path,
+            image.file_size,
+            image.modified_time_ns,
+            max(1, int(target_width)),
+            max(1, int(target_height)),
+            self.grayscale_preview,
+            self.mirrored_preview,
+            *settings.cache_key(),
+        )
+
+    def _request_linetop_overlay_render_current(self) -> None:
+        image = self.current_image()
+        if self._linetop_overlay_window is None or image is None or is_supported_video(image.file_path):
+            return
+        target_width, target_height = self._linetop_overlay_render_bounds(image)
+        self._request_linetop_overlay_render(image, target_width, target_height)
+
+    def _request_linetop_overlay_render(self, image: ImageItem, target_width: int, target_height: int) -> None:
+        if self._linetop_overlay_window is None:
+            return
+        cache_key = self._linetop_overlay_cache_key(image, target_width, target_height)
+        cached = self._linetop_overlay_render_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            self._linetop_overlay_window.set_pixmap(cached, parent_geometry=self.frameGeometry())
+            self._linetop_overlay_window.set_content_opacity(self._linetop_settings.opacity)
+            return
+        self._linetop_overlay_window.set_loading_message("处理中...")
+        if self._linetop_overlay_pending_token == cache_key:
+            return
+        if self._linetop_overlay_running_token is not None:
+            self._linetop_overlay_pending_token = cache_key
+            if self._linetop_overlay_running_token == cache_key:
+                return
+            self._linetop_overlay_queued_request = (
+                cache_key,
+                image.file_path,
+                target_width,
+                target_height,
+                self._linetop_processing_settings(),
+                self.grayscale_preview,
+                self.mirrored_preview,
+            )
+            return
+        self._start_linetop_overlay_render_task(
+            cache_key,
+            image.file_path,
+            target_width,
+            target_height,
+            self._linetop_processing_settings(),
+            self.grayscale_preview,
+            self.mirrored_preview,
+        )
+
+    def _start_linetop_overlay_render_task(
+        self,
+        token: tuple[object, ...],
+        image_path: str,
+        target_width: int,
+        target_height: int,
+        settings: LineTopSettings,
+        grayscale: bool,
+        mirror_horizontal: bool,
+    ) -> None:
+        self._linetop_overlay_pending_token = token
+        self._linetop_overlay_running_token = token
+        task = _LineTopRenderTask(
+            token=token,
+            image_path=image_path,
+            max_width=target_width,
+            max_height=target_height,
+            settings=settings,
+            grayscale=grayscale,
+            mirror_horizontal=mirror_horizontal,
+            signals=self._linetop_overlay_render_signals,
+            overlay=True,
+        )
+        self._linetop_thread_pool.start(task)
+
+    def _start_queued_linetop_overlay_render_if_needed(self) -> None:
+        request = self._linetop_overlay_queued_request
+        self._linetop_overlay_queued_request = None
+        if request is None:
+            return
+        token, image_path, target_width, target_height, settings, grayscale, mirror_horizontal = request
+        if token != self._linetop_overlay_pending_token:
+            return
+        image = self.current_image()
+        if self._linetop_overlay_window is None or image is None or is_supported_video(image.file_path):
+            return
+        if self._linetop_overlay_cache_key(image, target_width, target_height) != token:
+            return
+        cached = self._linetop_overlay_render_cache.get(token)
+        if cached is not None and not cached.isNull():
+            self._linetop_overlay_pending_token = None
+            self._linetop_overlay_window.set_pixmap(cached, parent_geometry=self.frameGeometry())
+            self._linetop_overlay_window.set_content_opacity(self._linetop_settings.opacity)
+            return
+        self._start_linetop_overlay_render_task(
+            token,
+            image_path,
+            target_width,
+            target_height,
+            settings,
+            grayscale,
+            mirror_horizontal,
+        )
+
+    def _handle_linetop_overlay_render_loaded(self, token: object, qimage: QImage, error: str) -> None:
+        if token == self._linetop_overlay_running_token:
+            self._linetop_overlay_running_token = None
+        if token != self._linetop_overlay_pending_token:
+            self._start_queued_linetop_overlay_render_if_needed()
+            return
+        self._linetop_overlay_pending_token = None
+        image = self.current_image()
+        if self._linetop_overlay_window is None or image is None or is_supported_video(image.file_path):
+            self._start_queued_linetop_overlay_render_if_needed()
+            return
+        if error or qimage.isNull():
+            self._linetop_overlay_window.set_loading_message("处理失败")
+            self._start_queued_linetop_overlay_render_if_needed()
+            return
+        pixmap = QPixmap.fromImage(qimage)
+        if pixmap.isNull():
+            self._linetop_overlay_window.set_loading_message("处理失败")
+            self._start_queued_linetop_overlay_render_if_needed()
+            return
+        if isinstance(token, tuple):
+            self._linetop_overlay_render_cache[token] = QPixmap(pixmap)
+            while len(self._linetop_overlay_render_cache) > LINETOP_OVERLAY_RENDER_CACHE_LIMIT:
+                oldest_key = next(iter(self._linetop_overlay_render_cache))
+                self._linetop_overlay_render_cache.pop(oldest_key, None)
+        self._linetop_overlay_window.set_pixmap(pixmap, parent_geometry=self.frameGeometry())
+        self._linetop_overlay_window.set_content_opacity(self._linetop_settings.opacity)
+        self._start_queued_linetop_overlay_render_if_needed()
+
     def _set_grayscale_preview(self, checked: bool) -> None:
         self.grayscale_preview = checked
         image = self.current_image()
@@ -1773,6 +2809,8 @@ class ImagePreviewDialog(QDialog):
             self._render_current_image(use_thumbnail_first=self._preview_base_pixmap.isNull())
             if self._preview_base_pixmap.isNull():
                 self._preview_refine_timer.start()
+            if self._linetop_overlay_window is not None:
+                self._linetop_overlay_render_timer.start()
 
     def _set_mirrored_preview(self, checked: bool) -> None:
         self.mirrored_preview = checked
@@ -1781,6 +2819,8 @@ class ImagePreviewDialog(QDialog):
             self._render_current_image(use_thumbnail_first=self._preview_base_pixmap.isNull())
             if self._preview_base_pixmap.isNull():
                 self._preview_refine_timer.start()
+            if self._linetop_overlay_window is not None:
+                self._linetop_overlay_render_timer.start()
 
     def _zoom_by(self, wheel_delta: int) -> None:
         image = self.current_image()
@@ -1891,60 +2931,6 @@ class ImagePreviewDialog(QDialog):
             grayscale=self.grayscale_preview,
             mirror_horizontal=self.mirrored_preview,
         )
-
-    def _load_preview_source_pixmap(
-        self,
-        image: ImageItem,
-        target_width: int,
-        target_height: int,
-    ) -> QPixmap:
-        base_key = self._preview_base_key_for(image)
-        if base_key != self._preview_base_key:
-            self._clear_preview_pixmap_cache()
-            self._preview_base_key = base_key
-
-        needs_source_load = self._preview_base_pixmap.isNull() or (
-            not self._preview_base_is_fallback
-            and self._preview_pixmap_is_too_small(
-                self._preview_base_pixmap,
-                target_width,
-                target_height,
-            )
-        )
-        if needs_source_load:
-            previous_base = self._preview_base_pixmap
-            previous_fallback = self._preview_base_is_fallback
-            load_width, load_height = self._source_load_bounds(image, target_width, target_height)
-            if image.file_size > INLINE_SOURCE_PREVIEW_MAX_BYTES:
-                self._request_preview_source_load(
-                    image,
-                    max_width=load_width,
-                    max_height=load_height,
-                )
-                if previous_base.isNull():
-                    return QPixmap()
-                pixmap = previous_base
-                fallback_used = previous_fallback
-                self._preview_base_pixmap = pixmap
-                self._preview_base_is_fallback = fallback_used
-                self._preview_variant_cache.clear()
-                return self._preview_variant_from_base()
-            pixmap = self._load_preview_pixmap(image.file_path, load_width, load_height)
-            fallback_used = False
-            if pixmap.isNull():
-                fallback = image.thumbnail_path if image.thumbnail_path and Path(image.thumbnail_path).exists() else None
-                pixmap = QPixmap(fallback) if fallback else QPixmap()
-                fallback_used = not pixmap.isNull()
-            if pixmap.isNull():
-                if previous_base.isNull():
-                    return QPixmap()
-                pixmap = previous_base
-                fallback_used = previous_fallback
-            self._preview_base_pixmap = pixmap
-            self._preview_base_is_fallback = fallback_used
-            self._preview_variant_cache.clear()
-
-        return self._preview_variant_from_base()
 
     def _preview_variant_from_base(self) -> QPixmap:
         variant_key = (self.grayscale_preview, self.mirrored_preview)
@@ -2108,6 +3094,19 @@ class ImagePreviewDialog(QDialog):
         return (
             target_width > int(pixmap.width() * 0.9)
             or target_height > int(pixmap.height() * 0.9)
+        )
+
+    def _preview_source_needs_load(self, image: ImageItem, target_width: int, target_height: int) -> bool:
+        if self._preview_base_key != self._preview_base_key_for(image):
+            return True
+        if self._preview_base_pixmap.isNull():
+            return True
+        if self._preview_base_is_fallback:
+            return True
+        return self._preview_pixmap_is_too_small(
+            self._preview_base_pixmap,
+            target_width,
+            target_height,
         )
 
     @staticmethod

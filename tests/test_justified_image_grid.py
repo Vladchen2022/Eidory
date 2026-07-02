@@ -9,7 +9,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QMimeData, QPoint, QUrl
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from eidory.models import ImageItem
@@ -149,6 +149,15 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
 
         self.assertEqual(calls, [])
 
+    def test_set_images_does_not_decode_dimensionless_images_during_layout(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        image = self._image(1, width=None, height=None, file_path="/tmp/first.jpg")
+
+        with patch.object(grid, "_load_scaled_pixmap", side_effect=AssertionError("layout decoded image")):
+            grid.set_images([image])
+
+        self.assertEqual(len(grid._rects), 1)
+
     def test_pixmap_cache_key_uses_image_metadata_without_filesystem_stat(self) -> None:
         grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
         image = self._image(1, file_path="/definitely/missing.jpg")
@@ -172,11 +181,13 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
         grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
         stale_key = ("/tmp/stale.jpg", 1, 100, 270)
         grid._pending_pixmap_loads.add(stale_key)
+        grid._loaded_pixmap_results[stale_key] = QImage(4, 4, QImage.Format.Format_RGB32)
         first = self._image(1, file_path="/tmp/first.jpg")
         second = self._image(2, file_path="/tmp/second.jpg")
 
         grid.set_images([first])
         self.assertNotIn(stale_key, grid._pending_pixmap_loads)
+        self.assertNotIn(stale_key, grid._loaded_pixmap_results)
         grid._pending_pixmap_loads.add(stale_key)
 
         grid.set_images([first])
@@ -185,14 +196,31 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
         grid.set_images([second])
         self.assertNotIn(stale_key, grid._pending_pixmap_loads)
 
+    def test_async_pixmap_loaded_flushes_to_cache_in_batches(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        grid._loaded_pixmap_flush_batch_size = 2
+        image = QImage(12, 12, QImage.Format.Format_RGB32)
+        image.fill(QColor("#336699"))
+        keys = [(f"/tmp/{index}.jpg", index, 100, 270) for index in range(5)]
+
+        for key in keys:
+            grid._handle_async_pixmap_loaded(key, image)
+
+        grid._flush_loaded_pixmap_results()
+
+        self.assertEqual(len(grid._pixmap_cache), 2)
+        self.assertEqual(len(grid._loaded_pixmap_results), 3)
+
     def test_thumbnail_size_change_clears_stale_pending_pixmap_loads(self) -> None:
         grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
         stale_key = ("/tmp/stale.jpg", 1, 100, 270)
         grid._pending_pixmap_loads.add(stale_key)
+        grid._loaded_pixmap_results[stale_key] = QImage(4, 4, QImage.Format.Format_RGB32)
 
         grid.set_thumbnail_size(160)
 
         self.assertEqual(grid._pending_pixmap_loads, set())
+        self.assertEqual(grid._loaded_pixmap_results, {})
 
     def test_single_selection_repaints_only_changed_indexes(self) -> None:
         grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)

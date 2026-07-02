@@ -35,6 +35,7 @@ from PySide6.QtCore import (
     QSize,
     QStringListModel,
     Qt,
+    QThread,
     QThreadPool,
     QTimer,
     QUrl,
@@ -880,6 +881,86 @@ class _DetailPreviewLoadTask(QRunnable):
         self.signals.loaded.emit(self.request_token, None, QImage())
 
 
+class _FileWatchWorker(QObject):
+    pathChanged = Signal(str)
+    configured = Signal(int)
+    failed = Signal(str)
+
+    _ADD_BATCH_SIZE = 24
+    _REMOVE_BATCH_SIZE = 64
+    _BATCH_DELAY_MS = 16
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._watcher: QFileSystemWatcher | None = None
+        self._pending_add_paths: list[str] = []
+        self._pending_remove_paths: list[str] = []
+        self._pending_configured_count = 0
+        self._configure_step_pending = False
+
+    def configure(self, paths: object) -> None:
+        try:
+            path_list = [str(path) for path in paths if isinstance(path, str)]
+            watcher = self._ensure_watcher()
+            self._pending_remove_paths = list(watcher.directories()) + list(watcher.files())
+            self._pending_add_paths = path_list
+            self._pending_configured_count = len(path_list)
+            self._schedule_configure_step()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def clear(self) -> None:
+        try:
+            if self._watcher is None:
+                self._pending_add_paths = []
+                self._pending_remove_paths = []
+                self._pending_configured_count = 0
+                self.configured.emit(0)
+                return
+            self._pending_add_paths = []
+            self._pending_remove_paths = list(self._watcher.directories()) + list(self._watcher.files())
+            self._pending_configured_count = 0
+            self._schedule_configure_step()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _schedule_configure_step(self, *, delay_ms: int = 0) -> None:
+        if self._configure_step_pending:
+            return
+        self._configure_step_pending = True
+        QTimer.singleShot(delay_ms, self._process_configure_step)
+
+    def _process_configure_step(self) -> None:
+        self._configure_step_pending = False
+        try:
+            watcher = self._ensure_watcher()
+            if self._pending_remove_paths:
+                chunk = self._pending_remove_paths[: self._REMOVE_BATCH_SIZE]
+                del self._pending_remove_paths[: self._REMOVE_BATCH_SIZE]
+                watcher.removePaths(chunk)
+                self._schedule_configure_step(delay_ms=self._BATCH_DELAY_MS)
+                return
+            if self._pending_add_paths:
+                chunk = self._pending_add_paths[: self._ADD_BATCH_SIZE]
+                del self._pending_add_paths[: self._ADD_BATCH_SIZE]
+                watcher.addPaths(chunk)
+                self._schedule_configure_step(delay_ms=self._BATCH_DELAY_MS)
+                return
+            self.configured.emit(self._pending_configured_count)
+        except Exception as exc:
+            self._pending_add_paths = []
+            self._pending_remove_paths = []
+            self._pending_configured_count = 0
+            self.failed.emit(str(exc))
+
+    def _ensure_watcher(self) -> QFileSystemWatcher:
+        if self._watcher is None:
+            self._watcher = QFileSystemWatcher()
+            self._watcher.directoryChanged.connect(self.pathChanged.emit)
+            self._watcher.fileChanged.connect(self.pathChanged.emit)
+        return self._watcher
+
+
 class ImageCompareDialog(QDialog):
     def __init__(self, images: list[ImageItem], *, parent: QWidget | None = None):
         super().__init__(parent)
@@ -932,6 +1013,9 @@ class ImageCompareDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    _file_watch_configure_requested = Signal(object)
+    _file_watch_clear_requested = Signal()
+
     def __init__(self, *, paths: AppPaths, store: MetadataStore):
         super().__init__()
         disable_qt_accessibility()
@@ -1105,6 +1189,7 @@ class MainWindow(QMainWindow):
         self._macos_titlebar_applied = False
         self._macos_accessibility_guard_applied = False
         self._database_maintenance_active = False
+        self._preview_dialogs: set[ImagePreviewDialog] = set()
         self._creative_all_nodes_in_progress = False
         self._background_threads: set[threading.Thread] = set()
         self._background_threads_lock = threading.Lock()
@@ -1116,8 +1201,27 @@ class MainWindow(QMainWindow):
             tuple[Callable[[list[str], set[str], list[int], int], None], list[str]],
         ] = {}
         self.file_watch_enabled = self._setting_choice("ui.file_watch_enabled", "1", {"0", "1"}) == "1"
-        self.file_watcher = QFileSystemWatcher(self)
         self._watch_path_roots: dict[str, str] = {}
+        self._pending_watch_paths_to_add: list[str] = []
+        self._pending_watch_path_total = 0
+        self._file_watch_refresh_generation = 0
+        self._file_watch_build_running = False
+        self._file_watch_configured_count = 0
+        self._file_watch_thread = QThread(self)
+        self._file_watch_worker = _FileWatchWorker()
+        self._file_watch_worker.moveToThread(self._file_watch_thread)
+        self._file_watch_configure_requested.connect(
+            self._file_watch_worker.configure,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._file_watch_clear_requested.connect(
+            self._file_watch_worker.clear,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._file_watch_worker.pathChanged.connect(self._handle_watched_path_changed)
+        self._file_watch_worker.configured.connect(self._handle_file_watch_configured)
+        self._file_watch_worker.failed.connect(self._handle_file_watch_worker_failed)
+        self._file_watch_thread.start()
         self._pending_watch_scan_roots: set[str] = set()
         self._watch_scan_running = False
         self._maintenance_controls_enabled: bool | None = None
@@ -1311,6 +1415,8 @@ class MainWindow(QMainWindow):
         return True
 
     def closeEvent(self, event) -> None:
+        for dialog in list(getattr(self, "_preview_dialogs", ())):
+            dialog.close()
         if hasattr(self, "selection_detail_timer"):
             self.selection_detail_timer.stop()
             self._pending_selection_images = None
@@ -1328,6 +1434,9 @@ class MainWindow(QMainWindow):
         self._stop_file_watcher_for_maintenance()
         self._stop_index_workers_for_maintenance(timeout_seconds=2.0)
         self._wait_for_background_tasks(timeout_seconds=2.0)
+        if hasattr(self, "_file_watch_thread"):
+            self._file_watch_thread.quit()
+            self._file_watch_thread.wait(1500)
         if getattr(self, "video_player", None) is not None:
             self.video_player.stop()
         if hasattr(self, "root_splitter"):
@@ -1442,14 +1551,17 @@ class MainWindow(QMainWindow):
                     )
 
     def _stop_file_watcher_for_maintenance(self) -> None:
-        if not hasattr(self, "file_watcher"):
+        if not hasattr(self, "_file_watch_worker"):
             return
         if hasattr(self, "watch_scan_timer"):
             self.watch_scan_timer.stop()
+        self._pending_watch_paths_to_add.clear()
+        self._pending_watch_path_total = 0
+        self._file_watch_refresh_generation += 1
+        self._file_watch_build_running = False
+        self._file_watch_configured_count = 0
         self._pending_watch_scan_roots.clear()
-        watched = list(self.file_watcher.directories()) + list(self.file_watcher.files())
-        if watched:
-            self.file_watcher.removePaths(watched)
+        self._file_watch_clear_requested.emit()
 
     def _restart_index_workers_after_maintenance(
         self,
@@ -2932,8 +3044,6 @@ class MainWindow(QMainWindow):
         self.apply_view_button.clicked.connect(self._apply_selected_saved_view)
         self.rename_view_button.clicked.connect(self._rename_selected_saved_view)
         self.delete_view_button.clicked.connect(self._delete_selected_saved_view)
-        self.file_watcher.directoryChanged.connect(self._handle_watched_path_changed)
-        self.file_watcher.fileChanged.connect(self._handle_watched_path_changed)
 
     def _minimize_window(self) -> None:
         self.showMinimized()
@@ -8183,10 +8293,20 @@ class MainWindow(QMainWindow):
         dialog.favoriteChanged.connect(self._handle_preview_favorite_changed)
         dialog.feedbackSaved.connect(self._handle_preview_feedback_saved)
         dialog.indexRemoved.connect(self._handle_preview_index_removed)
-        dialog.exec()
+        dialog.setModal(False)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.finished.connect(lambda _result, preview=dialog: self._handle_preview_dialog_finished(preview))
+        self._preview_dialogs.add(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _handle_preview_dialog_finished(self, dialog: ImagePreviewDialog) -> None:
         current = dialog.current_image()
         if current is not None and (self.selected_image is None or self.selected_image.id != current.id):
             self._sync_preview_selection(current)
+        self._preview_dialogs.discard(dialog)
+        dialog.deleteLater()
 
     def _preview_images_for(self, start_image: ImageItem) -> list[ImageItem]:
         if (
@@ -9258,8 +9378,8 @@ class MainWindow(QMainWindow):
         if image.is_missing:
             return QPixmap()
         target_size = self.preview_label.size()
-        max_width = max(1, target_size.width() * 2)
-        max_height = max(1, target_size.height() * 2)
+        max_width = max(1, target_size.width())
+        max_height = max(1, target_size.height())
         source_metadata = (int(image.modified_time_ns), int(image.file_size))
         candidates: list[tuple[str, tuple[int, int]]] = []
         if image.thumbnail_path:
@@ -9288,8 +9408,8 @@ class MainWindow(QMainWindow):
             self.preview_label.setText("无法预览")
             return
         target_size = self.preview_label.size()
-        max_width = max(1, target_size.width() * 2)
-        max_height = max(1, target_size.height() * 2)
+        max_width = max(1, target_size.width())
+        max_height = max(1, target_size.height())
         source_metadata = (int(image.modified_time_ns), int(image.file_size))
         request_token = (image.id, source_metadata[0], source_metadata[1], max_width, max_height)
         candidates: list[tuple[str, tuple[int, int]]] = []
@@ -9362,13 +9482,7 @@ class MainWindow(QMainWindow):
 
     def _apply_detail_preview_pixmap(self, pixmap: QPixmap) -> None:
         self.preview_label.setText("")
-        self.preview_label.setPixmap(
-            pixmap.scaled(
-                self.preview_label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+        self.preview_label.setPixmap(pixmap)
 
     def _ensure_detail_video_preview(self) -> tuple[QVideoWidget, QMediaPlayer]:
         if self.video_widget is None:
@@ -11367,11 +11481,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"自动监听文件变化{state}")
 
     def _refresh_file_watcher(self) -> None:
-        if not hasattr(self, "file_watcher"):
+        if not hasattr(self, "_file_watch_worker"):
             return
-        watched = list(self.file_watcher.directories()) + list(self.file_watcher.files())
-        if watched:
-            self.file_watcher.removePaths(watched)
+        self._file_watch_refresh_generation += 1
+        generation = self._file_watch_refresh_generation
+        self._file_watch_build_running = False
+        self._pending_watch_paths_to_add.clear()
+        self._pending_watch_path_total = 0
+        self._file_watch_configured_count = 0
+        self._file_watch_clear_requested.emit()
         self._watch_path_roots.clear()
         if self._database_maintenance_active:
             return
@@ -11385,19 +11503,79 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message)
         if not self.file_watch_enabled:
             return
-        paths_to_watch: list[str] = []
+        roots_to_watch: list[str] = []
         for folder in self.store.list_folders_with_collection_images():
             root = self._normalize_folder_path(folder.folder_path)
             if not os.path.isdir(root):
                 continue
-            for directory in self._watched_directories_for_root(root):
-                if directory in self._watch_path_roots:
-                    continue
-                paths_to_watch.append(directory)
-                self._watch_path_roots[directory] = root
+            roots_to_watch.append(root)
+        if not roots_to_watch:
+            return
+
+        self._file_watch_build_running = True
+        self.statusBar().showMessage(f"正在准备监听 {len(roots_to_watch)} 个导入目录")
+
+        def run() -> None:
+            try:
+                pairs = self._watched_directories_for_roots(roots_to_watch)
+                self.events.put(("file_watch_paths_ready", (generation, pairs, "")))
+            except Exception as exc:
+                self.events.put(("file_watch_paths_ready", (generation, [], str(exc))))
+
+        self._start_background_task(
+            run,
+            name="file-watch-build",
+            on_rejected=lambda: setattr(self, "_file_watch_build_running", False),
+        )
+
+    def _handle_file_watch_paths_ready(self, payload: object) -> None:
+        try:
+            generation, pairs, error = payload
+        except (TypeError, ValueError):
+            return
+        if int(generation) != self._file_watch_refresh_generation:
+            return
+        self._file_watch_build_running = False
+        if not self.file_watch_enabled or self._database_maintenance_active:
+            return
+        if error:
+            self._record_error(f"准备文件监听失败：{error}")
+            self.statusBar().showMessage("准备文件监听失败")
+            return
+        watch_pairs: list[tuple[str, str]] = [
+            (str(directory), str(root))
+            for directory, root in pairs
+            if isinstance(directory, str) and isinstance(root, str)
+        ]
+        self._watch_path_roots = {directory: root for directory, root in watch_pairs}
+        paths_to_watch = [directory for directory, _root in watch_pairs]
         if paths_to_watch:
-            self.file_watcher.addPaths(paths_to_watch)
-            self.statusBar().showMessage(f"已监听 {len(paths_to_watch)} 个本地目录")
+            self._pending_watch_path_total = len(paths_to_watch)
+            self._file_watch_configure_requested.emit(paths_to_watch)
+            self.statusBar().showMessage(f"正在后台监听 {len(paths_to_watch)} 个本地目录")
+
+    def _handle_file_watch_configured(self, count: int) -> None:
+        self._file_watch_configured_count = max(0, int(count))
+        self._pending_watch_path_total = 0
+        if self._file_watch_configured_count:
+            self.statusBar().showMessage(f"已监听 {self._file_watch_configured_count} 个本地目录")
+
+    def _handle_file_watch_worker_failed(self, message: str) -> None:
+        self._record_error(f"文件监听失败：{message}")
+        self.statusBar().showMessage("文件监听失败")
+
+    @classmethod
+    def _watched_directories_for_roots(cls, roots: Sequence[str]) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for root in roots:
+            normalized_root = os.path.abspath(root)
+            for directory in cls._watched_directories_for_root(normalized_root):
+                if directory in seen:
+                    continue
+                seen.add(directory)
+                pairs.append((directory, normalized_root))
+        return pairs
 
     @staticmethod
     def _watched_directories_for_root(root: str, *, max_directories: int = 1200) -> list[str]:
@@ -11989,6 +12167,8 @@ class MainWindow(QMainWindow):
                 self._handle_scan_missing_done(payload)
             elif kind == "watch_scan_done":
                 self._handle_watch_scan_done(payload)
+            elif kind == "file_watch_paths_ready":
+                self._handle_file_watch_paths_ready(payload)
             elif kind == "duplicates_done":
                 self._handle_duplicates_done(payload)
             elif kind == "import_done":

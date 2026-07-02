@@ -216,6 +216,18 @@ class ProjectBoardViewTest(unittest.TestCase):
 
         self.assertEqual(emitted, [[2]])
 
+    def test_select_image_uses_cached_selection_without_scene_scan(self) -> None:
+        board = ProjectBoardView()
+        board.set_images([self._image(1), self._image(2)])
+        emitted: list[list[int]] = []
+        board.selectionChanged.connect(lambda image_ids: emitted.append(list(image_ids)))
+
+        with patch.object(board._scene, "selectedItems", side_effect=AssertionError("scene selection scan")):
+            board._select_image_id(2)
+
+        self.assertEqual(board.selected_image_ids(), [2])
+        self.assertEqual(emitted, [[2]])
+
     def test_select_image_does_not_emit_layout_changed(self) -> None:
         board = ProjectBoardView()
         board.set_images([self._image(1), self._image(2)])

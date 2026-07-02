@@ -34,7 +34,7 @@ from eidory.core.search_filters import (
     search_filter_from_payload,
     search_filter_to_payload,
 )
-from eidory.models import ImageItem
+from eidory.models import FolderItem, ImageItem
 from eidory.ui.main_window import (
     COLLECTION_SEARCH_EXCLUDED_DIRECT_ROLE,
     COLLECTION_SEARCH_EXCLUDED_MATCH_ROLE,
@@ -61,6 +61,7 @@ from eidory.ui.main_window import (
     TOP_TOOL_BUTTON_MIN_WIDTH,
     TOP_TOOL_BUTTON_SPACING,
     TOOL_BUTTON_MIN_WIDTH,
+    _FileWatchWorker,
 )
 
 
@@ -124,6 +125,53 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.advanced_search_toggle_button.text(), "▾")
             window.close()
 
+    def test_image_preview_opens_modelessly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = AppPaths(
+                data_dir=root / "data",
+                thumbnail_dir=root / "data" / "thumbs",
+                database_path=root / "data" / "eidory.sqlite3",
+                log_dir=root / "data" / "logs",
+            )
+            paths.ensure()
+            image_path = root / "image.jpg"
+            Image.new("RGB", (80, 60), color="red").save(image_path)
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=80,
+                height=60,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            image = store.get_image(image_id)
+            window = MainWindow(paths=paths, store=store)
+            window.grid_view.set_images([image], selected_image_ids=[image.id])
+            window.show()
+            self.app.processEvents()
+
+            with patch("eidory.ui.main_window.ImagePreviewDialog.exec") as exec_mock:
+                window._open_image_preview(image)
+                self.app.processEvents()
+
+            self.assertFalse(exec_mock.called)
+            self.assertTrue(window.isEnabled())
+            self.assertEqual(len(window._preview_dialogs), 1)
+            dialog = next(iter(window._preview_dialogs))
+            self.assertFalse(dialog.isModal())
+            self.assertEqual(dialog.windowModality(), Qt.WindowModality.NonModal)
+            self.assertTrue(dialog.isVisible())
+
+            dialog.close()
+            self.app.processEvents()
+            self.assertEqual(len(window._preview_dialogs), 0)
+            window.close()
+
     def test_saved_view_combo_save_action_is_available_from_left_click_menu(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -176,7 +224,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window._selected_saved_view_id(), saved_view_id)
             window.close()
 
-    def test_main_window_disables_qt_accessibility_backend(self) -> None:
+    def test_main_window_does_not_disable_qt_accessibility_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -193,7 +241,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
 
-            self.assertFalse(QAccessible.isActive())
+            self.assertTrue(QAccessible.isActive())
             window.close()
 
     def test_sqlite_utility_connection_uses_store_busy_timeout(self) -> None:
@@ -221,18 +269,150 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window = MainWindow(paths=paths, store=store)
             window.show()
             self.app.processEvents()
-            self.assertTrue(window.file_watcher.addPath(str(watched_dir)))
+            window._pending_watch_paths_to_add = [str(watched_dir)]
+            window._pending_watch_path_total = 1
+            window._file_watch_configured_count = 1
             window._pending_watch_scan_roots.add(str(watched_dir))
             window.watch_scan_timer.start(10_000)
+            clear_requests: list[bool] = []
+            window._file_watch_clear_requested.connect(lambda: clear_requests.append(True))
             ran: list[bool] = []
 
             with window._database_maintenance("test"):
                 self.assertTrue(window._database_maintenance_active)
                 self.assertFalse(window.watch_scan_timer.isActive())
-                self.assertEqual(window.file_watcher.directories(), [])
+                self.assertEqual(window._pending_watch_paths_to_add, [])
+                self.assertEqual(window._pending_watch_path_total, 0)
+                self.assertEqual(window._file_watch_configured_count, 0)
+                self.assertEqual(clear_requests, [True])
                 self.assertFalse(window._start_background_task(lambda: ran.append(True)))
 
             self.assertEqual(ran, [])
+            window.close()
+
+    def test_file_watcher_configures_worker_off_main_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            watch_root = Path(tmp) / "library"
+            watch_root.mkdir()
+            watched_dirs = []
+            for index in range(40):
+                directory = watch_root / f"dir-{index}"
+                directory.mkdir()
+                watched_dirs.append(str(directory))
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            watch_pairs = [(directory, str(watch_root)) for directory in watched_dirs]
+            configured_paths: list[list[str]] = []
+            window._file_watch_configure_requested.connect(lambda paths: configured_paths.append(list(paths)))
+
+            def run_background_now(target, **_kwargs):
+                target()
+                return True
+
+            with (
+                patch.object(
+                    window.store,
+                    "list_folders_with_collection_images",
+                    return_value=[
+                        FolderItem(
+                            id=1,
+                            folder_path=str(watch_root),
+                            import_mode="indexed",
+                            added_at="2026-01-01T00:00:00+00:00",
+                            last_scanned_at=None,
+                            is_active=True,
+                        )
+                    ],
+                ),
+                patch.object(window, "_watched_directories_for_roots", return_value=watch_pairs),
+                patch.object(window, "_start_background_task", side_effect=run_background_now),
+            ):
+                window._refresh_file_watcher()
+                window._poll_events()
+                self.assertEqual(window._pending_watch_path_total, len(watched_dirs))
+                self.assertEqual(window._watch_path_roots, dict(watch_pairs))
+                self.assertEqual(configured_paths[-1], watched_dirs)
+            window.close()
+
+    def test_file_watch_worker_adds_paths_in_batches(self) -> None:
+        class FakeWatcher:
+            def __init__(self) -> None:
+                self.added: list[list[str]] = []
+                self.removed: list[list[str]] = []
+
+            def directories(self) -> list[str]:
+                return []
+
+            def files(self) -> list[str]:
+                return []
+
+            def addPaths(self, paths: list[str]) -> None:
+                self.added.append(list(paths))
+
+            def removePaths(self, paths: list[str]) -> None:
+                self.removed.append(list(paths))
+
+        worker = _FileWatchWorker()
+        fake_watcher = FakeWatcher()
+        worker._watcher = fake_watcher  # type: ignore[assignment]
+        worker._ADD_BATCH_SIZE = 3
+        configured: list[int] = []
+        worker.configured.connect(lambda count: configured.append(int(count)))
+
+        with patch.object(worker, "_schedule_configure_step") as schedule:
+            worker.configure([f"/tmp/watch-{index}" for index in range(7)])
+
+            self.assertEqual(schedule.call_count, 1)
+            worker._process_configure_step()
+            worker._process_configure_step()
+            worker._process_configure_step()
+            self.assertEqual(
+                fake_watcher.added,
+                [
+                    ["/tmp/watch-0", "/tmp/watch-1", "/tmp/watch-2"],
+                    ["/tmp/watch-3", "/tmp/watch-4", "/tmp/watch-5"],
+                    ["/tmp/watch-6"],
+                ],
+            )
+            self.assertEqual(configured, [])
+
+            worker._process_configure_step()
+
+        self.assertEqual(configured, [7])
+
+    def test_file_watcher_discards_stale_background_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            watch_root = Path(tmp) / "library"
+            watch_root.mkdir()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            window._file_watch_refresh_generation = 3
+            window._handle_file_watch_paths_ready((2, [(str(watch_root), str(watch_root))], ""))
+
+            self.assertEqual(window._watch_path_roots, {})
+            self.assertEqual(window._pending_watch_paths_to_add, [])
+            self.assertEqual(window._pending_watch_path_total, 0)
             window.close()
 
     def test_database_maintenance_aborts_when_index_workers_do_not_stop(self) -> None:

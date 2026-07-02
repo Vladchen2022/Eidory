@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
-import os
 import sys
-
-os.environ["QT_ACCESSIBILITY"] = "0"
 
 from eidory.config import AppPaths
 from eidory.core.metadata_store import MetadataStore

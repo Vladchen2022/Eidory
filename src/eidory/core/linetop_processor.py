@@ -87,6 +87,47 @@ def render_linetop_image(source: Image.Image, settings: LineTopSettings) -> Imag
     return Image.fromarray(rendered, "RGBA")
 
 
+def render_linetop_overlay_image(source: Image.Image, settings: LineTopSettings) -> Image.Image:
+    source_rgba = source.convert("RGBA")
+    rgba = np.array(source_rgba, dtype=np.uint8)
+    photo_like = settings.smart_preset == "photo"
+
+    if settings.mode == "color_limit":
+        rendered = _color_limited_rgba_from_image(
+            rgba,
+            color_count=int(np.clip(round(settings.color_limit_steps), 0, 15)),
+            grayscale=settings.color_limit_grayscale,
+            shape_simplification=int(np.clip(round(settings.color_limit_shape_simplification), 1, 10)),
+            photo_like=photo_like,
+            smart_enhance=settings.smart_enhance,
+            contrast=settings.overlay_contrast,
+            brightness=settings.overlay_brightness,
+        )
+        return Image.fromarray(rendered, "RGBA")
+
+    if settings.enhanced_line_engine:
+        gray = cv2.cvtColor(rgba, cv2.COLOR_RGBA2GRAY)
+        alpha_mask = _thin_line_mask_from_gray(
+            gray,
+            photo_like=photo_like,
+            edge_strength=settings.edge_strength,
+            contrast=settings.overlay_contrast,
+            brightness=settings.overlay_brightness,
+            line_thickness=settings.line_thickness,
+        )
+    else:
+        alpha_mask = _legacy_line_mask_from_rgba(
+            rgba,
+            photo_like=photo_like,
+            edge_strength=settings.edge_strength,
+            contrast=settings.overlay_contrast,
+            brightness=settings.overlay_brightness,
+            line_thickness=settings.line_thickness,
+        )
+    rendered = _line_mask_to_transparent_rgba(alpha_mask)
+    return Image.fromarray(rendered, "RGBA")
+
+
 def _line_mask_to_white_rgba(alpha_mask: np.ndarray, opacity: float) -> np.ndarray:
     alpha = np.clip(alpha_mask.astype(np.float32) * np.clip(opacity, 0.05, 1.0) / 255.0, 0.0, 1.0)
     value = np.clip(255.0 * (1.0 - alpha), 0, 255).astype(np.uint8)
@@ -95,6 +136,12 @@ def _line_mask_to_white_rgba(alpha_mask: np.ndarray, opacity: float) -> np.ndarr
     output[:, :, 1] = value
     output[:, :, 2] = value
     output[:, :, 3] = 255
+    return output
+
+
+def _line_mask_to_transparent_rgba(alpha_mask: np.ndarray) -> np.ndarray:
+    output = np.zeros((alpha_mask.shape[0], alpha_mask.shape[1], 4), dtype=np.uint8)
+    output[:, :, 3] = alpha_mask
     return output
 
 

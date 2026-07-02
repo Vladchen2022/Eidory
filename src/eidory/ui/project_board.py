@@ -429,6 +429,7 @@ class ProjectBoardView(QGraphicsView):
         self._last_pan_pos = QPoint()
         self._view_mode = "fit_all"
         self._last_fit_selection_ids: tuple[int, ...] = ()
+        self._selected_image_ids_cache: list[int] = []
         self._refit_timer_pending = False
         self._suppress_layout_changed = False
         self._layout_change_pending = False
@@ -453,10 +454,12 @@ class ProjectBoardView(QGraphicsView):
         }
         self.setUpdatesEnabled(False)
         previous_scene_signal_state = self._scene.blockSignals(True)
+        previous_selected_ids = list(self._selected_image_ids_cache)
         self._suppress_layout_changed = True
         try:
             self._scene.clear()
             self._image_items.clear()
+            self._selected_image_ids_cache = []
             self._scene.setSceneRect(0, 0, BOARD_WIDTH, BOARD_HEIGHT)
             self.resetTransform()
             self._zoom = 1.0
@@ -560,7 +563,8 @@ class ProjectBoardView(QGraphicsView):
             self._scene.blockSignals(previous_scene_signal_state)
             self._finish_layout_reset()
 
-        self.selectionChanged.emit([])
+        if previous_selected_ids:
+            self.selectionChanged.emit([])
         if images:
             self._schedule_refit_current_view_mode()
 
@@ -836,6 +840,9 @@ class ProjectBoardView(QGraphicsView):
             self._schedule_refit_current_view_mode()
 
     def selected_image_ids(self) -> list[int]:
+        return list(self._selected_image_ids_cache)
+
+    def _collect_selected_image_ids(self) -> list[int]:
         image_ids: list[int] = []
         seen: set[int] = set()
         for item in self._scene.selectedItems():
@@ -969,36 +976,36 @@ class ProjectBoardView(QGraphicsView):
 
     def _selected_image_items(self) -> list[QGraphicsItem]:
         items: list[QGraphicsItem] = []
-        seen: set[int] = set()
-        for item in self._scene.selectedItems():
-            image_id = self._image_id_for_item(item)
-            if image_id is None or image_id in seen:
-                continue
-            image_item = self._image_items.get(image_id)
-            if image_item is not None:
-                items.append(image_item)
-                seen.add(image_id)
+        for image_id in self._selected_image_ids_cache:
+            item = self._image_items.get(int(image_id))
+            if item is not None and item.isSelected():
+                items.append(item)
         return items
 
     def _select_image_id(self, image_id: int) -> None:
-        previous_ids = self.selected_image_ids()
+        previous_ids = list(self._selected_image_ids_cache)
         if previous_ids == [image_id]:
             return
         self._scene.blockSignals(True)
         try:
-            for item in self._scene.selectedItems():
+            for item in self._selected_image_items():
                 item.setSelected(False)
             target = self._image_items.get(image_id)
             if target is not None:
                 target.setSelected(True)
         finally:
             self._scene.blockSignals(False)
-        selected_ids = self.selected_image_ids()
+        selected_ids = [image_id] if image_id in self._image_items else []
         if selected_ids != previous_ids:
+            self._selected_image_ids_cache = selected_ids
             self.selectionChanged.emit(selected_ids)
 
     def _emit_selection_changed(self) -> None:
-        self.selectionChanged.emit(self.selected_image_ids())
+        selected_ids = self._collect_selected_image_ids()
+        if selected_ids == self._selected_image_ids_cache:
+            return
+        self._selected_image_ids_cache = selected_ids
+        self.selectionChanged.emit(selected_ids)
 
     def _visible_image_items(self) -> list[QGraphicsItem]:
         return [item for item in self._image_items.values() if item.isVisible()]

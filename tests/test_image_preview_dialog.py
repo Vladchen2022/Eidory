@@ -11,7 +11,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtCore import QEvent, QPointF, QRect, Qt
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QPixmap
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
@@ -44,6 +44,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
         dialog._preview_base_pixmap = pixmap
         dialog._preview_base_is_fallback = False
         dialog._preview_variant_cache.clear()
+        dialog._preview_display_cache.clear()
         dialog.image_view.set_pixmap(
             pixmap,
             original_width=image.width,
@@ -574,6 +575,29 @@ class ImagePreviewDialogTest(unittest.TestCase):
         self.assertEqual(right.green(), right.blue())
         self.assertLess(left.red(), right.red())
 
+    def test_preview_saturation_display_filter_maps_to_extreme_range(self) -> None:
+        self.assertEqual(ImagePreviewDialog._saturation_factor_from_value(0), 0.0)
+        self.assertEqual(ImagePreviewDialog._saturation_factor_from_value(100), 1.0)
+        self.assertEqual(ImagePreviewDialog._saturation_factor_from_value(200), 8.0)
+
+        image = QImage(2, 1, QImage.Format.Format_RGBA8888)
+        image.setPixelColor(0, 0, QColor(220, 40, 40))
+        image.setPixelColor(1, 0, QColor(40, 120, 220))
+        pixmap = QPixmap.fromImage(image)
+
+        desaturated = ImagePreviewDialog._apply_saturation_to_pixmap(pixmap, 0.0).toImage()
+        left = desaturated.pixelColor(0, 0)
+        right = desaturated.pixelColor(1, 0)
+        self.assertEqual(left.red(), left.green())
+        self.assertEqual(left.green(), left.blue())
+        self.assertEqual(right.red(), right.green())
+        self.assertEqual(right.green(), right.blue())
+
+        saturated = ImagePreviewDialog._apply_saturation_to_pixmap(pixmap, 8.0).toImage()
+        saturated_left = saturated.pixelColor(0, 0)
+        self.assertGreaterEqual(saturated_left.red(), left.red())
+        self.assertLessEqual(saturated_left.green(), left.green())
+
     def test_preview_transform_actions_use_icon_buttons(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -609,6 +633,11 @@ class ImagePreviewDialogTest(unittest.TestCase):
             self.assertFalse(dialog.mirror_button.icon().isNull())
             self.assertEqual(dialog.grayscale_button.accessibleName(), "黑白")
             self.assertEqual(dialog.mirror_button.accessibleName(), "左右翻转")
+            self.assertEqual(dialog.saturation_slider.minimum(), 0)
+            self.assertEqual(dialog.saturation_slider.maximum(), 200)
+            self.assertEqual(dialog.saturation_slider.value(), 100)
+            self.assertEqual(dialog.saturation_value_label.text(), "100%")
+            self.assertEqual(dialog.saturation_reset_button.text(), "复位")
             dialog.close()
 
     def test_tab_toggles_linetop_panel_without_source_render_blocking_ui(self) -> None:
@@ -666,6 +695,56 @@ class ImagePreviewDialogTest(unittest.TestCase):
             self.assertFalse(dialog.compare_toggle_button.isEnabled())
             self.assertFalse(dialog.compare_toggle_button.isChecked())
             self.assertFalse(dialog.save_render_button.isEnabled())
+            dialog.close()
+
+    def test_linetop_panel_expands_window_instead_of_shrinking_preview_area(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (640, 480), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=640,
+                height=480,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            dialog.resize(900, 640)
+            dialog.show()
+            self.app.processEvents()
+            original_window_width = dialog.width()
+            original_preview_width = dialog.preview_stack.width()
+
+            with (
+                patch.object(dialog, "_available_geometry_for_window", return_value=QRect(0, 0, 2400, 1600)),
+                patch.object(dialog, "_request_linetop_render"),
+            ):
+                dialog._set_linetop_panel_visible(True)
+                self.app.processEvents()
+
+                self.assertFalse(dialog.advanced_panel.isHidden())
+                self.assertEqual(dialog.width(), original_window_width + dialog._linetop_panel_outer_width())
+                self.assertGreaterEqual(dialog.preview_stack.width(), original_preview_width - 1)
+
+                dialog._set_linetop_panel_visible(False)
+                self.app.processEvents()
+
+            self.assertTrue(dialog.advanced_panel.isHidden())
+            self.assertEqual(dialog.width(), original_window_width)
             dialog.close()
 
     def test_linetop_controls_build_expected_settings(self) -> None:
@@ -730,6 +809,47 @@ class ImagePreviewDialogTest(unittest.TestCase):
             self.assertTrue(dialog.linetop_overlay_adjustable_frame_checkbox.isChecked())
             self.assertFalse(dialog.linetop_color_limit_row.isHidden())
             self.assertTrue(dialog.linetop_thickness_row.isHidden())
+            dialog.close()
+
+    def test_saturation_slider_does_not_change_linetop_processing_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            image = dialog.current_image()
+            self.assertIsNotNone(image)
+
+            before = dialog._linetop_cache_key(image, 640, 480)
+            dialog.saturation_slider.setValue(200)
+            after = dialog._linetop_cache_key(image, 640, 480)
+
+            self.assertEqual(before, after)
+            self.assertEqual(dialog.saturation_value_label.text(), "800%")
+            dialog.saturation_reset_button.click()
+            self.assertEqual(dialog.saturation_slider.value(), 100)
+            self.assertEqual(dialog.saturation_preview, 100)
+            self.assertEqual(dialog.saturation_value_label.text(), "100%")
             dialog.close()
 
     def test_compare_toggle_switches_between_source_and_processed_preview(self) -> None:

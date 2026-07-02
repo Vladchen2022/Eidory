@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
@@ -64,6 +64,9 @@ LINETOP_PANEL_WIDTH = 330
 LINETOP_RENDER_CACHE_LIMIT = 12
 LINETOP_OVERLAY_RENDER_CACHE_LIMIT = 4
 LINETOP_OVERLAY_MAX_LONG_SIDE = 2400
+PREVIEW_SATURATION_DEFAULT = 100
+PREVIEW_SATURATION_MAX_FACTOR = 8.0
+PREVIEW_DISPLAY_CACHE_LIMIT = 8
 _DETACHED_LINETOP_OVERLAYS: set[QObject] = set()
 
 
@@ -1341,6 +1344,7 @@ class ImagePreviewDialog(QDialog):
         self.zoom_factor = 1.0
         self.grayscale_preview = False
         self.mirrored_preview = False
+        self.saturation_preview = PREVIEW_SATURATION_DEFAULT
         self._panning = False
         self._pan_start_pos = QPoint()
         self._pan_start_horizontal = 0
@@ -1351,6 +1355,7 @@ class ImagePreviewDialog(QDialog):
         self._preview_base_pixmap = QPixmap()
         self._preview_base_is_fallback = False
         self._preview_variant_cache: dict[tuple[bool, bool], QPixmap] = {}
+        self._preview_display_cache: dict[tuple[int, int], QPixmap] = {}
         self._preview_source_pending_token: tuple[int, str, int, int, int, int] | None = None
         self._preview_source_running_token: tuple[int, str, int, int, int, int] | None = None
         self._preview_source_queued_request: tuple[
@@ -1384,6 +1389,7 @@ class ImagePreviewDialog(QDialog):
         self._linetop_render_timer.setSingleShot(True)
         self._linetop_render_timer.setInterval(120)
         self._linetop_render_timer.timeout.connect(self._render_current_image)
+        self._linetop_panel_window_delta = 0
         self._linetop_overlay_window: LineTopOverlayWindow | LineTopNativeOverlayWindow | None = None
         self._linetop_overlay_render_cache: dict[tuple[object, ...], QPixmap] = {}
         self._linetop_overlay_pending_token: tuple[object, ...] | None = None
@@ -1411,6 +1417,10 @@ class ImagePreviewDialog(QDialog):
         self._preview_refine_timer.setSingleShot(True)
         self._preview_refine_timer.setInterval(SOURCE_PREVIEW_REFINE_DELAY_MS)
         self._preview_refine_timer.timeout.connect(self._render_current_image)
+        self._saturation_render_timer = QTimer(self)
+        self._saturation_render_timer.setSingleShot(True)
+        self._saturation_render_timer.setInterval(35)
+        self._saturation_render_timer.timeout.connect(self._render_after_saturation_changed)
 
         self.setWindowTitle("Eidory 预览")
         self.resize(1200, 820)
@@ -1456,6 +1466,18 @@ class ImagePreviewDialog(QDialog):
             "左右翻转",
             "左右镜像翻转当前图片",
         )
+        self.saturation_label = QLabel("饱和度")
+        self.saturation_slider = QSlider(Qt.Orientation.Horizontal)
+        self.saturation_slider.setRange(0, 200)
+        self.saturation_slider.setValue(PREVIEW_SATURATION_DEFAULT)
+        self.saturation_slider.setFixedWidth(170)
+        self.saturation_slider.setToolTip("只调整预览显示饱和度，不保存到图库源图")
+        self.saturation_value_label = QLabel(self._saturation_value_text(PREVIEW_SATURATION_DEFAULT))
+        self.saturation_value_label.setFixedWidth(44)
+        self.saturation_value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.saturation_reset_button = QPushButton("复位")
+        self.saturation_reset_button.setFixedWidth(48)
+        self.saturation_reset_button.setToolTip("把饱和度恢复到默认 100%")
         self.video_play_pause_button = QPushButton("播放")
         self.video_position_slider = QSlider(Qt.Orientation.Horizontal)
         self.video_position_slider.setRange(0, 0)
@@ -1500,6 +1522,8 @@ class ImagePreviewDialog(QDialog):
         ]
         for button in [*nav_buttons, *self.feedback_buttons.values()]:
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.saturation_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.saturation_reset_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.open_original_button = QPushButton("打开源文件")
         self.reveal_button = QPushButton("Finder 中显示")
@@ -1521,6 +1545,11 @@ class ImagePreviewDialog(QDialog):
         controls.addWidget(self.actual_size_button)
         controls.addWidget(self.grayscale_button)
         controls.addWidget(self.mirror_button)
+        controls.addSpacing(8)
+        controls.addWidget(self.saturation_label)
+        controls.addWidget(self.saturation_slider)
+        controls.addWidget(self.saturation_value_label)
+        controls.addWidget(self.saturation_reset_button)
         controls.addSpacing(12)
         controls.addWidget(self.favorite_checkbox)
         controls.addSpacing(12)
@@ -1531,6 +1560,7 @@ class ImagePreviewDialog(QDialog):
 
         layout = QVBoxLayout(self)
         preview_row = QHBoxLayout()
+        self._preview_row_layout = preview_row
         preview_row.setContentsMargins(0, 0, 0, 0)
         preview_row.setSpacing(8)
         preview_row.addWidget(self.preview_stack, 1)
@@ -1546,6 +1576,8 @@ class ImagePreviewDialog(QDialog):
         self.actual_size_button.clicked.connect(self._actual_size_image)
         self.grayscale_button.toggled.connect(self._set_grayscale_preview)
         self.mirror_button.toggled.connect(self._set_mirrored_preview)
+        self.saturation_slider.valueChanged.connect(self._queue_saturation_preview_changed)
+        self.saturation_reset_button.clicked.connect(self._reset_saturation_preview)
         self.favorite_checkbox.toggled.connect(self._save_favorite)
         self.compare_toggle_button.toggled.connect(self._set_linetop_compare_original)
         self.save_render_button.clicked.connect(self._save_linetop_render_as)
@@ -1581,6 +1613,7 @@ class ImagePreviewDialog(QDialog):
         self._preview_source_queued_request = None
         self._zoom_refine_timer.stop()
         self._preview_refine_timer.stop()
+        self._saturation_render_timer.stop()
         if self._app_event_filter_installed:
             app = QApplication.instance()
             if app is not None:
@@ -1690,6 +1723,7 @@ class ImagePreviewDialog(QDialog):
             self.actual_size_button.setEnabled(False)
             self.grayscale_button.setEnabled(False)
             self.mirror_button.setEnabled(False)
+            self._set_saturation_controls_enabled(False)
             self.copy_image_button.setEnabled(False)
             self.compare_toggle_button.setEnabled(False)
             self.save_render_button.setEnabled(False)
@@ -1711,8 +1745,10 @@ class ImagePreviewDialog(QDialog):
         if is_supported_video(image.file_path):
             self._close_linetop_overlay_window()
             self._set_linetop_panel_visible(False)
+            self._set_saturation_controls_enabled(False)
             self._render_current_video(image)
         else:
+            self._set_saturation_controls_enabled(True)
             self.advanced_toggle_button.setEnabled(True)
             self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
             self.save_render_button.setEnabled(self._linetop_preview_active(image))
@@ -1787,6 +1823,7 @@ class ImagePreviewDialog(QDialog):
         self.actual_size_button.setEnabled(True)
         self.grayscale_button.setEnabled(True)
         self.mirror_button.setEnabled(True)
+        self._set_saturation_controls_enabled(True)
         self.copy_image_button.setEnabled(True)
         advanced_active = self._linetop_preview_active(image)
         self.compare_toggle_button.setEnabled(advanced_active)
@@ -1823,7 +1860,7 @@ class ImagePreviewDialog(QDialog):
             self._update_info(image)
             return
         self.image_view.set_pixmap(
-            pixmap,
+            self._display_pixmap_for_view(pixmap),
             original_width=image.width,
             original_height=image.height,
             fit_to_window=self.fit_to_window,
@@ -1857,6 +1894,7 @@ class ImagePreviewDialog(QDialog):
         self.actual_size_button.setEnabled(False)
         self.grayscale_button.setEnabled(False)
         self.mirror_button.setEnabled(False)
+        self._set_saturation_controls_enabled(False)
         self.copy_image_button.setEnabled(False)
         self._stop_pan()
         self.preview_stack.setCurrentWidget(video_widget)
@@ -1923,6 +1961,78 @@ class ImagePreviewDialog(QDialog):
         if mirror_horizontal:
             image = image.flipped(Qt.Orientation.Horizontal)
         return QPixmap.fromImage(image)
+
+    @staticmethod
+    def _saturation_factor_from_value(value: int) -> float:
+        value = max(0, min(200, int(value)))
+        if value <= PREVIEW_SATURATION_DEFAULT:
+            return value / PREVIEW_SATURATION_DEFAULT
+        high_ratio = (value - PREVIEW_SATURATION_DEFAULT) / PREVIEW_SATURATION_DEFAULT
+        return 1.0 + high_ratio * (PREVIEW_SATURATION_MAX_FACTOR - 1.0)
+
+    @staticmethod
+    def _saturation_value_text(value: int) -> str:
+        return f"{int(round(ImagePreviewDialog._saturation_factor_from_value(value) * 100)):d}%"
+
+    @staticmethod
+    def _apply_saturation_to_pixmap(pixmap: QPixmap, factor: float) -> QPixmap:
+        if pixmap.isNull() or abs(factor - 1.0) < 0.001:
+            return pixmap
+        qimage = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+        if qimage.isNull():
+            return pixmap
+        try:
+            pillow_image = Image.frombytes(
+                "RGBA",
+                (qimage.width(), qimage.height()),
+                bytes(qimage.constBits()),
+            )
+            enhanced = ImageEnhance.Color(pillow_image).enhance(max(0.0, float(factor)))
+            saturated = QPixmap.fromImage(_qimage_from_pillow(enhanced))
+        except Exception:
+            return pixmap
+        return saturated if not saturated.isNull() else pixmap
+
+    def _display_pixmap_for_view(self, pixmap: QPixmap) -> QPixmap:
+        if pixmap.isNull():
+            return pixmap
+        factor = self._saturation_factor_from_value(self.saturation_preview)
+        if abs(factor - 1.0) < 0.001:
+            return pixmap
+        cache_key = (int(pixmap.cacheKey()), int(self.saturation_preview))
+        cached = self._preview_display_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            return cached
+        saturated = self._apply_saturation_to_pixmap(pixmap, factor)
+        self._preview_display_cache[cache_key] = QPixmap(saturated)
+        while len(self._preview_display_cache) > PREVIEW_DISPLAY_CACHE_LIMIT:
+            oldest_key = next(iter(self._preview_display_cache))
+            self._preview_display_cache.pop(oldest_key, None)
+        return saturated
+
+    def _set_saturation_controls_enabled(self, enabled: bool) -> None:
+        self.saturation_label.setEnabled(enabled)
+        self.saturation_slider.setEnabled(enabled)
+        self.saturation_value_label.setEnabled(enabled)
+        self.saturation_reset_button.setEnabled(enabled)
+
+    def _queue_saturation_preview_changed(self, value: int) -> None:
+        self.saturation_preview = max(0, min(200, int(value)))
+        self.saturation_value_label.setText(self._saturation_value_text(self.saturation_preview))
+        self._preview_display_cache.clear()
+        image = self.current_image()
+        if image is None or is_supported_video(image.file_path):
+            return
+        self._saturation_render_timer.start()
+
+    def _reset_saturation_preview(self) -> None:
+        self.saturation_slider.setValue(PREVIEW_SATURATION_DEFAULT)
+
+    def _render_after_saturation_changed(self) -> None:
+        image = self.current_image()
+        if image is None or is_supported_video(image.file_path):
+            return
+        self._render_current_image(use_thumbnail_first=self._preview_base_pixmap.isNull())
 
     def _build_linetop_panel(self) -> QWidget:
         panel = QWidget()
@@ -2295,6 +2405,47 @@ class ImagePreviewDialog(QDialog):
     def _toggle_linetop_panel(self) -> None:
         self._set_linetop_panel_visible(self.advanced_panel.isHidden())
 
+    def _linetop_panel_outer_width(self) -> int:
+        spacing = 0
+        if hasattr(self, "_preview_row_layout"):
+            spacing = max(0, self._preview_row_layout.spacing())
+        panel_width = max(LINETOP_PANEL_WIDTH, self.advanced_panel.sizeHint().width(), self.advanced_panel.width())
+        return panel_width + spacing
+
+    def _available_geometry_for_window(self) -> QRect:
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            return screen.availableGeometry()
+        return QRect(0, 0, max(self.width(), 1), max(self.height(), 1))
+
+    def _resize_for_linetop_panel_visibility(self, visible: bool) -> None:
+        delta = self._linetop_panel_outer_width()
+        if delta <= 0:
+            return
+        geometry = QRect(self.geometry())
+        if visible:
+            target = QRect(geometry)
+            target.setWidth(geometry.width() + delta)
+            available = self._available_geometry_for_window()
+            if target.width() > available.width():
+                target.setWidth(available.width())
+                target.moveLeft(available.left())
+            elif target.right() > available.right():
+                target.moveLeft(max(available.left(), available.right() - target.width() + 1))
+            self._linetop_panel_window_delta = max(0, target.width() - geometry.width())
+            self.setGeometry(target)
+            return
+        collapse_delta = self._linetop_panel_window_delta
+        if collapse_delta <= 0:
+            return
+        target_width = max(self.minimumWidth(), geometry.width() - collapse_delta)
+        if target_width == geometry.width():
+            self._linetop_panel_window_delta = 0
+            return
+        geometry.setWidth(target_width)
+        self.setGeometry(geometry)
+        self._linetop_panel_window_delta = 0
+
     def _set_linetop_panel_visible(self, visible: bool) -> None:
         image = self.current_image()
         visible = bool(visible and image is not None and not is_supported_video(image.file_path))
@@ -2310,7 +2461,11 @@ class ImagePreviewDialog(QDialog):
             self.save_render_button.setEnabled(self._linetop_preview_active(image))
             self._refresh_linetop_action_buttons(image)
             return
+        if visible:
+            self._resize_for_linetop_panel_visibility(True)
         self.advanced_panel.setVisible(visible)
+        if not visible:
+            self._resize_for_linetop_panel_visibility(False)
         self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
         self.save_render_button.setEnabled(self._linetop_preview_active(image))
         self._refresh_linetop_action_buttons(image)
@@ -2362,7 +2517,7 @@ class ImagePreviewDialog(QDialog):
         cached = self._linetop_render_cache.get(cache_key)
         if cached is not None and not cached.isNull():
             self.image_view.set_pixmap(
-                cached,
+                self._display_pixmap_for_view(cached),
                 original_width=image.width,
                 original_height=image.height,
                 fit_to_window=self.fit_to_window,
@@ -2377,7 +2532,7 @@ class ImagePreviewDialog(QDialog):
                 fallback = self._load_quick_preview_pixmap(image, target_width, target_height)
             if not fallback.isNull():
                 self.image_view.set_pixmap(
-                    fallback,
+                    self._display_pixmap_for_view(fallback),
                     original_width=image.width,
                     original_height=image.height,
                     fit_to_window=self.fit_to_window,
@@ -2458,7 +2613,7 @@ class ImagePreviewDialog(QDialog):
         if cached is not None and not cached.isNull():
             self._linetop_render_pending_token = None
             self.image_view.set_pixmap(
-                cached,
+                self._display_pixmap_for_view(cached),
                 original_width=image.width,
                 original_height=image.height,
                 fit_to_window=self.fit_to_window,
@@ -2503,7 +2658,7 @@ class ImagePreviewDialog(QDialog):
                 oldest_key = next(iter(self._linetop_render_cache))
                 self._linetop_render_cache.pop(oldest_key, None)
         self.image_view.set_pixmap(
-            pixmap,
+            self._display_pixmap_for_view(pixmap),
             original_width=image.width,
             original_height=image.height,
             fit_to_window=self.fit_to_window,
@@ -3058,6 +3213,7 @@ class ImagePreviewDialog(QDialog):
         self._preview_base_pixmap = pixmap
         self._preview_base_is_fallback = fallback_used
         self._preview_variant_cache.clear()
+        self._preview_display_cache.clear()
         self._render_current_image(use_thumbnail_first=True)
         self._start_queued_preview_source_load_if_needed()
 
@@ -3129,6 +3285,7 @@ class ImagePreviewDialog(QDialog):
         self._preview_base_pixmap = QPixmap()
         self._preview_base_is_fallback = False
         self._preview_variant_cache.clear()
+        self._preview_display_cache.clear()
 
     def _toggle_video_playback(self) -> None:
         image = self.current_image()

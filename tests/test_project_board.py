@@ -14,7 +14,7 @@ from PySide6.QtGui import QColor, QKeyEvent, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from eidory.models import ImageItem
-from eidory.ui.project_board import ProjectBoardView, _cached_pixmap
+from eidory.ui.project_board import BoardImageItem, ProjectBoardView, _cached_pixmap
 
 
 class ProjectBoardViewTest(unittest.TestCase):
@@ -133,6 +133,83 @@ class ProjectBoardViewTest(unittest.TestCase):
             self.assertTrue(getattr(restored_item, "is_flipped")())
             self.assertTrue(getattr(restored_item, "is_grayscale")())
 
+    def test_layout_payload_restores_local_display_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "first.png"
+            pixmap = QPixmap(400, 300)
+            pixmap.fill(QColor("#334455"))
+            self.assertTrue(pixmap.save(str(image_path)))
+
+            image = self._image(1, file_path=str(image_path), width=400, height=300)
+            board = ProjectBoardView()
+            board.set_images([image])
+            item = board._image_items[1]
+            self.assertIsInstance(item, BoardImageItem)
+            getattr(item, "set_local_display")(
+                {
+                    "enabled": True,
+                    "type": "polygon",
+                    "points": [[0.1, 0.1], [0.8, 0.2], [0.4, 0.75]],
+                },
+                shrink_to_bounds=True,
+            )
+
+            payload = board.layout_payload()
+            restored = ProjectBoardView()
+            restored.set_images([image], layout_payload=payload)
+            restored_item = restored._image_items[1]
+            local_payload = getattr(restored_item, "local_display_payload")()
+
+            self.assertEqual(local_payload["type"], "polygon")
+            self.assertTrue(local_payload["enabled"])
+            self.assertEqual(len(local_payload["points"]), 3)
+            self.assertLess(getattr(restored_item, "display_width"), local_payload["full_width"])
+
+    def test_local_display_toggle_preserves_saved_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "first.png"
+            pixmap = QPixmap(400, 300)
+            pixmap.fill(QColor("#334455"))
+            self.assertTrue(pixmap.save(str(image_path)))
+
+            image = self._image(1, file_path=str(image_path), width=400, height=300)
+            board = ProjectBoardView()
+            board.set_images([image])
+            item = board._image_items[1]
+            self.assertIsInstance(item, BoardImageItem)
+            getattr(item, "set_local_display")(
+                {"enabled": True, "type": "rect", "bounds": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.5}},
+                shrink_to_bounds=True,
+            )
+            local_width = getattr(item, "display_width")
+
+            board._select_image_id(1)
+            self.assertEqual(board.toggle_selected_local_display(), 1)
+            self.assertFalse(getattr(item, "is_local_display_enabled")())
+            self.assertGreater(getattr(item, "display_width"), local_width)
+            self.assertIsNotNone(getattr(item, "local_display_payload")())
+
+            self.assertEqual(board.toggle_selected_local_display(), 1)
+            self.assertTrue(getattr(item, "is_local_display_enabled")())
+            self.assertAlmostEqual(getattr(item, "display_width"), local_width, delta=0.01)
+
+    def test_polygon_local_display_renders_transparent_outside_polygon(self) -> None:
+        pixmap = QPixmap(100, 100)
+        pixmap.fill(QColor("#ff0000"))
+        item = BoardImageItem(image_id=1, pixmap=pixmap, file_path="/tmp/source.png")
+
+        item.set_local_display(
+            {
+                "enabled": True,
+                "type": "polygon",
+                "points": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            }
+        )
+
+        image = item.pixmap().toImage()
+        self.assertEqual(image.pixelColor(5, 5).alpha(), 255)
+        self.assertEqual(image.pixelColor(95, 95).alpha(), 0)
+
     def test_delete_key_requests_selected_image_removal(self) -> None:
         board = ProjectBoardView()
         board.set_images([self._image(1), self._image(2)])
@@ -185,9 +262,12 @@ class ProjectBoardViewTest(unittest.TestCase):
             def setEnabled(self, enabled: bool) -> None:
                 self.enabled = enabled
 
+        created_menus: list[object] = []
+
         class FakeMenu:
             def __init__(self, *_args, **_kwargs) -> None:
                 self.actions: list[FakeAction] = []
+                created_menus.append(self)
 
             def addAction(self, text: str) -> FakeAction:
                 action = FakeAction(text)
@@ -205,6 +285,10 @@ class ProjectBoardViewTest(unittest.TestCase):
 
         self.assertEqual(emitted, [1])
         self.assertTrue(fake_event.accepted)
+        menu_texts = [action.text for action in created_menus[0].actions]
+        self.assertIn("编辑局部展示", menu_texts)
+        self.assertIn("切换局部/全图", menu_texts)
+        self.assertNotIn("清除局部展示", menu_texts)
 
     def test_select_image_emits_selection_changed(self) -> None:
         board = ProjectBoardView()

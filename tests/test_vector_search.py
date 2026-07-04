@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -249,6 +250,44 @@ class VectorSearchTest(unittest.TestCase):
             self.assertEqual(excluded_collection_result.searchable_count, 1)
             self.assertEqual([image.id for image in excluded_collection_result.images], [blue_id])
 
+    def test_color_search_batches_missing_feature_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            for index in range(5):
+                image_path = root / f"{index}.jpg"
+                self._make_image(image_path, "red")
+                self._insert_image(store, folder_id, image_path, index + 1)
+
+            provider = FakeEmbeddingProvider()
+            service = SearchService(
+                store=store,
+                embedding_provider=provider,
+                vector_index=VectorIndex(
+                    store,
+                    model_name=provider.model_name,
+                    model_revision=provider.model_revision,
+                    embedding_dim=provider.dim,
+                ),
+            )
+
+            with (
+                patch.object(SearchService, "_COLOR_FEATURE_WRITE_BATCH_SIZE", 2),
+                patch.object(
+                    store,
+                    "upsert_color_feature_successes",
+                    wraps=store.upsert_color_feature_successes,
+                ) as success_writer,
+            ):
+                result = service.color_search((255, 0, 0))
+
+            self.assertEqual(result.searchable_count, 5)
+            self.assertEqual(success_writer.call_count, 3)
+            self.assertEqual(len(store.color_features_by_image_ids([image.id for image in result.images])), 5)
+
     def test_vector_index_upsert_and_remove_keep_loaded_index_current(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = MetadataStore(Path(tmp) / "eidory.sqlite3")
@@ -318,9 +357,9 @@ class VectorSearchTest(unittest.TestCase):
     def test_adaptive_candidate_limit(self) -> None:
         self.assertEqual(adaptive_candidate_limit(0), 0)
         self.assertEqual(adaptive_candidate_limit(300), 300)
-        self.assertEqual(adaptive_candidate_limit(2_000), 1_000)
-        self.assertEqual(adaptive_candidate_limit(20_000), 2_000)
-        self.assertEqual(adaptive_candidate_limit(100_000), 5_000)
+        self.assertEqual(adaptive_candidate_limit(2_000), 2_000)
+        self.assertEqual(adaptive_candidate_limit(20_000), 20_000)
+        self.assertEqual(adaptive_candidate_limit(100_000), 100_000)
 
     @staticmethod
     def _insert_image(store: MetadataStore, folder_id: int, path: Path, mtime_ns: int) -> int:

@@ -9,11 +9,12 @@ from eidory.ui.accessibility import disable_qt_accessibility, hide_macos_accessi
 
 
 class AccessibilityTest(unittest.TestCase):
-    def test_disable_qt_accessibility_does_not_force_disable_ax(self) -> None:
+    def test_disable_qt_accessibility_forces_qt_widget_tree_off(self) -> None:
         with patch.dict(os.environ, {"QT_ACCESSIBILITY": "1"}):
             disable_qt_accessibility()
 
-            self.assertNotIn("QT_ACCESSIBILITY", os.environ)
+            self.assertEqual(os.environ["QT_ACCESSIBILITY"], "0")
+            self.assertIn("qt.accessibility.*=false", os.environ["QT_LOGGING_RULES"])
 
     def test_hide_macos_accessibility_tree_ignores_non_macos(self) -> None:
         class Widget:

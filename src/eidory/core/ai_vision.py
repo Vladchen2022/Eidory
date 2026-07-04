@@ -12,7 +12,14 @@ import requests
 from eidory.core.image_loader import MAX_AI_VISION_UPLOAD_BYTES, open_local_image
 
 
-AI_VISION_PROMPT_VERSION = "scene-v1"
+AI_VISION_ANALYSIS_SCENE = "scene"
+AI_VISION_ANALYSIS_CHARACTER = "character"
+AI_VISION_ANALYSIS_TYPES = {AI_VISION_ANALYSIS_SCENE, AI_VISION_ANALYSIS_CHARACTER}
+AI_VISION_PROMPT_VERSIONS = {
+    AI_VISION_ANALYSIS_SCENE: "scene-v1",
+    AI_VISION_ANALYSIS_CHARACTER: "character-v1",
+}
+AI_VISION_PROMPT_VERSION = AI_VISION_PROMPT_VERSIONS[AI_VISION_ANALYSIS_SCENE]
 AI_VISION_MAX_TOKENS = 3072
 AI_VISION_REPAIR_MAX_RAW_CHARS = 12000
 
@@ -32,6 +39,15 @@ AI_VISION_REQUIRED_KEYS = {
     "shot_scale",
     "view_angle",
     "lighting",
+    "notes",
+}
+AI_CHARACTER_VISION_FIELD_VALUES: dict[str, list[str]] = {
+    "character_gender": ["male", "female", "unknown"],
+    "character_age_group": ["elderly", "middle_aged", "young_adult", "child", "unknown"],
+}
+AI_CHARACTER_VISION_REQUIRED_KEYS = {
+    "character_gender",
+    "character_age_group",
     "notes",
 }
 
@@ -107,6 +123,45 @@ AI_VISION_VALUE_ALIASES: dict[str, dict[str, str]] = {
         "silhouette": "back_light",
         "rim_light": "back_light",
     },
+    "character_gender": {
+        "man": "male",
+        "male_character": "male",
+        "boy": "male",
+        "男性": "male",
+        "男": "male",
+        "woman": "female",
+        "female_character": "female",
+        "girl": "female",
+        "女性": "female",
+        "女": "female",
+        "unclear": "unknown",
+        "not_visible": "unknown",
+    },
+    "character_age_group": {
+        "senior": "elderly",
+        "old": "elderly",
+        "old_adult": "elderly",
+        "elder": "elderly",
+        "老年": "elderly",
+        "老人": "elderly",
+        "middle_age": "middle_aged",
+        "middle-aged": "middle_aged",
+        "middle_adult": "middle_aged",
+        "中年": "middle_aged",
+        "adult": "young_adult",
+        "young": "young_adult",
+        "youth": "young_adult",
+        "teen": "child",
+        "teenager": "child",
+        "minor": "child",
+        "kid": "child",
+        "children": "child",
+        "少年": "child",
+        "儿童": "child",
+        "少年儿童": "child",
+        "unclear": "unknown",
+        "not_visible": "unknown",
+    },
 }
 
 AI_VISION_FIELD_LABELS_ZH = {
@@ -117,6 +172,8 @@ AI_VISION_FIELD_LABELS_ZH = {
     "shot_scale": "景别",
     "view_angle": "视角",
     "lighting": "光照",
+    "character_gender": "性别",
+    "character_age_group": "年龄段",
 }
 
 AI_VISION_VALUE_LABELS_ZH = {
@@ -153,6 +210,12 @@ AI_VISION_VALUE_LABELS_ZH = {
     "high_key": "高调",
     "diffuse": "散射光",
     "unclear": "光照不明显",
+    "male": "男",
+    "female": "女",
+    "elderly": "老年",
+    "middle_aged": "中年",
+    "young_adult": "青年",
+    "child": "少年儿童",
     "unknown": "无法判断",
 }
 
@@ -164,6 +227,8 @@ AI_VISION_FIELD_LABELS_EN = {
     "shot_scale": "Scale",
     "view_angle": "Angle",
     "lighting": "Lighting",
+    "character_gender": "Gender",
+    "character_age_group": "Age",
 }
 
 AI_VISION_VALUE_LABELS_EN = {
@@ -201,6 +266,12 @@ AI_VISION_VALUE_LABELS_EN = {
     "high_key": "High key",
     "diffuse": "Diffuse",
     "unclear": "Unclear",
+    "male": "Male",
+    "female": "Female",
+    "elderly": "Elderly",
+    "middle_aged": "Middle-aged",
+    "young_adult": "Young adult",
+    "child": "Child",
     "unknown": "Unknown",
 }
 
@@ -217,6 +288,8 @@ class AIVisionAnalysis:
     confidence: dict[str, float]
     notes: str
     raw_json: dict[str, Any]
+    character_gender: str = "unknown"
+    character_age_group: str = "unknown"
 
 
 class AIVisionProviderError(RuntimeError):
@@ -242,18 +315,32 @@ class AIVisionProvider:
         self.timeout_seconds = timeout_seconds
         self.provider_name = self.service_name
 
-    def analyze_image(self, image_path: str | Path) -> AIVisionAnalysis:
+    def analyze_image(
+        self,
+        image_path: str | Path,
+        *,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+    ) -> AIVisionAnalysis:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         path = Path(image_path)
         if not path.exists():
             raise AIVisionProviderError(f"源文件不存在：{path}")
         model_name = self.model_name or self._first_available_model()
-        raw = self._chat_completion(model_name=model_name, image_path=path)
+        raw = self._chat_completion(
+            model_name=model_name,
+            image_path=path,
+            analysis_type=analysis_type,
+        )
         try:
-            return parse_ai_vision_analysis(raw)
+            return parse_ai_vision_analysis(raw, analysis_type=analysis_type)
         except AIVisionProviderError as original_error:
-            repaired = self._repair_chat_completion(model_name=model_name, raw=raw)
+            repaired = self._repair_chat_completion(
+                model_name=model_name,
+                raw=raw,
+                analysis_type=analysis_type,
+            )
             try:
-                return parse_ai_vision_analysis(repaired)
+                return parse_ai_vision_analysis(repaired, analysis_type=analysis_type)
             except AIVisionProviderError as repair_error:
                 raise AIVisionProviderError(
                     f"{original_error}；JSON 修复失败：{repair_error}"
@@ -265,7 +352,13 @@ class AIVisionProvider:
         self.model_name = self._first_available_model()
         return self.model_name
 
-    def _chat_completion(self, *, model_name: str, image_path: Path) -> str:
+    def _chat_completion(
+        self,
+        *,
+        model_name: str,
+        image_path: Path,
+        analysis_type: str,
+    ) -> str:
         payload: dict[str, Any] = {
             "model": model_name,
             "messages": [
@@ -283,14 +376,14 @@ class AIVisionProvider:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": build_ai_vision_prompt()},
+                        {"type": "text", "text": build_ai_vision_prompt(analysis_type)},
                         {"type": "image_url", "image_url": {"url": image_to_data_url(image_path)}},
                     ],
                 },
             ],
             "temperature": self.temperature,
             "max_tokens": AI_VISION_MAX_TOKENS,
-            "response_format": ai_vision_response_format(),
+            "response_format": ai_vision_response_format(analysis_type),
         }
         headers = self._headers()
         try:
@@ -322,7 +415,13 @@ class AIVisionProvider:
             raise AIVisionProviderError("视觉模型返回了空内容")
         return content
 
-    def _repair_chat_completion(self, *, model_name: str, raw: str) -> str:
+    def _repair_chat_completion(
+        self,
+        *,
+        model_name: str,
+        raw: str,
+        analysis_type: str,
+    ) -> str:
         payload: dict[str, Any] = {
             "model": model_name,
             "messages": [
@@ -335,11 +434,11 @@ class AIVisionProvider:
                         "不要新增不可见事实；缺失或不确定字段用 unknown/not_visible/unclear。"
                     ),
                 },
-                {"role": "user", "content": build_ai_vision_repair_prompt(raw)},
+                {"role": "user", "content": build_ai_vision_repair_prompt(raw, analysis_type)},
             ],
             "temperature": 0,
             "max_tokens": AI_VISION_MAX_TOKENS,
-            "response_format": ai_vision_response_format(),
+            "response_format": ai_vision_response_format(analysis_type),
         }
         headers = self._headers()
         try:
@@ -394,7 +493,28 @@ class AIVisionProvider:
         return {}
 
 
-def build_ai_vision_prompt() -> str:
+def normalize_ai_vision_analysis_type(analysis_type: str) -> str:
+    clean = str(analysis_type or AI_VISION_ANALYSIS_SCENE).strip().lower()
+    if clean not in AI_VISION_ANALYSIS_TYPES:
+        raise ValueError(f"unknown AI vision analysis type: {analysis_type}")
+    return clean
+
+
+def ai_vision_prompt_version(
+    analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+) -> str:
+    return AI_VISION_PROMPT_VERSIONS[normalize_ai_vision_analysis_type(analysis_type)]
+
+
+def build_ai_vision_prompt(
+    analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+) -> str:
+    if normalize_ai_vision_analysis_type(analysis_type) == AI_VISION_ANALYSIS_CHARACTER:
+        return build_ai_character_vision_prompt()
+    return build_ai_scene_vision_prompt()
+
+
+def build_ai_scene_vision_prompt() -> str:
     allowed = {
         **AI_VISION_FIELD_VALUES,
         "lighting": AI_VISION_LIGHTING_VALUES,
@@ -426,7 +546,35 @@ def build_ai_vision_prompt() -> str:
     )
 
 
-def build_ai_vision_repair_prompt(raw: str) -> str:
+def build_ai_character_vision_prompt() -> str:
+    allowed = AI_CHARACTER_VISION_FIELD_VALUES
+    return (
+        "/no_think\n"
+        "分析这张图中最主要、最清晰的人类或类人角色，只返回一个 JSON 对象。\n"
+        "第一字符必须是 {，最后字符必须是 }。禁止输出推理、解释、自然语言前后缀或 Markdown。\n"
+        "不要识别人物身份、艺术家、IP、职业、民族、种族或故事剧情。\n"
+        "只根据画面可见外观判断角色视觉标签；如果没有可见角色、看不清、多人冲突或无法判断，必须用 unknown。\n"
+        "字段必须严格如下：\n"
+        f"- character_gender 取值 {AI_CHARACTER_VISION_FIELD_VALUES['character_gender']}\n"
+        f"- character_age_group 取值 {AI_CHARACTER_VISION_FIELD_VALUES['character_age_group']}\n"
+        "每个字段输出 {\"value\":\"...\",\"confidence\":0.0,\"note\":\"...\"}。\n"
+        "所有 note 都必须很短，不超过 20 个中文字。\n"
+        "notes 输出一句很短的中文说明，专门写不确定或容易误判的地方。\n"
+        "不要输出允许值之外的值。\n"
+        f"允许值全集：{json.dumps(allowed, ensure_ascii=False)}"
+    )
+
+
+def build_ai_vision_repair_prompt(
+    raw: str,
+    analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+) -> str:
+    if normalize_ai_vision_analysis_type(analysis_type) == AI_VISION_ANALYSIS_CHARACTER:
+        return build_ai_character_vision_repair_prompt(raw)
+    return build_ai_scene_vision_repair_prompt(raw)
+
+
+def build_ai_scene_vision_repair_prompt(raw: str) -> str:
     allowed = {
         **AI_VISION_FIELD_VALUES,
         "lighting": AI_VISION_LIGHTING_VALUES,
@@ -448,7 +596,25 @@ def build_ai_vision_repair_prompt(raw: str) -> str:
     )
 
 
-def ai_vision_response_format() -> dict[str, Any]:
+def build_ai_character_vision_repair_prompt(raw: str) -> str:
+    clipped = raw.strip()[:AI_VISION_REPAIR_MAX_RAW_CHARS]
+    return (
+        "/no_think\n"
+        "把下面的视觉模型输出修复成 Eidory AI 角色视觉标签 JSON。\n"
+        "只输出 JSON 对象，不要 Markdown，不要解释，不要代码块。\n"
+        "字段必须完整：character_gender, character_age_group, notes。\n"
+        "每个字段格式：{\"value\":\"...\",\"confidence\":0.0,\"note\":\"...\"}。\n"
+        "如果原始输出缺失某字段，按可见信息补；不能判断就用 unknown。\n"
+        "不要输出允许值之外的值。\n"
+        f"允许值全集：{json.dumps(AI_CHARACTER_VISION_FIELD_VALUES, ensure_ascii=False)}\n"
+        "原始输出：\n"
+        f"{clipped}"
+    )
+
+
+def ai_vision_response_format(
+    analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+) -> dict[str, Any]:
     scalar = {
         "type": "object",
         "properties": {
@@ -459,6 +625,25 @@ def ai_vision_response_format() -> dict[str, Any]:
         "required": ["value", "confidence", "note"],
         "additionalProperties": False,
     }
+    if normalize_ai_vision_analysis_type(analysis_type) == AI_VISION_ANALYSIS_CHARACTER:
+        schema = {
+            "type": "object",
+            "properties": {
+                "character_gender": scalar,
+                "character_age_group": scalar,
+                "notes": {"type": "string"},
+            },
+            "required": ["character_gender", "character_age_group", "notes"],
+            "additionalProperties": False,
+        }
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "eidory_ai_character_vision_tags",
+                "strict": True,
+                "schema": schema,
+            },
+        }
     schema = {
         "type": "object",
         "properties": {
@@ -493,17 +678,29 @@ def ai_vision_response_format() -> dict[str, Any]:
     }
 
 
-def parse_ai_vision_analysis(raw: str) -> AIVisionAnalysis:
+def parse_ai_vision_analysis(
+    raw: str,
+    analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+) -> AIVisionAnalysis:
     content = raw.strip()
     if content.startswith("```"):
         content = content.strip("`")
         if content.startswith("json"):
             content = content[4:].strip()
-    data = _extract_ai_vision_json_object(content)
-    return normalize_ai_vision_analysis(data)
+    data = _extract_ai_vision_json_object(content, analysis_type=analysis_type)
+    return normalize_ai_vision_analysis(data, analysis_type=analysis_type)
 
 
-def _extract_ai_vision_json_object(content: str) -> dict[str, Any]:
+def _extract_ai_vision_json_object(
+    content: str,
+    *,
+    analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+) -> dict[str, Any]:
+    required_keys = (
+        AI_CHARACTER_VISION_REQUIRED_KEYS
+        if normalize_ai_vision_analysis_type(analysis_type) == AI_VISION_ANALYSIS_CHARACTER
+        else AI_VISION_REQUIRED_KEYS
+    )
     decoder = json.JSONDecoder()
     found_json_start = False
     last_error: json.JSONDecodeError | None = None
@@ -518,7 +715,7 @@ def _extract_ai_vision_json_object(content: str) -> dict[str, Any]:
             last_error = exc
             continue
         if isinstance(data, dict):
-            if AI_VISION_REQUIRED_KEYS.issubset(data.keys()):
+            if required_keys.issubset(data.keys()):
                 return data
             if fallback is None:
                 fallback = data
@@ -531,7 +728,12 @@ def _extract_ai_vision_json_object(content: str) -> dict[str, Any]:
     raise AIVisionProviderError("视觉模型没有返回 JSON 对象")
 
 
-def normalize_ai_vision_analysis(data: dict[str, Any]) -> AIVisionAnalysis:
+def normalize_ai_vision_analysis(
+    data: dict[str, Any],
+    analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+) -> AIVisionAnalysis:
+    if normalize_ai_vision_analysis_type(analysis_type) == AI_VISION_ANALYSIS_CHARACTER:
+        return normalize_ai_character_vision_analysis(data)
     values: dict[str, str] = {}
     confidence: dict[str, float] = {}
     for field, allowed in AI_VISION_FIELD_VALUES.items():
@@ -575,6 +777,38 @@ def normalize_ai_vision_analysis(data: dict[str, Any]) -> AIVisionAnalysis:
         confidence=confidence,
         notes=str(data.get("notes") or "").strip()[:1000],
         raw_json=data,
+    )
+
+
+def normalize_ai_character_vision_analysis(data: dict[str, Any]) -> AIVisionAnalysis:
+    values: dict[str, str] = {}
+    confidence: dict[str, float] = {}
+    for field, allowed in AI_CHARACTER_VISION_FIELD_VALUES.items():
+        item = data.get(field)
+        if not isinstance(item, dict):
+            raise AIVisionProviderError(f"{field} 缺失")
+        value = normalize_ai_vision_value(field, item.get("value"))
+        if value not in allowed:
+            raise AIVisionProviderError(f"{field} 取值无效：{value}")
+        conf = item.get("confidence")
+        if not isinstance(conf, (int, float)) or not 0 <= float(conf) <= 1:
+            raise AIVisionProviderError(f"{field} 置信度无效：{conf}")
+        values[field] = value
+        confidence[field] = float(conf)
+
+    return AIVisionAnalysis(
+        scene_location="unknown",
+        environment_type="unknown",
+        time_of_day="unknown",
+        weather="unknown",
+        shot_scale="unknown",
+        view_angle="unknown",
+        lighting=[],
+        confidence=confidence,
+        notes=str(data.get("notes") or "").strip()[:1000],
+        raw_json=data,
+        character_gender=values["character_gender"],
+        character_age_group=values["character_age_group"],
     )
 
 

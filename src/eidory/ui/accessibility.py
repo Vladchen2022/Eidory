@@ -8,17 +8,39 @@ from typing import Callable
 
 
 def disable_qt_accessibility(log_error: Callable[[str], None] | None = None) -> None:
-    # Keep the public helper for older call sites, but do not force-disable Qt AX.
-    # Disabling/hiding Qt's Cocoa accessibility tree can leave AppKit serving
-    # stale accessibility objects to external tools and has caused native crashes.
-    os.environ.pop("QT_ACCESSIBILITY", None)
+    # Keep AppKit's top-level window available for window managers, but stop
+    # Qt from exposing the full widget/table subtree. The Qt AX table backend
+    # can repeatedly query out-of-range cells on large Eidory views and burn CPU.
+    os.environ["QT_ACCESSIBILITY"] = "0"
+    _append_qt_logging_rule("qt.accessibility.*=false")
+    try:
+        from PySide6.QtGui import QAccessible
+
+        QAccessible.setActive(False)
+    except Exception as exc:
+        if log_error is not None:
+            log_error(f"禁用 Qt Accessibility 失败：{exc}")
+
+
+def _append_qt_logging_rule(rule: str) -> None:
+    existing = os.environ.get("QT_LOGGING_RULES", "").strip()
+    if not existing:
+        os.environ["QT_LOGGING_RULES"] = rule
+        return
+    rules = [part.strip() for part in existing.split(";") if part.strip()]
+    if rule not in rules:
+        os.environ["QT_LOGGING_RULES"] = ";".join([*rules, rule])
 
 
 def hide_macos_accessibility_tree(
     widget: object,
     log_error: Callable[[str], None] | None = None,
 ) -> bool:
-    """Hide the Cocoa/Qt accessibility subtree from deep external hierarchy scans."""
+    """Hide only the Qt content subtree from deep external hierarchy scans.
+
+    Keep NSApplication and NSWindow exposed so macOS window managers can still
+    resize and move the top-level window through Accessibility APIs.
+    """
 
     if sys.platform != "darwin":
         return False
@@ -107,8 +129,7 @@ def _hide_macos_accessibility_tree_for_native_view(native_view: int, objc_path: 
 
     window = send_id_message(native_view, "window")
     content_view = send_id_message(window, "contentView") if window else 0
-    ns_application = send_id_message(cls("NSApplication"), "sharedApplication")
-    targets = (ns_application, window, content_view, native_view)
+    targets = (content_view, native_view)
     applied = False
     for target in targets:
         applied = send_bool_message(target, "setAccessibilityElementsHidden:", True) or applied

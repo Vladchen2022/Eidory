@@ -19,7 +19,11 @@ from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem, QMessageBo
 from PIL import Image
 
 from eidory.config import AppPaths
-from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
+from eidory.core.ai_vision import (
+    AI_VISION_ANALYSIS_CHARACTER,
+    AI_VISION_PROMPT_VERSION,
+    AIVisionAnalysis,
+)
 from eidory.core.duplicate_detection import DuplicateGroup, DuplicateMember
 from eidory.core.embedding_worker import EmbeddingProgress
 from eidory.core.inspiration import InspirationMatch, InspirationTerm
@@ -224,7 +228,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window._selected_saved_view_id(), saved_view_id)
             window.close()
 
-    def test_main_window_does_not_disable_qt_accessibility_backend(self) -> None:
+    def test_main_window_disables_qt_accessibility_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -241,7 +245,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
 
-            self.assertTrue(QAccessible.isActive())
+            self.assertFalse(QAccessible.isActive())
             window.close()
 
     def test_sqlite_utility_connection_uses_store_busy_timeout(self) -> None:
@@ -390,6 +394,29 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
         self.assertEqual(configured, [7])
 
+    def test_file_watcher_configured_does_not_rewrite_status_bar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window.statusBar().showMessage("用户操作提示")
+
+            window._handle_file_watch_configured(147)
+
+            self.assertEqual(window._file_watch_configured_count, 147)
+            self.assertEqual(window._pending_watch_path_total, 0)
+            self.assertEqual(window.statusBar().currentMessage(), "用户操作提示")
+            window.close()
+
     def test_file_watcher_discards_stale_background_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -516,8 +543,14 @@ class MainWindowContextMenuTest(unittest.TestCase):
             store = MetadataStore(paths.database_path)
             store.initialize()
             included = store.create_collection("需要识别")
+            character_included = store.create_collection("角色识别")
             excluded = store.create_collection("旧排除项")
             store.set_ai_vision_collection_rule(included, mode="include")
+            store.set_ai_vision_collection_rule(
+                character_included,
+                mode="include",
+                analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+            )
             store.set_ai_vision_collection_rule(excluded, mode="exclude")
 
             window = MainWindow(paths=paths, store=store)
@@ -532,6 +565,11 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertFalse(hasattr(window, "add_ai_vision_exclude_rule_button"))
             self.assertEqual(window.ai_vision_rule_tree.topLevelItemCount(), 1)
             self.assertEqual(window.ai_vision_rule_tree.topLevelItem(0).text(0), "需要识别")
+            self.assertEqual(window.ai_vision_index_tabs.tabText(0), "场景视觉标签")
+            self.assertEqual(window.ai_vision_index_tabs.tabText(1), "角色视觉标签")
+            self.assertEqual(window.ai_character_vision_rule_tree.columnCount(), 5)
+            self.assertEqual(window.ai_character_vision_rule_tree.topLevelItemCount(), 1)
+            self.assertEqual(window.ai_character_vision_rule_tree.topLevelItem(0).text(0), "角色识别")
             window.close()
 
     def test_result_status_reuses_short_lived_count_cache(self) -> None:
@@ -894,6 +932,11 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(window.board_hide_selected_button.isVisible())
             self.assertTrue(window.board_fit_all_button.isVisible())
             self.assertTrue(window.board_grayscale_button.isVisible())
+            self.assertTrue(window.board_edit_local_display_button.isVisible())
+            self.assertTrue(window.board_toggle_local_display_button.isVisible())
+            self.assertFalse(window.save_project_board_layout_button.isVisible())
+            self.assertFalse(window.board_import_button.isVisible())
+            self.assertFalse(window.board_show_all_button.isVisible())
             window.close()
 
     def test_search_operation_defaults_to_replace_until_results_exist(self) -> None:
@@ -1036,6 +1079,49 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             self.assertTrue(window.color_mode_button.isChecked())
             start_search.assert_called_once_with(SearchFilter("color", (1, 2, 3)))
+            window.close()
+
+    def test_top_bar_has_separate_ai_character_filter_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            scene_fields = {
+                window.ai_vision_field_filter_combo.itemData(index)
+                for index in range(window.ai_vision_field_filter_combo.count())
+            }
+            character_fields = {
+                window.ai_character_vision_field_filter_combo.itemData(index)
+                for index in range(window.ai_character_vision_field_filter_combo.count())
+            }
+            self.assertNotIn("character_gender", scene_fields)
+            self.assertEqual(character_fields, {"character_gender", "character_age_group"})
+
+            window._set_combo_to_data(
+                window.ai_character_vision_field_filter_combo,
+                "character_age_group",
+            )
+            window._refresh_ai_character_vision_value_filter_combo()
+            window._set_combo_to_data(
+                window.ai_character_vision_value_filter_combo,
+                "young_adult",
+            )
+            with patch.object(window, "_start_search_with_filter") as start_search:
+                window._add_ai_character_vision_filter_from_controls()
+
+            start_search.assert_called_once_with(
+                SearchFilter("ai_vision", "character_age_group:young_adult")
+            )
             window.close()
 
     def test_cancel_search_operation_prompt_keeps_current_results(self) -> None:
@@ -3075,6 +3161,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ]
             self.assertNotIn("未标签", top_labels)
             self.assertNotIn("未AI标签", top_labels)
+            self.assertNotIn("未AI场景标签", top_labels)
+            self.assertNotIn("未AI角色标签", top_labels)
             self.assertEqual(top_labels[-1], "未分类")
             tag_labels = [window.tag_list.item(index).text() for index in range(window.tag_list.count())]
             self.assertTrue(any(label.startswith("未标签") for label in tag_labels))
@@ -3082,7 +3170,12 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 window.ai_vision_virtual_filter_list.item(index).text()
                 for index in range(window.ai_vision_virtual_filter_list.count())
             ]
-            self.assertTrue(any(label.startswith("未AI标签") for label in ai_labels))
+            ai_character_labels = [
+                window.ai_character_vision_virtual_filter_list.item(index).text()
+                for index in range(window.ai_character_vision_virtual_filter_list.count())
+            ]
+            self.assertTrue(any(label.startswith("未AI场景标签") for label in ai_labels))
+            self.assertTrue(any(label.startswith("未AI角色标签") for label in ai_character_labels))
 
             untagged_item = next(
                 window.tag_list.item(index)
@@ -5642,6 +5735,78 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window._refresh_visible_results_after_result_management_change()
 
             self.assertEqual([image.id for image in window.grid_view.images()], [3, 2, 1])
+            window.close()
+
+    def test_shuffle_library_uses_complete_current_scope_not_loaded_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            for image_id in range(1, 6):
+                store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{image_id}.jpg"),
+                    file_size=100,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=image_id,
+                )
+            window = MainWindow(paths=paths, store=store)
+            window.page_size = 2
+            window.show()
+            self.app.processEvents()
+            window._reload_images()
+            self.assertEqual([image.id for image in window.grid_view.images()], [5, 4])
+
+            with patch("eidory.ui.main_window.random.shuffle", side_effect=lambda values: values.reverse()):
+                window._shuffle_current_grid_images()
+
+            self.assertEqual([image.id for image in window.grid_view.images()], [1, 2, 3, 4, 5])
+            self.assertEqual(window.manual_result_order_ids, [1, 2, 3, 4, 5])
+            self.assertFalse(window.load_more_button.isEnabled())
+            window.close()
+
+    def test_gallery_scroll_near_bottom_auto_loads_next_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            for image_id in range(1, 6):
+                store.upsert_image(
+                    folder_id=folder_id,
+                    file_path=str(Path(tmp) / "library" / f"{image_id}.jpg"),
+                    file_size=100,
+                    width=100,
+                    height=100,
+                    created_time_ns=None,
+                    modified_time_ns=image_id,
+                )
+            window = MainWindow(paths=paths, store=store)
+            window.page_size = 2
+            window.show()
+            self.app.processEvents()
+            window._reload_images()
+            self.assertEqual([image.id for image in window.grid_view.images()], [5, 4])
+
+            window._maybe_auto_load_more(window.grid_view.verticalScrollBar().maximum())
+
+            self.assertEqual([image.id for image in window.grid_view.images()], [5, 4, 3, 2])
+            self.assertTrue(window.load_more_button.isEnabled())
             window.close()
 
     def test_background_embedding_progress_does_not_reset_current_grid(self) -> None:

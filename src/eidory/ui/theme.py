@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from PySide6.QtGui import QPalette, QColor
+from PySide6.QtGui import QFont, QFontDatabase, QPalette, QColor
 from PySide6.QtWidgets import QApplication
 
 
 def apply_dark_theme(app: QApplication) -> None:
+    families = set(QFontDatabase.families())
+    for family in (".AppleSystemUIFont", "Helvetica Neue", "Arial"):
+        if family in families:
+            app.setFont(QFont(family))
+            break
+    else:
+        app.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont))
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor("#34373d"))
     palette.setColor(QPalette.ColorRole.WindowText, QColor("#e6e8eb"))

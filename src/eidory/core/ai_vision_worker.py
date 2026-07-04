@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from eidory.core.ai_vision import AI_VISION_PROMPT_VERSION, AIVisionAnalysis, AIVisionProvider
+from eidory.core.ai_vision import (
+    AI_VISION_ANALYSIS_SCENE,
+    AIVisionAnalysis,
+    AIVisionProvider,
+    ai_vision_prompt_version,
+    normalize_ai_vision_analysis_type,
+)
 from eidory.core.metadata_store import MetadataStore
 from eidory.models import ImageItem
 
@@ -17,6 +23,7 @@ class AIVisionProgress:
     file_name: str | None
     status: str
     message: str
+    analysis_type: str = AI_VISION_ANALYSIS_SCENE
 
 
 AIVisionProgressCallback = Callable[[AIVisionProgress], None]
@@ -28,12 +35,15 @@ class AIVisionWorker(threading.Thread):
         *,
         store: MetadataStore,
         provider: AIVisionProvider,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
         idle_sleep_seconds: float = 2.0,
         on_progress: AIVisionProgressCallback | None = None,
     ):
         super().__init__(daemon=True)
         self.store = store
         self.provider = provider
+        self.analysis_type = normalize_ai_vision_analysis_type(analysis_type)
+        self.prompt_version = ai_vision_prompt_version(self.analysis_type)
         self.idle_sleep_seconds = idle_sleep_seconds
         self.on_progress = on_progress
         self._stop_event = threading.Event()
@@ -62,11 +72,11 @@ class AIVisionWorker(threading.Thread):
             jobs = self.store.next_ai_vision_jobs(
                 provider_name=self.provider.provider_name,
                 model_name=model_name,
-                prompt_version=AI_VISION_PROMPT_VERSION,
+                prompt_version=self.prompt_version,
+                analysis_type=self.analysis_type,
                 limit=1,
             )
             if not jobs:
-                self._emit(None, None, "idle", "no pending AI vision jobs")
                 self._stop_event.wait(self.idle_sleep_seconds)
                 continue
             for image in jobs:
@@ -84,7 +94,8 @@ class AIVisionWorker(threading.Thread):
                 image_id=image.id,
                 provider_name=self.provider.provider_name,
                 model_name=model_name,
-                prompt_version=AI_VISION_PROMPT_VERSION,
+                prompt_version=self.prompt_version,
+                analysis_type=self.analysis_type,
                 error_message=message,
             )
             self._emit(image.id, image.file_name, "failed", message)
@@ -93,7 +104,8 @@ class AIVisionWorker(threading.Thread):
             image_id=image.id,
             provider_name=self.provider.provider_name,
             model_name=model_name,
-            prompt_version=AI_VISION_PROMPT_VERSION,
+            prompt_version=self.prompt_version,
+            analysis_type=self.analysis_type,
         )
         self._emit(image.id, image.file_name, "processing", "analyzing image")
         try:
@@ -102,7 +114,8 @@ class AIVisionWorker(threading.Thread):
                 image_id=image.id,
                 provider_name=self.provider.provider_name,
                 model_name=model_name,
-                prompt_version=AI_VISION_PROMPT_VERSION,
+                prompt_version=self.prompt_version,
+                analysis_type=self.analysis_type,
                 analysis=analysis,
                 source_modified_time_ns=image.modified_time_ns,
             )
@@ -112,7 +125,8 @@ class AIVisionWorker(threading.Thread):
                 image_id=image.id,
                 provider_name=self.provider.provider_name,
                 model_name=model_name,
-                prompt_version=AI_VISION_PROMPT_VERSION,
+                prompt_version=self.prompt_version,
+                analysis_type=self.analysis_type,
                 error_message=str(exc),
             )
             self._emit(image.id, image.file_name, "failed", str(exc))
@@ -121,7 +135,10 @@ class AIVisionWorker(threading.Thread):
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                return self.provider.analyze_image(image.file_path)
+                return self.provider.analyze_image(
+                    image.file_path,
+                    analysis_type=self.analysis_type,
+                )
             except Exception as exc:
                 last_error = exc
                 if attempt >= 2 or not self._is_retryable_error(exc):
@@ -161,4 +178,12 @@ class AIVisionWorker(threading.Thread):
         message: str,
     ) -> None:
         if self.on_progress is not None:
-            self.on_progress(AIVisionProgress(image_id, file_name, status, message))
+            self.on_progress(
+                AIVisionProgress(
+                    image_id,
+                    file_name,
+                    status,
+                    message,
+                    self.analysis_type,
+                )
+            )

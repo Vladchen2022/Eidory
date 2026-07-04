@@ -69,7 +69,6 @@ class EmbeddingWorker(threading.Thread):
                 limit=self.batch_size,
             )
             if not jobs:
-                self._emit(None, None, "idle", "no pending embedding jobs")
                 self._stop_event.wait(self.idle_sleep_seconds)
                 continue
             for image in jobs:

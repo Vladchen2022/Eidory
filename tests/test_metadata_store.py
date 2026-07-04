@@ -8,7 +8,13 @@ from pathlib import Path
 
 import numpy as np
 
-from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
+from eidory.core.ai_vision import (
+    AI_VISION_ANALYSIS_CHARACTER,
+    AI_VISION_ANALYSIS_SCENE,
+    AI_VISION_PROMPT_VERSION,
+    AIVisionAnalysis,
+    ai_vision_prompt_version,
+)
 from eidory.core.color_features import COLOR_VECTOR_DIM
 from eidory.core.duplicate_detection import ImageHashCacheRecord
 from eidory.core.metadata_store import MetadataStore, TEMPORARY_PROJECT_COLORS
@@ -1155,6 +1161,10 @@ class MetadataStoreTest(unittest.TestCase):
                 [second, first, third],
             )
             self.assertEqual(
+                [image.id for image in store.list_images(limit=None, sort_key="duration")],
+                [second, first, third],
+            )
+            self.assertEqual(
                 [image.id for image in store.list_images(limit=10, sort_key="pixels")],
                 [second, third, first],
             )
@@ -1369,6 +1379,28 @@ class MetadataStoreTest(unittest.TestCase):
                     )
                 ],
                 [first],
+            )
+            self.assertEqual(
+                store.image_ids_matching_tags(
+                    [indoor_id, outdoor_id],
+                    tag_match_mode="any",
+                ),
+                {first, second, third},
+            )
+            self.assertEqual(
+                store.image_ids_matching_tags(
+                    [indoor_id, night_id],
+                    tag_match_mode="all",
+                ),
+                {first},
+            )
+            self.assertEqual(
+                store.image_ids_matching_tags(
+                    [indoor_id, outdoor_id],
+                    tag_match_mode="any",
+                    excluded_folder_path_prefixes=[str(root)],
+                ),
+                set(),
             )
 
     def test_tag_management_rename_delete_merge_and_counts(self) -> None:
@@ -1823,6 +1855,58 @@ class MetadataStoreTest(unittest.TestCase):
                 store.image_ids_matching_ai_vision("lighting", "back_light"),
                 {first},
             )
+            character_prompt_version = ai_vision_prompt_version(AI_VISION_ANALYSIS_CHARACTER)
+            store.set_ai_vision_collection_rule(
+                black,
+                mode="include",
+                include_descendants=True,
+                analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+            )
+            character_stats = store.ai_vision_stats(
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=character_prompt_version,
+                analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+            )
+            self.assertEqual(character_stats["total"], 1)
+            self.assertEqual(character_stats["pending"], 1)
+            self.assertEqual(
+                [image.id for image in store.next_ai_vision_jobs(
+                    provider_name="LM Studio",
+                    model_name="vision-model",
+                    prompt_version=character_prompt_version,
+                    analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+                    limit=10,
+                )],
+                [first],
+            )
+            store.upsert_ai_vision_success(
+                image_id=first,
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=character_prompt_version,
+                analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+                analysis=self._ai_character_vision_analysis(),
+                source_modified_time_ns=1,
+            )
+            self.assertEqual(
+                store.ai_vision_tags_for_image(
+                    first,
+                    analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+                )["character_gender"],
+                "male",
+            )
+            self.assertEqual(
+                store.ai_vision_tags_for_image(
+                    first,
+                    analysis_type=AI_VISION_ANALYSIS_SCENE,
+                )["scene_location"],
+                "outdoor",
+            )
+            self.assertEqual(
+                store.image_ids_matching_ai_vision("character_gender", "male"),
+                {first},
+            )
             stats = store.ai_vision_stats(
                 provider_name="LM Studio",
                 model_name="vision-model",
@@ -1851,6 +1935,13 @@ class MetadataStoreTest(unittest.TestCase):
                 modified_time_ns=99,
             )
             self.assertEqual(store.ai_vision_tags_for_image(first)["status"], "stale")
+            self.assertEqual(
+                store.ai_vision_tags_for_image(
+                    first,
+                    analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+                )["status"],
+                "stale",
+            )
 
             store.set_ai_vision_collection_rule(global_ref, mode="exclude")
             stats = store.ai_vision_stats(
@@ -1906,13 +1997,137 @@ class MetadataStoreTest(unittest.TestCase):
                 {uncategorized, tagged_no_ai, untagged_no_ai},
             )
             self.assertEqual(
+                {image.id for image in store.list_images(virtual_filter="un_ai_scene_tagged", limit=50)},
+                {uncategorized, tagged_no_ai, untagged_no_ai},
+            )
+            self.assertEqual(
+                {image.id for image in store.list_images(virtual_filter="un_ai_character_tagged", limit=50)},
+                {uncategorized, tagged_ready, tagged_no_ai, untagged_no_ai},
+            )
+            self.assertEqual(
                 {image.id for image in store.list_images(virtual_filter="uncategorized", limit=50)},
                 {uncategorized, video_id},
             )
 
             self.assertEqual(store.count_images_for_virtual_filter("untagged"), 3)
             self.assertEqual(store.count_images_for_virtual_filter("un_ai_tagged"), 3)
+            self.assertEqual(store.count_images_for_virtual_filter("un_ai_scene_tagged"), 3)
+            self.assertEqual(store.count_images_for_virtual_filter("un_ai_character_tagged"), 4)
             self.assertEqual(store.count_images_for_virtual_filter("uncategorized"), 2)
+
+    def test_ai_vision_schema_migration_preserves_scene_tags_and_allows_character_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            root = Path(tmp) / "library"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            collection_id = store.create_collection("参考")
+            image_id = self._insert_image(store, folder_id, root / "image.jpg", 1)
+            with store.connect() as conn:
+                conn.execute("DROP TABLE ai_vision_tags")
+                conn.execute("DROP TABLE ai_vision_collection_rules")
+                conn.execute(
+                    """
+                    CREATE TABLE ai_vision_collection_rules (
+                        collection_id INTEGER PRIMARY KEY,
+                        mode TEXT NOT NULL,
+                        include_descendants INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE ai_vision_tags (
+                        image_id INTEGER PRIMARY KEY,
+                        provider_name TEXT NOT NULL,
+                        model_name TEXT NOT NULL,
+                        prompt_version TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        scene_location TEXT,
+                        environment_type TEXT,
+                        time_of_day TEXT,
+                        weather TEXT,
+                        shot_scale TEXT,
+                        view_angle TEXT,
+                        lighting_json TEXT NOT NULL DEFAULT '[]',
+                        confidence_json TEXT NOT NULL DEFAULT '{}',
+                        notes TEXT,
+                        error_message TEXT,
+                        source_modified_time_ns INTEGER,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ai_vision_collection_rules(
+                        collection_id, mode, include_descendants, created_at, updated_at
+                    )
+                    VALUES (?, 'include', 1, 'now', 'now')
+                    """,
+                    (collection_id,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ai_vision_tags(
+                        image_id, provider_name, model_name, prompt_version, status,
+                        scene_location, environment_type, time_of_day, weather,
+                        shot_scale, view_angle, lighting_json, confidence_json, notes,
+                        error_message, source_modified_time_ns, created_at, updated_at
+                    )
+                    VALUES (
+                        ?, 'LM Studio', 'vision-model', ?, 'ready',
+                        'outdoor', 'natural', 'day', 'sunny',
+                        'long', 'eye_level', '["back_light"]', '{}', 'legacy',
+                        NULL, 1, 'now', 'now'
+                    )
+                    """,
+                    (image_id, AI_VISION_PROMPT_VERSION),
+                )
+
+            migrated = MetadataStore(db_path)
+            migrated.initialize()
+            scene_tags = migrated.ai_vision_tags_for_image(image_id)
+            self.assertIsNotNone(scene_tags)
+            assert scene_tags is not None
+            self.assertEqual(scene_tags["analysis_type"], AI_VISION_ANALYSIS_SCENE)
+            self.assertEqual(scene_tags["scene_location"], "outdoor")
+            self.assertIsNone(
+                migrated.ai_vision_tags_for_image(
+                    image_id,
+                    analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+                )
+            )
+            migrated.set_ai_vision_collection_rule(
+                collection_id,
+                mode="include",
+                analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+            )
+            character_prompt_version = ai_vision_prompt_version(AI_VISION_ANALYSIS_CHARACTER)
+            migrated.upsert_ai_vision_success(
+                image_id=image_id,
+                provider_name="LM Studio",
+                model_name="vision-model",
+                prompt_version=character_prompt_version,
+                analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+                analysis=self._ai_character_vision_analysis(),
+                source_modified_time_ns=1,
+            )
+            self.assertEqual(
+                migrated.ai_vision_tags_for_image(
+                    image_id,
+                    analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+                )["character_age_group"],
+                "young_adult",
+            )
+            self.assertEqual(
+                migrated.ai_vision_tags_for_image(image_id)["scene_location"],
+                "outdoor",
+            )
 
     @staticmethod
     def _ai_vision_analysis() -> AIVisionAnalysis:
@@ -1936,6 +2151,26 @@ class MetadataStoreTest(unittest.TestCase):
             },
             notes="test",
             raw_json={},
+        )
+
+    @staticmethod
+    def _ai_character_vision_analysis() -> AIVisionAnalysis:
+        return AIVisionAnalysis(
+            scene_location="unknown",
+            environment_type="unknown",
+            time_of_day="unknown",
+            weather="unknown",
+            shot_scale="unknown",
+            view_angle="unknown",
+            lighting=[],
+            confidence={
+                "character_gender": 0.9,
+                "character_age_group": 0.8,
+            },
+            notes="character test",
+            raw_json={},
+            character_gender="male",
+            character_age_group="young_adult",
         )
 
     @staticmethod

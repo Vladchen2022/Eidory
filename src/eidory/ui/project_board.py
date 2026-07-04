@@ -4,16 +4,34 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QImage, QImageReader, QKeySequence, QPainter, QPen, QPixmap, QTransform
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, QSizeF, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFontMetrics,
+    QImage,
+    QImageReader,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QTransform,
+)
 from PySide6.QtWidgets import (
+    QButtonGroup,
+    QDialog,
     QGraphicsItem,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsTextItem,
     QGraphicsView,
+    QHBoxLayout,
+    QLabel,
     QMenu,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 from eidory.models import ImageItem
@@ -33,6 +51,8 @@ DEFAULT_LAYOUT_TOP = 110.0
 DEFAULT_LAYOUT_ROW_WIDTH = 1600.0
 DEFAULT_LAYOUT_GAP_X = 48.0
 DEFAULT_LAYOUT_GAP_Y = 64.0
+LOCAL_DISPLAY_MIN_SIZE = 0.01
+LOCAL_DISPLAY_MAX_POINTS = 240
 
 
 _BOARD_PIXMAP_CACHE: OrderedDict[tuple[str, int, int, int], QPixmap] = OrderedDict()
@@ -97,6 +117,126 @@ def _estimated_pixmap_bytes(pixmap: QPixmap) -> int:
     return max(0, pixmap.width()) * max(0, pixmap.height()) * 4
 
 
+def _clamp_float(value: object, fallback: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if number != number:
+        return fallback
+    return number
+
+
+def _clamp01(value: object, fallback: float = 0.0) -> float:
+    return max(0.0, min(1.0, _clamp_float(value, fallback)))
+
+
+def _normalize_local_bounds(raw_bounds: object) -> dict[str, float] | None:
+    if not isinstance(raw_bounds, dict):
+        return None
+    x = _clamp01(raw_bounds.get("x"), 0.0)
+    y = _clamp01(raw_bounds.get("y"), 0.0)
+    w = max(0.0, _clamp_float(raw_bounds.get("w"), 0.0))
+    h = max(0.0, _clamp_float(raw_bounds.get("h"), 0.0))
+    if x + w > 1.0:
+        w = max(0.0, 1.0 - x)
+    if y + h > 1.0:
+        h = max(0.0, 1.0 - y)
+    if w < LOCAL_DISPLAY_MIN_SIZE or h < LOCAL_DISPLAY_MIN_SIZE:
+        return None
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _bounds_from_local_points(points: list[list[float]]) -> dict[str, float] | None:
+    if len(points) < 3:
+        return None
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    x = max(0.0, min(xs))
+    y = max(0.0, min(ys))
+    right = min(1.0, max(xs))
+    bottom = min(1.0, max(ys))
+    bounds = {"x": x, "y": y, "w": right - x, "h": bottom - y}
+    return _normalize_local_bounds(bounds)
+
+
+def _normalize_local_points(raw_points: object) -> list[list[float]]:
+    if not isinstance(raw_points, list):
+        return []
+    points: list[list[float]] = []
+    last_point: tuple[float, float] | None = None
+    for raw_point in raw_points[:LOCAL_DISPLAY_MAX_POINTS]:
+        if not isinstance(raw_point, (list, tuple)) or len(raw_point) < 2:
+            continue
+        point = (_clamp01(raw_point[0]), _clamp01(raw_point[1]))
+        if (
+            last_point is not None
+            and abs(last_point[0] - point[0]) < 0.001
+            and abs(last_point[1] - point[1]) < 0.001
+        ):
+            continue
+        points.append([point[0], point[1]])
+        last_point = point
+    if len(points) >= 3 and points[0] == points[-1]:
+        points.pop()
+    return points
+
+
+def _normalize_local_display(payload: object) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    display_type = str(payload.get("type") or "rect").strip().lower()
+    enabled = bool(payload.get("enabled", True))
+    normalized: dict[str, Any]
+    if display_type == "polygon":
+        points = _normalize_local_points(payload.get("points"))
+        bounds = _bounds_from_local_points(points)
+        if bounds is None:
+            return None
+        normalized = {
+            "enabled": enabled,
+            "type": "polygon",
+            "points": points,
+            "bounds": bounds,
+        }
+    else:
+        bounds = _normalize_local_bounds(payload.get("bounds", payload))
+        if bounds is None:
+            return None
+        normalized = {
+            "enabled": enabled,
+            "type": "rect",
+            "bounds": bounds,
+        }
+    full_width = _clamp_float(payload.get("full_width"), 0.0)
+    if full_width > 1:
+        normalized["full_width"] = float(full_width)
+    return normalized
+
+
+def _local_bounds_width(payload: dict[str, Any] | None) -> float:
+    if not isinstance(payload, dict):
+        return 1.0
+    bounds = _normalize_local_bounds(payload.get("bounds"))
+    if bounds is None:
+        return 1.0
+    return max(LOCAL_DISPLAY_MIN_SIZE, float(bounds["w"]))
+
+
+def _copy_local_display_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if payload is None:
+        return None
+    copied: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            copied[key] = dict(value)
+        elif isinstance(value, list):
+            copied[key] = [list(item) if isinstance(item, list) else item for item in value]
+        else:
+            copied[key] = value
+    return copied
+
+
 class BoardImageItem(QGraphicsPixmapItem):
     MIN_DISPLAY_WIDTH = 90.0
     RESIZE_MARGIN = 12.0
@@ -125,6 +265,7 @@ class BoardImageItem(QGraphicsPixmapItem):
         self._pinned = False
         self._flipped = False
         self._grayscale = False
+        self._local_display: dict[str, Any] | None = None
         self.setToolTip(file_path)
         self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self.setCacheMode(QGraphicsItem.CacheMode.ItemCoordinateCache)
@@ -156,7 +297,13 @@ class BoardImageItem(QGraphicsPixmapItem):
                 normalized.append(text)
         return normalized
 
-    def set_display_size(self, width: float, _height: float | None = None) -> None:
+    def set_display_size(
+        self,
+        width: float,
+        _height: float | None = None,
+        *,
+        sync_local_full_width: bool = True,
+    ) -> None:
         pixmap = self.pixmap()
         if pixmap.isNull():
             return
@@ -167,6 +314,8 @@ class BoardImageItem(QGraphicsPixmapItem):
         self._display_width = width
         self._display_height = width / max(0.001, self._aspect_ratio)
         self.setScale(self._display_width / max(1, pixmap.width()))
+        if sync_local_full_width:
+            self._sync_local_full_width_from_display_width()
         if (
             abs(previous_width - self._display_width) > 0.001
             or abs(previous_height - self._display_height) > 0.001
@@ -216,6 +365,70 @@ class BoardImageItem(QGraphicsPixmapItem):
     def is_grayscale(self) -> bool:
         return self._grayscale
 
+    def local_display_payload(self) -> dict[str, Any] | None:
+        return _copy_local_display_payload(self._local_display)
+
+    def has_local_display(self) -> bool:
+        return self._local_display is not None
+
+    def is_local_display_enabled(self) -> bool:
+        return bool(self._local_display and self._local_display.get("enabled", True))
+
+    def set_local_display(
+        self,
+        payload: object,
+        *,
+        shrink_to_bounds: bool = False,
+    ) -> bool:
+        normalized = _normalize_local_display(payload)
+        if normalized is None:
+            return self.clear_local_display()
+        full_width = _clamp_float(normalized.get("full_width"), 0.0)
+        if full_width <= 1:
+            full_width = self._full_display_width_guess()
+        normalized["full_width"] = max(self.MIN_DISPLAY_WIDTH, float(full_width))
+        self._local_display = normalized
+        target_width = self._display_width
+        if shrink_to_bounds:
+            target_width = self._target_width_for_local_enabled(bool(normalized.get("enabled", True)))
+        self._refresh_display_pixmap()
+        if abs(self._display_width - target_width) > 0.001:
+            self.set_display_size(target_width, sync_local_full_width=False)
+        self._notify_layout_changed()
+        return True
+
+    def set_local_display_enabled(self, enabled: bool) -> bool:
+        if self._local_display is None:
+            return False
+        enabled = bool(enabled)
+        if bool(self._local_display.get("enabled", True)) == enabled:
+            return False
+        self._local_display["full_width"] = self._full_display_width_guess()
+        self._local_display["enabled"] = enabled
+        target_width = self._target_width_for_local_enabled(enabled)
+        self._refresh_display_pixmap()
+        self.set_display_size(target_width, sync_local_full_width=False)
+        self._notify_layout_changed()
+        return True
+
+    def toggle_local_display_enabled(self) -> bool:
+        if self._local_display is None:
+            return False
+        return self.set_local_display_enabled(not self.is_local_display_enabled())
+
+    def clear_local_display(self) -> bool:
+        if self._local_display is None:
+            return False
+        target_width = self._full_display_width_guess()
+        self._local_display = None
+        self._refresh_display_pixmap()
+        self.set_display_size(target_width, sync_local_full_width=False)
+        self._notify_layout_changed()
+        return True
+
+    def source_pixmap(self) -> QPixmap:
+        return QPixmap(self._source_pixmap)
+
     def _apply_flags(self) -> None:
         flags = (
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
@@ -229,14 +442,95 @@ class BoardImageItem(QGraphicsPixmapItem):
         pixmap = self._source_pixmap
         if pixmap.isNull():
             return
+        pixmap = self._local_display_pixmap(pixmap)
         if self._grayscale:
             image = pixmap.toImage().convertToFormat(QImage.Format.Format_Grayscale8)
             pixmap = QPixmap.fromImage(image.convertToFormat(QImage.Format.Format_ARGB32))
         if self._flipped:
             pixmap = pixmap.transformed(QTransform().scale(-1, 1), Qt.TransformationMode.SmoothTransformation)
         current_width = self._display_width
+        self._aspect_ratio = pixmap.width() / max(1, pixmap.height())
         self.setPixmap(pixmap)
-        self.set_display_size(current_width)
+        self.set_display_size(current_width, sync_local_full_width=False)
+
+    def _local_display_pixmap(self, pixmap: QPixmap) -> QPixmap:
+        if pixmap.isNull() or not self.is_local_display_enabled():
+            return pixmap
+        payload = _normalize_local_display(self._local_display)
+        if payload is None:
+            return pixmap
+        bounds = payload.get("bounds")
+        if not isinstance(bounds, dict):
+            return pixmap
+        source_width = max(1, pixmap.width())
+        source_height = max(1, pixmap.height())
+        left = max(0, min(source_width - 1, int(round(float(bounds["x"]) * source_width))))
+        top = max(0, min(source_height - 1, int(round(float(bounds["y"]) * source_height))))
+        right = max(
+            left + 1,
+            min(source_width, int(round((float(bounds["x"]) + float(bounds["w"])) * source_width))),
+        )
+        bottom = max(
+            top + 1,
+            min(source_height, int(round((float(bounds["y"]) + float(bounds["h"])) * source_height))),
+        )
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+        if payload.get("type") != "polygon":
+            return pixmap.copy(left, top, width, height)
+        points = payload.get("points")
+        if not isinstance(points, list) or len(points) < 3:
+            return pixmap.copy(left, top, width, height)
+        output = QPixmap(width, height)
+        output.fill(Qt.GlobalColor.transparent)
+        path = QPainterPath()
+        first = True
+        for raw_point in points:
+            if not isinstance(raw_point, list) or len(raw_point) < 2:
+                continue
+            point = QPointF(
+                _clamp01(raw_point[0]) * source_width - left,
+                _clamp01(raw_point[1]) * source_height - top,
+            )
+            if first:
+                path.moveTo(point)
+                first = False
+            else:
+                path.lineTo(point)
+        if first:
+            return pixmap.copy(left, top, width, height)
+        path.closeSubpath()
+        painter = QPainter(output)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setClipPath(path)
+        painter.drawPixmap(-left, -top, pixmap)
+        painter.end()
+        return output
+
+    def _full_display_width_guess(self) -> float:
+        if self._local_display is None:
+            return max(self.MIN_DISPLAY_WIDTH, self._display_width)
+        stored_width = _clamp_float(self._local_display.get("full_width"), 0.0)
+        if stored_width > 1:
+            return max(self.MIN_DISPLAY_WIDTH, stored_width)
+        if self.is_local_display_enabled():
+            return max(self.MIN_DISPLAY_WIDTH, self._display_width / _local_bounds_width(self._local_display))
+        return max(self.MIN_DISPLAY_WIDTH, self._display_width)
+
+    def _target_width_for_local_enabled(self, enabled: bool) -> float:
+        full_width = self._full_display_width_guess()
+        if not enabled:
+            return full_width
+        return max(self.MIN_DISPLAY_WIDTH, full_width * _local_bounds_width(self._local_display))
+
+    def _sync_local_full_width_from_display_width(self) -> None:
+        if self._local_display is None:
+            return
+        if self.is_local_display_enabled():
+            full_width = self._display_width / _local_bounds_width(self._local_display)
+        else:
+            full_width = self._display_width
+        self._local_display["full_width"] = max(self.MIN_DISPLAY_WIDTH, float(full_width))
 
     def itemChange(self, change, value):
         result = super().itemChange(change, value)
@@ -392,6 +686,389 @@ class BoardPlaceholderItem(QGraphicsRectItem):
     def _notify_layout_changed(self) -> None:
         if self._on_layout_changed is not None:
             self._on_layout_changed()
+
+
+class LocalDisplayEditorCanvas(QWidget):
+    selectionCompleted = Signal()
+
+    def __init__(self, pixmap: QPixmap, payload: dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self._pixmap = pixmap
+        self._mode = "polygon"
+        self._dragging_rect = False
+        self._rect_start: QPointF | None = None
+        self._rect_end: QPointF | None = None
+        self._polygon_points: list[QPointF] = []
+        self._cursor_source_pos: QPointF | None = None
+        self.setMinimumSize(720, 520)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.set_payload(payload)
+
+    def mode(self) -> str:
+        return self._mode
+
+    def set_mode(self, mode: str) -> None:
+        mode = "rect" if mode == "rect" else "polygon"
+        if self._mode == mode:
+            return
+        self._mode = mode
+        self.update()
+
+    def set_payload(self, payload: dict[str, Any] | None) -> None:
+        normalized = _normalize_local_display(payload)
+        if normalized is None or self._pixmap.isNull():
+            return
+        self._mode = "rect" if normalized.get("type") == "rect" else "polygon"
+        bounds = normalized.get("bounds", {})
+        if isinstance(bounds, dict):
+            self._rect_start = QPointF(
+                float(bounds["x"]) * self._pixmap.width(),
+                float(bounds["y"]) * self._pixmap.height(),
+            )
+            self._rect_end = QPointF(
+                (float(bounds["x"]) + float(bounds["w"])) * self._pixmap.width(),
+                (float(bounds["y"]) + float(bounds["h"])) * self._pixmap.height(),
+            )
+        if normalized.get("type") == "polygon":
+            points = normalized.get("points", [])
+            if isinstance(points, list):
+                self._polygon_points = [
+                    QPointF(
+                        _clamp01(point[0]) * self._pixmap.width(),
+                        _clamp01(point[1]) * self._pixmap.height(),
+                    )
+                    for point in points
+                    if isinstance(point, list) and len(point) >= 2
+                ]
+        self.update()
+
+    def clear_selection(self) -> None:
+        self._rect_start = None
+        self._rect_end = None
+        self._polygon_points = []
+        self._cursor_source_pos = None
+        self.update()
+
+    def remove_last_polygon_point(self) -> bool:
+        if self._mode != "polygon" or not self._polygon_points:
+            return False
+        self._polygon_points.pop()
+        self.update()
+        return True
+
+    def has_selection(self) -> bool:
+        return self.selection_payload() is not None
+
+    def selection_payload(self) -> dict[str, Any] | None:
+        if self._pixmap.isNull():
+            return None
+        source_width = max(1.0, float(self._pixmap.width()))
+        source_height = max(1.0, float(self._pixmap.height()))
+        if self._mode == "rect":
+            rect = self._normalized_rect()
+            if rect is None:
+                return None
+            return _normalize_local_display(
+                {
+                    "enabled": True,
+                    "type": "rect",
+                    "bounds": {
+                        "x": rect.left() / source_width,
+                        "y": rect.top() / source_height,
+                        "w": rect.width() / source_width,
+                        "h": rect.height() / source_height,
+                    },
+                }
+            )
+        if len(self._polygon_points) < 3:
+            return None
+        points = [
+            [point.x() / source_width, point.y() / source_height]
+            for point in self._polygon_points[:LOCAL_DISPLAY_MAX_POINTS]
+        ]
+        return _normalize_local_display({"enabled": True, "type": "polygon", "points": points})
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#252b33"))
+        display_rect = self._display_rect()
+        if display_rect.isNull() or self._pixmap.isNull():
+            painter.setPen(QColor("#d8dee9"))
+            painter.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter), "无法载入图片")
+            painter.end()
+            return
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(
+            display_rect,
+            self._pixmap,
+            QRectF(0, 0, self._pixmap.width(), self._pixmap.height()),
+        )
+        selection_path = self._selection_path(display_rect)
+        if selection_path is not None:
+            outer = QPainterPath()
+            outer.addRect(display_rect)
+            overlay = outer.subtracted(selection_path)
+            painter.fillPath(overlay, QColor(10, 14, 20, 150))
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor("#4f83ff"), 2))
+            painter.drawPath(selection_path)
+        if self._mode == "polygon":
+            self._paint_polygon_points(painter, display_rect)
+        painter.setPen(QPen(QColor("#596674"), 1))
+        painter.drawRect(display_rect)
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        source_pos = self._source_pos_for_widget(event.position())
+        if source_pos is None:
+            super().mousePressEvent(event)
+            return
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if self._mode == "rect":
+            self._dragging_rect = True
+            self._rect_start = source_pos
+            self._rect_end = source_pos
+        else:
+            if len(self._polygon_points) < LOCAL_DISPLAY_MAX_POINTS:
+                self._polygon_points.append(source_pos)
+        self.update()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        source_pos = self._source_pos_for_widget(event.position())
+        self._cursor_source_pos = source_pos
+        if self._mode == "rect" and self._dragging_rect and source_pos is not None:
+            self._rect_end = source_pos
+            self.update()
+            event.accept()
+            return
+        if self._mode == "polygon":
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._mode == "rect" and self._dragging_rect and event.button() == Qt.MouseButton.LeftButton:
+            source_pos = self._source_pos_for_widget(event.position())
+            if source_pos is not None:
+                self._rect_end = source_pos
+            self._dragging_rect = False
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if (
+            self._mode == "polygon"
+            and event.button() == Qt.MouseButton.LeftButton
+            and len(self._polygon_points) >= 3
+        ):
+            self.selectionCompleted.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter} and self.has_selection():
+            self.selectionCompleted.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Backspace and self.remove_last_polygon_point():
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _display_rect(self) -> QRectF:
+        if self._pixmap.isNull():
+            return QRectF()
+        available = QRectF(self.rect()).adjusted(14, 14, -14, -14)
+        target = QSizeF(self._pixmap.size())
+        target.scale(available.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        left = available.left() + (available.width() - target.width()) / 2
+        top = available.top() + (available.height() - target.height()) / 2
+        return QRectF(left, top, target.width(), target.height())
+
+    def _source_pos_for_widget(self, widget_pos: QPointF) -> QPointF | None:
+        display_rect = self._display_rect()
+        if display_rect.isNull() or not display_rect.contains(widget_pos):
+            return None
+        x = (widget_pos.x() - display_rect.left()) / max(1.0, display_rect.width()) * self._pixmap.width()
+        y = (widget_pos.y() - display_rect.top()) / max(1.0, display_rect.height()) * self._pixmap.height()
+        return QPointF(
+            max(0.0, min(float(self._pixmap.width()), x)),
+            max(0.0, min(float(self._pixmap.height()), y)),
+        )
+
+    def _widget_pos_for_source(self, source_pos: QPointF, display_rect: QRectF) -> QPointF:
+        x = display_rect.left() + source_pos.x() / max(1.0, self._pixmap.width()) * display_rect.width()
+        y = display_rect.top() + source_pos.y() / max(1.0, self._pixmap.height()) * display_rect.height()
+        return QPointF(x, y)
+
+    def _normalized_rect(self) -> QRectF | None:
+        if self._rect_start is None or self._rect_end is None:
+            return None
+        left = max(0.0, min(self._rect_start.x(), self._rect_end.x()))
+        top = max(0.0, min(self._rect_start.y(), self._rect_end.y()))
+        right = min(float(self._pixmap.width()), max(self._rect_start.x(), self._rect_end.x()))
+        bottom = min(float(self._pixmap.height()), max(self._rect_start.y(), self._rect_end.y()))
+        rect = QRectF(left, top, right - left, bottom - top)
+        if rect.width() < 2 or rect.height() < 2:
+            return None
+        return rect
+
+    def _selection_path(self, display_rect: QRectF) -> QPainterPath | None:
+        if self._mode == "rect":
+            rect = self._normalized_rect()
+            if rect is None:
+                return None
+            top_left = self._widget_pos_for_source(rect.topLeft(), display_rect)
+            bottom_right = self._widget_pos_for_source(rect.bottomRight(), display_rect)
+            path = QPainterPath()
+            path.addRect(QRectF(top_left, bottom_right).normalized())
+            return path
+        points = list(self._polygon_points)
+        if self._cursor_source_pos is not None and points:
+            points.append(self._cursor_source_pos)
+        if len(points) < 2:
+            return None
+        path = QPainterPath()
+        path.moveTo(self._widget_pos_for_source(points[0], display_rect))
+        for point in points[1:]:
+            path.lineTo(self._widget_pos_for_source(point, display_rect))
+        if len(self._polygon_points) >= 3:
+            path.closeSubpath()
+        return path
+
+    def _paint_polygon_points(self, painter: QPainter, display_rect: QRectF) -> None:
+        if not self._polygon_points:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(QColor("#d8e5ff"), 1))
+        painter.setBrush(QColor("#4f83ff"))
+        for point in self._polygon_points:
+            center = self._widget_pos_for_source(point, display_rect)
+            painter.drawEllipse(center, 4.0, 4.0)
+        painter.restore()
+
+
+class LocalDisplayEditorDialog(QDialog):
+    def __init__(
+        self,
+        pixmap: QPixmap,
+        payload: dict[str, Any] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("编辑局部展示")
+        self.setModal(True)
+        self._canvas = LocalDisplayEditorCanvas(pixmap, payload)
+        self._selected_payload: dict[str, Any] | None = None
+        self._clear_requested = False
+        has_existing_payload = _normalize_local_display(payload) is not None
+
+        self._rect_button = QPushButton("矩形选区")
+        self._polygon_button = QPushButton("多边形选区")
+        for button in [self._rect_button, self._polygon_button]:
+            button.setCheckable(True)
+            button.setMinimumWidth(120)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_group.addButton(self._rect_button)
+        self._mode_group.addButton(self._polygon_button)
+        self._rect_button.clicked.connect(lambda: self._set_mode("rect"))
+        self._polygon_button.clicked.connect(lambda: self._set_mode("polygon"))
+        if self._canvas.mode() == "rect":
+            self._rect_button.setChecked(True)
+        else:
+            self._polygon_button.setChecked(True)
+
+        self._hint_label = QLabel()
+        self._hint_label.setWordWrap(True)
+        self._refresh_hint()
+
+        reset_button = QPushButton("重画")
+        clear_button = QPushButton("清除局部展示")
+        cancel_button = QPushButton("取消")
+        apply_button = QPushButton("应用")
+        reset_button.clicked.connect(self._canvas.clear_selection)
+        clear_button.clicked.connect(self._request_clear)
+        clear_button.setEnabled(has_existing_payload)
+        cancel_button.clicked.connect(self.reject)
+        apply_button.clicked.connect(self._accept_selection)
+        self._canvas.selectionCompleted.connect(self._accept_selection)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self._rect_button)
+        mode_row.addWidget(self._polygon_button)
+        mode_row.addStretch(1)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(reset_button)
+        action_row.addWidget(clear_button)
+        action_row.addStretch(1)
+        action_row.addWidget(cancel_button)
+        action_row.addWidget(apply_button)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(mode_row)
+        layout.addWidget(self._hint_label)
+        layout.addWidget(self._canvas, 1)
+        layout.addLayout(action_row)
+        self.resize(900, 680)
+
+    def selected_payload(self) -> dict[str, Any] | None:
+        return _copy_local_display_payload(self._selected_payload)
+
+    def clear_requested(self) -> bool:
+        return self._clear_requested
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
+            self._accept_selection()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Backspace:
+            if self._canvas.remove_last_polygon_point():
+                event.accept()
+                return
+        if event.key() == Qt.Key.Key_Escape:
+            self.reject()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _set_mode(self, mode: str) -> None:
+        self._canvas.set_mode(mode)
+        if mode == "rect":
+            self._rect_button.setChecked(True)
+        else:
+            self._polygon_button.setChecked(True)
+        self._refresh_hint()
+
+    def _refresh_hint(self) -> None:
+        if self._canvas.mode() == "rect":
+            text = "拖拽出矩形区域，点击应用。"
+        else:
+            text = "单击添加多边形点；Enter 或双击应用；Backspace 删除上一个点。"
+        self._hint_label.setText(text)
+
+    def _accept_selection(self) -> None:
+        payload = self._canvas.selection_payload()
+        if payload is None:
+            self._hint_label.setText("还没有有效选区。")
+            return
+        self._selected_payload = payload
+        self.accept()
+
+    def _request_clear(self) -> None:
+        self._selected_payload = None
+        self._clear_requested = True
+        self.accept()
 
 
 class ProjectBoardView(QGraphicsView):
@@ -614,13 +1291,33 @@ class ProjectBoardView(QGraphicsView):
                 changed += 1
         return changed
 
+    def edit_selected_local_display(self) -> bool:
+        selected = [item for item in self._selected_image_items() if isinstance(item, BoardImageItem)]
+        if not selected:
+            return False
+        return self._edit_local_display_item(selected[0])
+
+    def toggle_selected_local_display(self) -> int:
+        changed = 0
+        for item in self._selected_image_items():
+            if isinstance(item, BoardImageItem) and item.toggle_local_display_enabled():
+                changed += 1
+        return changed
+
+    def clear_selected_local_display(self) -> int:
+        changed = 0
+        for item in self._selected_image_items():
+            if isinstance(item, BoardImageItem) and item.clear_local_display():
+                changed += 1
+        return changed
+
     def set_title_visible(self, visible: bool) -> None:
         if self._title_item is not None:
             self._title_item.setVisible(visible)
 
     def layout_payload(self) -> dict[str, Any]:
         self.flush_pending_layout_change()
-        items: dict[str, dict[str, float]] = {}
+        items: dict[str, dict[str, Any]] = {}
         for image_id, item in self._image_items.items():
             if isinstance(item, BoardImageItem):
                 width = item.display_width
@@ -644,6 +1341,9 @@ class ProjectBoardView(QGraphicsView):
                         "grayscale": item.is_grayscale(),
                     }
                 )
+                local_display = item.local_display_payload()
+                if local_display is not None:
+                    items[str(image_id)]["local_display"] = local_display
         return {"version": 1, "items": items}
 
     def fit_visible_images(self) -> None:
@@ -708,6 +1408,21 @@ class ProjectBoardView(QGraphicsView):
                 self.removeImagesRequested.emit(image_ids)
                 event.accept()
                 return
+        if event.key() == Qt.Key.Key_C and not event.isAutoRepeat():
+            modifiers = event.modifiers()
+            blocked_modifiers = (
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.MetaModifier
+                | Qt.KeyboardModifier.AltModifier
+            )
+            if not bool(modifiers & blocked_modifiers):
+                if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                    if self.toggle_selected_local_display():
+                        event.accept()
+                        return
+                elif self.edit_selected_local_display():
+                    event.accept()
+                    return
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
             self._space_pan_active = True
             self._space_pan_moved = False
@@ -819,11 +1534,25 @@ class ProjectBoardView(QGraphicsView):
         menu = QMenu(self)
         preview_action = menu.addAction("通过预览显示图片")
         menu.addSeparator()
+        edit_local_action = menu.addAction("编辑局部展示")
+        toggle_local_action = menu.addAction("切换局部/全图")
+        selected_board_items = [item for item in self._selected_image_items() if isinstance(item, BoardImageItem)]
+        edit_local_action.setEnabled(len(selected_board_items) == 1)
+        toggle_local_action.setEnabled(any(item.has_local_display() for item in selected_board_items))
+        menu.addSeparator()
         remove_action = menu.addAction("从当前项目移除")
         remove_action.setEnabled(bool(self.selected_image_ids()))
         chosen = menu.exec(event.globalPos())
         if chosen == preview_action:
             self.imagePreviewRequested.emit(image_id)
+            event.accept()
+            return
+        if chosen == edit_local_action:
+            self._edit_local_display_for_image(image_id)
+            event.accept()
+            return
+        if chosen == toggle_local_action:
+            self.toggle_selected_local_display()
             event.accept()
             return
         if chosen == remove_action:
@@ -973,6 +1702,8 @@ class ProjectBoardView(QGraphicsView):
                 item.set_flipped(bool(item_payload.get("flipped")))
             if "grayscale" in item_payload:
                 item.set_grayscale(bool(item_payload.get("grayscale")))
+            if "local_display" in item_payload:
+                item.set_local_display(item_payload.get("local_display"), shrink_to_bounds=False)
 
     def _selected_image_items(self) -> list[QGraphicsItem]:
         items: list[QGraphicsItem] = []
@@ -999,6 +1730,27 @@ class ProjectBoardView(QGraphicsView):
         if selected_ids != previous_ids:
             self._selected_image_ids_cache = selected_ids
             self.selectionChanged.emit(selected_ids)
+
+    def _edit_local_display_for_image(self, image_id: int) -> bool:
+        item = self._image_items.get(image_id)
+        if not isinstance(item, BoardImageItem):
+            return False
+        return self._edit_local_display_item(item)
+
+    def _edit_local_display_item(self, item: BoardImageItem) -> bool:
+        source_pixmap = item.source_pixmap()
+        if source_pixmap.isNull():
+            return False
+        dialog = LocalDisplayEditorDialog(source_pixmap, item.local_display_payload(), self.window())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        if dialog.clear_requested():
+            return item.clear_local_display()
+        payload = dialog.selected_payload()
+        if payload is None:
+            return False
+        item.set_local_display(payload, shrink_to_bounds=True)
+        return True
 
     def _emit_selection_changed(self) -> None:
         selected_ids = self._collect_selected_image_ids()

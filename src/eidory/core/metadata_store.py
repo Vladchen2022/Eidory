@@ -12,7 +12,13 @@ from typing import Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 
-from eidory.core.ai_vision import AIVisionAnalysis, AI_VISION_PROMPT_VERSION
+from eidory.core.ai_vision import (
+    AI_VISION_ANALYSIS_CHARACTER,
+    AI_VISION_ANALYSIS_SCENE,
+    AI_VISION_PROMPT_VERSION,
+    AIVisionAnalysis,
+    normalize_ai_vision_analysis_type,
+)
 from eidory.core.color_features import COLOR_VECTOR_DIM, COLOR_VECTOR_VERSION
 from eidory.core.duplicate_detection import ImageHashCacheRecord
 from eidory.core.inspiration import InspirationTerm
@@ -63,7 +69,13 @@ DEFAULT_AI_VISION_COLLECTION_PATHS = (
     ("ML-07 黑白摄影",),
 )
 
-VIRTUAL_IMAGE_FILTERS = {"untagged", "un_ai_tagged", "uncategorized"}
+VIRTUAL_IMAGE_FILTERS = {
+    "untagged",
+    "un_ai_tagged",
+    "un_ai_scene_tagged",
+    "un_ai_character_tagged",
+    "uncategorized",
+}
 
 
 def _clean_color_hex(value: object) -> str:
@@ -505,29 +517,123 @@ class MetadataStore:
 
     @staticmethod
     def _ensure_ai_vision_schema(conn: sqlite3.Connection) -> None:
+        MetadataStore._ensure_ai_vision_collection_rules_schema(conn)
+        MetadataStore._ensure_ai_vision_tags_schema(conn)
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS ai_vision_collection_rules (
-                collection_id INTEGER PRIMARY KEY,
-                mode TEXT NOT NULL,
-                include_descendants INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE,
-                CHECK(mode IN ('include', 'exclude'))
+            CREATE INDEX IF NOT EXISTS idx_ai_vision_collection_rules_type_mode
+            ON ai_vision_collection_rules(analysis_type, mode)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_vision_tags_type_status
+            ON ai_vision_tags(analysis_type, status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_vision_tags_scene_fields
+            ON ai_vision_tags(
+                analysis_type, scene_location, environment_type, time_of_day,
+                weather, shot_scale, view_angle
             )
             """
         )
         conn.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_ai_vision_collection_rules_mode
-            ON ai_vision_collection_rules(mode)
+            CREATE INDEX IF NOT EXISTS idx_ai_vision_tags_character_fields
+            ON ai_vision_tags(analysis_type, character_gender, character_age_group)
             """
         )
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+        return {
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+
+    @staticmethod
+    def _table_primary_key_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        keyed = sorted(
+            ((int(row["pk"]), str(row["name"])) for row in rows if int(row["pk"]) > 0),
+            key=lambda item: item[0],
+        )
+        return [name for _, name in keyed]
+
+    @staticmethod
+    def _create_ai_vision_collection_rules_table(conn: sqlite3.Connection) -> None:
         conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS ai_vision_collection_rules (
+                collection_id INTEGER NOT NULL,
+                analysis_type TEXT NOT NULL DEFAULT '{AI_VISION_ANALYSIS_SCENE}',
+                mode TEXT NOT NULL,
+                include_descendants INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(collection_id, analysis_type),
+                FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+                CHECK(analysis_type IN ('{AI_VISION_ANALYSIS_SCENE}', '{AI_VISION_ANALYSIS_CHARACTER}')),
+                CHECK(mode IN ('include', 'exclude'))
+            )
             """
+        )
+
+    @staticmethod
+    def _ensure_ai_vision_collection_rules_schema(conn: sqlite3.Connection) -> None:
+        if not MetadataStore._table_exists(conn, "ai_vision_collection_rules"):
+            MetadataStore._create_ai_vision_collection_rules_table(conn)
+            return
+        columns = MetadataStore._table_columns(conn, "ai_vision_collection_rules")
+        primary_key = MetadataStore._table_primary_key_columns(conn, "ai_vision_collection_rules")
+        if "analysis_type" in columns and primary_key == ["collection_id", "analysis_type"]:
+            return
+        conn.execute("DROP TABLE IF EXISTS ai_vision_collection_rules_migration_old")
+        conn.execute("ALTER TABLE ai_vision_collection_rules RENAME TO ai_vision_collection_rules_migration_old")
+        old_columns = MetadataStore._table_columns(conn, "ai_vision_collection_rules_migration_old")
+        MetadataStore._create_ai_vision_collection_rules_table(conn)
+        analysis_type_expr = (
+            f"COALESCE(NULLIF(analysis_type, ''), '{AI_VISION_ANALYSIS_SCENE}')"
+            if "analysis_type" in old_columns
+            else f"'{AI_VISION_ANALYSIS_SCENE}'"
+        )
+        conn.execute(
+            f"""
+            INSERT OR IGNORE INTO ai_vision_collection_rules(
+                collection_id, analysis_type, mode, include_descendants, created_at, updated_at
+            )
+            SELECT
+                collection_id,
+                {analysis_type_expr},
+                mode,
+                include_descendants,
+                created_at,
+                updated_at
+            FROM ai_vision_collection_rules_migration_old
+            WHERE collection_id IS NOT NULL
+              AND mode IN ('include', 'exclude')
+            """
+        )
+        conn.execute("DROP TABLE ai_vision_collection_rules_migration_old")
+
+    @staticmethod
+    def _create_ai_vision_tags_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            f"""
             CREATE TABLE IF NOT EXISTS ai_vision_tags (
-                image_id INTEGER PRIMARY KEY,
+                image_id INTEGER NOT NULL,
+                analysis_type TEXT NOT NULL DEFAULT '{AI_VISION_ANALYSIS_SCENE}',
                 provider_name TEXT NOT NULL,
                 model_name TEXT NOT NULL,
                 prompt_version TEXT NOT NULL,
@@ -539,29 +645,83 @@ class MetadataStore:
                 shot_scale TEXT,
                 view_angle TEXT,
                 lighting_json TEXT NOT NULL DEFAULT '[]',
-                confidence_json TEXT NOT NULL DEFAULT '{}',
+                character_gender TEXT,
+                character_age_group TEXT,
+                confidence_json TEXT NOT NULL DEFAULT '{{}}',
                 notes TEXT,
                 error_message TEXT,
                 source_modified_time_ns INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                PRIMARY KEY(image_id, analysis_type),
                 FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE,
+                CHECK(analysis_type IN ('{AI_VISION_ANALYSIS_SCENE}', '{AI_VISION_ANALYSIS_CHARACTER}')),
                 CHECK(status IN ('pending', 'processing', 'ready', 'failed', 'stale', 'skipped'))
             )
             """
         )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_ai_vision_tags_status
-            ON ai_vision_tags(status)
-            """
+
+    @staticmethod
+    def _ensure_ai_vision_tags_schema(conn: sqlite3.Connection) -> None:
+        if not MetadataStore._table_exists(conn, "ai_vision_tags"):
+            MetadataStore._create_ai_vision_tags_table(conn)
+            return
+        columns = MetadataStore._table_columns(conn, "ai_vision_tags")
+        primary_key = MetadataStore._table_primary_key_columns(conn, "ai_vision_tags")
+        required_columns = {"analysis_type", "character_gender", "character_age_group"}
+        if required_columns.issubset(columns) and primary_key == ["image_id", "analysis_type"]:
+            return
+        conn.execute("DROP TABLE IF EXISTS ai_vision_tags_migration_old")
+        conn.execute("ALTER TABLE ai_vision_tags RENAME TO ai_vision_tags_migration_old")
+        old_columns = MetadataStore._table_columns(conn, "ai_vision_tags_migration_old")
+        MetadataStore._create_ai_vision_tags_table(conn)
+        analysis_type_expr = (
+            f"COALESCE(NULLIF(analysis_type, ''), '{AI_VISION_ANALYSIS_SCENE}')"
+            if "analysis_type" in old_columns
+            else f"'{AI_VISION_ANALYSIS_SCENE}'"
+        )
+        character_gender_expr = "character_gender" if "character_gender" in old_columns else "NULL"
+        character_age_group_expr = (
+            "character_age_group" if "character_age_group" in old_columns else "NULL"
         )
         conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_ai_vision_tags_fields
-            ON ai_vision_tags(scene_location, environment_type, time_of_day, weather, shot_scale, view_angle)
+            f"""
+            INSERT OR IGNORE INTO ai_vision_tags(
+                image_id, analysis_type, provider_name, model_name, prompt_version, status,
+                scene_location, environment_type, time_of_day, weather,
+                shot_scale, view_angle, lighting_json,
+                character_gender, character_age_group,
+                confidence_json, notes, error_message, source_modified_time_ns,
+                created_at, updated_at
+            )
+            SELECT
+                image_id,
+                {analysis_type_expr},
+                provider_name,
+                model_name,
+                prompt_version,
+                status,
+                scene_location,
+                environment_type,
+                time_of_day,
+                weather,
+                shot_scale,
+                view_angle,
+                COALESCE(lighting_json, '[]'),
+                {character_gender_expr},
+                {character_age_group_expr},
+                COALESCE(confidence_json, '{{}}'),
+                notes,
+                error_message,
+                source_modified_time_ns,
+                created_at,
+                updated_at
+            FROM ai_vision_tags_migration_old
+            WHERE image_id IS NOT NULL
+              AND status IN ('pending', 'processing', 'ready', 'failed', 'stale', 'skipped')
             """
         )
+        conn.execute("DROP TABLE ai_vision_tags_migration_old")
 
     @contextmanager
     def connect(self, *, readonly: bool = False) -> Iterator[sqlite3.Connection]:
@@ -1951,7 +2111,7 @@ class MetadataStore:
     def list_images(
         self,
         *,
-        limit: int = 500,
+        limit: int | None = 500,
         offset: int = 0,
         folder_id: int | None = None,
         folder_path_prefix: str | None = None,
@@ -2057,7 +2217,12 @@ class MetadataStore:
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_by = self._image_order_by(sort_key, sort_desc)
-        params.extend([limit, offset])
+        pagination = ""
+        if limit is not None:
+            safe_limit = max(0, int(limit))
+            safe_offset = max(0, int(offset))
+            pagination = "LIMIT ? OFFSET ?"
+            params.extend([safe_limit, safe_offset])
         with self.connect(readonly=True) as conn:
             rows = conn.execute(
                 f"""
@@ -2065,11 +2230,55 @@ class MetadataStore:
                 FROM images
                 {where}
                 ORDER BY {order_by}
-                LIMIT ? OFFSET ?
+                {pagination}
                 """,
                 params,
             ).fetchall()
             return [self._image_from_row(row) for row in rows]
+
+    def image_ids_matching_tags(
+        self,
+        tag_ids: Sequence[int],
+        *,
+        tag_match_mode: str = "any",
+        include_missing: bool = False,
+        excluded_folder_path_prefixes: Sequence[str] | None = None,
+        excluded_collection_ids: Sequence[int] | None = None,
+    ) -> set[int]:
+        tag_clause, tag_params = self._tag_filter_clause(
+            "images.id",
+            tag_ids=tag_ids,
+            tag_match_mode=tag_match_mode,
+        )
+        if not tag_clause:
+            return set()
+        clauses = [tag_clause]
+        params = list(tag_params)
+        if not include_missing:
+            clauses.append("images.is_missing = 0")
+        self._append_excluded_folder_path_clauses(
+            clauses,
+            params,
+            "images.file_path",
+            excluded_folder_path_prefixes,
+        )
+        self._append_excluded_collection_clauses(
+            clauses,
+            params,
+            "images.id",
+            excluded_collection_ids,
+        )
+        where = f"WHERE {' AND '.join(clauses)}"
+        with self.connect(readonly=True) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT images.id
+                FROM images
+                {where}
+                """,
+                params,
+            ).fetchall()
+        return {int(row["id"]) for row in rows}
 
     @staticmethod
     def _image_order_by(sort_key: str, sort_desc: bool) -> str:
@@ -2153,7 +2362,12 @@ class MetadataStore:
                 """,
                 [],
             )
-        if virtual_filter == "un_ai_tagged":
+        if virtual_filter in {"un_ai_tagged", "un_ai_scene_tagged", "un_ai_character_tagged"}:
+            analysis_type = (
+                AI_VISION_ANALYSIS_CHARACTER
+                if virtual_filter == "un_ai_character_tagged"
+                else AI_VISION_ANALYSIS_SCENE
+            )
             image_placeholders = ",".join("?" for _ in SUPPORTED_IMAGE_EXTENSIONS)
             return (
                 f"""
@@ -2162,10 +2376,11 @@ class MetadataStore:
                     SELECT 1
                     FROM ai_vision_tags avt
                     WHERE avt.image_id = {image_id_expr}
+                      AND avt.analysis_type = ?
                       AND avt.status = 'ready'
                 )
                 """,
-                list(sorted(SUPPORTED_IMAGE_EXTENSIONS)),
+                [*sorted(SUPPORTED_IMAGE_EXTENSIONS), analysis_type],
             )
         return (
             f"""
@@ -5686,8 +5901,15 @@ class MetadataStore:
     def seed_default_ai_vision_collection_rules(
         self,
         default_paths: Sequence[Sequence[str]] = DEFAULT_AI_VISION_COLLECTION_PATHS,
+        *,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
     ) -> int:
-        setting_key = "ai_vision.default_rules_seeded"
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
+        setting_key = (
+            "ai_vision.default_rules_seeded"
+            if analysis_type == AI_VISION_ANALYSIS_SCENE
+            else f"ai_vision.{analysis_type}.default_rules_seeded"
+        )
         with self.connect() as conn:
             seeded_row = conn.execute(
                 "SELECT value FROM app_settings WHERE key = ?",
@@ -5695,7 +5917,14 @@ class MetadataStore:
             ).fetchone()
             if seeded_row is not None and str(seeded_row["value"]) == "1":
                 return 0
-            row = conn.execute("SELECT COUNT(*) AS count FROM ai_vision_collection_rules").fetchone()
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM ai_vision_collection_rules
+                WHERE analysis_type = ?
+                """,
+                (analysis_type,),
+            ).fetchone()
             if int(row["count"]) > 0:
                 now = utc_now_iso()
                 conn.execute(
@@ -5722,11 +5951,11 @@ class MetadataStore:
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO ai_vision_collection_rules(
-                        collection_id, mode, include_descendants, created_at, updated_at
+                        collection_id, analysis_type, mode, include_descendants, created_at, updated_at
                     )
-                    VALUES (?, 'include', 1, ?, ?)
+                    VALUES (?, ?, 'include', 1, ?, ?)
                     """,
-                    (collection_id, now, now),
+                    (collection_id, analysis_type, now, now),
                 )
                 inserted += int(cur.rowcount)
             if inserted:
@@ -5746,9 +5975,11 @@ class MetadataStore:
         *,
         mode: str,
         include_descendants: bool = True,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
     ) -> None:
         if mode not in {"include", "exclude"}:
             raise ValueError("AI vision rule mode must be include or exclude")
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         now = utc_now_iso()
         with self.connect() as conn:
             collection = conn.execute(
@@ -5759,22 +5990,31 @@ class MetadataStore:
             conn.execute(
                 """
                 INSERT INTO ai_vision_collection_rules(
-                    collection_id, mode, include_descendants, created_at, updated_at
+                    collection_id, analysis_type, mode, include_descendants, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(collection_id) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(collection_id, analysis_type) DO UPDATE SET
                     mode = excluded.mode,
                     include_descendants = excluded.include_descendants,
                     updated_at = excluded.updated_at
                 """,
-                (collection_id, mode, 1 if include_descendants else 0, now, now),
+                (collection_id, analysis_type, mode, 1 if include_descendants else 0, now, now),
             )
 
-    def remove_ai_vision_collection_rule(self, collection_id: int) -> bool:
+    def remove_ai_vision_collection_rule(
+        self,
+        collection_id: int,
+        *,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+    ) -> bool:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         with self.connect() as conn:
             cur = conn.execute(
-                "DELETE FROM ai_vision_collection_rules WHERE collection_id = ?",
-                (collection_id,),
+                """
+                DELETE FROM ai_vision_collection_rules
+                WHERE collection_id = ? AND analysis_type = ?
+                """,
+                (collection_id, analysis_type),
             )
             return int(cur.rowcount) > 0
 
@@ -5784,7 +6024,9 @@ class MetadataStore:
         provider_name: str,
         model_name: str,
         prompt_version: str = AI_VISION_PROMPT_VERSION,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
     ) -> list[dict[str, object]]:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         path_by_id = {
             collection.id: " / ".join(path)
             for collection, path in self.collection_export_paths()
@@ -5796,8 +6038,11 @@ class MetadataStore:
                 FROM ai_vision_collection_rules r
                 JOIN collections c ON c.id = r.collection_id
                 WHERE r.mode = 'include'
+                  AND r.analysis_type = ?
                 ORDER BY r.mode DESC, c.name COLLATE NOCASE
                 """
+                ,
+                (analysis_type,),
             ).fetchall()
         rules: list[dict[str, object]] = []
         for row in rows:
@@ -5808,6 +6053,7 @@ class MetadataStore:
                 provider_name=provider_name,
                 model_name=model_name,
                 prompt_version=prompt_version,
+                analysis_type=analysis_type,
             )
             rules.append(
                 {
@@ -5829,7 +6075,9 @@ class MetadataStore:
         provider_name: str,
         model_name: str,
         prompt_version: str = AI_VISION_PROMPT_VERSION,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
     ) -> dict[str, int]:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         with self.connect() as conn:
             image_ids = self._ai_vision_rule_image_ids(
                 conn,
@@ -5842,6 +6090,7 @@ class MetadataStore:
                 provider_name=provider_name,
                 model_name=model_name,
                 prompt_version=prompt_version,
+                analysis_type=analysis_type,
             )
 
     def ai_vision_stats(
@@ -5850,15 +6099,18 @@ class MetadataStore:
         provider_name: str,
         model_name: str,
         prompt_version: str = AI_VISION_PROMPT_VERSION,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
     ) -> dict[str, int]:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         with self.connect() as conn:
-            image_ids = self._ai_vision_effective_image_ids(conn)
+            image_ids = self._ai_vision_effective_image_ids(conn, analysis_type=analysis_type)
             return self._ai_vision_stats_for_image_ids(
                 conn,
                 image_ids,
                 provider_name=provider_name,
                 model_name=model_name,
                 prompt_version=prompt_version,
+                analysis_type=analysis_type,
             )
 
     def next_ai_vision_jobs(
@@ -5867,10 +6119,12 @@ class MetadataStore:
         provider_name: str,
         model_name: str,
         prompt_version: str,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
         limit: int,
     ) -> list[ImageItem]:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         with self.connect(readonly=True) as conn:
-            image_ids = sorted(self._ai_vision_effective_image_ids(conn))
+            image_ids = sorted(self._ai_vision_effective_image_ids(conn, analysis_type=analysis_type))
             if not image_ids:
                 return []
             rows: list[sqlite3.Row] = []
@@ -5883,7 +6137,9 @@ class MetadataStore:
                     f"""
                     SELECT i.*
                     FROM images i
-                    LEFT JOIN ai_vision_tags t ON t.image_id = i.id
+                    LEFT JOIN ai_vision_tags t
+                      ON t.image_id = i.id
+                     AND t.analysis_type = ?
                     WHERE i.id IN ({placeholders})
                       AND (
                         t.image_id IS NULL
@@ -5895,7 +6151,7 @@ class MetadataStore:
                     ORDER BY i.id
                     LIMIT ?
                     """,
-                    (*chunk, provider_name, model_name, prompt_version, remaining),
+                    (analysis_type, *chunk, provider_name, model_name, prompt_version, remaining),
                 ).fetchall()
                 rows.extend(chunk_rows)
                 remaining = max(0, int(limit) - len(rows))
@@ -5908,17 +6164,19 @@ class MetadataStore:
         provider_name: str,
         model_name: str,
         prompt_version: str,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
     ) -> None:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         now = utc_now_iso()
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO ai_vision_tags(
-                    image_id, provider_name, model_name, prompt_version, status,
+                    image_id, analysis_type, provider_name, model_name, prompt_version, status,
                     lighting_json, confidence_json, error_message, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 'processing', '[]', '{}', NULL, ?, ?)
-                ON CONFLICT(image_id) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, 'processing', '[]', '{}', NULL, ?, ?)
+                ON CONFLICT(image_id, analysis_type) DO UPDATE SET
                     provider_name = excluded.provider_name,
                     model_name = excluded.model_name,
                     prompt_version = excluded.prompt_version,
@@ -5926,7 +6184,7 @@ class MetadataStore:
                     error_message = NULL,
                     updated_at = excluded.updated_at
                 """,
-                (image_id, provider_name, model_name, prompt_version, now, now),
+                (image_id, analysis_type, provider_name, model_name, prompt_version, now, now),
             )
 
     def upsert_ai_vision_success(
@@ -5936,21 +6194,24 @@ class MetadataStore:
         provider_name: str,
         model_name: str,
         prompt_version: str,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
         analysis: AIVisionAnalysis,
         source_modified_time_ns: int,
     ) -> None:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         now = utc_now_iso()
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO ai_vision_tags(
-                    image_id, provider_name, model_name, prompt_version, status,
+                    image_id, analysis_type, provider_name, model_name, prompt_version, status,
                     scene_location, environment_type, time_of_day, weather,
-                    shot_scale, view_angle, lighting_json, confidence_json, notes,
+                    shot_scale, view_angle, lighting_json, character_gender, character_age_group,
+                    confidence_json, notes,
                     error_message, source_modified_time_ns, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
-                ON CONFLICT(image_id) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                ON CONFLICT(image_id, analysis_type) DO UPDATE SET
                     provider_name = excluded.provider_name,
                     model_name = excluded.model_name,
                     prompt_version = excluded.prompt_version,
@@ -5962,6 +6223,8 @@ class MetadataStore:
                     shot_scale = excluded.shot_scale,
                     view_angle = excluded.view_angle,
                     lighting_json = excluded.lighting_json,
+                    character_gender = excluded.character_gender,
+                    character_age_group = excluded.character_age_group,
                     confidence_json = excluded.confidence_json,
                     notes = excluded.notes,
                     error_message = NULL,
@@ -5970,6 +6233,7 @@ class MetadataStore:
                 """,
                 (
                     image_id,
+                    analysis_type,
                     provider_name,
                     model_name,
                     prompt_version,
@@ -5980,6 +6244,8 @@ class MetadataStore:
                     analysis.shot_scale,
                     analysis.view_angle,
                     json.dumps(analysis.lighting, ensure_ascii=False),
+                    analysis.character_gender,
+                    analysis.character_age_group,
                     json.dumps(analysis.confidence, ensure_ascii=False),
                     analysis.notes,
                     source_modified_time_ns,
@@ -5995,18 +6261,20 @@ class MetadataStore:
         provider_name: str,
         model_name: str,
         prompt_version: str,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
         error_message: str,
     ) -> None:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         now = utc_now_iso()
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO ai_vision_tags(
-                    image_id, provider_name, model_name, prompt_version, status,
+                    image_id, analysis_type, provider_name, model_name, prompt_version, status,
                     lighting_json, confidence_json, error_message, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, 'failed', '[]', '{}', ?, ?, ?)
-                ON CONFLICT(image_id) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, 'failed', '[]', '{}', ?, ?, ?)
+                ON CONFLICT(image_id, analysis_type) DO UPDATE SET
                     provider_name = excluded.provider_name,
                     model_name = excluded.model_name,
                     prompt_version = excluded.prompt_version,
@@ -6018,12 +6286,15 @@ class MetadataStore:
                     shot_scale = NULL,
                     view_angle = NULL,
                     lighting_json = '[]',
+                    character_gender = NULL,
+                    character_age_group = NULL,
                     confidence_json = '{}',
                     error_message = excluded.error_message,
                     updated_at = excluded.updated_at
                 """,
                 (
                     image_id,
+                    analysis_type,
                     provider_name,
                     model_name,
                     prompt_version,
@@ -6033,10 +6304,15 @@ class MetadataStore:
                 ),
             )
 
-    def retry_failed_ai_vision(self) -> int:
+    def retry_failed_ai_vision(
+        self,
+        *,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+    ) -> int:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         now = utc_now_iso()
         with self.connect() as conn:
-            image_ids = sorted(self._ai_vision_effective_image_ids(conn))
+            image_ids = sorted(self._ai_vision_effective_image_ids(conn, analysis_type=analysis_type))
             if not image_ids:
                 return 0
             placeholders = ",".join("?" for _ in image_ids)
@@ -6045,17 +6321,28 @@ class MetadataStore:
                 UPDATE ai_vision_tags
                 SET status = 'pending', error_message = NULL, updated_at = ?
                 WHERE image_id IN ({placeholders})
+                  AND analysis_type = ?
                   AND status IN ('failed', 'processing')
                 """,
-                (now, *image_ids),
+                (now, *image_ids, analysis_type),
             )
             return int(cur.rowcount)
 
-    def ai_vision_tags_for_image(self, image_id: int) -> dict[str, object] | None:
+    def ai_vision_tags_for_image(
+        self,
+        image_id: int,
+        *,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+    ) -> dict[str, object] | None:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         with self.connect(readonly=True) as conn:
             row = conn.execute(
-                "SELECT * FROM ai_vision_tags WHERE image_id = ?",
-                (image_id,),
+                """
+                SELECT *
+                FROM ai_vision_tags
+                WHERE image_id = ? AND analysis_type = ?
+                """,
+                (image_id, analysis_type),
             ).fetchone()
         if row is None:
             return None
@@ -6069,6 +6356,7 @@ class MetadataStore:
             confidence = {}
         return {
             "image_id": int(row["image_id"]),
+            "analysis_type": str(row["analysis_type"]),
             "provider_name": str(row["provider_name"]),
             "model_name": str(row["model_name"]),
             "prompt_version": str(row["prompt_version"]),
@@ -6080,6 +6368,8 @@ class MetadataStore:
             "shot_scale": row["shot_scale"],
             "view_angle": row["view_angle"],
             "lighting": lighting if isinstance(lighting, list) else [],
+            "character_gender": row["character_gender"],
+            "character_age_group": row["character_age_group"],
             "confidence": confidence if isinstance(confidence, dict) else {},
             "notes": str(row["notes"] or ""),
             "error_message": str(row["error_message"] or ""),
@@ -6087,6 +6377,12 @@ class MetadataStore:
         }
 
     def image_ids_matching_ai_vision(self, field: str, value: str) -> set[int]:
+        character_fields = {"character_gender", "character_age_group"}
+        analysis_type = (
+            AI_VISION_ANALYSIS_CHARACTER
+            if field in character_fields
+            else AI_VISION_ANALYSIS_SCENE
+        )
         if field == "lighting":
             with self.connect() as conn:
                 rows = conn.execute(
@@ -6094,9 +6390,10 @@ class MetadataStore:
                     SELECT image_id
                     FROM ai_vision_tags
                     WHERE status = 'ready'
+                      AND analysis_type = ?
                       AND lighting_json LIKE ?
                     """,
-                    (f'%"{value}"%',),
+                    (analysis_type, f'%"{value}"%'),
                 ).fetchall()
             return {int(row["image_id"]) for row in rows}
         if field not in {
@@ -6106,6 +6403,8 @@ class MetadataStore:
             "weather",
             "shot_scale",
             "view_angle",
+            "character_gender",
+            "character_age_group",
         }:
             return set()
         with self.connect() as conn:
@@ -6114,9 +6413,10 @@ class MetadataStore:
                 SELECT image_id
                 FROM ai_vision_tags
                 WHERE status = 'ready'
+                  AND analysis_type = ?
                   AND {field} = ?
                 """,
-                (value,),
+                (analysis_type, value),
             ).fetchall()
         return {int(row["image_id"]) for row in rows}
 
@@ -6267,14 +6567,22 @@ class MetadataStore:
         return {int(row["id"]) for row in rows}
 
     @classmethod
-    def _ai_vision_effective_image_ids(cls, conn: sqlite3.Connection) -> set[int]:
+    def _ai_vision_effective_image_ids(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
+    ) -> set[int]:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         rule_rows = conn.execute(
             """
             SELECT collection_id, mode, include_descendants
             FROM ai_vision_collection_rules
             WHERE mode = 'include'
+              AND analysis_type = ?
             ORDER BY mode
-            """
+            """,
+            (analysis_type,),
         ).fetchall()
         include_ids: set[int] = set()
         for row in rule_rows:
@@ -6294,7 +6602,9 @@ class MetadataStore:
         provider_name: str,
         model_name: str,
         prompt_version: str,
+        analysis_type: str = AI_VISION_ANALYSIS_SCENE,
     ) -> dict[str, int]:
+        analysis_type = normalize_ai_vision_analysis_type(analysis_type)
         stats = {
             "total": len(image_ids),
             "ready": 0,
@@ -6315,8 +6625,9 @@ class MetadataStore:
                     SELECT image_id, provider_name, model_name, prompt_version, status
                     FROM ai_vision_tags
                     WHERE image_id IN ({placeholders})
+                      AND analysis_type = ?
                     """,
-                    tuple(chunk),
+                    (*chunk, analysis_type),
                 ).fetchall()
             )
         seen: set[int] = set()
@@ -6475,6 +6786,8 @@ class MetadataStore:
                 shot_scale = NULL,
                 view_angle = NULL,
                 lighting_json = '[]',
+                character_gender = NULL,
+                character_age_group = NULL,
                 confidence_json = '{}',
                 notes = NULL,
                 error_message = NULL,

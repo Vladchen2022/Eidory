@@ -29,18 +29,12 @@ class ColorSearchResult:
 
 
 def adaptive_candidate_limit(searchable_count: int) -> int:
-    if searchable_count <= 0:
-        return 0
-    if searchable_count <= 500:
-        return searchable_count
-    if searchable_count <= 5_000:
-        return min(searchable_count, 1_000)
-    if searchable_count <= 50_000:
-        return min(searchable_count, 2_000)
-    return min(searchable_count, 5_000)
+    return max(0, int(searchable_count))
 
 
 class SearchService:
+    _COLOR_FEATURE_WRITE_BATCH_SIZE = 64
+
     def __init__(
         self,
         *,
@@ -95,7 +89,7 @@ class SearchService:
                 virtual_filter=virtual_filter,
                 excluded_folder_path_prefixes=excluded_folder_path_prefixes,
                 excluded_collection_ids=excluded_collection_ids,
-                limit=500,
+                limit=None,
             )
             if allowed_image_ids is not None:
                 images = [image for image in images if image.id in allowed_image_ids]
@@ -222,7 +216,7 @@ class SearchService:
         status_filter: str | None = None,
         virtual_filter: str | None = None,
         allowed_image_ids: set[int] | None = None,
-        limit: int = 5_000,
+        limit: int | None = None,
         excluded_folder_path_prefixes: Sequence[str] | None = None,
         excluded_collection_ids: Sequence[int] | None = None,
     ) -> ColorSearchResult:
@@ -274,20 +268,32 @@ class SearchService:
                 (feature_ids[int(index)], float(scores_array[int(index)]))
                 for index in ordered_indexes
             ]
-        limited = scored[: max(0, limit)]
+        limited = scored if limit is None else scored[: max(0, int(limit))]
         image_ids = [image_id for image_id, _score in limited]
         scores = {image_id: score for image_id, score in limited}
         return ColorSearchResult(
             images=self.store.images_by_ids(image_ids, scores),
             searchable_count=len(candidates),
             indexed_count=len(features),
-            candidate_limit=min(len(scored), max(0, limit)),
+            candidate_limit=len(limited),
         )
 
     def _ensure_color_features(self, images: list[ImageItem]) -> None:
         image_ids = [image.id for image in images]
         ready_ids = set(self.store.color_features_by_image_ids(image_ids))
         failed_ids = self.store.color_feature_ids_by_status(image_ids, ["failed"])
+        success_records: list[tuple[int, np.ndarray]] = []
+        failure_records: list[tuple[int, str]] = []
+
+        def flush() -> None:
+            nonlocal success_records, failure_records
+            if success_records:
+                self.store.upsert_color_feature_successes(success_records)
+                success_records = []
+            if failure_records:
+                self.store.mark_color_features_failed(failure_records)
+                failure_records = []
+
         for image in images:
             if image.id in ready_ids or image.id in failed_ids:
                 continue
@@ -295,9 +301,9 @@ class SearchService:
             if image.is_missing or not path.exists():
                 continue
             try:
-                self.store.upsert_color_feature_success(
-                    image_id=image.id,
-                    vector=encode_image_color(image.file_path),
-                )
+                success_records.append((image.id, encode_image_color(image.file_path)))
             except Exception as exc:
-                self.store.mark_color_feature_failed(image.id, str(exc))
+                failure_records.append((image.id, str(exc)))
+            if len(success_records) + len(failure_records) >= self._COLOR_FEATURE_WRITE_BATCH_SIZE:
+                flush()
+        flush()

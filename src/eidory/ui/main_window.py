@@ -107,11 +107,15 @@ from PySide6.QtWidgets import (
 
 from eidory.config import AppPaths
 from eidory.core.ai_vision import (
+    AI_CHARACTER_VISION_FIELD_VALUES,
+    AI_VISION_ANALYSIS_CHARACTER,
+    AI_VISION_ANALYSIS_SCENE,
     AI_VISION_FIELD_VALUES,
     AI_VISION_LIGHTING_VALUES,
     AI_VISION_PROMPT_VERSION,
     AIVisionProvider,
     ai_vision_label,
+    ai_vision_prompt_version,
 )
 from eidory.core.creative_templates import (
     CREATIVE_TEMPLATES,
@@ -218,7 +222,9 @@ SAVED_VIEW_RENAME_ACTION = "__eidory_rename_current_filter_preset__"
 SAVED_VIEW_DELETE_ACTION = "__eidory_delete_current_filter_preset__"
 VIRTUAL_COLLECTION_FILTERS = (
     ("untagged", "未标签", "没有用户手动标签的图片/视频。"),
-    ("un_ai_tagged", "未AI标签", "还没有可用 AI 场景视觉标签的图片。"),
+    ("un_ai_tagged", "未AI场景标签", "还没有可用 AI 场景视觉标签的图片。"),
+    ("un_ai_scene_tagged", "未AI场景标签", "还没有可用 AI 场景视觉标签的图片。"),
+    ("un_ai_character_tagged", "未AI角色标签", "还没有可用 AI 角色视觉标签的图片。"),
     ("uncategorized", "未分类", "没有放入任何 Eidory 文件夹的图片/视频。"),
 )
 RIGHT_TAB_DETAIL = 0
@@ -881,6 +887,85 @@ class _DetailPreviewLoadTask(QRunnable):
         self.signals.loaded.emit(self.request_token, None, QImage())
 
 
+class _SelectionMetadataLoadSignals(QObject):
+    loaded = Signal(object, object, object, object, object, object)
+
+
+class _SelectionMetadataLoadTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        image_id: int,
+        store: MetadataStore,
+        signals: _SelectionMetadataLoadSignals,
+    ) -> None:
+        super().__init__()
+        self.image_id = int(image_id)
+        self.store = store
+        self.signals = signals
+
+    def run(self) -> None:
+        collection_paths: list[str] = []
+        tags: list[str] = []
+        scene_tags: object = None
+        character_tags: object = None
+        success = True
+        try:
+            collection_paths = self.store.collection_paths_for_image(self.image_id)
+            tags = self.store.get_image_tags(self.image_id)
+            scene_tags = self.store.ai_vision_tags_for_image(
+                self.image_id,
+                analysis_type=AI_VISION_ANALYSIS_SCENE,
+            )
+            character_tags = self.store.ai_vision_tags_for_image(
+                self.image_id,
+                analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+            )
+        except Exception:
+            success = False
+        self.signals.loaded.emit(
+            self.image_id,
+            collection_paths,
+            tags,
+            scene_tags,
+            character_tags,
+            success,
+        )
+
+
+class _SearchFeedbackLoadSignals(QObject):
+    loaded = Signal(object, object)
+
+
+class _SearchFeedbackLoadTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        key: tuple[str, int, str, str, int],
+        store: MetadataStore,
+        signals: _SearchFeedbackLoadSignals,
+    ) -> None:
+        super().__init__()
+        self.key = key
+        self.store = store
+        self.signals = signals
+
+    def run(self) -> None:
+        query, image_id, model_name, model_revision, embedding_dim = self.key
+        label: str | None = None
+        try:
+            label = self.store.get_search_feedback(
+                query=query,
+                image_id=image_id,
+                model_name=model_name,
+                model_revision=model_revision,
+                embedding_dim=embedding_dim,
+            )
+        except Exception:
+            label = None
+        self.signals.loaded.emit(self.key, label)
+
+
 class _FileWatchWorker(QObject):
     pathChanged = Signal(str)
     configured = Signal(int)
@@ -1057,9 +1142,11 @@ class MainWindow(QMainWindow):
         )
         self.embedding_worker: EmbeddingWorker | None = None
         self.ai_vision_worker: AIVisionWorker | None = None
+        self.ai_character_vision_worker: AIVisionWorker | None = None
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.current_offset = 0
         self.page_size = 500
+        self._loading_more_images = False
         self.current_sort_key = self._setting_choice(
             "ui.sort_key",
             "default",
@@ -1169,6 +1256,19 @@ class MainWindow(QMainWindow):
         self._detail_preview_signals = _DetailPreviewLoadSignals()
         self._detail_preview_signals.loaded.connect(self._handle_detail_preview_loaded)
         self._detail_preview_thread_pool = QThreadPool.globalInstance()
+        self._selection_metadata_signals = _SelectionMetadataLoadSignals()
+        self._selection_metadata_signals.loaded.connect(self._handle_selection_metadata_loaded)
+        self._selection_metadata_thread_pool = QThreadPool.globalInstance()
+        self._selection_metadata_pending_image_id: int | None = None
+        self._selection_metadata_running_image_id: int | None = None
+        self._selection_metadata_queued_image_id: int | None = None
+        self._search_feedback_signals = _SearchFeedbackLoadSignals()
+        self._search_feedback_signals.loaded.connect(self._handle_search_feedback_loaded)
+        self._search_feedback_thread_pool = QThreadPool.globalInstance()
+        self._search_feedback_cache: dict[tuple[str, int, str, str, int], str | None] = {}
+        self._search_feedback_pending_key: tuple[str, int, str, str, int] | None = None
+        self._search_feedback_running_key: tuple[str, int, str, str, int] | None = None
+        self._search_feedback_queued_key: tuple[str, int, str, str, int] | None = None
         self._pending_selection_images: list[ImageItem] | None = None
         self._last_selection_image_ids: tuple[int, ...] = ()
         self._detail_panel_dirty = False
@@ -1496,6 +1596,7 @@ class MainWindow(QMainWindow):
         workers = [
             ("语义索引", self.embedding_worker),
             ("AI 视觉识别", self.ai_vision_worker),
+            ("AI 角色视觉识别", self.ai_character_vision_worker),
         ]
         for _label, worker in workers:
             if worker is not None and worker.is_alive():
@@ -1529,6 +1630,11 @@ class MainWindow(QMainWindow):
             and self.ai_vision_worker is not None
             and self.ai_vision_worker.is_alive()
         )
+        restart_ai_character_vision = (
+            restart_index_workers
+            and self.ai_character_vision_worker is not None
+            and self.ai_character_vision_worker.is_alive()
+        )
         workers_stopped = False
         self._database_maintenance_active = True
         self._stop_file_watcher_for_maintenance()
@@ -1548,6 +1654,7 @@ class MainWindow(QMainWindow):
                     self._restart_index_workers_after_maintenance(
                         restart_embedding=restart_embedding,
                         restart_ai_vision=restart_ai_vision,
+                        restart_ai_character_vision=restart_ai_character_vision,
                     )
 
     def _stop_file_watcher_for_maintenance(self) -> None:
@@ -1568,11 +1675,14 @@ class MainWindow(QMainWindow):
         *,
         restart_embedding: bool,
         restart_ai_vision: bool,
+        restart_ai_character_vision: bool = False,
     ) -> None:
         if restart_embedding:
             self._start_embedding()
         if restart_ai_vision:
             self._start_ai_vision()
+        if restart_ai_character_vision:
+            self._start_ai_character_vision()
 
     def _build_ui(self) -> None:
         self.central_shell = QWidget()
@@ -1962,6 +2072,15 @@ class MainWindow(QMainWindow):
         ]:
             self.ai_vision_field_filter_combo.addItem(label, field)
         self._refresh_ai_vision_value_filter_combo()
+        self.ai_character_vision_field_filter_combo = QComboBox()
+        self.ai_character_vision_value_filter_combo = QComboBox()
+        self.add_ai_character_vision_filter_button = QPushButton("添加条件")
+        for field, label in [
+            ("character_gender", "性别"),
+            ("character_age_group", "年龄段"),
+        ]:
+            self.ai_character_vision_field_filter_combo.addItem(label, field)
+        self._refresh_ai_character_vision_value_filter_combo()
 
         self.status_filter_combo.setMinimumWidth(110)
         metadata_filter_row.addWidget(QLabel("基础条件"))
@@ -2021,6 +2140,12 @@ class MainWindow(QMainWindow):
         ai_scene_filter_row.addWidget(self.ai_vision_field_filter_combo)
         ai_scene_filter_row.addWidget(self.ai_vision_value_filter_combo)
         ai_scene_filter_row.addWidget(self.add_ai_vision_filter_button)
+        ai_scene_filter_row.addSpacing(12)
+        ai_scene_filter_row.addWidget(QLabel("AI 角色条件"))
+        ai_scene_filter_row.addSpacing(8)
+        ai_scene_filter_row.addWidget(self.ai_character_vision_field_filter_combo)
+        ai_scene_filter_row.addWidget(self.ai_character_vision_value_filter_combo)
+        ai_scene_filter_row.addWidget(self.add_ai_character_vision_filter_button)
         ai_scene_filter_row.addStretch(1)
 
         self.filter_chain_widget = QWidget()
@@ -2069,25 +2194,27 @@ class MainWindow(QMainWindow):
         self.center_result_stack.addWidget(self.grid_view)
         self.center_result_stack.addWidget(self.project_board_view)
 
-        self.load_more_button = QPushButton("加载更多")
+        self.load_more_button = QPushButton("加载更多", panel)
+        self.load_more_button.hide()
         thumbnail_size_row = QHBoxLayout()
         self.show_gallery_button = QPushButton("图片墙")
         self.show_project_board_button = QPushButton("看板")
-        self.save_project_board_layout_button = QPushButton("保存看板")
+        self.save_project_board_layout_button = QPushButton("保存看板", panel)
         self.board_pin_button = QPushButton()
         self.board_pin_button.setCheckable(True)
         self.board_hide_selected_button = QPushButton()
         self.board_fit_all_button = QPushButton()
         self.board_flip_button = QPushButton()
         self.board_grayscale_button = QPushButton()
-        self.board_import_button = QPushButton("导入图片")
-        self.board_show_all_button = QPushButton("显示全部")
+        self.board_import_button = QPushButton("导入图片", panel)
+        self.board_show_all_button = QPushButton("显示全部", panel)
+        self.board_edit_local_display_button = QPushButton("局部显示编辑")
+        self.board_toggle_local_display_button = QPushButton("局部/全图切换")
         for board_button in [
             self.show_gallery_button,
             self.show_project_board_button,
-            self.save_project_board_layout_button,
-            self.board_import_button,
-            self.board_show_all_button,
+            self.board_edit_local_display_button,
+            self.board_toggle_local_display_button,
         ]:
             board_button.setMinimumWidth(TOOL_BUTTON_MIN_WIDTH)
         self._configure_board_icon_button(
@@ -2126,11 +2253,14 @@ class MainWindow(QMainWindow):
             self.board_fit_all_button,
             self.board_flip_button,
             self.board_grayscale_button,
-            self.board_import_button,
-            self.board_show_all_button,
+            self.board_edit_local_display_button,
+            self.board_toggle_local_display_button,
         ]:
             board_action_button.hide()
         self.save_project_board_layout_button.setEnabled(False)
+        self.save_project_board_layout_button.hide()
+        self.board_import_button.hide()
+        self.board_show_all_button.hide()
         self.thumbnail_size_label = QLabel(f"缩略图：{self.initial_thumbnail_size}")
         self.thumbnail_size_slider = QSlider(Qt.Orientation.Horizontal)
         self.thumbnail_size_slider.setRange(96, 320)
@@ -2138,7 +2268,6 @@ class MainWindow(QMainWindow):
         self.thumbnail_size_slider.setMaximumWidth(220)
         thumbnail_size_row.addWidget(self.show_gallery_button)
         thumbnail_size_row.addWidget(self.show_project_board_button)
-        thumbnail_size_row.addWidget(self.save_project_board_layout_button)
         thumbnail_size_row.addSpacing(16)
         thumbnail_size_row.addWidget(self.board_pin_button)
         thumbnail_size_row.addWidget(self.board_hide_selected_button)
@@ -2146,8 +2275,8 @@ class MainWindow(QMainWindow):
         thumbnail_size_row.addWidget(self.board_flip_button)
         thumbnail_size_row.addWidget(self.board_grayscale_button)
         thumbnail_size_row.addSpacing(16)
-        thumbnail_size_row.addWidget(self.board_import_button)
-        thumbnail_size_row.addWidget(self.board_show_all_button)
+        thumbnail_size_row.addWidget(self.board_edit_local_display_button)
+        thumbnail_size_row.addWidget(self.board_toggle_local_display_button)
         thumbnail_size_row.addStretch(1)
         thumbnail_size_row.addWidget(self.shuffle_results_button)
         thumbnail_size_row.addWidget(self.save_result_set_button)
@@ -2176,7 +2305,6 @@ class MainWindow(QMainWindow):
         layout.addLayout(threshold_row)
         layout.addLayout(compact_status_row)
         layout.addWidget(self.center_result_stack, 1)
-        layout.addWidget(self.load_more_button)
         layout.addLayout(thumbnail_size_row)
         return panel
 
@@ -2438,6 +2566,31 @@ class MainWindow(QMainWindow):
         self.add_ai_vision_include_rule_button.setToolTip("把左侧当前选中的文件夹加入 AI 识别列表；子文件夹也会被识别。")
         self.remove_ai_vision_rule_button.setToolTip("从 AI 识别列表移除右侧表格中选中的文件夹；不删除图片或已有 AI 标签。")
 
+        self.ai_character_vision_progress_bar = QProgressBar()
+        self.ai_character_vision_progress_bar.setRange(0, 100)
+        self.ai_character_vision_progress_bar.setValue(0)
+        self.ai_character_vision_stats_label = QLabel("AI 角色标签：0 / 0")
+        self.ai_character_vision_stats_label.setWordWrap(True)
+        self.ai_character_vision_virtual_filter_list = QListWidget()
+        self.ai_character_vision_virtual_filter_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.ai_character_vision_virtual_filter_list.setMaximumHeight(34)
+        self.ai_character_vision_virtual_filter_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.ai_character_vision_virtual_filter_list.setToolTip("按 AI 角色标签状态筛选图库。")
+        self.ai_character_vision_rule_tree = QTreeWidget()
+        self.ai_character_vision_rule_tree.setColumnCount(5)
+        self.ai_character_vision_rule_tree.setHeaderLabels(["文件夹", "完成", "失败", "未处理", "总数"])
+        self.ai_character_vision_rule_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.ai_character_vision_rule_tree.setMaximumHeight(180)
+        self.ai_character_vision_rule_tree.setToolTip("列表中的文件夹及其子文件夹会进行 AI 角色视觉识别。")
+        self.add_ai_character_vision_include_rule_button = QPushButton("添加选中文件夹")
+        self.remove_ai_character_vision_rule_button = QPushButton("移除选中文件夹")
+        self.start_ai_character_vision_button = QPushButton("开始AI识别")
+        self.pause_ai_character_vision_button = QPushButton("暂停AI识别")
+        self.retry_failed_ai_character_vision_button = QPushButton("重试AI失败")
+        self.refresh_ai_character_vision_button = QPushButton("刷新AI统计")
+        self.add_ai_character_vision_include_rule_button.setToolTip("把左侧当前选中的文件夹加入 AI 角色识别列表；子文件夹也会被识别。")
+        self.remove_ai_character_vision_rule_button.setToolTip("从 AI 角色识别列表移除右侧表格中选中的文件夹；不删除图片或已有 AI 标签。")
+
         form = QFormLayout()
         self.detail_form = form
         self._configure_sidebar_form(form)
@@ -2664,23 +2817,53 @@ class MainWindow(QMainWindow):
         index_layout.addWidget(self.pause_embedding_button)
         index_layout.addWidget(self.retry_failed_button)
         index_layout.addSpacing(8)
-        index_layout.addWidget(QLabel("AI 场景视觉标签"))
-        index_layout.addWidget(self.ai_vision_progress_bar)
-        index_layout.addWidget(self.ai_vision_stats_label)
-        index_layout.addWidget(self.ai_vision_virtual_filter_list)
-        index_layout.addWidget(self.ai_vision_rule_tree)
+        self.ai_vision_index_tabs = QTabWidget()
+        scene_ai_index_tab = QWidget()
+        scene_ai_index_layout = QVBoxLayout(scene_ai_index_tab)
+        scene_ai_index_layout.setContentsMargins(0, 0, 0, 0)
+        scene_ai_index_layout.setSpacing(6)
+        scene_ai_index_layout.addWidget(self.ai_vision_progress_bar)
+        scene_ai_index_layout.addWidget(self.ai_vision_stats_label)
+        scene_ai_index_layout.addWidget(self.ai_vision_virtual_filter_list)
+        scene_ai_index_layout.addWidget(self.ai_vision_rule_tree)
         ai_rule_row = QHBoxLayout()
         ai_rule_row.setContentsMargins(0, 0, 0, 0)
         ai_rule_row.addWidget(self.add_ai_vision_include_rule_button)
         ai_rule_row.addWidget(self.remove_ai_vision_rule_button)
-        index_layout.addLayout(ai_rule_row)
+        scene_ai_index_layout.addLayout(ai_rule_row)
         ai_worker_row = QHBoxLayout()
         ai_worker_row.setContentsMargins(0, 0, 0, 0)
         ai_worker_row.addWidget(self.start_ai_vision_button)
         ai_worker_row.addWidget(self.pause_ai_vision_button)
         ai_worker_row.addWidget(self.retry_failed_ai_vision_button)
-        index_layout.addLayout(ai_worker_row)
-        index_layout.addWidget(self.refresh_ai_vision_button)
+        scene_ai_index_layout.addLayout(ai_worker_row)
+        scene_ai_index_layout.addWidget(self.refresh_ai_vision_button)
+        scene_ai_index_layout.addStretch(1)
+        self.ai_vision_index_tabs.addTab(scene_ai_index_tab, "场景视觉标签")
+
+        character_ai_index_tab = QWidget()
+        character_ai_index_layout = QVBoxLayout(character_ai_index_tab)
+        character_ai_index_layout.setContentsMargins(0, 0, 0, 0)
+        character_ai_index_layout.setSpacing(6)
+        character_ai_index_layout.addWidget(self.ai_character_vision_progress_bar)
+        character_ai_index_layout.addWidget(self.ai_character_vision_stats_label)
+        character_ai_index_layout.addWidget(self.ai_character_vision_virtual_filter_list)
+        character_ai_index_layout.addWidget(self.ai_character_vision_rule_tree)
+        ai_character_rule_row = QHBoxLayout()
+        ai_character_rule_row.setContentsMargins(0, 0, 0, 0)
+        ai_character_rule_row.addWidget(self.add_ai_character_vision_include_rule_button)
+        ai_character_rule_row.addWidget(self.remove_ai_character_vision_rule_button)
+        character_ai_index_layout.addLayout(ai_character_rule_row)
+        ai_character_worker_row = QHBoxLayout()
+        ai_character_worker_row.setContentsMargins(0, 0, 0, 0)
+        ai_character_worker_row.addWidget(self.start_ai_character_vision_button)
+        ai_character_worker_row.addWidget(self.pause_ai_character_vision_button)
+        ai_character_worker_row.addWidget(self.retry_failed_ai_character_vision_button)
+        character_ai_index_layout.addLayout(ai_character_worker_row)
+        character_ai_index_layout.addWidget(self.refresh_ai_character_vision_button)
+        character_ai_index_layout.addStretch(1)
+        self.ai_vision_index_tabs.addTab(character_ai_index_tab, "角色视觉标签")
+        index_layout.addWidget(self.ai_vision_index_tabs)
         index_layout.addStretch(1)
 
         settings_tab = QWidget()
@@ -2885,6 +3068,12 @@ class MainWindow(QMainWindow):
         self.add_dimension_filter_button.clicked.connect(self._add_dimension_filter_from_controls)
         self.ai_vision_field_filter_combo.currentIndexChanged.connect(self._refresh_ai_vision_value_filter_combo)
         self.add_ai_vision_filter_button.clicked.connect(self._add_ai_vision_filter_from_controls)
+        self.ai_character_vision_field_filter_combo.currentIndexChanged.connect(
+            self._refresh_ai_character_vision_value_filter_combo
+        )
+        self.add_ai_character_vision_filter_button.clicked.connect(
+            self._add_ai_character_vision_filter_from_controls
+        )
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         self.sort_order_combo.currentIndexChanged.connect(self._on_sort_changed)
         self.score_threshold_slider.sliderMoved.connect(self._preview_score_threshold)
@@ -2900,12 +3089,15 @@ class MainWindow(QMainWindow):
         self.board_grayscale_button.clicked.connect(self._toggle_board_selected_grayscale)
         self.board_import_button.clicked.connect(self._import_images_to_current_board)
         self.board_show_all_button.clicked.connect(self._show_all_board_images)
+        self.board_edit_local_display_button.clicked.connect(self._edit_board_selected_local_display)
+        self.board_toggle_local_display_button.clicked.connect(self._toggle_board_selected_local_display)
         self.project_board_view.selectionChanged.connect(self._on_project_board_selection_changed)
         self.project_board_view.layoutChanged.connect(self._mark_current_board_layout_dirty)
         self.project_board_view.imagePreviewRequested.connect(self._open_project_board_image_preview)
         self.project_board_view.removeImagesRequested.connect(self._remove_images_from_current_board)
         self.project_board_view.undoRemovalRequested.connect(self._undo_last_board_removal)
         self.load_more_button.clicked.connect(self._load_more)
+        self.grid_view.verticalScrollBar().valueChanged.connect(self._maybe_auto_load_more)
         self.grid_view.selectionChanged.connect(self._on_grid_image_selected)
         self.grid_view.selectionSetChanged.connect(self._on_grid_selection_changed)
         self.grid_view.imageDoubleClicked.connect(self._open_image_preview)
@@ -2982,6 +3174,12 @@ class MainWindow(QMainWindow):
         self.pause_ai_vision_button.clicked.connect(self._pause_ai_vision)
         self.retry_failed_ai_vision_button.clicked.connect(self._retry_failed_ai_vision)
         self.refresh_ai_vision_button.clicked.connect(self._refresh_ai_vision_stats)
+        self.add_ai_character_vision_include_rule_button.clicked.connect(self._add_selected_collection_to_ai_character_vision)
+        self.remove_ai_character_vision_rule_button.clicked.connect(self._remove_selected_ai_character_vision_rule)
+        self.start_ai_character_vision_button.clicked.connect(self._start_ai_character_vision)
+        self.pause_ai_character_vision_button.clicked.connect(self._pause_ai_character_vision)
+        self.retry_failed_ai_character_vision_button.clicked.connect(self._retry_failed_ai_character_vision)
+        self.refresh_ai_character_vision_button.clicked.connect(self._refresh_ai_character_vision_stats)
         self.rescan_all_button.clicked.connect(self._rescan_all_folders)
         self.rescan_new_button.clicked.connect(self._rescan_new_or_changed_folders)
         self.rescan_missing_button.clicked.connect(self._rescan_missing_folders)
@@ -3004,6 +3202,9 @@ class MainWindow(QMainWindow):
         self.status_filter_combo.currentIndexChanged.connect(self._save_status_filter)
         self.tag_list.itemSelectionChanged.connect(self._on_tag_list_selection_changed)
         self.ai_vision_virtual_filter_list.itemSelectionChanged.connect(
+            self._on_ai_vision_virtual_filter_selection_changed
+        )
+        self.ai_character_vision_virtual_filter_list.itemSelectionChanged.connect(
             self._on_ai_vision_virtual_filter_selection_changed
         )
         self.tag_search_input.textChanged.connect(self._on_tag_search_changed)
@@ -3645,10 +3846,13 @@ class MainWindow(QMainWindow):
             )
             self.board_import_button.setText("Import")
             self.board_show_all_button.setText("Show All")
+            self.board_edit_local_display_button.setText("Edit Local View")
+            self.board_toggle_local_display_button.setText("Local / Full")
             self.generate_inspiration_button.setText("Generate Probes")
             self.search_inspiration_button.setText("Save and Search")
             self.save_temp_project_button.setText("Save Selected")
             self.add_ai_vision_filter_button.setText("Add Scene Tag")
+            self.add_ai_character_vision_filter_button.setText("Add Character Tag")
             self.ai_vision_rule_tree.setHeaderLabels(["Folder", "Done", "Failed", "Pending", "Total"])
             self.add_ai_vision_include_rule_button.setText("Add Selected Folder")
             self.remove_ai_vision_rule_button.setText("Remove Selected Folder")
@@ -3656,6 +3860,15 @@ class MainWindow(QMainWindow):
             self.pause_ai_vision_button.setText("Pause AI Vision")
             self.retry_failed_ai_vision_button.setText("Retry Failed")
             self.refresh_ai_vision_button.setText("Refresh Stats")
+            self.ai_character_vision_rule_tree.setHeaderLabels(["Folder", "Done", "Failed", "Pending", "Total"])
+            self.add_ai_character_vision_include_rule_button.setText("Add Selected Folder")
+            self.remove_ai_character_vision_rule_button.setText("Remove Selected Folder")
+            self.start_ai_character_vision_button.setText("Start AI Vision")
+            self.pause_ai_character_vision_button.setText("Pause AI Vision")
+            self.retry_failed_ai_character_vision_button.setText("Retry Failed")
+            self.refresh_ai_character_vision_button.setText("Refresh Stats")
+            self.ai_vision_index_tabs.setTabText(0, "Scene Tags")
+            self.ai_vision_index_tabs.setTabText(1, "Character Tags")
             self.rescan_all_button.setText("Scan All")
             self.rescan_new_button.setText("Scan New")
             self.rescan_missing_button.setText("Scan Missing")
@@ -3785,10 +3998,13 @@ class MainWindow(QMainWindow):
             )
             self.board_import_button.setText("导入图片")
             self.board_show_all_button.setText("显示全部")
+            self.board_edit_local_display_button.setText("局部显示编辑")
+            self.board_toggle_local_display_button.setText("局部/全图切换")
             self.generate_inspiration_button.setText("生成语义探针")
             self.search_inspiration_button.setText("保存并搜索")
             self.save_temp_project_button.setText("存为语义探针项目")
             self.add_ai_vision_filter_button.setText("添加场景标签")
+            self.add_ai_character_vision_filter_button.setText("添加角色标签")
             self.ai_vision_rule_tree.setHeaderLabels(["文件夹", "完成", "失败", "未处理", "总数"])
             self.add_ai_vision_include_rule_button.setText("添加选中文件夹")
             self.remove_ai_vision_rule_button.setText("移除选中文件夹")
@@ -3796,6 +4012,15 @@ class MainWindow(QMainWindow):
             self.pause_ai_vision_button.setText("暂停AI识别")
             self.retry_failed_ai_vision_button.setText("重试AI失败")
             self.refresh_ai_vision_button.setText("刷新AI统计")
+            self.ai_character_vision_rule_tree.setHeaderLabels(["文件夹", "完成", "失败", "未处理", "总数"])
+            self.add_ai_character_vision_include_rule_button.setText("添加选中文件夹")
+            self.remove_ai_character_vision_rule_button.setText("移除选中文件夹")
+            self.start_ai_character_vision_button.setText("开始AI识别")
+            self.pause_ai_character_vision_button.setText("暂停AI识别")
+            self.retry_failed_ai_character_vision_button.setText("重试AI失败")
+            self.refresh_ai_character_vision_button.setText("刷新AI统计")
+            self.ai_vision_index_tabs.setTabText(0, "场景视觉标签")
+            self.ai_vision_index_tabs.setTabText(1, "角色视觉标签")
             self.rescan_all_button.setText("扫描全部")
             self.rescan_new_button.setText("扫描新增")
             self.rescan_missing_button.setText("扫描缺失")
@@ -3827,6 +4052,7 @@ class MainWindow(QMainWindow):
             self.right_tab_widget.setTabText(4, "设置")
         self._update_color_swatch()
         self._refresh_ai_vision_value_filter_combo()
+        self._refresh_ai_character_vision_value_filter_combo()
 
     def _choose_folder(self) -> None:
         collection_id = self._selected_collection_id()
@@ -5463,7 +5689,10 @@ class MainWindow(QMainWindow):
             return
         field = str(self.ai_vision_field_filter_combo.currentData() or "scene_location")
         previous = self.ai_vision_value_filter_combo.currentData() if hasattr(self, "ai_vision_value_filter_combo") else None
-        values = AI_VISION_LIGHTING_VALUES if field == "lighting" else AI_VISION_FIELD_VALUES.get(field, [])
+        if field == "lighting":
+            values = AI_VISION_LIGHTING_VALUES
+        else:
+            values = AI_VISION_FIELD_VALUES.get(field, [])
         self.ai_vision_value_filter_combo.blockSignals(True)
         self.ai_vision_value_filter_combo.clear()
         for value in values:
@@ -5474,11 +5703,45 @@ class MainWindow(QMainWindow):
             self._set_combo_to_data(self.ai_vision_value_filter_combo, previous)
         self.ai_vision_value_filter_combo.blockSignals(False)
 
+    def _refresh_ai_character_vision_value_filter_combo(self) -> None:
+        if not hasattr(self, "ai_character_vision_field_filter_combo"):
+            return
+        field = str(
+            self.ai_character_vision_field_filter_combo.currentData()
+            or "character_gender"
+        )
+        previous = (
+            self.ai_character_vision_value_filter_combo.currentData()
+            if hasattr(self, "ai_character_vision_value_filter_combo")
+            else None
+        )
+        values = AI_CHARACTER_VISION_FIELD_VALUES.get(field, [])
+        self.ai_character_vision_value_filter_combo.blockSignals(True)
+        self.ai_character_vision_value_filter_combo.clear()
+        for value in values:
+            label = ai_vision_label(field, value, language=self.current_language)
+            label = label.split(": ", 1)[1] if ": " in label else label
+            self.ai_character_vision_value_filter_combo.addItem(label, value)
+        if previous is not None:
+            self._set_combo_to_data(
+                self.ai_character_vision_value_filter_combo,
+                previous,
+            )
+        self.ai_character_vision_value_filter_combo.blockSignals(False)
+
     def _add_ai_vision_filter_from_controls(self) -> None:
         field = str(self.ai_vision_field_filter_combo.currentData() or "")
         value = str(self.ai_vision_value_filter_combo.currentData() or "")
         if not field or not value:
             self.statusBar().showMessage("请选择 AI 场景筛选条件")
+            return
+        self._start_search_with_filter(SearchFilter("ai_vision", f"{field}:{value}"))
+
+    def _add_ai_character_vision_filter_from_controls(self) -> None:
+        field = str(self.ai_character_vision_field_filter_combo.currentData() or "")
+        value = str(self.ai_character_vision_value_filter_combo.currentData() or "")
+        if not field or not value:
+            self.statusBar().showMessage("请选择 AI 角色筛选条件")
             return
         self._start_search_with_filter(SearchFilter("ai_vision", f"{field}:{value}"))
 
@@ -6100,7 +6363,7 @@ class MainWindow(QMainWindow):
                         virtual_filter=virtual_filter,
                         excluded_folder_path_prefixes=excluded_folder_path_prefixes,
                         excluded_collection_ids=excluded_collection_ids,
-                        limit=5_000,
+                        limit=None,
                     )
                 else:
                     images = [
@@ -6333,7 +6596,7 @@ class MainWindow(QMainWindow):
             virtual_filter=virtual_filter,
             excluded_folder_path_prefixes=excluded_folder_path_prefixes,
             excluded_collection_ids=excluded_collection_ids,
-            limit=50_000,
+            limit=None,
         )
 
     def _apply_score_threshold_for_filter(
@@ -6821,14 +7084,12 @@ class MainWindow(QMainWindow):
     def _image_ids_for_tags(self, tag_ids: list[int] | set[int], match_mode: str) -> set[int]:
         if not tag_ids:
             return set()
-        images = self.store.list_images(
-            tag_ids=sorted(set(tag_ids)),
+        return self.store.image_ids_matching_tags(
+            sorted(set(tag_ids)),
             tag_match_mode="any" if match_mode == "any" else "all",
             excluded_folder_path_prefixes=self._search_excluded_folder_prefixes(),
             excluded_collection_ids=self._search_excluded_collection_ids(),
-            limit=50_000,
         )
-        return {image.id for image in images}
 
     def _image_ids_for_collections(self, collection_ids: list[int] | set[int]) -> set[int]:
         image_ids: set[int] = set()
@@ -7282,6 +7543,8 @@ class MainWindow(QMainWindow):
             sort_key=self._database_sort_key(),
             sort_desc=self.current_sort_desc,
         )
+        self.current_offset = len(images)
+        self.load_more_button.setEnabled(len(images) >= self.page_size)
         self.grid_view.set_images(images)
         self._set_result_status(f"全部图库：已加载 {len(images)} 张")
         self._update_search_diagnostics([])
@@ -7297,31 +7560,47 @@ class MainWindow(QMainWindow):
         self.temp_project_list.blockSignals(False)
 
     def _load_more(self) -> None:
-        if self.search_filters or self.current_result_mode in {
-            "semantic",
-            "color",
-            "search_chain",
-            "inspiration",
-            "temp_project",
-            "creative_node",
-        }:
+        if not self._can_load_more_library_page():
             return
-        self.current_offset += self.page_size
-        images = self.store.list_images(
-            text_query=self.current_keyword_query,
-            status_filter=self._selected_status_filter(),
-            tag_ids=[],
-            tag_match_mode="any",
-            folder_path_prefix=self._selected_folder_path_prefix(),
-            collection_id=self._selected_collection_id(),
-            virtual_filter=self._selected_virtual_filter(),
-            limit=self.page_size,
-            offset=self.current_offset,
-            sort_key=self._database_sort_key(),
-            sort_desc=self.current_sort_desc,
+        self._loading_more_images = True
+        try:
+            offset = self.grid_view.rowCount()
+            images = self.store.list_images(
+                text_query=self.current_keyword_query,
+                status_filter=self._selected_status_filter(),
+                tag_ids=[],
+                tag_match_mode="any",
+                folder_path_prefix=self._selected_folder_path_prefix(),
+                collection_id=self._selected_collection_id(),
+                virtual_filter=self._selected_virtual_filter(),
+                limit=self.page_size,
+                offset=offset,
+                sort_key=self._database_sort_key(),
+                sort_desc=self.current_sort_desc,
+            )
+            if images:
+                self.grid_view.append_images(images)
+            self.current_offset = self.grid_view.rowCount()
+            self.load_more_button.setEnabled(len(images) >= self.page_size)
+            self._set_result_status(f"已加载 {self.grid_view.rowCount()} 张，新增加载 {len(images)} 张")
+        finally:
+            self._loading_more_images = False
+
+    def _can_load_more_library_page(self) -> bool:
+        return (
+            not self._loading_more_images
+            and self.current_result_mode == "library"
+            and not self.search_filters
+            and self.load_more_button.isEnabled()
         )
-        self.grid_view.append_images(images)
-        self._set_result_status(f"已加载 {self.grid_view.rowCount()} 张，新增加载 {len(images)} 张")
+
+    def _maybe_auto_load_more(self, value: int) -> None:
+        if not self._can_load_more_library_page():
+            return
+        bar = self.grid_view.verticalScrollBar()
+        threshold = max(240, self.grid_view.viewport().height())
+        if bar.maximum() - value <= threshold:
+            self._load_more()
 
     def _clear_search(self) -> None:
         should_restore_duplicate_dialog = (
@@ -7409,14 +7688,14 @@ class MainWindow(QMainWindow):
                 folder_path_prefix=self._selected_folder_path_prefix(),
                 collection_id=self._selected_collection_id(),
                 virtual_filter=self._selected_virtual_filter(),
-                limit=self.page_size,
-                offset=0,
+                limit=None,
                 sort_key=self._database_sort_key(),
                 sort_desc=self.current_sort_desc,
                 excluded_folder_path_prefixes=self._search_excluded_folder_prefixes(),
                 excluded_collection_ids=self._search_excluded_collection_ids(),
             )
-            self.current_offset = 0
+            self.current_offset = len(images)
+            self.load_more_button.setEnabled(False)
             images = self._apply_result_management_filters(images)
             self.grid_view.set_images(images)
             self._set_result_status(f"关键词结果：{len(images)}{self._result_management_status_suffix()}")
@@ -7618,6 +7897,21 @@ class MainWindow(QMainWindow):
 
     def _shuffle_current_grid_images(self) -> None:
         images = self.grid_view.images()
+        if self.current_result_mode == "library" and not self.search_filters:
+            scope_images = self.store.list_images(
+                text_query=self.current_keyword_query,
+                status_filter=self._selected_status_filter(),
+                tag_ids=[],
+                tag_match_mode="any",
+                folder_path_prefix=self._selected_folder_path_prefix(),
+                collection_id=self._selected_collection_id(),
+                virtual_filter=self._selected_virtual_filter(),
+                limit=None,
+                sort_key=self._database_sort_key(),
+                sort_desc=self.current_sort_desc,
+            )
+            if len(scope_images) > len(images):
+                images = scope_images
         if len(images) <= 1:
             self.statusBar().showMessage("当前没有足够的图片可打乱")
             return
@@ -7627,7 +7921,10 @@ class MainWindow(QMainWindow):
             images,
             badges_by_image_id=self._current_grid_badges_by_image_id(),
         )
-        self.statusBar().showMessage(f"已打乱当前显示的 {len(images)} 张图片")
+        self.current_offset = len(images)
+        if self.current_result_mode == "library" and not self.search_filters:
+            self.load_more_button.setEnabled(False)
+        self.statusBar().showMessage(f"已打乱当前范围的 {len(images)} 张图片")
 
     def _current_grid_badges_by_image_id(self) -> dict[int, list[str]]:
         return {
@@ -7680,10 +7977,11 @@ class MainWindow(QMainWindow):
         image = self._selected_grid_image()
         return [image] if image is not None else []
 
-    def _refresh_temp_project_save_button(self) -> None:
+    def _refresh_temp_project_save_button(self, count: int | None = None) -> None:
         if not hasattr(self, "save_temp_project_button"):
             return
-        count = len(self._selected_grid_images())
+        if count is None:
+            count = len(self._selected_grid_images())
         self.save_temp_project_button.setEnabled(count > 0)
         if hasattr(self, "save_selection_to_creative_node_button"):
             self.save_selection_to_creative_node_button.setEnabled(
@@ -8382,18 +8680,85 @@ class MainWindow(QMainWindow):
         if not can_feedback or image is None or self.current_semantic_query is None:
             return
 
-        label = self.store.get_search_feedback(
-            query=self.current_semantic_query,
-            image_id=image.id,
-            model_name=self.embedding_provider.model_name,
-            model_revision=self.embedding_provider.model_revision,
-            embedding_dim=self.embedding_provider.dim,
-        )
+        key = self._search_feedback_cache_key(image)
+        if key is None:
+            return
+        if key not in self._search_feedback_cache:
+            self._request_search_feedback(key)
+            return
+        label = self._search_feedback_cache.get(key)
         if label in self.feedback_buttons:
             button = self.feedback_buttons[label]
             button.blockSignals(True)
             button.setChecked(True)
             button.blockSignals(False)
+
+    def _search_feedback_cache_key(self, image: ImageItem | None) -> tuple[str, int, str, str, int] | None:
+        query = self.current_semantic_query
+        if image is None or not query:
+            return None
+        return (
+            query,
+            int(image.id),
+            self.embedding_provider.model_name,
+            self.embedding_provider.model_revision,
+            int(self.embedding_provider.dim),
+        )
+
+    def _request_search_feedback(self, key: tuple[str, int, str, str, int]) -> None:
+        if (
+            self._search_feedback_pending_key == key
+            or self._search_feedback_running_key == key
+            or self._search_feedback_queued_key == key
+        ):
+            return
+        self._search_feedback_pending_key = key
+        if self._search_feedback_running_key is not None:
+            self._search_feedback_queued_key = key
+            return
+        self._start_search_feedback_task(key)
+
+    def _start_search_feedback_task(self, key: tuple[str, int, str, str, int]) -> None:
+        self._search_feedback_pending_key = key
+        self._search_feedback_running_key = key
+        self._search_feedback_thread_pool.start(
+            _SearchFeedbackLoadTask(
+                key=key,
+                store=self.store,
+                signals=self._search_feedback_signals,
+            )
+        )
+
+    def _start_queued_search_feedback_if_needed(self) -> None:
+        queued_key = self._search_feedback_queued_key
+        self._search_feedback_queued_key = None
+        if queued_key is None:
+            return
+        if self._search_feedback_pending_key != queued_key:
+            return
+        self._start_search_feedback_task(queued_key)
+
+    def _handle_search_feedback_loaded(self, key: object, label: object) -> None:
+        if not isinstance(key, tuple) or len(key) != 5:
+            return
+        feedback_key = (
+            str(key[0]),
+            int(key[1]),
+            str(key[2]),
+            str(key[3]),
+            int(key[4]),
+        )
+        if self._search_feedback_running_key == feedback_key:
+            self._search_feedback_running_key = None
+        clean_label = str(label) if label in self.feedback_buttons else None
+        self._search_feedback_cache[feedback_key] = clean_label
+        self._trim_search_feedback_cache()
+        if self._search_feedback_pending_key == feedback_key:
+            self._search_feedback_pending_key = None
+        current_key = self._search_feedback_cache_key(self.selected_image)
+        if current_key == feedback_key:
+            self._refresh_feedback_buttons(self.selected_image)
+        self._start_queued_search_feedback_if_needed()
 
     def _save_search_feedback(self, label: str) -> None:
         image = self._selected_grid_image()
@@ -8412,9 +8777,18 @@ class MainWindow(QMainWindow):
             score=image.score,
             label=label,
         )
+        key = self._search_feedback_cache_key(image)
+        if key is not None:
+            self._search_feedback_cache[key] = label
+            self._trim_search_feedback_cache()
         self._refresh_feedback_buttons(image)
         self._update_search_diagnostics(self.current_semantic_filtered_images)
         self.statusBar().showMessage(f"搜索反馈已保存：{self._feedback_label_text(label)}")
+
+    def _trim_search_feedback_cache(self, limit: int = 1024) -> None:
+        while len(self._search_feedback_cache) > limit:
+            oldest_key = next(iter(self._search_feedback_cache))
+            self._search_feedback_cache.pop(oldest_key, None)
 
     @staticmethod
     def _feedback_label_text(label: str) -> str:
@@ -9033,7 +9407,7 @@ class MainWindow(QMainWindow):
         self.selected_image = image
 
     def _on_grid_selection_changed(self, images: list[ImageItem]) -> None:
-        self._refresh_temp_project_save_button()
+        self._refresh_temp_project_save_button(len(images))
         self._queue_selection_detail_state(images)
 
     def _on_project_board_selection_changed(self, image_ids: list[int]) -> None:
@@ -9045,7 +9419,7 @@ class MainWindow(QMainWindow):
             if (image := self._board_image_by_id.get(int(image_id))) is not None
         ]
         self.selected_image = images[-1] if images else None
-        self._refresh_temp_project_save_button()
+        self._refresh_temp_project_save_button(len(images))
         self._queue_selection_detail_state(images)
 
     def _queue_selection_detail_state(self, images: Sequence[ImageItem]) -> None:
@@ -9106,7 +9480,7 @@ class MainWindow(QMainWindow):
                 self._tag_assignment_dirty = False
             else:
                 self._tag_assignment_dirty = True
-        self._refresh_temp_project_save_button()
+        self._refresh_temp_project_save_button(len(images))
 
     def _detail_tab_is_visible(self) -> bool:
         return (
@@ -9209,6 +9583,18 @@ class MainWindow(QMainWindow):
         self._save_selected_tag_filter()
 
     def _on_ai_vision_virtual_filter_selection_changed(self) -> None:
+        sender = self.sender()
+        if sender is getattr(self, "ai_vision_virtual_filter_list", None):
+            if hasattr(self, "ai_character_vision_virtual_filter_list"):
+                self.ai_character_vision_virtual_filter_list.blockSignals(True)
+                self.ai_character_vision_virtual_filter_list.clearSelection()
+                self.ai_character_vision_virtual_filter_list.setCurrentItem(None)
+                self.ai_character_vision_virtual_filter_list.blockSignals(False)
+        elif sender is getattr(self, "ai_character_vision_virtual_filter_list", None):
+            self.ai_vision_virtual_filter_list.blockSignals(True)
+            self.ai_vision_virtual_filter_list.clearSelection()
+            self.ai_vision_virtual_filter_list.setCurrentItem(None)
+            self.ai_vision_virtual_filter_list.blockSignals(False)
         selected_virtual_filter = self._selected_ai_vision_virtual_filter()
         previous_virtual_filter = self.current_virtual_filter
         if selected_virtual_filter:
@@ -9228,7 +9614,11 @@ class MainWindow(QMainWindow):
             else:
                 self._tag_assignment_dirty = True
             self._refresh_temp_project_save_button()
-        elif previous_virtual_filter == "un_ai_tagged":
+        elif previous_virtual_filter in {
+            "un_ai_tagged",
+            "un_ai_scene_tagged",
+            "un_ai_character_tagged",
+        }:
             self.current_virtual_filter = None
             self._refresh_virtual_collection_filters()
             self._refresh_current_results_for_filters()
@@ -9252,10 +9642,16 @@ class MainWindow(QMainWindow):
     def _clear_ai_vision_virtual_filter_selection(self) -> None:
         if not hasattr(self, "ai_vision_virtual_filter_list"):
             return
-        self.ai_vision_virtual_filter_list.blockSignals(True)
-        self.ai_vision_virtual_filter_list.clearSelection()
-        self.ai_vision_virtual_filter_list.setCurrentItem(None)
-        self.ai_vision_virtual_filter_list.blockSignals(False)
+        for list_widget in (
+            self.ai_vision_virtual_filter_list,
+            getattr(self, "ai_character_vision_virtual_filter_list", None),
+        ):
+            if list_widget is None:
+                continue
+            list_widget.blockSignals(True)
+            list_widget.clearSelection()
+            list_widget.setCurrentItem(None)
+            list_widget.blockSignals(False)
 
     def _set_detail_controls_enabled(self, enabled: bool) -> None:
         for widget in [
@@ -9343,12 +9739,16 @@ class MainWindow(QMainWindow):
         self._suppress_detail_auto_save = True
         self.file_name_input.setText(image.file_name)
         self._set_path_text(image.file_path)
-        collection_paths = self._collection_paths_for_image_cached(image.id)
-        self.image_collections_label.setText("；".join(collection_paths) if collection_paths else "未归类")
+        collection_paths = self._image_collection_paths_cache.get(image.id)
+        if collection_paths is None:
+            self.image_collections_label.setText("载入中...")
+        else:
+            self.image_collections_label.setText("；".join(collection_paths) if collection_paths else "未归类")
         self.size_label.setText(self._format_media_dimensions(image))
         self.modified_label.setText(image.modified_at or "-")
         self.embedding_label.setText(image.embedding_status)
-        self.ai_vision_detail_label.setText(self._format_ai_vision_details_cached(image.id))
+        ai_vision_text = self._ai_vision_detail_cache.get(image.id)
+        self.ai_vision_detail_label.setText(ai_vision_text if ai_vision_text is not None else "载入中...")
         if self.current_result_mode == "inspiration" and image.id in self.current_inspiration_matches:
             matches = self.current_inspiration_matches[image.id]
             titles = "、".join(match.term_title for match in matches[:3])
@@ -9357,13 +9757,18 @@ class MainWindow(QMainWindow):
         else:
             self.score_label.setText("-" if image.score is None else f"{image.score:.4f}")
         self.favorite_checkbox.setChecked(image.is_favorite)
-        tags = self._image_tags_cached(image.id)
-        self._set_tags_display(tags)
+        tags = self._image_tags_cache.get(image.id)
+        if tags is None:
+            self._set_tags_display([], "标签载入中...")
+        else:
+            self._set_tags_display(tags)
         self.note_input.setPlainText(image.note or "")
         self._suppress_detail_auto_save = False
         self._refresh_feedback_buttons(image)
         if self.current_result_mode == "creative_node":
             self._refresh_creative_selection_panel([image])
+        if collection_paths is None or tags is None or ai_vision_text is None:
+            self._request_selection_metadata(image.id)
 
         if is_supported_video(image.file_path):
             self._show_video_details(image)
@@ -9581,6 +9986,93 @@ class MainWindow(QMainWindow):
             return
         video_player.setSource(QUrl.fromLocalFile(image.file_path))
 
+    def _request_selection_metadata(self, image_id: int) -> None:
+        clean_id = int(image_id)
+        if (
+            clean_id in self._image_collection_paths_cache
+            and clean_id in self._image_tags_cache
+            and clean_id in self._ai_vision_detail_cache
+        ):
+            return
+        if (
+            self._selection_metadata_pending_image_id == clean_id
+            or self._selection_metadata_running_image_id == clean_id
+            or self._selection_metadata_queued_image_id == clean_id
+        ):
+            return
+        self._selection_metadata_pending_image_id = clean_id
+        if self._selection_metadata_running_image_id is not None:
+            self._selection_metadata_queued_image_id = clean_id
+            return
+        self._start_selection_metadata_task(clean_id)
+
+    def _start_selection_metadata_task(self, image_id: int) -> None:
+        clean_id = int(image_id)
+        self._selection_metadata_pending_image_id = clean_id
+        self._selection_metadata_running_image_id = clean_id
+        self._selection_metadata_thread_pool.start(
+            _SelectionMetadataLoadTask(
+                image_id=clean_id,
+                store=self.store,
+                signals=self._selection_metadata_signals,
+            )
+        )
+
+    def _start_queued_selection_metadata_if_needed(self) -> None:
+        queued_id = self._selection_metadata_queued_image_id
+        self._selection_metadata_queued_image_id = None
+        if queued_id is None:
+            return
+        if self._selection_metadata_pending_image_id != queued_id:
+            return
+        self._start_selection_metadata_task(queued_id)
+
+    def _handle_selection_metadata_loaded(
+        self,
+        image_id: object,
+        collection_paths: object,
+        tags: object,
+        scene_tags: object,
+        character_tags: object,
+        success: object,
+    ) -> None:
+        clean_id = int(image_id)
+        if self._selection_metadata_running_image_id == clean_id:
+            self._selection_metadata_running_image_id = None
+        if not bool(success):
+            if (
+                self.selected_image is not None
+                and self.selected_image.id == clean_id
+                and self._detail_tab_is_visible()
+            ):
+                self.image_collections_label.setText("载入失败")
+                self._set_tags_display([], "标签载入失败")
+                self.ai_vision_detail_label.setText("载入失败")
+            self._start_queued_selection_metadata_if_needed()
+            return
+
+        clean_collection_paths = [str(path) for path in collection_paths] if isinstance(collection_paths, list) else []
+        clean_tags = [str(tag) for tag in tags] if isinstance(tags, list) else []
+        self._image_collection_paths_cache[clean_id] = clean_collection_paths
+        self._image_tags_cache[clean_id] = clean_tags
+        self._ai_vision_detail_cache[clean_id] = self._format_ai_vision_detail_text(
+            scene_tags if isinstance(scene_tags, Mapping) else None,
+            character_tags if isinstance(character_tags, Mapping) else None,
+        )
+        if (
+            self.selected_image is not None
+            and self.selected_image.id == clean_id
+            and self._detail_tab_is_visible()
+        ):
+            self.image_collections_label.setText(
+                "；".join(clean_collection_paths) if clean_collection_paths else "未归类"
+            )
+            self._set_tags_display(clean_tags)
+            self.ai_vision_detail_label.setText(self._ai_vision_detail_cache[clean_id])
+        if self._selection_metadata_pending_image_id == clean_id:
+            self._selection_metadata_pending_image_id = None
+        self._start_queued_selection_metadata_if_needed()
+
     def _collection_paths_for_image_cached(self, image_id: int) -> list[str]:
         cached = self._image_collection_paths_cache.get(image_id)
         if cached is not None:
@@ -9618,7 +10110,41 @@ class MainWindow(QMainWindow):
             self._ai_vision_detail_cache.pop(clean_id, None)
 
     def _format_ai_vision_details(self, image_id: int) -> str:
-        tags = self.store.ai_vision_tags_for_image(image_id)
+        scene_tags = self.store.ai_vision_tags_for_image(
+            image_id,
+            analysis_type=AI_VISION_ANALYSIS_SCENE,
+        )
+        character_tags = self.store.ai_vision_tags_for_image(
+            image_id,
+            analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+        )
+        return self._format_ai_vision_detail_text(scene_tags, character_tags)
+
+    def _format_ai_vision_detail_text(
+        self,
+        scene_tags: Mapping[str, object] | None,
+        character_tags: Mapping[str, object] | None,
+    ) -> str:
+        if scene_tags is None and character_tags is None:
+            return "未识别" if self.current_language != "en" else "Not indexed"
+
+        sections: list[str] = []
+        scene_text = self._format_single_ai_vision_details(scene_tags, kind="scene")
+        if scene_text:
+            scene_title = "Scene" if self.current_language == "en" else "场景"
+            sections.append(f"{scene_title}：\n{scene_text}")
+        character_text = self._format_single_ai_vision_details(character_tags, kind="character")
+        if character_text:
+            character_title = "Character" if self.current_language == "en" else "角色"
+            sections.append(f"{character_title}：\n{character_text}")
+        return "\n\n".join(sections) if sections else "-"
+
+    def _format_single_ai_vision_details(
+        self,
+        tags: Mapping[str, object] | None,
+        *,
+        kind: str,
+    ) -> str:
         if tags is None:
             return "未识别" if self.current_language != "en" else "Not indexed"
         status = str(tags.get("status") or "")
@@ -9628,25 +10154,30 @@ class MainWindow(QMainWindow):
                 return f"{status}: {error[:120]}"
             return status
         parts: list[str] = []
-        for field in [
-            "scene_location",
-            "environment_type",
-            "time_of_day",
-            "weather",
-            "shot_scale",
-            "view_angle",
-        ]:
+        if kind == "character":
+            fields = ["character_gender", "character_age_group"]
+        else:
+            fields = [
+                "scene_location",
+                "environment_type",
+                "time_of_day",
+                "weather",
+                "shot_scale",
+                "view_angle",
+            ]
+        for field in fields:
             value = tags.get(field)
             if isinstance(value, str) and value:
                 parts.append(ai_vision_label(field, value, language=self.current_language))
-        lighting = tags.get("lighting")
-        if isinstance(lighting, list) and lighting:
-            label = " / ".join(
-                ai_vision_label("lighting", str(value), language=self.current_language).split(": ", 1)[-1]
-                for value in lighting
-            )
-            field_label = "Lighting" if self.current_language == "en" else "光照"
-            parts.append(f"{field_label}: {label}")
+        if kind == "scene":
+            lighting = tags.get("lighting")
+            if isinstance(lighting, list) and lighting:
+                label = " / ".join(
+                    ai_vision_label("lighting", str(value), language=self.current_language).split(": ", 1)[-1]
+                    for value in lighting
+                )
+                field_label = "Lighting" if self.current_language == "en" else "光照"
+                parts.append(f"{field_label}: {label}")
         notes = str(tags.get("notes") or "").strip()
         if notes:
             parts.append(notes)
@@ -11513,7 +12044,6 @@ class MainWindow(QMainWindow):
             return
 
         self._file_watch_build_running = True
-        self.statusBar().showMessage(f"正在准备监听 {len(roots_to_watch)} 个导入目录")
 
         def run() -> None:
             try:
@@ -11552,13 +12082,10 @@ class MainWindow(QMainWindow):
         if paths_to_watch:
             self._pending_watch_path_total = len(paths_to_watch)
             self._file_watch_configure_requested.emit(paths_to_watch)
-            self.statusBar().showMessage(f"正在后台监听 {len(paths_to_watch)} 个本地目录")
 
     def _handle_file_watch_configured(self, count: int) -> None:
         self._file_watch_configured_count = max(0, int(count))
         self._pending_watch_path_total = 0
-        if self._file_watch_configured_count:
-            self.statusBar().showMessage(f"已监听 {self._file_watch_configured_count} 个本地目录")
 
     def _handle_file_watch_worker_failed(self, message: str) -> None:
         self._record_error(f"文件监听失败：{message}")
@@ -12089,6 +12616,7 @@ class MainWindow(QMainWindow):
         self.ai_vision_worker = AIVisionWorker(
             store=self.store,
             provider=provider,
+            analysis_type=AI_VISION_ANALYSIS_SCENE,
             on_progress=lambda progress: self.events.put(("ai_vision", progress)),
         )
         self.ai_vision_worker.start()
@@ -12099,8 +12627,8 @@ class MainWindow(QMainWindow):
             self.ai_vision_worker.pause()
 
     def _retry_failed_ai_vision(self) -> None:
-        count = self.store.retry_failed_ai_vision()
-        self.statusBar().showMessage(f"已重试 {count} 个 AI 识别失败项")
+        count = self.store.retry_failed_ai_vision(analysis_type=AI_VISION_ANALYSIS_SCENE)
+        self.statusBar().showMessage(f"已重试 {count} 个 AI 场景识别失败项")
         self._refresh_ai_vision_stats()
         if count:
             self._start_ai_vision()
@@ -12110,7 +12638,12 @@ class MainWindow(QMainWindow):
         if collection_id is None:
             self.statusBar().showMessage("请先在左侧选择一个普通文件夹")
             return
-        self.store.set_ai_vision_collection_rule(collection_id, mode="include", include_descendants=True)
+        self.store.set_ai_vision_collection_rule(
+            collection_id,
+            mode="include",
+            include_descendants=True,
+            analysis_type=AI_VISION_ANALYSIS_SCENE,
+        )
         self._refresh_ai_vision_stats()
         self.statusBar().showMessage(f"已加入 AI 场景识别文件夹：{self._collection_path_text(collection_id)}")
 
@@ -12122,11 +12655,77 @@ class MainWindow(QMainWindow):
         collection_id = item.data(0, Qt.ItemDataRole.UserRole)
         if collection_id is None:
             return
-        removed = self.store.remove_ai_vision_collection_rule(int(collection_id))
+        removed = self.store.remove_ai_vision_collection_rule(
+            int(collection_id),
+            analysis_type=AI_VISION_ANALYSIS_SCENE,
+        )
         self._refresh_ai_vision_stats()
         self.statusBar().showMessage("已移除 AI 识别文件夹" if removed else "AI 识别文件夹不存在")
 
+    def _start_ai_character_vision(self) -> None:
+        if self._database_maintenance_active:
+            self.statusBar().showMessage("数据库维护中，暂不启动 AI 角色识别")
+            return
+        if (
+            self.ai_character_vision_worker is not None
+            and self.ai_character_vision_worker.is_alive()
+        ):
+            self.ai_character_vision_worker.resume_work()
+            self._refresh_ai_character_vision_stats()
+            return
+        provider = self._make_ai_vision_provider()
+        self.ai_character_vision_worker = AIVisionWorker(
+            store=self.store,
+            provider=provider,
+            analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+            on_progress=lambda progress: self.events.put(("ai_vision", progress)),
+        )
+        self.ai_character_vision_worker.start()
+        self._refresh_ai_character_vision_stats()
+
+    def _pause_ai_character_vision(self) -> None:
+        if self.ai_character_vision_worker is not None:
+            self.ai_character_vision_worker.pause()
+
+    def _retry_failed_ai_character_vision(self) -> None:
+        count = self.store.retry_failed_ai_vision(analysis_type=AI_VISION_ANALYSIS_CHARACTER)
+        self.statusBar().showMessage(f"已重试 {count} 个 AI 角色识别失败项")
+        self._refresh_ai_character_vision_stats()
+        if count:
+            self._start_ai_character_vision()
+
+    def _add_selected_collection_to_ai_character_vision(self) -> None:
+        collection_id = self._selected_collection_id()
+        if collection_id is None:
+            self.statusBar().showMessage("请先在左侧选择一个普通文件夹")
+            return
+        self.store.set_ai_vision_collection_rule(
+            collection_id,
+            mode="include",
+            include_descendants=True,
+            analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+        )
+        self._refresh_ai_character_vision_stats()
+        self.statusBar().showMessage(f"已加入 AI 角色识别文件夹：{self._collection_path_text(collection_id)}")
+
+    def _remove_selected_ai_character_vision_rule(self) -> None:
+        item = self.ai_character_vision_rule_tree.currentItem()
+        if item is None:
+            self.statusBar().showMessage("请先在 AI 角色识别文件夹列表中选择一个文件夹")
+            return
+        collection_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if collection_id is None:
+            return
+        removed = self.store.remove_ai_vision_collection_rule(
+            int(collection_id),
+            analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+        )
+        self._refresh_ai_character_vision_stats()
+        self.statusBar().showMessage("已移除 AI 角色识别文件夹" if removed else "AI 角色识别文件夹不存在")
+
     def _handle_ai_vision_progress(self, progress: AIVisionProgress) -> None:
+        if progress.status == "idle":
+            return
         self._queue_ai_vision_stats_refresh()
         if progress.status in {"ready", "failed", "stale", "pending"}:
             self._refresh_virtual_collection_counts()
@@ -12399,6 +12998,10 @@ class MainWindow(QMainWindow):
                     self.start_ai_vision_button.setEnabled(True)
                     self.pause_ai_vision_button.setEnabled(True)
                     self.retry_failed_ai_vision_button.setEnabled(True)
+                if hasattr(self, "start_ai_character_vision_button"):
+                    self.start_ai_character_vision_button.setEnabled(True)
+                    self.pause_ai_character_vision_button.setEnabled(True)
+                    self.retry_failed_ai_character_vision_button.setEnabled(True)
                 self._set_maintenance_controls_enabled(True)
                 if hasattr(self, "export_library_button"):
                     self._set_export_controls_enabled(True)
@@ -12643,6 +13246,8 @@ class MainWindow(QMainWindow):
         self.search_diagnostics_label.setText("搜索诊断：-")
 
     def _handle_embedding_progress(self, progress: EmbeddingProgress) -> None:
+        if progress.status == "idle":
+            return
         self._queue_embedding_stats_refresh()
         if progress.image_id is None:
             self.statusBar().showMessage(progress.message)
@@ -12867,18 +13472,38 @@ class MainWindow(QMainWindow):
     def _refresh_ai_vision_virtual_filter_entry(self, counts: Mapping[str, int]) -> None:
         if not hasattr(self, "ai_vision_virtual_filter_list"):
             return
-        previous = self.ai_vision_virtual_filter_list.blockSignals(True)
-        try:
-            self.ai_vision_virtual_filter_list.clear()
-            item = QListWidgetItem(f"未AI标签    {counts.get('un_ai_tagged', 0)}")
-            item.setData(COLLECTION_VIRTUAL_FILTER_ROLE, "un_ai_tagged")
-            item.setToolTip(self._virtual_filter_help("un_ai_tagged"))
-            self.ai_vision_virtual_filter_list.addItem(item)
-            if self.current_virtual_filter == "un_ai_tagged":
-                item.setSelected(True)
-                self.ai_vision_virtual_filter_list.setCurrentItem(item)
-        finally:
-            self.ai_vision_virtual_filter_list.blockSignals(previous)
+        entries = [
+            (
+                self.ai_vision_virtual_filter_list,
+                "un_ai_scene_tagged",
+                "未AI场景标签",
+                counts.get("un_ai_scene_tagged", counts.get("un_ai_tagged", 0)),
+            ),
+            (
+                getattr(self, "ai_character_vision_virtual_filter_list", None),
+                "un_ai_character_tagged",
+                "未AI角色标签",
+                counts.get("un_ai_character_tagged", 0),
+            ),
+        ]
+        for list_widget, virtual_filter, label, count in entries:
+            if list_widget is None:
+                continue
+            previous = list_widget.blockSignals(True)
+            try:
+                list_widget.clear()
+                item = QListWidgetItem(f"{label}    {count}")
+                item.setData(COLLECTION_VIRTUAL_FILTER_ROLE, virtual_filter)
+                item.setToolTip(self._virtual_filter_help(virtual_filter))
+                list_widget.addItem(item)
+                selected_filters = {virtual_filter}
+                if virtual_filter == "un_ai_scene_tagged":
+                    selected_filters.add("un_ai_tagged")
+                if self.current_virtual_filter in selected_filters:
+                    item.setSelected(True)
+                    list_widget.setCurrentItem(item)
+            finally:
+                list_widget.blockSignals(previous)
 
     def _refresh_creative_projects(self, select_project_id: int | None = None) -> None:
         if not hasattr(self, "creative_project_combo"):
@@ -14316,7 +14941,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "center_result_stack"):
             self.center_result_stack.setCurrentWidget(self.grid_view)
         if hasattr(self, "load_more_button"):
-            self.load_more_button.show()
+            self.load_more_button.hide()
         if hasattr(self, "save_project_board_layout_button"):
             self.save_project_board_layout_button.setEnabled(False)
         self._set_board_toolbar_visible(False)
@@ -14410,8 +15035,8 @@ class MainWindow(QMainWindow):
             self.board_fit_all_button,
             self.board_flip_button,
             self.board_grayscale_button,
-            self.board_import_button,
-            self.board_show_all_button,
+            self.board_edit_local_display_button,
+            self.board_toggle_local_display_button,
         ]
         for button in board_buttons:
             button.setVisible(visible)
@@ -14635,6 +15260,23 @@ class MainWindow(QMainWindow):
     def _toggle_board_selected_grayscale(self) -> None:
         changed = self.project_board_view.toggle_selected_grayscale()
         self.statusBar().showMessage(f"已切换黑白显示：{changed} 张")
+
+    def _edit_board_selected_local_display(self) -> None:
+        if not self.project_board_view.selected_image_ids():
+            self.statusBar().showMessage("先选择一张看板图片")
+            return
+        if self.project_board_view.edit_selected_local_display():
+            self.statusBar().showMessage("已更新局部展示")
+
+    def _toggle_board_selected_local_display(self) -> None:
+        if not self.project_board_view.selected_image_ids():
+            self.statusBar().showMessage("先选择看板图片")
+            return
+        changed = self.project_board_view.toggle_selected_local_display()
+        if changed:
+            self.statusBar().showMessage(f"已切换局部/全图：{changed} 张")
+        else:
+            self.statusBar().showMessage("选中的图片还没有局部展示")
 
     def _show_all_board_images(self) -> None:
         self.project_board_view.show_all_items()
@@ -16113,11 +16755,19 @@ class MainWindow(QMainWindow):
     def _selected_ai_vision_virtual_filter(self) -> str | None:
         if not hasattr(self, "ai_vision_virtual_filter_list"):
             return None
-        item = self.ai_vision_virtual_filter_list.currentItem()
-        if item is None:
-            return None
-        value = item.data(COLLECTION_VIRTUAL_FILTER_ROLE)
-        return str(value) if value else None
+        for list_widget in (
+            self.ai_vision_virtual_filter_list,
+            getattr(self, "ai_character_vision_virtual_filter_list", None),
+        ):
+            if list_widget is None:
+                continue
+            item = list_widget.currentItem()
+            if item is None:
+                continue
+            value = item.data(COLLECTION_VIRTUAL_FILTER_ROLE)
+            if value:
+                return str(value)
+        return None
 
     def _selected_tag_match_mode(self) -> str:
         return "any" if self.tag_match_combo.currentData() == "any" else "all"
@@ -16878,6 +17528,7 @@ class MainWindow(QMainWindow):
             provider_name=provider_name,
             model_name=model_name,
             prompt_version=AI_VISION_PROMPT_VERSION,
+            analysis_type=AI_VISION_ANALYSIS_SCENE,
         )
         total = stats["total"]
         ready = stats["ready"]
@@ -16897,6 +17548,7 @@ class MainWindow(QMainWindow):
             provider_name=provider_name,
             model_name=model_name,
             prompt_version=AI_VISION_PROMPT_VERSION,
+            analysis_type=AI_VISION_ANALYSIS_SCENE,
         ):
             rule_stats = rule["stats"]
             assert isinstance(rule_stats, dict)
@@ -16914,6 +17566,57 @@ class MainWindow(QMainWindow):
             self.ai_vision_rule_tree.addTopLevelItem(item)
         self.ai_vision_rule_tree.blockSignals(False)
         self._refresh_ai_vision_virtual_filter_entry(self.store.virtual_image_filter_counts())
+        self._refresh_ai_character_vision_stats(refresh_virtual_filters=False)
+
+    def _refresh_ai_character_vision_stats(self, *, refresh_virtual_filters: bool = True) -> None:
+        if not hasattr(self, "ai_character_vision_progress_bar"):
+            return
+        provider_name = self._ai_vision_provider_name()
+        model_name = self._ai_vision_model_name_for_stats()
+        prompt_version = ai_vision_prompt_version(AI_VISION_ANALYSIS_CHARACTER)
+        stats = self.store.ai_vision_stats(
+            provider_name=provider_name,
+            model_name=model_name,
+            prompt_version=prompt_version,
+            analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+        )
+        total = stats["total"]
+        ready = stats["ready"]
+        failed = stats["failed"]
+        processing = stats["processing"]
+        pending = stats["pending"] + stats["stale"]
+        percent = int((ready / total) * 100) if total else 0
+        self.ai_character_vision_progress_bar.setValue(percent)
+        self.ai_character_vision_stats_label.setText(
+            f"已完成：{ready} / {total}\n"
+            f"剩余：{pending}    处理中：{processing}\n"
+            f"失败：{failed}    进度：{percent}%"
+        )
+        self.ai_character_vision_rule_tree.blockSignals(True)
+        self.ai_character_vision_rule_tree.clear()
+        for rule in self.store.list_ai_vision_collection_rules_with_stats(
+            provider_name=provider_name,
+            model_name=model_name,
+            prompt_version=prompt_version,
+            analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+        ):
+            rule_stats = rule["stats"]
+            assert isinstance(rule_stats, dict)
+            pending_count = int(rule_stats["pending"]) + int(rule_stats["stale"])
+            item = QTreeWidgetItem(
+                [
+                    str(rule["path"]),
+                    str(rule_stats["ready"]),
+                    str(rule_stats["failed"]),
+                    str(pending_count),
+                    str(rule_stats["total"]),
+                ]
+            )
+            item.setData(0, Qt.ItemDataRole.UserRole, int(rule["collection_id"]))
+            self.ai_character_vision_rule_tree.addTopLevelItem(item)
+        self.ai_character_vision_rule_tree.blockSignals(False)
+        if refresh_virtual_filters:
+            self._refresh_ai_vision_virtual_filter_entry(self.store.virtual_image_filter_counts())
 
     def _apply_sidebar_filters(self, images: list[ImageItem]) -> list[ImageItem]:
         folder_path_prefix = self._selected_folder_path_prefix()

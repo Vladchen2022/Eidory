@@ -8,11 +8,14 @@ from unittest.mock import patch
 from PIL import Image
 
 from eidory.core.ai_vision import (
+    AI_VISION_ANALYSIS_CHARACTER,
     AI_VISION_MAX_TOKENS,
     AIVisionProvider,
     AIVisionProviderError,
+    ai_vision_label,
     image_to_data_url,
     normalize_ai_vision_analysis,
+    parse_ai_vision_analysis,
 )
 from eidory.core.image_loader import MAX_AI_VISION_UPLOAD_BYTES
 
@@ -103,7 +106,11 @@ class AIVisionTest(unittest.TestCase):
                 model_name="vision-model",
             )
             with patch("eidory.core.ai_vision.requests.post", side_effect=fake_post):
-                provider._chat_completion(model_name="vision-model", image_path=image_path)
+                provider._chat_completion(
+                    model_name="vision-model",
+                    image_path=image_path,
+                    analysis_type="scene",
+                )
 
             self.assertEqual(captured_payloads[0]["max_tokens"], AI_VISION_MAX_TOKENS)
             self.assertGreaterEqual(AI_VISION_MAX_TOKENS, 2048)
@@ -132,6 +139,25 @@ class AIVisionTest(unittest.TestCase):
         self.assertEqual(analysis.shot_scale, "long")
         self.assertEqual(analysis.view_angle, "eye_level")
         self.assertEqual(analysis.lighting, ["unclear", "diffuse"])
+
+    def test_parse_ai_character_vision_analysis(self) -> None:
+        raw = """
+        {
+          "character_gender": {"value": "女性", "confidence": 0.8, "note": ""},
+          "character_age_group": {"value": "中年", "confidence": 0.7, "note": ""},
+          "notes": "主要角色清晰"
+        }
+        """
+
+        analysis = parse_ai_vision_analysis(
+            raw,
+            analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+        )
+
+        self.assertEqual(analysis.character_gender, "female")
+        self.assertEqual(analysis.character_age_group, "middle_aged")
+        self.assertEqual(ai_vision_label("character_gender", "female"), "性别: 女")
+        self.assertEqual(ai_vision_label("character_age_group", "middle_aged"), "年龄段: 中年")
 
     def test_image_to_data_url_uses_bounded_thumbnail_not_source_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

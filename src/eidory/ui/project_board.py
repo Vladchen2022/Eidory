@@ -791,10 +791,10 @@ class LocalDisplayEditorCanvas(QWidget):
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#252b33"))
+        painter.fillRect(self.rect(), QColor("#242a31"))
         display_rect = self._display_rect()
         if display_rect.isNull() or self._pixmap.isNull():
-            painter.setPen(QColor("#d8dee9"))
+            painter.setPen(QColor("#dfe6ef"))
             painter.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter), "无法载入图片")
             painter.end()
             return
@@ -809,13 +809,13 @@ class LocalDisplayEditorCanvas(QWidget):
             outer = QPainterPath()
             outer.addRect(display_rect)
             overlay = outer.subtracted(selection_path)
-            painter.fillPath(overlay, QColor(10, 14, 20, 150))
+            painter.fillPath(overlay, QColor(12, 16, 22, 154))
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setPen(QPen(QColor("#4f83ff"), 2))
             painter.drawPath(selection_path)
         if self._mode == "polygon":
             self._paint_polygon_points(painter, display_rect)
-        painter.setPen(QPen(QColor("#596674"), 1))
+        painter.setPen(QPen(QColor("#657386"), 1))
         painter.drawRect(display_rect)
         painter.end()
 
@@ -1096,7 +1096,7 @@ class ProjectBoardView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self.setBackgroundBrush(QColor("#20262d"))
+        self.setBackgroundBrush(QColor("#202830"))
         self._image_items: dict[int, QGraphicsItem] = {}
         self._title_item: QGraphicsTextItem | None = None
         self._zoom = 1.0
@@ -1492,10 +1492,10 @@ class ProjectBoardView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
-        painter.fillRect(rect, QColor("#252b33"))
-        minor_pen = QPen(QColor("#303842"))
+        painter.fillRect(rect, QColor("#202830"))
+        minor_pen = QPen(QColor("#2b3440"))
         minor_pen.setWidth(0)
-        major_pen = QPen(QColor("#3a4450"))
+        major_pen = QPen(QColor("#364250"))
         major_pen.setWidth(0)
 
         left = int(rect.left()) - (int(rect.left()) % GRID_SIZE)
@@ -1659,11 +1659,11 @@ class ProjectBoardView(QGraphicsView):
                 QRectF(0, 0, width, height),
                 on_layout_changed=self._schedule_layout_changed,
             )
-            frame.setBrush(QColor("#171b21"))
-            frame.setPen(QPen(QColor("#4b5563"), 1))
+            frame.setBrush(QColor("#202830"))
+            frame.setPen(QPen(QColor("#536071"), 1))
             item: QGraphicsItem = frame
             label = QGraphicsTextItem(image.file_name, frame)
-            label.setDefaultTextColor(QColor("#d8dee9"))
+            label.setDefaultTextColor(QColor("#dfe6ef"))
             label.setTextWidth(width - 18)
             label.setPos(9, height / 2 - 20)
         else:

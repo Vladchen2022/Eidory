@@ -248,9 +248,9 @@ class JustifiedImageGridView(QAbstractScrollArea):
                 self._draw_badges(painter, draw_rect, image)
                 if index in self._selected_indexes:
                     old_pen = painter.pen()
-                    painter.fillRect(draw_rect, QColor(79, 124, 255, 92))
-                    outer_pen = QPen(QColor("#78a3ff"), 3)
-                    inner_pen = QPen(QColor("#d7e3ff"), 1)
+                    painter.fillRect(draw_rect, QColor(79, 131, 255, 86))
+                    outer_pen = QPen(QColor("#86aaff"), 3)
+                    inner_pen = QPen(QColor("#e0e9ff"), 1)
                     painter.setPen(outer_pen)
                     painter.drawRect(draw_rect.adjusted(1, 1, -2, -2))
                     painter.setPen(inner_pen)
@@ -258,7 +258,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
                     painter.setPen(old_pen)
                 if index == self._selected_index and index not in self._selected_indexes:
                     pen = painter.pen()
-                    focus_pen = QPen(QColor("#78a3ff"), 2)
+                    focus_pen = QPen(QColor("#86aaff"), 2)
                     painter.setPen(focus_pen)
                     painter.drawRect(draw_rect.adjusted(0, 0, -1, -1))
                     painter.setPen(pen)
@@ -788,8 +788,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         return max(0, pixmap.width()) * max(0, pixmap.height()) * 4
 
     def _draw_placeholder(self, painter: QPainter, rect: QRect, image: ImageItem) -> None:
-        painter.fillRect(rect, QColor("#2d3138"))
-        painter.setPen(QColor("#d8dee9"))
+        painter.fillRect(rect, QColor("#242a31"))
+        painter.setPen(QColor("#dfe6ef"))
         if image.is_missing:
             text = "文件丢失"
         elif is_supported_video(image.file_path):
@@ -817,8 +817,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
             max(1, badge_width),
             badge_height,
         )
-        painter.fillRect(badge_rect, QColor(17, 19, 24, 190))
-        painter.setPen(QColor("#f4f6fb"))
+        painter.fillRect(badge_rect, QColor(16, 20, 26, 205))
+        painter.setPen(QColor("#f3f6fb"))
         painter.drawText(
             badge_rect.adjusted(padding_x, 0, -padding_x, 0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,

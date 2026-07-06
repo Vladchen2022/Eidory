@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 from PIL import Image, ImageFile
@@ -22,7 +23,12 @@ def open_local_image(image_path: str | Path) -> Image.Image:
         raise ValueError(f"image file is too large: {file_size:,} bytes")
     Image.MAX_IMAGE_PIXELS = MAX_DECODED_IMAGE_PIXELS
     ImageFile.LOAD_TRUNCATED_IMAGES = True
-    image = Image.open(path)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            image = Image.open(path)
+    except Image.DecompressionBombError as exc:
+        raise ValueError(f"image dimensions are too large: {path.name}") from exc
     pixels = int(image.width) * int(image.height)
     if pixels > MAX_DECODED_IMAGE_PIXELS:
         image.close()

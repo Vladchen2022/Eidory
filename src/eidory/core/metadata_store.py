@@ -1319,6 +1319,30 @@ class MetadataStore:
             ).fetchall()
         return {int(row["image_id"]) for row in rows}
 
+    def image_ids_for_collections(self, collection_ids: Sequence[int]) -> set[int]:
+        all_collection_ids: set[int] = set()
+        for collection_id in self._clean_ids(collection_ids):
+            all_collection_ids.update(self.collection_descendant_ids(collection_id))
+        if not all_collection_ids:
+            return set()
+        clean_collection_ids = sorted(all_collection_ids)
+        image_ids: set[int] = set()
+        with self.connect(readonly=True) as conn:
+            for chunk in self._chunks(clean_collection_ids, self._sqlite_chunk_size):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT ic.image_id
+                    FROM image_collections ic
+                    JOIN images i ON i.id = ic.image_id
+                    WHERE ic.collection_id IN ({placeholders})
+                      AND i.is_missing = 0
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+                image_ids.update(int(row["image_id"]) for row in rows)
+        return image_ids
+
     def create_collection(self, name: str, parent_id: int | None = None) -> int:
         clean_name = name.strip()
         if not clean_name:
@@ -3161,6 +3185,28 @@ class MetadataStore:
                 (image_id,),
             ).fetchall()
             return [str(row["tag_name"]) for row in rows]
+
+    def image_tags_for_image_ids(self, image_ids: Sequence[int]) -> dict[int, list[str]]:
+        clean_ids = self._clean_ids(image_ids)
+        if not clean_ids:
+            return {}
+        tags_by_image_id: dict[int, list[str]] = {image_id: [] for image_id in clean_ids}
+        with self.connect(readonly=True) as conn:
+            for chunk in self._chunks(clean_ids, self._sqlite_chunk_size):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT it.image_id, t.tag_name
+                    FROM image_tags it
+                    JOIN tags t ON t.id = it.tag_id
+                    WHERE it.image_id IN ({placeholders})
+                    ORDER BY it.image_id, t.tag_name COLLATE NOCASE
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+                for row in rows:
+                    tags_by_image_id.setdefault(int(row["image_id"]), []).append(str(row["tag_name"]))
+        return tags_by_image_id
 
     def tag_counts_for_images(self, image_ids: Sequence[int]) -> dict[str, int]:
         clean_ids = self._clean_ids(image_ids)
@@ -5892,6 +5938,87 @@ class MetadataStore:
         }
         for row in status_rows:
             status = str(row["status"])
+            if status in stats:
+                stats[status] = int(row["count"])
+        known = stats["ready"] + stats["failed"] + stats["processing"] + stats["stale"]
+        stats["pending"] = max(0, stats["total"] - known)
+        return stats
+
+    def thumbnail_stats(self) -> dict[str, int]:
+        with self.connect(readonly=True) as conn:
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM images WHERE is_missing = 0"
+            ).fetchone()
+            status_rows = conn.execute(
+                """
+                SELECT thumbnail_status AS status, COUNT(*) AS count
+                FROM images
+                WHERE is_missing = 0
+                GROUP BY thumbnail_status
+                """
+            ).fetchall()
+        stats = {
+            "total": int(total_row["count"]),
+            "ready": 0,
+            "failed": 0,
+            "processing": 0,
+            "stale": 0,
+            "pending": 0,
+        }
+        for row in status_rows:
+            status = str(row["status"] or "pending")
+            if status in stats:
+                stats[status] = int(row["count"])
+            else:
+                stats["pending"] += int(row["count"])
+        known = stats["ready"] + stats["failed"] + stats["processing"] + stats["stale"] + stats["pending"]
+        if known < stats["total"]:
+            stats["pending"] += stats["total"] - known
+        return stats
+
+    def color_feature_stats(
+        self,
+        *,
+        vector_version: str = COLOR_VECTOR_VERSION,
+        vector_dim: int = COLOR_VECTOR_DIM,
+    ) -> dict[str, int]:
+        with self.connect(readonly=True) as conn:
+            total_row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM images
+                WHERE is_missing = 0
+                  AND {self._image_extension_clause("file_ext")}
+                """,
+                tuple(sorted(SUPPORTED_IMAGE_EXTENSIONS)),
+            ).fetchone()
+            status_rows = conn.execute(
+                """
+                SELECT cf.status, COUNT(*) AS count
+                FROM color_features cf
+                JOIN images i ON i.id = cf.image_id
+                WHERE cf.vector_version = ?
+                  AND cf.vector_dim = ?
+                  AND i.is_missing = 0
+                  AND i.file_ext IN ({})
+                GROUP BY cf.status
+                """.format(",".join("?" for _ in SUPPORTED_IMAGE_EXTENSIONS)),
+                (
+                    vector_version,
+                    vector_dim,
+                    *sorted(SUPPORTED_IMAGE_EXTENSIONS),
+                ),
+            ).fetchall()
+        stats = {
+            "total": int(total_row["count"]),
+            "ready": 0,
+            "failed": 0,
+            "processing": 0,
+            "stale": 0,
+            "pending": 0,
+        }
+        for row in status_rows:
+            status = str(row["status"] or "pending")
             if status in stats:
                 stats[status] = int(row["count"])
         known = stats["ready"] + stats["failed"] + stats["processing"] + stats["stale"]

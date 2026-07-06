@@ -65,6 +65,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
     def __init__(self, thumbnail_size: int = 180, spacing: int = 4):
         super().__init__()
         self._images: list[ImageItem] = []
+        self._indexes_by_image_id: dict[int, int] = {}
         self._rects: list[QRect] = []
         self._row_ranges: list[tuple[int, int, int, int]] = []
         self._row_tops: list[int] = []
@@ -86,7 +87,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._viewport_update_pending = False
         self._pixmap_load_signals = _PixmapLoadSignals()
         self._pixmap_load_signals.loaded.connect(self._handle_async_pixmap_loaded)
-        self._thread_pool = QThreadPool.globalInstance()
+        self._thread_pool = QThreadPool(self)
+        self._thread_pool.setMaxThreadCount(2)
         self._cache_limit = 700
         self._cache_byte_limit = 180 * 1024 * 1024
         self._pending_load_limit = 48
@@ -167,7 +169,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._images = new_images
         self._layout_signature = new_layout_signature
         self._badges_by_image_id = dict(badges_by_image_id or {})
-        indexes_by_id = {image.id: index for index, image in enumerate(self._images)}
+        self._rebuild_index_map()
+        indexes_by_id = self._indexes_by_image_id
         self._selected_indexes = {
             indexes_by_id[image_id]
             for image_id in selected_image_ids
@@ -188,9 +191,15 @@ class JustifiedImageGridView(QAbstractScrollArea):
     def append_images(self, images: list[ImageItem]) -> None:
         if not images:
             return
+        old_count = len(self._images)
         self._images.extend(images)
-        self._layout_signature = self._layout_keys(self._images)
-        self._rebuild_layout()
+        self._layout_signature = self._layout_signature + self._layout_keys(images)
+        for offset, image in enumerate(images):
+            self._indexes_by_image_id[image.id] = old_count + offset
+        if self._row_ranges:
+            self._rebuild_layout_from(self._row_ranges[-1][2])
+        else:
+            self._rebuild_layout()
         self.viewport().update()
 
     def image_at(self, row: int) -> ImageItem | None:
@@ -202,11 +211,11 @@ class JustifiedImageGridView(QAbstractScrollArea):
         return self.image_at(self._selected_index)
 
     def select_image_id(self, image_id: int) -> None:
-        for index, image in enumerate(self._images):
-            if image.id == image_id:
-                self._select_single(index)
-                self._ensure_index_visible(index)
-                return
+        index = self._indexes_by_image_id.get(int(image_id))
+        if index is None:
+            return
+        self._select_single(index)
+        self._ensure_index_visible(index)
 
     def set_thumbnail_size(self, size: int) -> None:
         self._target_height = max(80, min(420, size))
@@ -555,11 +564,36 @@ class JustifiedImageGridView(QAbstractScrollArea):
         return -1
 
     def _rebuild_layout(self) -> None:
+        self._rebuild_layout_from(0)
+
+    def _rebuild_layout_from(self, start_index: int) -> None:
         viewport_width = max(1, self.viewport().width())
         available_width = max(1, viewport_width)
-        y = 0
-        rects: list[QRect] = [QRect() for _ in self._images]
-        row_ranges: list[tuple[int, int, int, int]] = []
+        start_index = max(0, min(int(start_index), len(self._images)))
+        if start_index <= 0 or not self._row_ranges or not self._rects:
+            y = 0
+            rects: list[QRect] = [QRect() for _ in self._images]
+            row_ranges: list[tuple[int, int, int, int]] = []
+            start_index = 0
+        else:
+            rects = self._rects
+            if len(rects) < len(self._images):
+                rects.extend(QRect() for _ in range(len(self._images) - len(rects)))
+            elif len(rects) > len(self._images):
+                del rects[len(self._images):]
+            row_ranges = []
+            y = 0
+            for row in self._row_ranges:
+                row_top, row_bottom, row_start, row_end = row
+                if row_end <= start_index:
+                    row_ranges.append(row)
+                    y = row_bottom
+                    continue
+                start_index = row_start
+                y = row_top
+                break
+            for index in range(start_index, len(rects)):
+                rects[index] = QRect()
         row_indexes: list[int] = []
         row_aspects: list[float] = []
         row_width = 0.0
@@ -576,7 +610,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
             row_indexes = []
             row_aspects = []
 
-        for index, image in enumerate(self._images):
+        for index in range(start_index, len(self._images)):
+            image = self._images[index]
             aspect = self._aspect_ratio(image)
             next_width = self._target_height * aspect
             spacing_width = self._spacing * len(row_indexes)
@@ -597,6 +632,9 @@ class JustifiedImageGridView(QAbstractScrollArea):
         bar = self.verticalScrollBar()
         bar.setPageStep(self.viewport().height())
         bar.setRange(0, max(0, content_height - self.viewport().height()))
+
+    def _rebuild_index_map(self) -> None:
+        self._indexes_by_image_id = {image.id: index for index, image in enumerate(self._images)}
 
     @staticmethod
     def _layout_keys(images: list[ImageItem]) -> tuple[tuple[object, ...], ...]:

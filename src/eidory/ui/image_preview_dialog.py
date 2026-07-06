@@ -1367,7 +1367,8 @@ class ImagePreviewDialog(QDialog):
         ] | None = None
         self._preview_source_signals = _PreviewSourceLoadSignals()
         self._preview_source_signals.loaded.connect(self._handle_preview_source_loaded)
-        self._preview_source_thread_pool = QThreadPool.globalInstance()
+        self._preview_source_thread_pool = QThreadPool(self)
+        self._preview_source_thread_pool.setMaxThreadCount(2)
         self._linetop_settings = LineTopSettings()
         self._linetop_show_original_compare = False
         self._linetop_render_cache: dict[tuple[object, ...], QPixmap] = {}
@@ -1384,7 +1385,8 @@ class ImagePreviewDialog(QDialog):
         ] | None = None
         self._linetop_render_signals = _LineTopRenderSignals()
         self._linetop_render_signals.loaded.connect(self._handle_linetop_render_loaded)
-        self._linetop_thread_pool = QThreadPool.globalInstance()
+        self._linetop_thread_pool = QThreadPool(self)
+        self._linetop_thread_pool.setMaxThreadCount(1)
         self._linetop_render_timer = QTimer(self)
         self._linetop_render_timer.setSingleShot(True)
         self._linetop_render_timer.setInterval(120)
@@ -1490,6 +1492,9 @@ class ImagePreviewDialog(QDialog):
         self.save_render_button = QPushButton("保存为")
         self.save_render_button.setToolTip("把当前高级处理结果另存为 PNG，不改动图库源图")
         self.save_render_button.setEnabled(False)
+        self.copy_render_button = QPushButton("复制处理图")
+        self.copy_render_button.setToolTip("把当前高级处理结果复制到剪贴板，不改动图库源图")
+        self.copy_render_button.setEnabled(False)
         self.advanced_toggle_button = QPushButton("高级")
         self.advanced_toggle_button.setCheckable(True)
         self.advanced_toggle_button.setToolTip("显示或隐藏高级功能区（Tab）")
@@ -1518,6 +1523,7 @@ class ImagePreviewDialog(QDialog):
             self.mirror_button,
             self.compare_toggle_button,
             self.save_render_button,
+            self.copy_render_button,
             self.advanced_toggle_button,
         ]
         for button in [*nav_buttons, *self.feedback_buttons.values()]:
@@ -1556,6 +1562,7 @@ class ImagePreviewDialog(QDialog):
         controls.addStretch(1)
         controls.addWidget(self.compare_toggle_button)
         controls.addWidget(self.save_render_button)
+        controls.addWidget(self.copy_render_button)
         controls.addWidget(self.advanced_toggle_button)
 
         layout = QVBoxLayout(self)
@@ -1581,6 +1588,7 @@ class ImagePreviewDialog(QDialog):
         self.favorite_checkbox.toggled.connect(self._save_favorite)
         self.compare_toggle_button.toggled.connect(self._set_linetop_compare_original)
         self.save_render_button.clicked.connect(self._save_linetop_render_as)
+        self.copy_render_button.clicked.connect(self._copy_linetop_render_to_clipboard)
         self.advanced_toggle_button.toggled.connect(self._set_linetop_panel_visible)
         self.feedback_relevant_button.clicked.connect(lambda: self._save_feedback("relevant"))
         self.feedback_irrelevant_button.clicked.connect(lambda: self._save_feedback("irrelevant"))
@@ -1727,6 +1735,7 @@ class ImagePreviewDialog(QDialog):
             self.copy_image_button.setEnabled(False)
             self.compare_toggle_button.setEnabled(False)
             self.save_render_button.setEnabled(False)
+            self.copy_render_button.setEnabled(False)
             self.advanced_toggle_button.setEnabled(False)
             self._refresh_linetop_action_buttons(None)
             self.remove_index_button.setEnabled(False)
@@ -1752,6 +1761,7 @@ class ImagePreviewDialog(QDialog):
             self.advanced_toggle_button.setEnabled(True)
             self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
             self.save_render_button.setEnabled(self._linetop_preview_active(image))
+            self.copy_render_button.setEnabled(self._linetop_preview_active(image))
             self._refresh_linetop_action_buttons(image)
             self._render_current_image(use_thumbnail_first=True)
             self._preview_refine_timer.start()
@@ -1828,6 +1838,7 @@ class ImagePreviewDialog(QDialog):
         advanced_active = self._linetop_preview_active(image)
         self.compare_toggle_button.setEnabled(advanced_active)
         self.save_render_button.setEnabled(advanced_active)
+        self.copy_render_button.setEnabled(advanced_active)
         self._refresh_linetop_action_buttons(image)
         max_width, max_height = self._render_bounds()
         if advanced_active and not self._linetop_show_original_compare:
@@ -2401,6 +2412,8 @@ class ImagePreviewDialog(QDialog):
         active = self._linetop_preview_active(image)
         if hasattr(self, "linetop_open_overlay_button"):
             self.linetop_open_overlay_button.setEnabled(active)
+        if hasattr(self, "copy_render_button"):
+            self.copy_render_button.setEnabled(active)
 
     def _toggle_linetop_panel(self) -> None:
         self._set_linetop_panel_visible(self.advanced_panel.isHidden())
@@ -2459,6 +2472,7 @@ class ImagePreviewDialog(QDialog):
         if panel_is_visible == visible:
             self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
             self.save_render_button.setEnabled(self._linetop_preview_active(image))
+            self.copy_render_button.setEnabled(self._linetop_preview_active(image))
             self._refresh_linetop_action_buttons(image)
             return
         if visible:
@@ -2468,6 +2482,7 @@ class ImagePreviewDialog(QDialog):
             self._resize_for_linetop_panel_visibility(False)
         self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
         self.save_render_button.setEnabled(self._linetop_preview_active(image))
+        self.copy_render_button.setEnabled(self._linetop_preview_active(image))
         self._refresh_linetop_action_buttons(image)
         self._linetop_render_timer.stop()
         self._linetop_render_pending_token = None
@@ -2706,6 +2721,26 @@ class ImagePreviewDialog(QDialog):
             rendered.save(target_path, "PNG")
         except Exception as exc:
             QMessageBox.warning(self, "Eidory", f"保存失败：{exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _copy_linetop_render_to_clipboard(self) -> None:
+        image = self.current_image()
+        if image is None or not self._linetop_preview_active(image):
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            rendered = self._render_linetop_export_image(image)
+            qimage = _qimage_from_pillow(rendered)
+            pixmap = QPixmap.fromImage(qimage) if not qimage.isNull() else QPixmap()
+            if pixmap.isNull():
+                QMessageBox.warning(self, "Eidory", "复制失败：处理结果为空。")
+                return
+            clipboard = QApplication.clipboard()
+            clipboard.setPixmap(pixmap)
+            self.info_label.setText(f"{image.file_name}    已复制处理图")
+        except Exception as exc:
+            QMessageBox.warning(self, "Eidory", f"复制失败：{exc}")
         finally:
             QApplication.restoreOverrideCursor()
 

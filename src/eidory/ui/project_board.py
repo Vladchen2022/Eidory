@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
@@ -266,6 +267,7 @@ class BoardImageItem(QGraphicsPixmapItem):
         self._flipped = False
         self._grayscale = False
         self._local_display: dict[str, Any] | None = None
+        self._display_variant_cache: OrderedDict[tuple[object, ...], QPixmap] = OrderedDict()
         self.setToolTip(file_path)
         self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self.setCacheMode(QGraphicsItem.CacheMode.ItemCoordinateCache)
@@ -442,16 +444,36 @@ class BoardImageItem(QGraphicsPixmapItem):
         pixmap = self._source_pixmap
         if pixmap.isNull():
             return
-        pixmap = self._local_display_pixmap(pixmap)
-        if self._grayscale:
-            image = pixmap.toImage().convertToFormat(QImage.Format.Format_Grayscale8)
-            pixmap = QPixmap.fromImage(image.convertToFormat(QImage.Format.Format_ARGB32))
-        if self._flipped:
-            pixmap = pixmap.transformed(QTransform().scale(-1, 1), Qt.TransformationMode.SmoothTransformation)
+        cache_key = self._display_variant_cache_key()
+        cached = self._display_variant_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            self._display_variant_cache.move_to_end(cache_key)
+            pixmap = QPixmap(cached)
+        else:
+            pixmap = self._local_display_pixmap(pixmap)
+            if self._grayscale:
+                image = pixmap.toImage().convertToFormat(QImage.Format.Format_Grayscale8)
+                pixmap = QPixmap.fromImage(image.convertToFormat(QImage.Format.Format_ARGB32))
+            if self._flipped:
+                pixmap = pixmap.transformed(QTransform().scale(-1, 1), Qt.TransformationMode.SmoothTransformation)
+            self._display_variant_cache[cache_key] = QPixmap(pixmap)
+            self._display_variant_cache.move_to_end(cache_key)
+            while len(self._display_variant_cache) > 4:
+                self._display_variant_cache.popitem(last=False)
         current_width = self._display_width
         self._aspect_ratio = pixmap.width() / max(1, pixmap.height())
         self.setPixmap(pixmap)
         self.set_display_size(current_width, sync_local_full_width=False)
+
+    def _display_variant_cache_key(self) -> tuple[object, ...]:
+        local_payload = _normalize_local_display(self._local_display)
+        local_json = json.dumps(local_payload, sort_keys=True, separators=(",", ":")) if local_payload else ""
+        return (
+            int(self._source_pixmap.cacheKey()),
+            bool(self._grayscale),
+            bool(self._flipped),
+            local_json,
+        )
 
     def _local_display_pixmap(self, pixmap: QPixmap) -> QPixmap:
         if pixmap.isNull() or not self.is_local_display_enabled():
@@ -699,6 +721,7 @@ class LocalDisplayEditorCanvas(QWidget):
         self._rect_start: QPointF | None = None
         self._rect_end: QPointF | None = None
         self._polygon_points: list[QPointF] = []
+        self._dragging_polygon_point_index: int | None = None
         self._cursor_source_pos: QPointF | None = None
         self.setMinimumSize(720, 520)
         self.setMouseTracking(True)
@@ -747,6 +770,7 @@ class LocalDisplayEditorCanvas(QWidget):
         self._rect_start = None
         self._rect_end = None
         self._polygon_points = []
+        self._dragging_polygon_point_index = None
         self._cursor_source_pos = None
         self.update()
 
@@ -833,7 +857,11 @@ class LocalDisplayEditorCanvas(QWidget):
             self._rect_start = source_pos
             self._rect_end = source_pos
         else:
-            if len(self._polygon_points) < LOCAL_DISPLAY_MAX_POINTS:
+            point_index = self._nearest_polygon_point_index(source_pos)
+            if point_index is not None:
+                self._dragging_polygon_point_index = point_index
+                self._polygon_points[point_index] = source_pos
+            elif len(self._polygon_points) < LOCAL_DISPLAY_MAX_POINTS:
                 self._polygon_points.append(source_pos)
         self.update()
         event.accept()
@@ -843,6 +871,11 @@ class LocalDisplayEditorCanvas(QWidget):
         self._cursor_source_pos = source_pos
         if self._mode == "rect" and self._dragging_rect and source_pos is not None:
             self._rect_end = source_pos
+            self.update()
+            event.accept()
+            return
+        if self._mode == "polygon" and self._dragging_polygon_point_index is not None and source_pos is not None:
+            self._polygon_points[self._dragging_polygon_point_index] = source_pos
             self.update()
             event.accept()
             return
@@ -856,6 +889,14 @@ class LocalDisplayEditorCanvas(QWidget):
             if source_pos is not None:
                 self._rect_end = source_pos
             self._dragging_rect = False
+            self.update()
+            event.accept()
+            return
+        if self._mode == "polygon" and self._dragging_polygon_point_index is not None:
+            source_pos = self._source_pos_for_widget(event.position())
+            if source_pos is not None:
+                self._polygon_points[self._dragging_polygon_point_index] = source_pos
+            self._dragging_polygon_point_index = None
             self.update()
             event.accept()
             return
@@ -907,6 +948,19 @@ class LocalDisplayEditorCanvas(QWidget):
         x = display_rect.left() + source_pos.x() / max(1.0, self._pixmap.width()) * display_rect.width()
         y = display_rect.top() + source_pos.y() / max(1.0, self._pixmap.height()) * display_rect.height()
         return QPointF(x, y)
+
+    def _nearest_polygon_point_index(self, source_pos: QPointF) -> int | None:
+        if self._mode != "polygon" or not self._polygon_points:
+            return None
+        tolerance = max(10.0, min(self._pixmap.width(), self._pixmap.height()) * 0.018)
+        best_index: int | None = None
+        best_distance = tolerance
+        for index, point in enumerate(self._polygon_points):
+            distance = ((point.x() - source_pos.x()) ** 2 + (point.y() - source_pos.y()) ** 2) ** 0.5
+            if distance <= best_distance:
+                best_index = index
+                best_distance = distance
+        return best_index
 
     def _normalized_rect(self) -> QRectF | None:
         if self._rect_start is None or self._rect_end is None:

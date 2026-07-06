@@ -1255,16 +1255,19 @@ class MainWindow(QMainWindow):
         ] | None = None
         self._detail_preview_signals = _DetailPreviewLoadSignals()
         self._detail_preview_signals.loaded.connect(self._handle_detail_preview_loaded)
-        self._detail_preview_thread_pool = QThreadPool.globalInstance()
+        self._detail_preview_thread_pool = QThreadPool(self)
+        self._detail_preview_thread_pool.setMaxThreadCount(2)
         self._selection_metadata_signals = _SelectionMetadataLoadSignals()
         self._selection_metadata_signals.loaded.connect(self._handle_selection_metadata_loaded)
-        self._selection_metadata_thread_pool = QThreadPool.globalInstance()
+        self._selection_metadata_thread_pool = QThreadPool(self)
+        self._selection_metadata_thread_pool.setMaxThreadCount(1)
         self._selection_metadata_pending_image_id: int | None = None
         self._selection_metadata_running_image_id: int | None = None
         self._selection_metadata_queued_image_id: int | None = None
         self._search_feedback_signals = _SearchFeedbackLoadSignals()
         self._search_feedback_signals.loaded.connect(self._handle_search_feedback_loaded)
-        self._search_feedback_thread_pool = QThreadPool.globalInstance()
+        self._search_feedback_thread_pool = QThreadPool(self)
+        self._search_feedback_thread_pool.setMaxThreadCount(1)
         self._search_feedback_cache: dict[tuple[str, int, str, str, int], str | None] = {}
         self._search_feedback_pending_key: tuple[str, int, str, str, int] | None = None
         self._search_feedback_running_key: tuple[str, int, str, str, int] | None = None
@@ -1375,6 +1378,7 @@ class MainWindow(QMainWindow):
         self._refresh_search_operation_controls()
         self._refresh_embedding_stats()
         self._refresh_ai_vision_stats()
+        self._refresh_index_health()
         self._refresh_file_watcher()
         if startup_removed_images:
             message = (
@@ -2355,6 +2359,9 @@ class MainWindow(QMainWindow):
         self.modified_label = QLabel("-")
         self.embedding_label = QLabel("-")
         self.score_label = QLabel("-")
+        self.match_reason_label = QLabel("-")
+        self.match_reason_label.setWordWrap(True)
+        self.match_reason_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.ai_vision_detail_label = QLabel("-")
         self.ai_vision_detail_label.setWordWrap(True)
         self.ai_vision_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -2617,6 +2624,7 @@ class MainWindow(QMainWindow):
         form.addRow("索引状态", self.embedding_label)
         form.addRow("AI 标签", self.ai_vision_detail_label)
         form.addRow("相似度", self.score_label)
+        form.addRow("命中原因", self.match_reason_label)
         form.addRow("", self.favorite_checkbox)
         form.addRow("创作节点", self.creative_selection_widget)
         form.addRow("批量标签", self.batch_tags_widget)
@@ -2826,6 +2834,13 @@ class MainWindow(QMainWindow):
         index_layout.addWidget(self.start_embedding_button)
         index_layout.addWidget(self.pause_embedding_button)
         index_layout.addWidget(self.retry_failed_button)
+        self.index_health_label = QLabel("索引健康：-")
+        self.index_health_label.setWordWrap(True)
+        self.refresh_index_health_button = QPushButton("刷新索引健康")
+        index_layout.addSpacing(8)
+        index_layout.addWidget(QLabel("索引健康"))
+        index_layout.addWidget(self.index_health_label)
+        index_layout.addWidget(self.refresh_index_health_button)
         index_layout.addSpacing(8)
         self.ai_vision_index_tabs = QTabWidget()
         scene_ai_index_tab = QWidget()
@@ -3178,6 +3193,7 @@ class MainWindow(QMainWindow):
         self.start_embedding_button.clicked.connect(self._start_embedding)
         self.pause_embedding_button.clicked.connect(self._pause_embedding)
         self.retry_failed_button.clicked.connect(self._retry_failed_embeddings)
+        self.refresh_index_health_button.clicked.connect(self._refresh_index_health)
         self.add_ai_vision_include_rule_button.clicked.connect(self._add_selected_collection_to_ai_vision)
         self.remove_ai_vision_rule_button.clicked.connect(self._remove_selected_ai_vision_rule)
         self.start_ai_vision_button.clicked.connect(self._start_ai_vision)
@@ -6105,11 +6121,10 @@ class MainWindow(QMainWindow):
         if not source_ids:
             return []
         if search_filter.kind == "keyword":
-            return [
-                image
-                for image in self.store.images_by_ids(sorted(source_ids))
-                if self._image_matches_keyword(image, str(search_filter.value))
-            ]
+            return self._filter_images_by_keyword(
+                self.store.images_by_ids(sorted(source_ids)),
+                str(search_filter.value),
+            )
         if search_filter.kind == "semantic":
             return self.search_service.semantic_search(
                 str(search_filter.value),
@@ -6119,6 +6134,7 @@ class MainWindow(QMainWindow):
             return self.search_service.color_search(
                 search_filter.value,  # type: ignore[arg-type]
                 allowed_image_ids=set(source_ids),
+                generate_missing_features=False,
             ).images
         if search_filter.kind == "tag":
             selected_ids, match_mode = self._tag_filter_parts(search_filter)
@@ -6353,6 +6369,7 @@ class MainWindow(QMainWindow):
                     tag_match_mode=tag_match_mode,
                     status_filter=status_filter,
                     allowed_image_ids=allowed_image_ids,
+                    generate_missing_features=False,
                     excluded_folder_path_prefixes=excluded_folder_path_prefixes,
                     excluded_collection_ids=excluded_collection_ids,
                 )
@@ -6376,11 +6393,7 @@ class MainWindow(QMainWindow):
                         limit=None,
                     )
                 else:
-                    images = [
-                        image
-                        for image in images
-                        if self._image_matches_keyword(image, query)
-                    ]
+                    images = self._filter_images_by_keyword(images, query)
             elif search_filter.kind == "file_type":
                 if allowed_image_ids is None:
                     images = self._list_chain_base_images(
@@ -6552,14 +6565,13 @@ class MainWindow(QMainWindow):
             for prefix in (excluded_folder_path_prefixes or [])
             if str(prefix).strip()
         ]
-        excluded_ids: set[int] = set()
+        excluded_collection_id_values: list[int] = []
         for collection_id in excluded_collection_ids or []:
             try:
-                root_collection_id = int(collection_id)
+                excluded_collection_id_values.append(int(collection_id))
             except (TypeError, ValueError):
                 continue
-            for descendant_id in self.store.collection_descendant_ids(root_collection_id):
-                excluded_ids.update(self.store.image_ids_for_collection(descendant_id))
+        excluded_ids = self.store.image_ids_for_collections(excluded_collection_id_values)
 
         filtered: list[ImageItem] = []
         for image in images:
@@ -6638,6 +6650,29 @@ class MainWindow(QMainWindow):
             needle in tag.casefold()
             for tag in self.store.get_image_tags(image.id)
         )
+
+    def _filter_images_by_keyword(self, images: list[ImageItem], query: str) -> list[ImageItem]:
+        needle = query.strip().casefold()
+        if not needle:
+            return list(images)
+        quick_match_ids: set[int] = set()
+        tag_candidates: list[ImageItem] = []
+        for image in images:
+            values = [image.file_name, image.file_path, image.note or ""]
+            if any(needle in value.casefold() for value in values):
+                quick_match_ids.add(image.id)
+            else:
+                tag_candidates.append(image)
+        if not tag_candidates:
+            return [image for image in images if image.id in quick_match_ids]
+        tags_by_image_id = self.store.image_tags_for_image_ids([image.id for image in tag_candidates])
+        tag_match_ids = {
+            image.id
+            for image in tag_candidates
+            if any(needle in tag.casefold() for tag in tags_by_image_id.get(image.id, []))
+        }
+        matched_ids = quick_match_ids | tag_match_ids
+        return [image for image in images if image.id in matched_ids]
 
     @staticmethod
     def _image_matches_file_type(image: ImageItem, value: str) -> bool:
@@ -9697,6 +9732,9 @@ class MainWindow(QMainWindow):
             self.tags_display.addItem(item)
 
     def _show_multi_selection_details(self, images: list[ImageItem]) -> None:
+        if hasattr(self, "selection_detail_timer"):
+            self.selection_detail_timer.stop()
+            self._pending_selection_images = None
         self._save_pending_note()
         count = len(images)
         total_size = sum(image.file_size for image in images)
@@ -9718,6 +9756,7 @@ class MainWindow(QMainWindow):
         self.embedding_label.setText(f"ready {ready_count} / {count}")
         self.ai_vision_detail_label.setText("-")
         self.score_label.setText("-")
+        self.match_reason_label.setText(f"多选：{count} 张")
         self.favorite_checkbox.setChecked(favorite_count == count)
         self._set_tags_display([], "多选标签请到“标签”页编辑。")
         self.note_input.clear()
@@ -9736,6 +9775,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已选择 {count} 张")
 
     def _show_image_details(self, image: ImageItem | None) -> None:
+        if hasattr(self, "selection_detail_timer"):
+            self.selection_detail_timer.stop()
+            self._pending_selection_images = None
         self._save_pending_note()
         if image is None:
             self._show_collection_details(self._selected_collection_id())
@@ -9766,6 +9808,7 @@ class MainWindow(QMainWindow):
             self.score_label.setText(f"{score_text} | {titles}")
         else:
             self.score_label.setText("-" if image.score is None else f"{image.score:.4f}")
+        self.match_reason_label.setText(self._match_reason_text(image))
         self.favorite_checkbox.setChecked(image.is_favorite)
         tags = self._image_tags_cache.get(image.id)
         if tags is None:
@@ -9788,6 +9831,50 @@ class MainWindow(QMainWindow):
         self.preview_stack.setCurrentWidget(self.preview_label)
         self.play_pause_button.setEnabled(False)
         self._request_detail_preview(image)
+
+    def _match_reason_text(self, image: ImageItem) -> str:
+        parts: list[str] = []
+        if self.current_result_mode == "semantic":
+            query = (self.current_semantic_query or "").strip()
+            parts.append(f"语义搜索：{query}" if query else "语义搜索结果")
+        elif self.current_result_mode == "color":
+            parts.append(f"颜色搜索：{self._format_color_hex(self.current_color_rgb)}")
+        elif self.current_result_mode == "similar":
+            parts.append("相似图搜索结果")
+        elif self.current_result_mode == "search_chain":
+            chain_text = self._format_filter_chain(tuple(self.search_filters)) if self.search_filters else "筛选链"
+            parts.append(chain_text)
+        elif self.current_result_mode == "inspiration":
+            matches = self.current_inspiration_matches.get(image.id, [])
+            if matches:
+                titles = "、".join(match.term_title for match in matches[:5])
+                parts.append(f"语义探针命中：{titles}")
+            else:
+                parts.append("语义探针结果")
+        elif self.current_result_mode == "creative_node":
+            node = self._current_creative_node()
+            parts.append(f"当前创作节点：{node.title}" if node is not None else "当前创作节点")
+            badges = self.current_creative_node_badges.get(image.id, [])
+            if badges:
+                parts.append("节点标签：" + "、".join(badges[:5]))
+        elif self.current_result_mode == "temp_project":
+            parts.append("临时项目 / 搜索结果集")
+            badges = self.current_temp_project_badges.get(image.id, [])
+            if badges:
+                parts.append("来源标签：" + "、".join(badges[:5]))
+        elif self.current_keyword_query:
+            parts.append(f"关键词：{self.current_keyword_query}")
+        else:
+            selected_collection_id = self._selected_collection_id()
+            scope = (
+                self._collection_name(selected_collection_id)
+                if selected_collection_id is not None
+                else None
+            ) or "全部图库"
+            parts.append(f"当前范围：{scope}")
+        if image.score is not None:
+            parts.append(f"分数：{image.score:.4f}")
+        return "\n".join(parts)
 
     def _load_detail_preview_pixmap(self, image: ImageItem) -> QPixmap:
         if image.is_missing:
@@ -9939,6 +10026,7 @@ class MainWindow(QMainWindow):
             )
             self.open_collection_import_dir_button.setEnabled(False)
             self.ai_vision_detail_label.setText("-")
+            self.match_reason_label.setText("-")
             return
 
         if collection_id is None:
@@ -9953,6 +10041,7 @@ class MainWindow(QMainWindow):
             )
             self.open_collection_import_dir_button.setEnabled(False)
             self.ai_vision_detail_label.setText("-")
+            self.match_reason_label.setText("-")
             return
 
         collection = self._collection_by_id(collection_id)
@@ -9966,6 +10055,7 @@ class MainWindow(QMainWindow):
             )
             self.open_collection_import_dir_button.setEnabled(False)
             self.ai_vision_detail_label.setText("-")
+            self.match_reason_label.setText("-")
             return
 
         counts = self._collection_image_counts_for_status()
@@ -9978,6 +10068,7 @@ class MainWindow(QMainWindow):
             "当前显示的是所选文件夹范围。可以把图片拖入中间图片墙导入；选择图片后，这里会切换为图片详情。"
         )
         self.open_collection_import_dir_button.setEnabled(True)
+        self.match_reason_label.setText("-")
 
     def _show_video_details(self, image: ImageItem) -> None:
         self._detail_preview_pending_token = None
@@ -17475,8 +17566,16 @@ class MainWindow(QMainWindow):
         )
 
     def _update_color_search_diagnostics(self, images: list[ImageItem]) -> None:
-        if self.current_result_mode != "color" or not images:
+        if self.current_result_mode != "color":
             self.search_diagnostics_label.setText("搜索诊断：-")
+            return
+        if not images:
+            missing = max(0, self.current_color_searchable_count - self.current_color_indexed_count)
+            suffix = f"，缺失颜色索引 {missing} 张已转入后台补算" if missing else ""
+            self.search_diagnostics_label.setText(
+                f"搜索诊断：候选图片 {self.current_color_searchable_count}，"
+                f"已有颜色索引 {self.current_color_indexed_count}{suffix}"
+            )
             return
 
         scores = [image.score for image in images if image.score is not None]
@@ -17491,13 +17590,15 @@ class MainWindow(QMainWindow):
             else f"{threshold:.3f}（强度 {self.score_threshold_slider.value()}%）"
         )
         avg_score = sum(scores) / len(scores)
+        missing = max(0, self.current_color_searchable_count - self.current_color_indexed_count)
+        missing_text = f"，缺失颜色索引 {missing} 张已转入后台补算" if missing else ""
         self.search_diagnostics_label.setText(
             "搜索诊断："
             f"显示 {len(images)}，候选图片 {self.current_color_searchable_count}，"
             f"已有颜色索引 {self.current_color_indexed_count}，"
             f"候选上限 {self.current_color_candidate_limit}，"
             f"最高 {max(scores):.3f}，最低 {min(scores):.3f}，"
-            f"平均 {avg_score:.3f}，阈值 {threshold_text}"
+            f"平均 {avg_score:.3f}，阈值 {threshold_text}{missing_text}"
         )
 
     def _color_score_threshold(self, images: list[ImageItem], *, value: int | None = None) -> float | None:
@@ -17627,6 +17728,55 @@ class MainWindow(QMainWindow):
         self.ai_character_vision_rule_tree.blockSignals(False)
         if refresh_virtual_filters:
             self._refresh_ai_vision_virtual_filter_entry(self.store.virtual_image_filter_counts())
+
+    def _refresh_index_health(self) -> None:
+        if not hasattr(self, "index_health_label"):
+            return
+        try:
+            embedding_stats = self.store.embedding_stats(
+                model_name=self.embedding_provider.model_name,
+                model_revision=self.embedding_provider.model_revision,
+                embedding_dim=self.embedding_provider.dim,
+            )
+            thumbnail_stats = self.store.thumbnail_stats()
+            color_stats = self.store.color_feature_stats()
+            provider_name = self._ai_vision_provider_name()
+            model_name = self._ai_vision_model_name_for_stats()
+            scene_stats = self.store.ai_vision_stats(
+                provider_name=provider_name,
+                model_name=model_name,
+                prompt_version=AI_VISION_PROMPT_VERSION,
+                analysis_type=AI_VISION_ANALYSIS_SCENE,
+            )
+            character_stats = self.store.ai_vision_stats(
+                provider_name=provider_name,
+                model_name=model_name,
+                prompt_version=ai_vision_prompt_version(AI_VISION_ANALYSIS_CHARACTER),
+                analysis_type=AI_VISION_ANALYSIS_CHARACTER,
+            )
+        except Exception as exc:
+            self.index_health_label.setText(f"索引健康读取失败：{exc}")
+            return
+        self.index_health_label.setText(
+            "\n".join(
+                [
+                    self._format_index_health_line("缩略图", thumbnail_stats),
+                    self._format_index_health_line("语义", embedding_stats),
+                    self._format_index_health_line("颜色", color_stats),
+                    self._format_index_health_line("AI 场景", scene_stats),
+                    self._format_index_health_line("AI 角色", character_stats),
+                ]
+            )
+        )
+
+    @staticmethod
+    def _format_index_health_line(label: str, stats: Mapping[str, int]) -> str:
+        total = int(stats.get("total", 0))
+        ready = int(stats.get("ready", 0))
+        failed = int(stats.get("failed", 0))
+        processing = int(stats.get("processing", 0))
+        pending = int(stats.get("pending", 0)) + int(stats.get("stale", 0))
+        return f"{label}: {ready}/{total}，待处理 {pending}，处理中 {processing}，失败 {failed}"
 
     def _apply_sidebar_filters(self, images: list[ImageItem]) -> list[ImageItem]:
         folder_path_prefix = self._selected_folder_path_prefix()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -45,6 +47,9 @@ class SearchService:
         self.store = store
         self.embedding_provider = embedding_provider
         self.vector_index = vector_index
+        self._color_generation_lock = threading.Lock()
+        self._color_generation_queue: OrderedDict[int, ImageItem] = OrderedDict()
+        self._color_generation_running = False
 
     def keyword_search(
         self,
@@ -217,6 +222,7 @@ class SearchService:
         virtual_filter: str | None = None,
         allowed_image_ids: set[int] | None = None,
         limit: int | None = None,
+        generate_missing_features: bool = True,
         excluded_folder_path_prefixes: Sequence[str] | None = None,
         excluded_collection_ids: Sequence[int] | None = None,
     ) -> ColorSearchResult:
@@ -238,8 +244,14 @@ class SearchService:
             return ColorSearchResult(images=[], searchable_count=0, indexed_count=0, candidate_limit=0)
 
         candidate_ids = [image.id for image in candidates]
-        self._ensure_color_features(candidates)
+        missing_ids = self.store.color_feature_ids_needing_generation(candidate_ids)
+        if missing_ids and generate_missing_features:
+            self._ensure_color_features([image for image in candidates if image.id in missing_ids])
         features = self.store.color_features_by_image_ids(candidate_ids)
+        if missing_ids and not generate_missing_features:
+            self._queue_color_feature_generation(
+                [image for image in candidates if image.id in missing_ids]
+            )
         if not features:
             return ColorSearchResult(
                 images=[],
@@ -277,6 +289,39 @@ class SearchService:
             indexed_count=len(features),
             candidate_limit=len(limited),
         )
+
+    def _queue_color_feature_generation(self, images: list[ImageItem]) -> None:
+        queued = False
+        with self._color_generation_lock:
+            for image in images:
+                if image.id in self._color_generation_queue:
+                    continue
+                self._color_generation_queue[image.id] = image
+                queued = True
+            if not queued or self._color_generation_running:
+                return
+            self._color_generation_running = True
+        worker = threading.Thread(
+            target=self._run_color_feature_generation,
+            name="EidoryColorFeatureWorker",
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_color_feature_generation(self) -> None:
+        while True:
+            batch: list[ImageItem] = []
+            with self._color_generation_lock:
+                while self._color_generation_queue and len(batch) < self._COLOR_FEATURE_WRITE_BATCH_SIZE:
+                    _image_id, image = self._color_generation_queue.popitem(last=False)
+                    batch.append(image)
+                if not batch:
+                    self._color_generation_running = False
+                    return
+            try:
+                self._ensure_color_features(batch)
+            except Exception:
+                continue
 
     def _ensure_color_features(self, images: list[ImageItem]) -> None:
         image_ids = [image.id for image in images]

@@ -227,6 +227,7 @@ VIRTUAL_COLLECTION_FILTERS = (
     ("un_ai_character_tagged", "未AI角色标签", "还没有可用 AI 角色视觉标签的图片。"),
     ("uncategorized", "未分类", "没有放入任何 Eidory 文件夹的图片/视频。"),
 )
+TEMPORARY_IMPORT_COLLECTION_NAME = "临时文件夹"
 RIGHT_TAB_DETAIL = 0
 RIGHT_TAB_AI = 1
 RIGHT_TAB_TAGS = 2
@@ -1217,6 +1218,9 @@ class MainWindow(QMainWindow):
         self._creative_node_undo_stack: list[dict[str, object]] = []
         self._board_removal_undo_stack: list[dict[str, object]] = []
         self._pending_board_import_node_id: int | None = None
+        self._pending_board_import_context: dict[str, object] | None = None
+        self._board_external_import_queue: list[dict[str, object]] = []
+        self._board_external_import_active = False
         self._board_focus_mode = False
         self._board_focus_previous_splitter_sizes: list[int] | None = None
         self._board_focus_widget_visibility: dict[QWidget, bool] = {}
@@ -1367,6 +1371,7 @@ class MainWindow(QMainWindow):
         self._apply_runtime_language_settings()
         self._connect_signals()
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
+        self._ensure_temporary_import_collection()
         self._refresh_folders()
         self._refresh_collections()
         self.store.seed_default_ai_vision_collection_rules()
@@ -3121,6 +3126,8 @@ class MainWindow(QMainWindow):
         self.project_board_view.imagePreviewRequested.connect(self._open_project_board_image_preview)
         self.project_board_view.removeImagesRequested.connect(self._remove_images_from_current_board)
         self.project_board_view.undoRemovalRequested.connect(self._undo_last_board_removal)
+        self.project_board_view.filesDropped.connect(self._import_external_files_to_current_board)
+        self.project_board_view.dropPayloadDropped.connect(self._import_external_payload_to_current_board)
         self.load_more_button.clicked.connect(self._load_more)
         self.grid_view.verticalScrollBar().valueChanged.connect(self._maybe_auto_load_more)
         self.grid_view.selectionChanged.connect(self._on_grid_image_selected)
@@ -4499,6 +4506,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"近似图片处理完成：替换 {replaced_count}，放弃 {skipped_count}，没有新图片导入"
             )
+            if self._board_external_import_active or self._pending_board_import_context is not None:
+                self._finish_project_board_external_import_entry()
+                self._pending_board_import_node_id = None
             return
         collection_name = self._collection_name(collection_id) or "当前文件夹"
         self.statusBar().showMessage(f"导入图片到“{collection_name}”")
@@ -10821,8 +10831,10 @@ class MainWindow(QMainWindow):
         self,
         collection_id: int,
         payload: dict[str, object],
+        *,
+        confirm: bool = True,
     ) -> None:
-        if not self._confirm_drop_import(collection_id, payload):
+        if confirm and not self._confirm_drop_import(collection_id, payload):
             return
         collection_name = self._collection_name(collection_id) or "文件夹"
         target_dir = self._collection_import_directory(collection_id)
@@ -13106,6 +13118,9 @@ class MainWindow(QMainWindow):
                 self._set_maintenance_controls_enabled(True)
                 if hasattr(self, "export_library_button"):
                     self._set_export_controls_enabled(True)
+                if self._board_external_import_active or self._pending_board_import_context is not None:
+                    self._finish_project_board_external_import_entry()
+                    self._pending_board_import_node_id = None
                 QMessageBox.critical(self, "Eidory", str(payload))
         if processed >= max_events_per_tick and not self.events.empty():
             QTimer.singleShot(0, self._poll_events)
@@ -13267,17 +13282,25 @@ class MainWindow(QMainWindow):
     ) -> None:
         self._set_import_controls_enabled(True)
         self._refresh_folders()
-        self._refresh_collections(select_collection_id=collection_id)
-        self.store.seed_default_ai_vision_collection_rules()
         clean_imported_ids = [
             int(image_id)
             for image_id in imported_image_ids or []
             if int(image_id) > 0
         ]
+        pending_context = self._pending_board_import_context
+        self._pending_board_import_context = None
         pending_node_id = self._pending_board_import_node_id
         self._pending_board_import_node_id = None
+        board_import_requested = isinstance(pending_context, dict) or pending_node_id is not None
+        self._refresh_collections(select_collection_id=None if board_import_requested else collection_id)
+        self.store.seed_default_ai_vision_collection_rules()
         imported_to_board = False
-        if pending_node_id is not None and clean_imported_ids:
+        if isinstance(pending_context, dict) and clean_imported_ids:
+            imported_to_board = self._add_imported_images_to_board_context(
+                pending_context,
+                clean_imported_ids,
+            )
+        elif pending_node_id is not None and clean_imported_ids:
             node = self.store.get_creative_node(pending_node_id)
             if node is not None:
                 self.store.add_images_to_creative_node(
@@ -13294,7 +13317,7 @@ class MainWindow(QMainWindow):
                     self._show_current_creative_board()
         if clean_imported_ids and not imported_to_board:
             self._show_imported_images_first(collection_id, clean_imported_ids)
-        else:
+        elif not imported_to_board:
             self._refresh_after_scan_database_change(select_collection_id=collection_id)
         if clean_imported_ids:
             self._refresh_embedding_stats()
@@ -13304,6 +13327,62 @@ class MainWindow(QMainWindow):
             f"拖入导入成功：{collection_name}，扫描 {scanned}，"
             f"新增 {new_files}，变化 {changed_files}，加入 {assigned}"
         )
+        if self._board_external_import_active:
+            self._board_external_import_active = False
+            if self._board_external_import_queue:
+                QTimer.singleShot(0, self._start_next_project_board_external_import)
+
+    def _add_imported_images_to_board_context(
+        self,
+        context: dict[str, object],
+        image_ids: list[int],
+    ) -> bool:
+        kind = str(context.get("kind") or "")
+        target_id = int(context.get("id", 0) or 0)
+        if target_id <= 0:
+            return False
+        if kind == "creative":
+            node = self.store.get_creative_node(target_id)
+            if node is None:
+                return False
+            changed = self.store.add_images_to_creative_node(
+                node.id,
+                image_ids,
+                intent_label=str(context.get("intent_label") or node.title),
+                intent_query=str(context.get("intent_query") or node.search_query or node.title),
+            )
+            self._expand_project_sidebar_section("creative")
+            self._refresh_creative_projects(select_project_id=node.project_id)
+            self._refresh_after_creative_node_images_changed(node)
+            if changed:
+                self.statusBar().showMessage(f"已加入当前看板：{changed} 张")
+            return True
+        if kind == "temporary":
+            project = self.store.get_temporary_project(target_id)
+            if project is None or project.kind == "search":
+                return False
+            labels = {image_id: str(context.get("intent_label") or "看板导入") for image_id in image_ids}
+            queries = {image_id: str(context.get("intent_query") or project.name) for image_id in image_ids}
+            changed = self.store.add_images_to_temporary_project(
+                project.id,
+                image_ids,
+                intent_labels=labels,
+                intent_queries=queries,
+            )
+            self._refresh_temporary_projects(
+                select_project_id=project.id,
+                select_kind=self._temporary_project_ui_kind(project),
+            )
+            if (
+                self.center_result_stack.currentWidget() is self.project_board_view
+                and self._current_board_temp_project_id == project.id
+            ):
+                self._current_board_image_ids = ()
+                self._show_temporary_project_board(project.id)
+            if changed:
+                self.statusBar().showMessage(f"已加入当前看板：{changed} 张")
+            return True
+        return False
 
     def _show_imported_images_first(
         self,
@@ -15402,8 +15481,211 @@ class MainWindow(QMainWindow):
         )
         if not files:
             return
+        self._pending_board_import_context = {
+            "kind": "creative",
+            "id": node.id,
+            "title": node.title,
+            "intent_label": node.title,
+            "intent_query": node.search_query or node.title,
+        }
         self._pending_board_import_node_id = node.id
         self._start_file_import(files, collection_id)
+
+    def _import_external_files_to_current_board(self, paths: list[str]) -> None:
+        file_paths, folder_paths = self._split_local_import_paths([str(path) for path in paths])
+        if folder_paths:
+            self.statusBar().showMessage("看板拖入只处理图片/视频文件；文件夹请拖到左侧文件夹树导入")
+        entries = [
+            {
+                "kind": "file",
+                "path": file_path,
+                "source_label": Path(file_path).name,
+            }
+            for file_path in file_paths
+        ]
+        self._enqueue_project_board_external_import_entries(entries)
+
+    def _import_external_payload_to_current_board(self, payload: dict[str, object]) -> None:
+        entries: list[dict[str, object]] = []
+        raw_paths = payload.get("local_paths", [])
+        if isinstance(raw_paths, list) and raw_paths:
+            file_paths, folder_paths = self._split_local_import_paths([str(path) for path in raw_paths])
+            if folder_paths:
+                self.statusBar().showMessage("看板拖入只处理图片/视频文件；文件夹请拖到左侧文件夹树导入")
+            entries.extend(
+                {
+                    "kind": "file",
+                    "path": file_path,
+                    "source_label": Path(file_path).name,
+                }
+                for file_path in file_paths
+            )
+
+        payload_has_nonlocal_media = (
+            bool(payload.get("urls"))
+            or bool(payload.get("html"))
+            or bool(payload.get("text"))
+            or payload.get("image") is not None
+        )
+        if not entries and payload_has_nonlocal_media:
+            prepared_payload = dict(payload)
+            prepared_payload["local_paths"] = []
+            entries.append(
+                {
+                    "kind": "payload",
+                    "payload": prepared_payload,
+                    "source_label": "网页图片",
+                }
+            )
+        self._enqueue_project_board_external_import_entries(entries)
+
+    def _enqueue_project_board_external_import_entries(self, entries: list[dict[str, object]]) -> None:
+        if not entries:
+            self.statusBar().showMessage("拖入内容里没有可导入的图片或视频")
+            return
+        board_context = self._current_project_board_import_context()
+        if board_context is None:
+            self.statusBar().showMessage("先进入一个项目看板，再拖入外部图片")
+            return
+        for entry in entries:
+            queued = dict(entry)
+            queued["board_context"] = dict(board_context)
+            self._board_external_import_queue.append(queued)
+        self.statusBar().showMessage(f"已加入看板导入队列：{len(entries)} 个")
+        self._start_next_project_board_external_import()
+
+    def _current_project_board_import_context(self) -> dict[str, object] | None:
+        if self.center_result_stack.currentWidget() is not self.project_board_view:
+            return None
+        if self._current_board_node_id is not None:
+            node = self.store.get_creative_node(self._current_board_node_id)
+            if node is None:
+                return None
+            return {
+                "kind": "creative",
+                "id": node.id,
+                "title": node.title,
+                "intent_label": node.title,
+                "intent_query": node.search_query or node.title,
+            }
+        if self._current_board_temp_project_id is not None:
+            project = self.store.get_temporary_project(self._current_board_temp_project_id)
+            if project is None or project.kind == "search":
+                return None
+            return {
+                "kind": "temporary",
+                "id": project.id,
+                "title": project.name,
+                "intent_label": "看板导入",
+                "intent_query": project.name,
+            }
+        return None
+
+    def _start_next_project_board_external_import(self) -> None:
+        if self._board_external_import_active:
+            return
+        if not self._board_external_import_queue:
+            return
+        entry = self._board_external_import_queue.pop(0)
+        source_label = str(entry.get("source_label") or "外部图片")
+        collection_id = self._select_project_board_drop_collection(source_label)
+        if collection_id is None:
+            self.statusBar().showMessage(f"已取消导入：{source_label}")
+            QTimer.singleShot(0, self._start_next_project_board_external_import)
+            return
+        board_context = entry.get("board_context")
+        if not isinstance(board_context, dict):
+            self.statusBar().showMessage("看板导入目标已失效")
+            QTimer.singleShot(0, self._start_next_project_board_external_import)
+            return
+        self._pending_board_import_context = dict(board_context)
+        self._board_external_import_active = True
+        self.statusBar().showMessage(
+            f"导入“{source_label}”到“{self._collection_path_text(collection_id)}”"
+        )
+        if entry.get("kind") == "file":
+            path = str(entry.get("path") or "")
+            if not path:
+                self._finish_project_board_external_import_entry()
+                return
+            self._start_file_import([path], collection_id)
+            return
+        payload = entry.get("payload")
+        if isinstance(payload, dict):
+            self._import_drop_payload_to_collection(collection_id, payload, confirm=False)
+            return
+        self._finish_project_board_external_import_entry()
+
+    def _finish_project_board_external_import_entry(self) -> None:
+        self._pending_board_import_context = None
+        self._board_external_import_active = False
+        if self._board_external_import_queue:
+            QTimer.singleShot(0, self._start_next_project_board_external_import)
+
+    def _select_project_board_drop_collection(self, source_label: str) -> int | None:
+        self._ensure_temporary_import_collection()
+        default_collection_id = self._temporary_import_collection_id() or self._selected_collection_id()
+        rows = self.store.list_collections_with_counts()
+        if not rows:
+            self.statusBar().showMessage("还没有可导入的 Eidory 文件夹")
+            return None
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择导入文件夹")
+        layout = QVBoxLayout(dialog)
+        label = QLabel(f"为“{source_label}”选择保存到图库里的文件夹。")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["文件夹", "张"])
+        tree.setMinimumHeight(280)
+        tree.setAlternatingRowColors(True)
+        collection_by_id = {collection.id: collection for collection, _count in rows}
+        counts = {collection.id: count for collection, count in rows}
+        children_by_parent: dict[int | None, list[int]] = {}
+        for collection, _count in rows:
+            children_by_parent.setdefault(collection.parent_id, []).append(collection.id)
+        for children in children_by_parent.values():
+            children.sort(key=lambda collection_id: collection_by_id[collection_id].sort_order)
+
+        selected_item: QTreeWidgetItem | None = None
+
+        def add_items(parent_item: QTreeWidgetItem | None, parent_id: int | None) -> None:
+            nonlocal selected_item
+            for collection_id in children_by_parent.get(parent_id, []):
+                collection = collection_by_id[collection_id]
+                item = QTreeWidgetItem([collection.name, str(counts.get(collection_id, 0))])
+                item.setData(0, Qt.ItemDataRole.UserRole, collection.id)
+                if parent_item is None:
+                    tree.addTopLevelItem(item)
+                else:
+                    parent_item.addChild(item)
+                if default_collection_id == collection.id:
+                    selected_item = item
+                add_items(item, collection.id)
+
+        add_items(None, None)
+        tree.expandAll()
+        if selected_item is not None:
+            tree.setCurrentItem(selected_item)
+        tree.resizeColumnToContents(0)
+        layout.addWidget(tree)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        item = tree.currentItem()
+        if item is None:
+            return None
+        collection_id = item.data(0, Qt.ItemDataRole.UserRole)
+        return int(collection_id) if collection_id is not None else None
 
     def _open_project_board_image_preview(self, image_id: int) -> None:
         image = self.store.get_image(int(image_id))
@@ -16542,6 +16824,22 @@ class MainWindow(QMainWindow):
             if key == virtual_filter:
                 return help_text
         return "当前显示的是虚拟聚类。"
+
+    def _ensure_temporary_import_collection(self) -> int | None:
+        collection_id = self._temporary_import_collection_id()
+        if collection_id is not None:
+            return collection_id
+        try:
+            return self.store.ensure_collection_path([TEMPORARY_IMPORT_COLLECTION_NAME])
+        except ValueError as exc:
+            self._record_error(f"创建临时文件夹失败：{exc}")
+            return None
+
+    def _temporary_import_collection_id(self) -> int | None:
+        for collection in self.store.list_collections():
+            if collection.parent_id is None and collection.name == TEMPORARY_IMPORT_COLLECTION_NAME:
+                return collection.id
+        return None
 
     def _collection_by_id(self, collection_id: int):
         for collection in self.store.list_collections():

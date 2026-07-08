@@ -60,6 +60,7 @@ from eidory.ui.main_window import (
     SIDEBAR_COLLAPSE_THRESHOLD,
     SIDEBAR_COUNT_COLUMN_WIDTH,
     TAG_GROUP_HEADER_ROLE,
+    TEMPORARY_IMPORT_COLLECTION_NAME,
     TagPickerDialog,
     THUMBNAIL_SIZE_SETTING_DEBOUNCE_MS,
     TOP_TOOL_BUTTON_MIN_WIDTH,
@@ -7137,6 +7138,149 @@ class MainWindowContextMenuTest(unittest.TestCase):
             reload_images.assert_not_called()
             refresh_results.assert_not_called()
             self.assertEqual([image.id for image in window.grid_view.images()], [1, 2])
+            window.close()
+
+    def test_startup_creates_temporary_import_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+
+            temporary = [
+                collection
+                for collection in store.list_collections()
+                if collection.parent_id is None and collection.name == TEMPORARY_IMPORT_COLLECTION_NAME
+            ]
+
+            self.assertEqual(len(temporary), 1)
+            window.close()
+
+    def test_project_board_external_file_imports_are_processed_one_by_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+
+            first = Path(tmp) / "first.jpg"
+            second = Path(tmp) / "second.jpg"
+            Image.new("RGB", (8, 8), color="red").save(first)
+            Image.new("RGB", (8, 8), color="blue").save(second)
+            collection_id = window._temporary_import_collection_id()
+            self.assertIsNotNone(collection_id)
+
+            context = {
+                "kind": "creative",
+                "id": 42,
+                "title": "节点",
+                "intent_label": "节点",
+                "intent_query": "节点",
+            }
+            with (
+                patch.object(window, "_current_project_board_import_context", return_value=context),
+                patch.object(window, "_select_project_board_drop_collection", return_value=collection_id),
+                patch.object(window, "_start_file_import") as start_file_import,
+            ):
+                window._import_external_files_to_current_board([str(first), str(second)])
+
+                self.assertEqual(start_file_import.call_count, 1)
+                self.assertEqual(start_file_import.call_args.args, ([str(first)], collection_id))
+                self.assertTrue(window._board_external_import_active)
+                self.assertEqual(len(window._board_external_import_queue), 1)
+
+                window._finish_project_board_external_import_entry()
+                self.app.processEvents()
+
+                self.assertEqual(start_file_import.call_count, 2)
+                self.assertEqual(start_file_import.call_args.args, ([str(second)], collection_id))
+
+            window.close()
+
+    def test_project_board_import_done_does_not_switch_to_gallery_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            collection_id = window._temporary_import_collection_id()
+            self.assertIsNotNone(collection_id)
+            window._pending_board_import_context = {
+                "kind": "creative",
+                "id": 42,
+                "title": "节点",
+                "intent_label": "节点",
+                "intent_query": "节点",
+            }
+
+            with (
+                patch.object(window, "_add_imported_images_to_board_context", return_value=True) as add_to_board,
+                patch.object(window, "_show_imported_images_first") as show_imported,
+                patch.object(window, "_refresh_after_scan_database_change") as refresh_after_scan,
+            ):
+                window._handle_drop_import_done(
+                    collection_id=int(collection_id),
+                    collection_name=TEMPORARY_IMPORT_COLLECTION_NAME,
+                    scanned=1,
+                    new_files=1,
+                    changed_files=0,
+                    assigned=1,
+                    imported_image_ids=[101],
+                )
+
+            add_to_board.assert_called_once()
+            show_imported.assert_not_called()
+            refresh_after_scan.assert_not_called()
+            window.close()
+
+    def test_project_board_payload_with_local_file_ignores_extra_html_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            source = Path(tmp) / "source.jpg"
+            Image.new("RGB", (8, 8), color="red").save(source)
+            payload = {
+                "local_paths": [str(source)],
+                "html": "<img src='https://example.invalid/image.jpg'>",
+                "text": "https://example.invalid/image.jpg",
+                "urls": [],
+                "image": None,
+            }
+
+            with patch.object(window, "_enqueue_project_board_external_import_entries") as enqueue:
+                window._import_external_payload_to_current_board(payload)
+
+            enqueue.assert_called_once()
+            entries = enqueue.call_args.args[0]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["kind"], "file")
+            self.assertEqual(entries[0]["path"], str(source))
             window.close()
 
     @staticmethod

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QMimeData, Qt, QUrl
 from PySide6.QtGui import QColor, QKeyEvent, QPixmap
 from PySide6.QtWidgets import QApplication
 
@@ -38,6 +38,12 @@ class ProjectBoardViewTest(unittest.TestCase):
         board.toggle_fit_selection_or_restore()
         self.assertEqual(board._view_mode, "fit_all")
         self.assertEqual(board._last_fit_selection_ids, ())
+
+    def test_board_accepts_external_file_drop_payload(self) -> None:
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile("/tmp/source.jpg")])
+
+        self.assertTrue(ProjectBoardView._supports_external_import_drop(mime))
 
     def test_selected_wide_image_can_fit_beyond_default_zoom_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

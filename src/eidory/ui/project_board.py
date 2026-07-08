@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from eidory.models import ImageItem
+from eidory.ui.drop_import_box import payload_from_mime_data, payload_supports_mime_data
 
 
 BOARD_WIDTH = 5200
@@ -1132,6 +1133,8 @@ class ProjectBoardView(QGraphicsView):
     layoutChanged = Signal()
     removeImagesRequested = Signal(list)
     undoRemovalRequested = Signal()
+    filesDropped = Signal(object)
+    dropPayloadDropped = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1147,6 +1150,8 @@ class ProjectBoardView(QGraphicsView):
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate)
         self.setCacheMode(QGraphicsView.CacheModeFlag.CacheBackground)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
@@ -1544,6 +1549,41 @@ class ProjectBoardView(QGraphicsView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def dragEnterEvent(self, event) -> None:
+        if self._supports_external_import_drop(event.mimeData()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if self._supports_external_import_drop(event.mimeData()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:
+        if not self._supports_external_import_drop(event.mimeData()):
+            super().dropEvent(event)
+            return
+        payload = payload_from_mime_data(event.mimeData())
+        local_paths = [
+            str(path)
+            for path in payload.get("local_paths", [])
+            if str(path)
+        ]
+        if local_paths and not payload.get("urls") and not payload.get("html") and not payload.get("text") and payload.get("image") is None:
+            self.filesDropped.emit(local_paths)
+        else:
+            self.dropPayloadDropped.emit(payload)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+
+    @staticmethod
+    def _supports_external_import_drop(mime_data) -> bool:
+        return payload_supports_mime_data(mime_data)
 
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
         painter.fillRect(rect, QColor("#202830"))

@@ -210,6 +210,7 @@ PROJECT_LIST_PINNED_ROLE = Qt.ItemDataRole.UserRole + 15
 PROJECT_LIST_SECTION_ID_ROLE = Qt.ItemDataRole.UserRole + 16
 PROJECT_LIST_SECTION_EXPANDED_ROLE = Qt.ItemDataRole.UserRole + 17
 PROJECT_LIST_SECTION_KIND = "section"
+PROJECT_LIST_PROJECT_KINDS = {"temporary", "quick", "creative", "search"}
 FOLDER_SEARCH_EXCLUDED_DIRECT_ROLE = Qt.ItemDataRole.UserRole + 18
 FOLDER_SEARCH_EXCLUDED_MATCH_ROLE = Qt.ItemDataRole.UserRole + 19
 COLLECTION_SEARCH_EXCLUDED_DIRECT_ROLE = Qt.ItemDataRole.UserRole + 20
@@ -289,7 +290,7 @@ class ProjectListItemDelegate(QStyledItemDelegate):
             )
             painter.restore()
             return
-        if kind not in {"temporary", "quick", "creative"}:
+        if kind not in PROJECT_LIST_PROJECT_KINDS:
             super().paint(painter, option, index)
             return
 
@@ -333,6 +334,45 @@ class ProjectListItemDelegate(QStyledItemDelegate):
         else:
             size.setHeight(max(20, size.height()))
         return size
+
+
+class ProjectSidebarListWidget(QListWidget):
+    projectsReordered = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDragDropOverwriteMode(False)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+    def startDrag(self, supported_actions) -> None:
+        item = self.currentItem()
+        if item is None or item.data(PROJECT_LIST_KIND_ROLE) not in PROJECT_LIST_PROJECT_KINDS:
+            return
+        super().startDrag(supported_actions)
+
+    def dropEvent(self, event) -> None:
+        before = self.project_orders()
+        super().dropEvent(event)
+        after = self.project_orders()
+        if after != before:
+            self.projectsReordered.emit(after)
+
+    def project_orders(self) -> dict[str, list[int]]:
+        orders: dict[str, list[int]] = {}
+        for row in range(self.count()):
+            item = self.item(row)
+            kind = item.data(PROJECT_LIST_KIND_ROLE)
+            project_id = item.data(PROJECT_LIST_ID_ROLE)
+            if kind not in PROJECT_LIST_PROJECT_KINDS or project_id is None:
+                continue
+            orders.setdefault(str(kind), []).append(int(project_id))
+        return orders
 
 
 class FolderTreeItemDelegate(QStyledItemDelegate):
@@ -1797,7 +1837,7 @@ class MainWindow(QMainWindow):
         self._configure_sidebar_count_tree(self.collection_tree)
         self.collection_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
-        self.temp_project_list = QListWidget()
+        self.temp_project_list = ProjectSidebarListWidget()
         self.temp_project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.temp_project_list.setMinimumWidth(0)
         self.temp_project_list.setMinimumHeight(220)
@@ -3257,6 +3297,7 @@ class MainWindow(QMainWindow):
         self.collection_tree.customContextMenuRequested.connect(self._show_collection_context_menu)
         self.temp_project_list.itemClicked.connect(self._handle_project_sidebar_item_clicked)
         self.temp_project_list.itemSelectionChanged.connect(self._load_selected_temporary_project)
+        self.temp_project_list.projectsReordered.connect(self._save_project_sidebar_order)
         self.temp_project_list.customContextMenuRequested.connect(self._show_temporary_project_context_menu)
         self.tag_list.customContextMenuRequested.connect(self._show_tag_context_menu)
         self.right_tab_widget.currentChanged.connect(self._on_right_tab_changed)
@@ -9476,6 +9517,7 @@ class MainWindow(QMainWindow):
         ]
         self.selected_image = images[-1] if images else None
         self._refresh_temp_project_save_button(len(images))
+        self._refresh_board_local_display_button_state()
         self._queue_selection_detail_state(images)
 
     def _queue_selection_detail_state(self, images: Sequence[ImageItem]) -> None:
@@ -15227,6 +15269,7 @@ class MainWindow(QMainWindow):
         for button in board_buttons:
             button.setVisible(visible)
         self.board_pin_button.setChecked(self._board_window_pinned)
+        self._refresh_board_local_display_button_state()
         if hasattr(self, "board_focus_shortcut"):
             self.board_focus_shortcut.setEnabled(True)
         self.shuffle_results_button.setVisible(not visible)
@@ -15447,18 +15490,30 @@ class MainWindow(QMainWindow):
         changed = self.project_board_view.toggle_selected_grayscale()
         self.statusBar().showMessage(f"已切换黑白显示：{changed} 张")
 
+    def _refresh_board_local_display_button_state(self) -> None:
+        if not hasattr(self, "board_toggle_local_display_button"):
+            return
+        enabled = (
+            self.center_result_stack.currentWidget() is self.project_board_view
+            and self.project_board_view.selected_has_local_display()
+        )
+        self.board_toggle_local_display_button.setEnabled(enabled)
+
     def _edit_board_selected_local_display(self) -> None:
         if not self.project_board_view.selected_image_ids():
             self.statusBar().showMessage("先选择一张看板图片")
             return
         if self.project_board_view.edit_selected_local_display():
+            self._refresh_board_local_display_button_state()
             self.statusBar().showMessage("已更新局部展示")
 
     def _toggle_board_selected_local_display(self) -> None:
         if not self.project_board_view.selected_image_ids():
             self.statusBar().showMessage("先选择看板图片")
+            self._refresh_board_local_display_button_state()
             return
         changed = self.project_board_view.toggle_selected_local_display()
+        self._refresh_board_local_display_button_state()
         if changed:
             self.statusBar().showMessage(f"已切换局部/全图：{changed} 张")
         else:
@@ -16008,6 +16063,12 @@ class MainWindow(QMainWindow):
             nonlocal selected_item
             for project in projects:
                 item = QListWidgetItem(f"◇ {project.name}    {project.image_count}")
+                item.setFlags(
+                    item.flags()
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                )
                 item.setData(PROJECT_LIST_KIND_ROLE, kind_role)
                 item.setData(PROJECT_LIST_ID_ROLE, project.id)
                 item.setData(PROJECT_LIST_NAME_ROLE, project.name)
@@ -16030,6 +16091,12 @@ class MainWindow(QMainWindow):
             for project in creative_projects:
                 pin = "⬆ " if project.is_pinned else ""
                 item = QListWidgetItem(f"◇ {pin}{project.title}    {project.image_count}")
+                item.setFlags(
+                    item.flags()
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                )
                 item.setData(PROJECT_LIST_KIND_ROLE, "creative")
                 item.setData(PROJECT_LIST_ID_ROLE, project.id)
                 item.setData(PROJECT_LIST_NAME_ROLE, project.title)
@@ -16062,6 +16129,8 @@ class MainWindow(QMainWindow):
 
     def _handle_project_sidebar_item_clicked(self, item: QListWidgetItem) -> None:
         if item.data(PROJECT_LIST_KIND_ROLE) != PROJECT_LIST_SECTION_KIND:
+            self.temp_project_list.setCurrentItem(item)
+            self._load_selected_temporary_project()
             return
         section_id = item.data(PROJECT_LIST_SECTION_ID_ROLE)
         if section_id is None:
@@ -16070,6 +16139,49 @@ class MainWindow(QMainWindow):
         was_expanded = bool(self.project_sidebar_expanded_sections.get(section_key, False))
         self._set_project_sidebar_expanded_section(None if was_expanded else section_key)
         self._refresh_project_sidebar()
+
+    def _save_project_sidebar_order(self, orders: Mapping[str, object]) -> None:
+        if not isinstance(orders, Mapping):
+            return
+        current_item = self.temp_project_list.currentItem()
+        select_kind: str | None = None
+        select_id: int | None = None
+        if current_item is not None:
+            current_kind = current_item.data(PROJECT_LIST_KIND_ROLE)
+            current_id = current_item.data(PROJECT_LIST_ID_ROLE)
+            if current_kind in PROJECT_LIST_PROJECT_KINDS and current_id is not None:
+                select_kind = str(current_kind)
+                select_id = int(current_id)
+
+        def clean_order(value: object) -> list[int]:
+            if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+                return []
+            clean: list[int] = []
+            seen: set[int] = set()
+            for raw_id in value:
+                project_id = int(raw_id)
+                if project_id in seen:
+                    continue
+                clean.append(project_id)
+                seen.add(project_id)
+            return clean
+
+        changed = False
+        creative_order = clean_order(orders.get("creative"))
+        if creative_order:
+            changed = self.store.reorder_creative_projects(creative_order) or changed
+        temporary_kind_map = {
+            "temporary": "semantic",
+            "quick": "quick",
+            "search": "search",
+        }
+        for ui_kind, store_kind in temporary_kind_map.items():
+            project_order = clean_order(orders.get(ui_kind))
+            if project_order:
+                changed = self.store.reorder_temporary_projects(project_order, kind=store_kind) or changed
+        self._refresh_project_sidebar(select_kind=select_kind, select_id=select_id)
+        if changed:
+            self.statusBar().showMessage("项目顺序已更新")
 
     def _expand_project_sidebar_section(self, section_id: str) -> None:
         if section_id not in self.project_sidebar_expanded_sections:
@@ -16092,18 +16204,37 @@ class MainWindow(QMainWindow):
             project_id = item.data(Qt.ItemDataRole.UserRole)
         if project_id is None:
             return
+        project_id_int = int(project_id)
+        if self._project_sidebar_item_is_current_view(str(kind), project_id_int):
+            return
         if kind == "creative":
             self._set_ai_workflow_mode("project")
             self.creative_project_combo.blockSignals(True)
-            self._set_combo_to_data(self.creative_project_combo, int(project_id))
+            self._set_combo_to_data(self.creative_project_combo, project_id_int)
             self.creative_project_combo.blockSignals(False)
-            self._load_creative_project(int(project_id), show_board=True)
+            self._load_creative_project(project_id_int, show_board=True)
             self.right_tab_widget.setCurrentIndex(1)
             return
         if kind == "search":
-            self._load_temporary_project(int(project_id))
+            self._load_temporary_project(project_id_int)
             return
-        self._show_temporary_project_board(int(project_id))
+        self._show_temporary_project_board(project_id_int)
+
+    def _project_sidebar_item_is_current_view(self, kind: str, project_id: int) -> bool:
+        if kind == "creative":
+            return (
+                self.current_creative_project_id == project_id
+                and self.center_result_stack.currentWidget() is self.project_board_view
+            )
+        if kind == "search":
+            return (
+                self.current_search_result_set_project_id == project_id
+                and self.center_result_stack.currentWidget() is self.grid_view
+            )
+        return (
+            self._current_board_temp_project_id == project_id
+            and self.center_result_stack.currentWidget() is self.project_board_view
+        )
 
     def _load_temporary_project(self, project_id: int, *, update_grid: bool = True) -> None:
         project = self.store.get_temporary_project(project_id)
@@ -16277,41 +16408,20 @@ class MainWindow(QMainWindow):
             return
         label = self._temporary_project_label(project)
         menu = QMenu(self)
-        open_action = menu.addAction(f"打开{label}")
         edit_action = menu.addAction("编辑名称和摘要")
-        ai_details_action = menu.addAction("AI 重新命名和摘要")
-        ai_details_action.setEnabled(project.kind == "semantic")
-        move_up_action = menu.addAction("上移")
-        move_down_action = menu.addAction("下移")
         delete_action = menu.addAction(f"删除{label}")
         action = menu.exec(self.temp_project_list.viewport().mapToGlobal(position))
-        if action == open_action:
-            if project.kind == "search":
-                self._load_temporary_project(int(project_id))
-            else:
-                self._show_temporary_project_board(int(project_id))
-        elif action == edit_action:
+        if action == edit_action:
             self._edit_temporary_project_details(int(project_id))
-        elif action == ai_details_action:
-            self._request_temporary_project_ai_details(int(project_id))
-        elif action == move_up_action:
-            self._move_temporary_project(int(project_id), -1)
-        elif action == move_down_action:
-            self._move_temporary_project(int(project_id), 1)
         elif action == delete_action:
             self._delete_temporary_project(int(project_id), str(project_name or label))
 
     def _build_creative_sidebar_project_context_menu(self) -> tuple[QMenu, dict[str, QAction]]:
         menu = QMenu(self)
         actions = {
-            "open": menu.addAction("打开创作节点项目"),
             "edit": menu.addAction("编辑名称和摘要"),
-            "ai_details": menu.addAction("AI 重新命名和摘要"),
-            "move_up": menu.addAction("上移"),
-            "move_down": menu.addAction("下移"),
             "delete": menu.addAction("删除创作节点项目"),
         }
-        actions["ai_details"].setEnabled(False)
         return menu, actions
 
     def _show_creative_sidebar_project_context_menu(self, project_id: int, global_pos) -> None:
@@ -16322,16 +16432,8 @@ class MainWindow(QMainWindow):
             return
         menu, actions = self._build_creative_sidebar_project_context_menu()
         chosen = menu.exec(global_pos)
-        if chosen == actions["open"]:
-            self._set_ai_workflow_mode("project")
-            self._load_creative_project(project.id, show_board=True)
-            self.right_tab_widget.setCurrentIndex(1)
-        elif chosen == actions["edit"]:
+        if chosen == actions["edit"]:
             self._edit_creative_project_details(project.id)
-        elif chosen == actions["move_up"]:
-            self._move_creative_sidebar_project(project.id, -1)
-        elif chosen == actions["move_down"]:
-            self._move_creative_sidebar_project(project.id, 1)
         elif chosen == actions["delete"]:
             self._delete_creative_project(project.id)
 

@@ -1406,6 +1406,12 @@ class ProjectBoardView(QGraphicsView):
                 changed += 1
         return changed
 
+    def selected_has_local_display(self) -> bool:
+        return any(
+            isinstance(item, BoardImageItem) and item.has_local_display()
+            for item in self._selected_image_items()
+        )
+
     def clear_selected_local_display(self) -> int:
         changed = 0
         for item in self._selected_image_items():
@@ -1794,25 +1800,11 @@ class ProjectBoardView(QGraphicsView):
         menu = QMenu(self)
         preview_action = menu.addAction("通过预览显示图片")
         menu.addSeparator()
-        edit_local_action = menu.addAction("编辑局部展示")
-        toggle_local_action = menu.addAction("切换局部/全图")
-        selected_board_items = [item for item in self._selected_image_items() if isinstance(item, BoardImageItem)]
-        edit_local_action.setEnabled(len(selected_board_items) == 1)
-        toggle_local_action.setEnabled(any(item.has_local_display() for item in selected_board_items))
-        menu.addSeparator()
         remove_action = menu.addAction("从当前项目移除")
         remove_action.setEnabled(bool(self.selected_image_ids()))
         chosen = menu.exec(event.globalPos())
         if chosen == preview_action:
             self.imagePreviewRequested.emit(image_id)
-            event.accept()
-            return
-        if chosen == edit_local_action:
-            self._edit_local_display_for_image(image_id)
-            event.accept()
-            return
-        if chosen == toggle_local_action:
-            self.toggle_selected_local_display()
             event.accept()
             return
         if chosen == remove_action:

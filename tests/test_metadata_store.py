@@ -921,6 +921,48 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertEqual(store.temporary_project_image_ids(quick_project), [])
             self.assertEqual(store.temporary_project_image_ids(search_project), [image_id])
 
+    def test_temporary_projects_can_be_reordered_by_explicit_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "eidory.sqlite3"
+            store = MetadataStore(db_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=10,
+                height=20,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            first_id = store.create_temporary_project("一", [image_id], kind="semantic")
+            second_id = store.create_temporary_project("二", [image_id], kind="semantic")
+            third_id = store.create_temporary_project("三", [image_id], kind="semantic")
+            quick_id = store.create_temporary_project("暂存", [image_id], kind="quick")
+
+            self.assertTrue(
+                store.reorder_temporary_projects(
+                    [first_id, third_id, second_id],
+                    kind="semantic",
+                )
+            )
+            self.assertEqual(
+                [project.id for project in store.list_temporary_projects(kind="semantic")],
+                [first_id, third_id, second_id],
+            )
+            self.assertEqual(
+                [project.id for project in store.list_temporary_projects(kind="quick")],
+                [quick_id],
+            )
+            self.assertFalse(store.reorder_temporary_projects([first_id, quick_id], kind="semantic"))
+            self.assertFalse(
+                store.reorder_temporary_projects(
+                    [first_id, third_id, second_id],
+                    kind="semantic",
+                )
+            )
+
     def test_temporary_project_state_persists_and_cascades(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "eidory.sqlite3"
@@ -1102,6 +1144,13 @@ class MetadataStoreTest(unittest.TestCase):
                 [third_id, second_id, first_id],
             )
             self.assertFalse(store.move_creative_project(third_id, -1))
+            self.assertTrue(store.reorder_creative_projects([first_id, third_id, second_id]))
+            self.assertEqual(
+                [project.id for project in store.list_creative_projects()],
+                [first_id, third_id, second_id],
+            )
+            self.assertFalse(store.reorder_creative_projects([first_id, third_id, second_id]))
+            self.assertFalse(store.reorder_creative_projects([first_id, third_id]))
 
             updated = store.update_creative_project_details(
                 first_id,

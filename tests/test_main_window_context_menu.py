@@ -2110,6 +2110,51 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.selected_image, image)
             window.close()
 
+    def test_board_local_toggle_button_requires_local_display_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            image_path = Path(tmp) / "first.png"
+            pixmap = QPixmap(400, 300)
+            pixmap.fill(QColor("#334455"))
+            self.assertTrue(pixmap.save(str(image_path)))
+            image = self._image(1, file_path=str(image_path), file_ext=".png", width=400, height=300)
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._board_image_by_id = {image.id: image}
+            window.project_board_view.set_images([image])
+            window.center_result_stack.setCurrentWidget(window.project_board_view)
+            window._set_board_toolbar_visible(True)
+            self.app.processEvents()
+
+            window.project_board_view._select_image_id(image.id)
+            self.app.processEvents()
+
+            self.assertFalse(window.board_toggle_local_display_button.isEnabled())
+
+            item = window.project_board_view._image_items[image.id]
+            getattr(item, "set_local_display")(
+                {"enabled": True, "type": "rect", "bounds": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.5}},
+                shrink_to_bounds=True,
+            )
+            window._on_project_board_selection_changed([image.id])
+
+            self.assertTrue(window.board_toggle_local_display_button.isEnabled())
+
+            getattr(item, "clear_local_display")()
+            window._on_project_board_selection_changed([image.id])
+
+            self.assertFalse(window.board_toggle_local_display_button.isEnabled())
+            window.close()
+
     def test_detail_note_and_favorite_auto_save_without_renaming_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -6017,14 +6062,51 @@ class MainWindowContextMenuTest(unittest.TestCase):
                     if not action.isSeparator()
                 ],
                 [
-                    ("打开创作节点项目", True),
                     ("编辑名称和摘要", True),
-                    ("AI 重新命名和摘要", False),
-                    ("上移", True),
-                    ("下移", True),
                     ("删除创作节点项目", True),
                 ],
             )
+            window.close()
+
+    def test_project_sidebar_item_click_opens_project_board(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            folder_id = store.add_folder(str(Path(tmp) / "library"))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(Path(tmp) / "library" / "first.jpg"),
+                file_size=123,
+                width=100,
+                height=100,
+                created_time_ns=None,
+                modified_time_ns=1,
+            )
+            project_id = store.create_temporary_project("泥泞街道", [image_id], kind="semantic")
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            self._expand_project_sidebar_section(window, "temporary")
+            temporary_item = next(
+                item
+                for item in (window.temp_project_list.item(index) for index in range(window.temp_project_list.count()))
+                if item.data(PROJECT_LIST_KIND_ROLE) == "temporary"
+            )
+
+            window._handle_project_sidebar_item_clicked(temporary_item)
+            self.app.processEvents()
+
+            self.assertEqual(window.current_temp_project_id, project_id)
+            self.assertEqual(window.center_result_stack.currentWidget(), window.project_board_view)
+            self.assertIn("语义探针项目看板", window.result_state_label.text())
             window.close()
 
     def test_creative_project_copy_done_updates_copy_text_area(self) -> None:

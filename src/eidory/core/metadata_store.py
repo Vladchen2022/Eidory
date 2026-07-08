@@ -3983,6 +3983,42 @@ class MetadataStore:
             )
             return True
 
+    def reorder_temporary_projects(
+        self,
+        project_ids: Sequence[int],
+        *,
+        kind: str | None = None,
+    ) -> bool:
+        clean_ids = self._clean_ids(project_ids)
+        if not clean_ids:
+            return False
+        clean_kind = _clean_temporary_project_kind(kind) if kind is not None else None
+        with self.connect() as conn:
+            self._normalize_temporary_project_sort_order(conn)
+            where = "WHERE kind = ?" if clean_kind is not None else ""
+            params: tuple[object, ...] = (clean_kind,) if clean_kind is not None else ()
+            rows = conn.execute(
+                f"""
+                SELECT id
+                FROM temporary_projects
+                {where}
+                ORDER BY sort_order DESC, updated_at DESC, id DESC
+                """,
+                params,
+            ).fetchall()
+            existing_ids = [int(row["id"]) for row in rows]
+            if set(existing_ids) != set(clean_ids):
+                return False
+            if existing_ids == clean_ids:
+                return False
+            highest_order = len(clean_ids) - 1
+            for index, project_id in enumerate(clean_ids):
+                conn.execute(
+                    "UPDATE temporary_projects SET sort_order = ? WHERE id = ?",
+                    (highest_order - index, int(project_id)),
+                )
+            return True
+
     def update_temporary_project_details(
         self,
         project_id: int,
@@ -4624,6 +4660,42 @@ class MetadataStore:
                 "UPDATE creative_projects SET sort_order = ? WHERE id = ?",
                 (int(current["sort_order"]), int(target["id"])),
             )
+            return True
+
+    def reorder_creative_projects(self, project_ids: Sequence[int]) -> bool:
+        clean_ids = self._clean_ids(project_ids)
+        if not clean_ids:
+            return False
+        with self.connect() as conn:
+            self._normalize_creative_project_sort_order(conn)
+            rows = conn.execute(
+                """
+                SELECT id, is_pinned
+                FROM creative_projects
+                ORDER BY is_pinned DESC, sort_order DESC, updated_at DESC, id DESC
+                """
+            ).fetchall()
+            existing_ids = [int(row["id"]) for row in rows]
+            if set(existing_ids) != set(clean_ids):
+                return False
+            pinned_by_id = {int(row["id"]): int(row["is_pinned"] or 0) for row in rows}
+            existing_by_pinned = {
+                1: [project_id for project_id in existing_ids if pinned_by_id[project_id] == 1],
+                0: [project_id for project_id in existing_ids if pinned_by_id[project_id] == 0],
+            }
+            desired_by_pinned = {
+                1: [project_id for project_id in clean_ids if pinned_by_id[project_id] == 1],
+                0: [project_id for project_id in clean_ids if pinned_by_id[project_id] == 0],
+            }
+            if existing_by_pinned == desired_by_pinned:
+                return False
+            for ids in desired_by_pinned.values():
+                highest_order = len(ids) - 1
+                for index, project_id in enumerate(ids):
+                    conn.execute(
+                        "UPDATE creative_projects SET sort_order = ? WHERE id = ?",
+                        (highest_order - index, int(project_id)),
+                    )
             return True
 
     def update_creative_project_details(

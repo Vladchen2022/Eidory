@@ -191,6 +191,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             local_width = getattr(item, "display_width")
 
             board._select_image_id(1)
+            self.assertTrue(board.selected_has_local_display())
             self.assertEqual(board.toggle_selected_local_display(), 1)
             self.assertFalse(getattr(item, "is_local_display_enabled")())
             self.assertGreater(getattr(item, "display_width"), local_width)
@@ -199,6 +200,28 @@ class ProjectBoardViewTest(unittest.TestCase):
             self.assertEqual(board.toggle_selected_local_display(), 1)
             self.assertTrue(getattr(item, "is_local_display_enabled")())
             self.assertAlmostEqual(getattr(item, "display_width"), local_width, delta=0.01)
+
+    def test_selected_has_local_display_requires_local_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "first.png"
+            pixmap = QPixmap(400, 300)
+            pixmap.fill(QColor("#334455"))
+            self.assertTrue(pixmap.save(str(image_path)))
+
+            image = self._image(1, file_path=str(image_path), width=400, height=300)
+            board = ProjectBoardView()
+            board.set_images([image])
+            board._select_image_id(1)
+            self.assertFalse(board.selected_has_local_display())
+
+            item = board._image_items[1]
+            self.assertIsInstance(item, BoardImageItem)
+            getattr(item, "set_local_display")(
+                {"enabled": True, "type": "rect", "bounds": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.5}},
+                shrink_to_bounds=True,
+            )
+
+            self.assertTrue(board.selected_has_local_display())
 
     def test_polygon_local_display_renders_transparent_outside_polygon(self) -> None:
         pixmap = QPixmap(100, 100)
@@ -293,8 +316,10 @@ class ProjectBoardViewTest(unittest.TestCase):
         self.assertEqual(emitted, [1])
         self.assertTrue(fake_event.accepted)
         menu_texts = [action.text for action in created_menus[0].actions]
-        self.assertIn("编辑局部展示", menu_texts)
-        self.assertIn("切换局部/全图", menu_texts)
+        self.assertIn("通过预览显示图片", menu_texts)
+        self.assertIn("从当前项目移除", menu_texts)
+        self.assertNotIn("编辑局部展示", menu_texts)
+        self.assertNotIn("切换局部/全图", menu_texts)
         self.assertNotIn("清除局部展示", menu_texts)
 
     def test_select_image_emits_selection_changed(self) -> None:

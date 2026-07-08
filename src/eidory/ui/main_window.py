@@ -1221,6 +1221,7 @@ class MainWindow(QMainWindow):
         self._pending_board_import_context: dict[str, object] | None = None
         self._board_external_import_queue: list[dict[str, object]] = []
         self._board_external_import_active = False
+        self._board_external_import_refresh_pending = False
         self._board_focus_mode = False
         self._board_focus_previous_splitter_sizes: list[int] | None = None
         self._board_focus_widget_visibility: dict[QWidget, bool] = {}
@@ -13281,7 +13282,6 @@ class MainWindow(QMainWindow):
         imported_image_ids: list[int] | None = None,
     ) -> None:
         self._set_import_controls_enabled(True)
-        self._refresh_folders()
         clean_imported_ids = [
             int(image_id)
             for image_id in imported_image_ids or []
@@ -13292,8 +13292,13 @@ class MainWindow(QMainWindow):
         pending_node_id = self._pending_board_import_node_id
         self._pending_board_import_node_id = None
         board_import_requested = isinstance(pending_context, dict) or pending_node_id is not None
-        self._refresh_collections(select_collection_id=None if board_import_requested else collection_id)
-        self.store.seed_default_ai_vision_collection_rules()
+        defer_external_board_refresh = bool(self._board_external_import_active and board_import_requested)
+        if defer_external_board_refresh:
+            self._board_external_import_refresh_pending = True
+        else:
+            self._refresh_folders()
+            self._refresh_collections(select_collection_id=None if board_import_requested else collection_id)
+            self.store.seed_default_ai_vision_collection_rules()
         imported_to_board = False
         if isinstance(pending_context, dict) and clean_imported_ids:
             imported_to_board = self._add_imported_images_to_board_context(
@@ -13320,17 +13325,18 @@ class MainWindow(QMainWindow):
         elif not imported_to_board:
             self._refresh_after_scan_database_change(select_collection_id=collection_id)
         if clean_imported_ids:
-            self._refresh_embedding_stats()
-            self._refresh_ai_vision_stats()
-            self._refresh_file_watcher()
+            if defer_external_board_refresh:
+                self._board_external_import_refresh_pending = True
+            else:
+                self._queue_embedding_stats_refresh()
+                self._queue_ai_vision_stats_refresh()
+                self._refresh_file_watcher()
         self.statusBar().showMessage(
             f"拖入导入成功：{collection_name}，扫描 {scanned}，"
             f"新增 {new_files}，变化 {changed_files}，加入 {assigned}"
         )
         if self._board_external_import_active:
-            self._board_external_import_active = False
-            if self._board_external_import_queue:
-                QTimer.singleShot(0, self._start_next_project_board_external_import)
+            self._finish_project_board_external_import_entry()
 
     def _add_imported_images_to_board_context(
         self,
@@ -15585,18 +15591,19 @@ class MainWindow(QMainWindow):
         if self._board_external_import_active:
             return
         if not self._board_external_import_queue:
+            self._flush_project_board_external_import_refreshes()
             return
         entry = self._board_external_import_queue.pop(0)
         source_label = str(entry.get("source_label") or "外部图片")
         collection_id = self._select_project_board_drop_collection(source_label)
         if collection_id is None:
             self.statusBar().showMessage(f"已取消导入：{source_label}")
-            QTimer.singleShot(0, self._start_next_project_board_external_import)
+            self._finish_project_board_external_import_entry()
             return
         board_context = entry.get("board_context")
         if not isinstance(board_context, dict):
             self.statusBar().showMessage("看板导入目标已失效")
-            QTimer.singleShot(0, self._start_next_project_board_external_import)
+            self._finish_project_board_external_import_entry()
             return
         self._pending_board_import_context = dict(board_context)
         self._board_external_import_active = True
@@ -15621,6 +15628,19 @@ class MainWindow(QMainWindow):
         self._board_external_import_active = False
         if self._board_external_import_queue:
             QTimer.singleShot(0, self._start_next_project_board_external_import)
+        else:
+            self._flush_project_board_external_import_refreshes()
+
+    def _flush_project_board_external_import_refreshes(self) -> None:
+        if not self._board_external_import_refresh_pending:
+            return
+        self._board_external_import_refresh_pending = False
+        self._refresh_folders()
+        self._refresh_collections(select_collection_id=None)
+        self.store.seed_default_ai_vision_collection_rules()
+        self._queue_embedding_stats_refresh()
+        self._queue_ai_vision_stats_refresh()
+        self._refresh_file_watcher()
 
     def _select_project_board_drop_collection(self, source_label: str) -> int | None:
         self._ensure_temporary_import_collection()

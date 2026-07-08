@@ -7251,6 +7251,69 @@ class MainWindowContextMenuTest(unittest.TestCase):
             refresh_after_scan.assert_not_called()
             window.close()
 
+    def test_project_board_external_import_batches_side_refreshes_until_queue_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            collection_id = window._temporary_import_collection_id()
+            self.assertIsNotNone(collection_id)
+            window._pending_board_import_context = {
+                "kind": "creative",
+                "id": 42,
+                "title": "节点",
+                "intent_label": "节点",
+                "intent_query": "节点",
+            }
+            window._board_external_import_active = True
+            window._board_external_import_queue.append({"kind": "file", "path": "next.jpg"})
+
+            with (
+                patch.object(window, "_add_imported_images_to_board_context", return_value=True),
+                patch.object(window, "_refresh_folders") as refresh_folders,
+                patch.object(window, "_refresh_collections") as refresh_collections,
+                patch.object(window.store, "seed_default_ai_vision_collection_rules") as seed_rules,
+                patch.object(window, "_queue_embedding_stats_refresh") as queue_embedding,
+                patch.object(window, "_queue_ai_vision_stats_refresh") as queue_ai,
+                patch.object(window, "_refresh_file_watcher") as refresh_watcher,
+            ):
+                window._handle_drop_import_done(
+                    collection_id=int(collection_id),
+                    collection_name=TEMPORARY_IMPORT_COLLECTION_NAME,
+                    scanned=1,
+                    new_files=1,
+                    changed_files=0,
+                    assigned=1,
+                    imported_image_ids=[101],
+                )
+
+                refresh_folders.assert_not_called()
+                refresh_collections.assert_not_called()
+                seed_rules.assert_not_called()
+                queue_embedding.assert_not_called()
+                queue_ai.assert_not_called()
+                refresh_watcher.assert_not_called()
+                self.assertTrue(window._board_external_import_refresh_pending)
+
+                window._board_external_import_queue.clear()
+                window._finish_project_board_external_import_entry()
+
+                refresh_folders.assert_called_once()
+                refresh_collections.assert_called_once_with(select_collection_id=None)
+                seed_rules.assert_called_once()
+                queue_embedding.assert_called_once()
+                queue_ai.assert_called_once()
+                refresh_watcher.assert_called_once()
+                self.assertFalse(window._board_external_import_refresh_pending)
+            window.close()
+
     def test_project_board_payload_with_local_file_ignores_extra_html_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(

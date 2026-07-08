@@ -9,8 +9,9 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QMimeData, Qt, QUrl
+from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QUrl
 from PySide6.QtGui import QColor, QKeyEvent, QPixmap
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from eidory.models import ImageItem
@@ -448,6 +449,82 @@ class ProjectBoardViewTest(unittest.TestCase):
                 )
 
             self.assertFalse(loaded.isNull())
+
+    def test_board_item_batches_layout_notifications_while_dragging(self) -> None:
+        pixmap = QPixmap(320, 180)
+        pixmap.fill(QColor("#445566"))
+        notifications: list[str] = []
+        item = BoardImageItem(
+            image_id=1,
+            pixmap=pixmap,
+            file_path="/tmp/source.jpg",
+            on_layout_changed=lambda: notifications.append("changed"),
+        )
+
+        item._begin_layout_interaction()
+        item.setPos(10, 10)
+        item.setPos(24, 18)
+
+        self.assertEqual(notifications, [])
+
+        item._finish_layout_interaction()
+
+        self.assertEqual(notifications, ["changed"])
+
+    def test_board_view_batches_layout_notifications_for_multi_item_drag(self) -> None:
+        board = ProjectBoardView()
+        board.set_images([self._image(1), self._image(2)])
+        notifications: list[str] = []
+        board.layoutChanged.connect(lambda: notifications.append("changed"))
+
+        board._begin_item_drag_layout_batch()
+        board._image_items[1].setPos(10, 10)
+        board._image_items[2].setPos(24, 18)
+
+        self.assertEqual(notifications, [])
+        self.assertTrue(board._item_drag_layout_pending)
+
+        board._finish_item_drag_layout_batch()
+        self.assertTrue(board.flush_pending_layout_change())
+
+        self.assertEqual(notifications, ["changed"])
+
+    def test_board_mouse_drag_commits_position_once_on_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "source.jpg"
+            pixmap = QPixmap(640, 360)
+            pixmap.fill(QColor("#445566"))
+            self.assertTrue(pixmap.save(str(image_path)))
+            board = ProjectBoardView()
+            board.resize(1000, 760)
+            board.show()
+            self.app.processEvents()
+            board.set_images([self._image(1, file_path=str(image_path), width=640, height=360)])
+            self.app.processEvents()
+            item = board._image_items[1]
+            self.assertIsInstance(item, BoardImageItem)
+            original_pos = QPoint(int(item.pos().x()), int(item.pos().y()))
+            notifications: list[str] = []
+            board.layoutChanged.connect(lambda: notifications.append("changed"))
+
+            start = board.mapFromScene(item.sceneBoundingRect().center())
+            QTest.mousePress(board.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, start)
+            QTest.mouseMove(board.viewport(), start + QPoint(90, 45), delay=0)
+
+            self.assertEqual(QPoint(int(item.pos().x()), int(item.pos().y())), original_pos)
+
+            QTest.mouseRelease(
+                board.viewport(),
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+                start + QPoint(90, 45),
+            )
+            self.app.processEvents()
+
+            self.assertGreater(item.pos().x(), original_pos.x())
+            self.assertGreater(item.pos().y(), original_pos.y())
+            self.assertTrue(board.flush_pending_layout_change())
+            self.assertEqual(notifications, ["changed"])
 
     @staticmethod
     def _image(

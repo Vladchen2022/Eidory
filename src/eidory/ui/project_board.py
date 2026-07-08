@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenu,
+    QApplication,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -267,6 +268,8 @@ class BoardImageItem(QGraphicsPixmapItem):
         self._pinned = False
         self._flipped = False
         self._grayscale = False
+        self._layout_interaction_active = False
+        self._layout_interaction_dirty = False
         self._local_display: dict[str, Any] | None = None
         self._display_variant_cache: OrderedDict[tuple[object, ...], QPixmap] = OrderedDict()
         self.setToolTip(file_path)
@@ -339,6 +342,12 @@ class BoardImageItem(QGraphicsPixmapItem):
 
     def is_pinned(self) -> bool:
         return self._pinned
+
+    def can_start_drag_at_scene_pos(self, scene_pos: QPointF) -> bool:
+        if self._pinned:
+            return False
+        local_pos = self.mapFromScene(scene_pos)
+        return self._resize_zone_at(local_pos) not in {"corner", "right", "bottom"}
 
     def set_flipped(self, flipped: bool) -> None:
         flipped = bool(flipped)
@@ -561,7 +570,27 @@ class BoardImageItem(QGraphicsPixmapItem):
             self._notify_layout_changed()
         return result
 
+    def _begin_layout_interaction(self) -> None:
+        if self._layout_interaction_active:
+            return
+        self._layout_interaction_active = True
+        self._layout_interaction_dirty = False
+        self.setTransformationMode(Qt.TransformationMode.FastTransformation)
+
+    def _finish_layout_interaction(self) -> None:
+        if not self._layout_interaction_active:
+            return
+        should_notify = self._layout_interaction_dirty
+        self._layout_interaction_active = False
+        self._layout_interaction_dirty = False
+        self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        if should_notify:
+            self._notify_layout_changed()
+
     def _notify_layout_changed(self) -> None:
+        if self._layout_interaction_active:
+            self._layout_interaction_dirty = True
+            return
         if self._on_layout_changed is not None:
             self._on_layout_changed()
 
@@ -650,8 +679,10 @@ class BoardImageItem(QGraphicsPixmapItem):
                 self._resizing = True
                 self._resize_start_scene = event.scenePos()
                 self._resize_start_width = self._display_width
+                self._begin_layout_interaction()
                 event.accept()
                 return
+            self._begin_layout_interaction()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -672,9 +703,12 @@ class BoardImageItem(QGraphicsPixmapItem):
         if self._resizing:
             self._resizing = False
             self._resize_zone = ""
+            self._finish_layout_interaction()
             event.accept()
             return
         super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._finish_layout_interaction()
 
     def _resize_zone_at(self, pos: QPointF) -> str:
         rect = self.boundingRect()
@@ -1167,6 +1201,15 @@ class ProjectBoardView(QGraphicsView):
         self._last_fit_selection_ids: tuple[int, ...] = ()
         self._selected_image_ids_cache: list[int] = []
         self._refit_timer_pending = False
+        self._item_drag_layout_batch_active = False
+        self._item_drag_layout_pending = False
+        self._manual_item_drag_pending = False
+        self._manual_item_drag_active = False
+        self._manual_item_drag_start_viewport = QPoint()
+        self._manual_item_drag_start_scene = QPointF()
+        self._manual_item_drag_delta = QPointF()
+        self._manual_item_drag_anchor_item: BoardImageItem | None = None
+        self._manual_item_drag_items: list[tuple[BoardImageItem, QPointF, QRectF, float]] = []
         self._suppress_layout_changed = False
         self._layout_change_pending = False
         self._layout_change_timer = QTimer(self)
@@ -1524,6 +1567,17 @@ class ProjectBoardView(QGraphicsView):
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
+        scene_press_pos = self.mapToScene(event.position().toPoint())
+        if event.button() == Qt.MouseButton.LeftButton:
+            image_id = self._image_id_at(event.position().toPoint())
+            item = self._image_items.get(image_id) if image_id is not None else None
+            if isinstance(item, BoardImageItem) and item.can_start_drag_at_scene_pos(scene_press_pos):
+                self._manual_item_drag_pending = True
+                self._manual_item_drag_active = False
+                self._manual_item_drag_anchor_item = item
+                self._manual_item_drag_start_viewport = event.position().toPoint()
+                self._manual_item_drag_start_scene = scene_press_pos
+                self._manual_item_drag_delta = QPointF()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -1537,6 +1591,19 @@ class ProjectBoardView(QGraphicsView):
             self._last_pan_pos = current_pos
             event.accept()
             return
+        if self._manual_item_drag_pending or self._manual_item_drag_active:
+            current_viewport_pos = event.position().toPoint()
+            if not self._manual_item_drag_active:
+                drag_delta = current_viewport_pos - self._manual_item_drag_start_viewport
+                if drag_delta.manhattanLength() < QApplication.startDragDistance():
+                    event.accept()
+                    return
+                self._begin_manual_item_drag()
+            if self._manual_item_drag_active:
+                scene_pos = self.mapToScene(current_viewport_pos)
+                self._update_manual_item_drag(scene_pos - self._manual_item_drag_start_scene)
+                event.accept()
+                return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
@@ -1547,6 +1614,17 @@ class ProjectBoardView(QGraphicsView):
             else:
                 self.viewport().unsetCursor()
             event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._manual_item_drag_active:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            self._update_manual_item_drag(scene_pos - self._manual_item_drag_start_scene)
+            self._finish_manual_item_drag(commit=True)
+            super().mouseReleaseEvent(event)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._manual_item_drag_pending:
+            self._reset_manual_item_drag()
+            super().mouseReleaseEvent(event)
             return
         super().mouseReleaseEvent(event)
 
@@ -1585,8 +1663,96 @@ class ProjectBoardView(QGraphicsView):
     def _supports_external_import_drop(mime_data) -> bool:
         return payload_supports_mime_data(mime_data)
 
+    def _begin_manual_item_drag(self) -> None:
+        items = [
+            item
+            for item in self._selected_image_items()
+            if isinstance(item, BoardImageItem) and not item.is_pinned()
+        ]
+        anchor = self._manual_item_drag_anchor_item
+        if anchor is not None and not anchor.is_pinned() and anchor not in items:
+            items.insert(0, anchor)
+        if not items:
+            self._reset_manual_item_drag()
+            return
+        self._manual_item_drag_items = [
+            (item, QPointF(item.pos()), QRectF(item.sceneBoundingRect()), float(item.opacity()))
+            for item in items
+        ]
+        self._manual_item_drag_active = True
+        self._manual_item_drag_pending = False
+        self._manual_item_drag_delta = QPointF()
+        self._begin_item_drag_layout_batch()
+        for item, _pos, rect, _opacity in self._manual_item_drag_items:
+            item._begin_layout_interaction()
+            item.setOpacity(0.0)
+            self._update_scene_rect(rect.adjusted(-8, -8, 8, 8))
+
+    def _update_manual_item_drag(self, delta: QPointF) -> None:
+        if not self._manual_item_drag_active:
+            return
+        previous_delta = QPointF(self._manual_item_drag_delta)
+        self._manual_item_drag_delta = QPointF(delta)
+        for _item, _start_pos, rect, _opacity in self._manual_item_drag_items:
+            self._update_scene_rect(rect.translated(previous_delta).adjusted(-8, -8, 8, 8))
+            self._update_scene_rect(rect.translated(self._manual_item_drag_delta).adjusted(-8, -8, 8, 8))
+
+    def _finish_manual_item_drag(self, *, commit: bool) -> None:
+        if not self._manual_item_drag_active and not self._manual_item_drag_pending:
+            return
+        final_delta = QPointF(self._manual_item_drag_delta)
+        items = list(self._manual_item_drag_items)
+        for item, start_pos, rect, opacity in items:
+            if commit:
+                item.setPos(start_pos + final_delta)
+            item.setOpacity(opacity)
+            item._finish_layout_interaction()
+            self._update_scene_rect(rect.translated(final_delta).adjusted(-8, -8, 8, 8))
+            self._update_scene_rect(item.sceneBoundingRect().adjusted(-8, -8, 8, 8))
+        self._reset_manual_item_drag()
+        self._finish_item_drag_layout_batch()
+
+    def _reset_manual_item_drag(self) -> None:
+        self._manual_item_drag_pending = False
+        self._manual_item_drag_active = False
+        self._manual_item_drag_start_viewport = QPoint()
+        self._manual_item_drag_start_scene = QPointF()
+        self._manual_item_drag_delta = QPointF()
+        self._manual_item_drag_anchor_item = None
+        self._manual_item_drag_items = []
+
+    def _update_scene_rect(self, rect: QRectF) -> None:
+        if rect.isNull() or not rect.isValid():
+            return
+        polygon = self.mapFromScene(rect)
+        viewport_rect = polygon.boundingRect().adjusted(-4, -4, 4, 4)
+        self.viewport().update(viewport_rect.intersected(self.viewport().rect()))
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
+        super().drawForeground(painter, rect)
+        if not self._manual_item_drag_active or not self._manual_item_drag_items:
+            return
+        painter.save()
+        painter.setOpacity(0.92)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        for item, _start_pos, source_rect, _opacity in self._manual_item_drag_items:
+            target_rect = source_rect.translated(self._manual_item_drag_delta)
+            if not target_rect.intersects(rect):
+                continue
+            pixmap = item.pixmap()
+            if pixmap.isNull():
+                continue
+            painter.drawPixmap(
+                target_rect,
+                pixmap,
+                QRectF(0, 0, pixmap.width(), pixmap.height()),
+            )
+        painter.restore()
+
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
         painter.fillRect(rect, QColor("#202830"))
+        if self._manual_item_drag_active:
+            return
         minor_pen = QPen(QColor("#2b3440"))
         minor_pen.setWidth(0)
         major_pen = QPen(QColor("#364250"))
@@ -1720,10 +1886,16 @@ class ProjectBoardView(QGraphicsView):
     def _schedule_layout_changed(self) -> None:
         if self._suppress_layout_changed or not self._image_items:
             return
+        if self._item_drag_layout_batch_active:
+            self._item_drag_layout_pending = True
+            return
         self._layout_change_pending = True
         self._layout_change_timer.start()
 
     def flush_pending_layout_change(self) -> bool:
+        if self._item_drag_layout_pending:
+            self._item_drag_layout_pending = False
+            self._layout_change_pending = True
         if not self._layout_change_pending:
             return False
         self._layout_change_timer.stop()
@@ -1737,6 +1909,19 @@ class ProjectBoardView(QGraphicsView):
         if self._suppress_layout_changed or not self._image_items:
             return
         self.layoutChanged.emit()
+
+    def _begin_item_drag_layout_batch(self) -> None:
+        self._item_drag_layout_batch_active = True
+        self._item_drag_layout_pending = False
+
+    def _finish_item_drag_layout_batch(self) -> None:
+        if not self._item_drag_layout_batch_active:
+            return
+        should_schedule = self._item_drag_layout_pending
+        self._item_drag_layout_batch_active = False
+        self._item_drag_layout_pending = False
+        if should_schedule:
+            self._schedule_layout_changed()
 
     def _add_image_item(
         self,

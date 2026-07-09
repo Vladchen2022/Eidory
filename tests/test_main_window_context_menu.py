@@ -15,6 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAccessible, QColor, QKeySequence, QPixmap
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem, QMessageBox, QPushButton, QTreeWidget, QTreeWidgetItem
 from PIL import Image
 
@@ -24,6 +25,7 @@ from eidory.core.ai_vision import (
     AI_VISION_PROMPT_VERSION,
     AIVisionAnalysis,
 )
+from eidory.core.creative_templates import CREATIVE_TEMPLATES
 from eidory.core.duplicate_detection import DuplicateGroup, DuplicateMember
 from eidory.core.embedding_worker import EmbeddingProgress
 from eidory.core.inspiration import InspirationMatch, InspirationTerm
@@ -3943,6 +3945,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
     def test_folder_search_exclusion_marks_tree_filters_search_not_browsing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(FolderTreeItemDelegate.EXCLUDED_NAME_COLOR.name(), "#4f83ff")
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
                 thumbnail_dir=Path(tmp) / "data" / "thumbs",
@@ -5550,6 +5553,227 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(node.search_query, "空间站餐桌 晚餐 蓝色地球光")
             window.close()
 
+    def test_creative_node_note_is_saved_before_switching_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="角色项目",
+                brief="赛博朋克医生",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            head_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="头面部",
+                note="",
+                search_query="",
+            )
+            body_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="身体结构",
+                note="身体结构原说明",
+                search_query="身体结构原搜索",
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=head_id, show_board=False)
+            self.app.processEvents()
+
+            window.creative_node_note_input.setPlainText("脏辫，左眼义眼，脸颊旧伤疤")
+            window.creative_node_query_input.setText("脏辫 义眼 旧伤疤")
+            self.app.processEvents()
+            immediately_saved = store.get_creative_node(head_id)
+            self.assertIsNotNone(immediately_saved)
+            assert immediately_saved is not None
+            self.assertEqual(immediately_saved.note, "脏辫，左眼义眼，脸颊旧伤疤")
+            self.assertEqual(immediately_saved.search_query, "脏辫 义眼 旧伤疤")
+
+            body_item = window._find_creative_node_tree_item(body_id)
+            self.assertIsNotNone(body_item)
+            window.creative_node_tree.setCurrentItem(body_item)
+            self.app.processEvents()
+
+            head_node = store.get_creative_node(head_id)
+            self.assertIsNotNone(head_node)
+            assert head_node is not None
+            self.assertEqual(head_node.note, "脏辫，左眼义眼，脸颊旧伤疤")
+            self.assertEqual(head_node.search_query, "脏辫 义眼 旧伤疤")
+            self.assertIsNone(window._pending_creative_node_detail_id)
+            self.assertEqual(window.creative_node_note_input.toPlainText(), "身体结构原说明")
+
+            head_item = window._find_creative_node_tree_item(head_id)
+            self.assertIsNotNone(head_item)
+            window.creative_node_tree.setCurrentItem(head_item)
+            self.app.processEvents()
+            self.assertEqual(window.creative_node_note_input.toPlainText(), "脏辫，左眼义眼，脸颊旧伤疤")
+            self.assertEqual(window.creative_node_query_input.text(), "脏辫 义眼 旧伤疤")
+            window.close()
+
+    def test_creative_node_switch_captures_editor_text_even_if_autosave_was_missed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="角色项目",
+                brief="赛博朋克医生",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            head_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="头面部",
+                note="",
+                search_query="",
+            )
+            body_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="身体结构",
+                note="",
+                search_query="",
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=head_id, show_board=False)
+            self.app.processEvents()
+
+            window._suppress_creative_node_auto_save = True
+            window.creative_node_note_input.setPlainText("脏辫，右脸烧伤，蓝色义眼")
+            window.creative_node_query_input.setText("脏辫 蓝色义眼")
+            window._suppress_creative_node_auto_save = False
+            self.assertEqual(store.get_creative_node(head_id).note, "")
+
+            body_item = window._find_creative_node_tree_item(body_id)
+            self.assertIsNotNone(body_item)
+            window.creative_node_tree.blockSignals(True)
+            window.creative_node_tree.setCurrentItem(body_item)
+            window.creative_node_tree.blockSignals(False)
+            window.current_creative_node_id = body_id
+            window._on_creative_node_selection_changed(body_item, None)
+            self.app.processEvents()
+
+            saved_head = store.get_creative_node(head_id)
+            self.assertIsNotNone(saved_head)
+            assert saved_head is not None
+            self.assertEqual(saved_head.note, "脏辫，右脸烧伤，蓝色义眼")
+            self.assertEqual(saved_head.search_query, "脏辫 蓝色义眼")
+
+            head_item = window._find_creative_node_tree_item(head_id)
+            self.assertIsNotNone(head_item)
+            window.creative_node_tree.setCurrentItem(head_item)
+            self.app.processEvents()
+            self.assertEqual(window.creative_node_note_input.toPlainText(), "脏辫，右脸烧伤，蓝色义眼")
+            self.assertEqual(window.creative_node_query_input.text(), "脏辫 蓝色义眼")
+            window.close()
+
+    def test_creative_node_tree_mouse_click_commits_visible_editor_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="角色项目",
+                brief="赛博朋克医生",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            head_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="头面部",
+                note="",
+                search_query="",
+            )
+            body_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="身体结构",
+                note="",
+                search_query="",
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=head_id, show_board=False)
+            self.app.processEvents()
+
+            window._suppress_creative_node_auto_save = True
+            window.creative_node_note_input.setPlainText("脏辫，右脸烧伤，蓝色义眼")
+            window.creative_node_query_input.setText("脏辫 蓝色义眼")
+            window._suppress_creative_node_auto_save = False
+            self.assertEqual(store.get_creative_node(head_id).note, "")
+
+            body_item = window._find_creative_node_tree_item(body_id)
+            self.assertIsNotNone(body_item)
+            assert body_item is not None
+            window.creative_node_tree.scrollToItem(body_item)
+            self.app.processEvents()
+            click_pos = window.creative_node_tree.visualItemRect(body_item).center()
+            QTest.mouseClick(
+                window.creative_node_tree.viewport(),
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+                click_pos,
+            )
+            self.app.processEvents()
+
+            saved_head = store.get_creative_node(head_id)
+            self.assertIsNotNone(saved_head)
+            assert saved_head is not None
+            self.assertEqual(saved_head.note, "脏辫，右脸烧伤，蓝色义眼")
+            self.assertEqual(saved_head.search_query, "脏辫 蓝色义眼")
+
+            head_item = window._find_creative_node_tree_item(head_id)
+            self.assertIsNotNone(head_item)
+            assert head_item is not None
+            window.creative_node_tree.scrollToItem(head_item)
+            self.app.processEvents()
+            QTest.mouseClick(
+                window.creative_node_tree.viewport(),
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+                window.creative_node_tree.visualItemRect(head_item).center(),
+            )
+            self.app.processEvents()
+            self.assertEqual(window.creative_node_note_input.toPlainText(), "脏辫，右脸烧伤，蓝色义眼")
+            self.assertEqual(window.creative_node_query_input.text(), "脏辫 蓝色义眼")
+            window.close()
+
     def test_creative_node_ai_completion_preserves_user_written_note(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -5587,7 +5811,11 @@ class MainWindowContextMenuTest(unittest.TestCase):
             assert node is not None
             self.assertIn(user_note, node.note)
             self.assertIn("漂浮餐具", node.note)
-            self.assertEqual(node.search_query, "空间站餐区 漂浮餐具 舱内灯 飞船剪影")
+            self.assertIn("晚餐时间", node.search_query)
+            self.assertIn("舷窗外有蓝色地球光", node.search_query)
+            self.assertIn("空间站餐区", node.search_query)
+            self.assertIn("漂浮餐具", node.search_query)
+            self.assertNotIn("用户确认", node.search_query)
             window.close()
 
     def test_creative_node_ai_completion_rejects_placeholder_note(self) -> None:
@@ -5738,7 +5966,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(filled_item.data(0, CREATIVE_NODE_HAS_NOTE_ROLE))
             self.assertFalse(filled_item.icon(0).isNull())
 
-            window.current_creative_node_id = empty_child_id
+            window.creative_node_tree.setCurrentItem(empty_item)
+            self.app.processEvents()
             window.creative_node_note_input.setPlainText("用户新增：餐具漂浮在半空。")
             window._save_pending_creative_node_details()
             self.assertTrue(empty_item.data(0, CREATIVE_NODE_HAS_NOTE_ROLE))
@@ -6219,7 +6448,9 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.open_creative_copy_button.text(), "文案")
             self.assertEqual(window.back_creative_nodes_button.text(), "返回节点树")
             self.assertFalse(hasattr(window, "open_creative_board_button"))
-            self.assertTrue(window.generate_all_creative_nodes_button.isEnabled())
+            self.assertFalse(window.creative_content_tabs.isEnabled())
+            self.assertFalse(window.creative_node_tree.isEnabled())
+            self.assertFalse(window.generate_all_creative_nodes_button.isEnabled())
             self.assertTrue(window.creative_ai_project_button.isEnabled())
             self.assertFalse(window.open_creative_copy_button.isEnabled())
             window.close()
@@ -6307,6 +6538,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(preview_root.child(0).text(0), "世界观")
             self.assertIsNone(window.creative_project_combo.currentData())
             self.assertIn("模板预览", window.creative_node_status_label.text())
+            self.assertFalse(window.creative_content_tabs.isEnabled())
+            self.assertFalse(window.creative_node_tree.isEnabled())
 
             natural_index = window.creative_template_combo.findData("sceneNatural")
             self.assertGreaterEqual(natural_index, 0)
@@ -6322,6 +6555,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.current_creative_project_id, project_id)
             self.assertEqual(window.creative_node_tree.topLevelItem(0).text(0), "旧项目")
             self.assertEqual(window.center_result_stack.currentWidget(), window.project_board_view)
+            self.assertTrue(window.creative_content_tabs.isEnabled())
+            self.assertTrue(window.creative_node_tree.isEnabled())
 
             object_index = window.creative_template_combo.findData("object")
             self.assertGreaterEqual(object_index, 0)
@@ -6415,6 +6650,1519 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertIn(user_note, root.note)
             self.assertIn("空间站晚餐 AI补充说明", root.note)
             self.assertIn("时间 AI补充说明", time_node.note)
+            self.assertFalse(window._creative_all_nodes_in_progress)
+            window.close()
+
+    def test_complete_all_creative_nodes_supports_every_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, str]] = []
+
+                def generate_creative_node_note(self, **kwargs: str) -> tuple[SimpleNamespace, str]:
+                    self.calls.append(dict(kwargs))
+                    title = str(kwargs["node_title"])
+                    return (
+                        SimpleNamespace(
+                            note=f"{title} AI补全说明，包含非故事模板也可用的视觉参考。",
+                            search_query=f"{title} 视觉参考",
+                        ),
+                        "fake",
+                    )
+
+            provider = FakeProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                for template in CREATIVE_TEMPLATES:
+                    template_index = window.creative_template_combo.findData(template.id)
+                    self.assertGreaterEqual(template_index, 0)
+                    window.creative_template_combo.setCurrentIndex(template_index)
+                    window.current_creative_project_id = None
+                    window.current_creative_node_id = None
+                    brief = f"{template.label} 测试主题"
+                    window.inspiration_brief_input.setPlainText(brief)
+                    window.inspiration_answers_input.setPlainText("医生，赛博朋克，地下诊所")
+                    window._generate_all_creative_node_notes()
+                    window._poll_events()
+
+                    project = next(
+                        item for item in store.list_creative_projects() if item.title == brief[:32].strip()
+                    )
+                    nodes = store.list_creative_nodes(project.id)
+                    self.assertGreaterEqual(len(nodes), len(template.root.children) + 1)
+                    self.assertEqual(
+                        sum(1 for node in nodes if "AI补全说明" in node.note),
+                        len(nodes),
+                        template.label,
+                    )
+                    self.assertFalse(window._creative_all_nodes_in_progress)
+
+            self.assertGreaterEqual(len(provider.calls), sum(len(item.root.children) + 1 for item in CREATIVE_TEMPLATES))
+            window.close()
+
+    def test_complete_all_creative_nodes_uses_batch_provider_and_template_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeBatchProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+
+                def generate_creative_node_notes(self, **kwargs: object) -> tuple[dict[str, SimpleNamespace], str]:
+                    self.calls.append(dict(kwargs))
+                    nodes = list(kwargs["nodes"])  # type: ignore[index]
+                    result: dict[str, SimpleNamespace] = {}
+                    for raw in nodes:
+                        node = dict(raw)
+                        node_id = str(node["node_id"])
+                        title = str(node["node_title"])
+                        result[node_id] = SimpleNamespace(
+                            note=f"{title}：围绕半人半机器医生生成的赛博朋克人机结合视觉设定。",
+                            search_query=f"半人半机器医生 {title} 赛博朋克 人机结合",
+                        )
+                    return result, "fake"
+
+            provider = FakeBatchProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            window.inspiration_brief_input.setPlainText("赛博朋克世界观里的一个半人半机器人的医生")
+            window.inspiration_answers_input.setPlainText("赛博朋克，人机结合")
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+
+            self.assertEqual(len(provider.calls), 1)
+            call = provider.calls[0]
+            self.assertNotIn("脸型、五官、发型", str(call["project_outline"]))
+            batch_nodes = [dict(item) for item in call["nodes"]]  # type: ignore[index]
+            head = next(item for item in batch_nodes if item["node_title"] == "头面部")
+            self.assertEqual(head["current_note"], "")
+            self.assertIn("脸型、五官、发型", head["node_template_hint"])
+            project = store.list_creative_projects()[0]
+            nodes = store.list_creative_nodes(project.id)
+            self.assertTrue(any(node.title == "头面部" and "半人半机器医生" in node.note for node in nodes))
+            self.assertFalse(any(node.note == "脸型、五官、发型、年龄感、表情、伤痕、妆容、义眼或其他识别点。" for node in nodes))
+            window.close()
+
+    def test_complete_all_creative_nodes_preserves_unsaved_user_node_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeBatchProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+                    self.single_calls: list[dict[str, object]] = []
+
+                def generate_creative_node_notes(self, **kwargs: object) -> tuple[dict[str, SimpleNamespace], str]:
+                    self.calls.append(dict(kwargs))
+                    result: dict[str, SimpleNamespace] = {}
+                    for raw in list(kwargs["nodes"]):  # type: ignore[index]
+                        node = dict(raw)
+                        title = str(node["node_title"])
+                        result[str(node["node_id"])] = SimpleNamespace(
+                            note=f"{title}：AI生成的赛博朋克医生视觉补充。",
+                            search_query=f"赛博朋克医生 {title}",
+                        )
+                    return result, "fake"
+
+                def generate_creative_node_note(self, **kwargs: object) -> tuple[SimpleNamespace, str]:
+                    self.single_calls.append(dict(kwargs))
+                    title = str(kwargs["node_title"])
+                    return (
+                        SimpleNamespace(
+                            note=f"{title}：AI生成的赛博朋克医生视觉补充。",
+                            search_query=f"赛博朋克医生 {title}",
+                        ),
+                        "fake",
+                    )
+
+            provider = FakeBatchProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="赛博朋克世界观里的一个半人半机器人的医生",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                extra="赛博朋克，人机结合",
+                model_name="fake",
+            )
+            head_node = next(node for node in store.list_creative_nodes(project_id) if node.title == "头面部")
+            window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
+            self.app.processEvents()
+            window.creative_node_note_input.setPlainText("秃头，老人，老年斑")
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+
+            head_request = next(call for call in provider.single_calls if call["node_title"] == "头面部")
+            self.assertEqual(head_request["current_note"], "秃头，老人，老年斑")
+            updated_head = store.get_creative_node(head_node.id)
+            self.assertIsNotNone(updated_head)
+            assert updated_head is not None
+            self.assertTrue(updated_head.note.startswith("秃头，老人，老年斑"))
+            self.assertIn("AI生成的赛博朋克医生视觉补充", updated_head.note)
+            window.close()
+
+    def test_complete_all_creative_nodes_preserves_query_only_user_constraint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeBatchProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+                    self.single_calls: list[dict[str, object]] = []
+
+                def generate_creative_node_notes(self, **kwargs: object) -> tuple[dict[str, SimpleNamespace], str]:
+                    self.calls.append(dict(kwargs))
+                    result: dict[str, SimpleNamespace] = {}
+                    for raw in list(kwargs["nodes"]):  # type: ignore[index]
+                        node = dict(raw)
+                        title = str(node["node_title"])
+                        result[str(node["node_id"])] = SimpleNamespace(
+                            note=f"{title}：模型没有主动保留用户搜索短语。",
+                            search_query=f"赛博朋克医生 {title}",
+                        )
+                    return result, "fake"
+
+                def generate_creative_node_note(self, **kwargs: object) -> tuple[SimpleNamespace, str]:
+                    self.single_calls.append(dict(kwargs))
+                    title = str(kwargs["node_title"])
+                    return (
+                        SimpleNamespace(
+                            note=f"{title}：模型没有主动保留用户搜索短语。",
+                            search_query=f"{title} 搜图",
+                        ),
+                        "fake",
+                    )
+
+            provider = FakeBatchProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="赛博朋克世界观里的一个半人半机器人的医生",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                extra="赛博朋克，人机结合",
+                model_name="fake",
+            )
+            head_node = next(node for node in store.list_creative_nodes(project_id) if node.title == "头面部")
+            window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
+            self.app.processEvents()
+            window.creative_node_query_input.setText("秃顶，老年斑")
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+
+            head_request = next(call for call in provider.single_calls if call["node_title"] == "头面部")
+            self.assertEqual(head_request["current_note"], "秃顶，老年斑")
+            updated_head = store.get_creative_node(head_node.id)
+            self.assertIsNotNone(updated_head)
+            assert updated_head is not None
+            self.assertTrue(updated_head.note.startswith("秃顶，老年斑"))
+            self.assertIn("模型没有主动保留用户搜索短语", updated_head.note)
+            window.close()
+
+    def test_complete_current_creative_node_preserves_query_only_user_constraint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+
+                def generate_creative_node_note(self, **kwargs: object) -> tuple[SimpleNamespace, str]:
+                    self.calls.append(dict(kwargs))
+                    return (
+                        SimpleNamespace(
+                            note="人类侧面容消瘦，眼神锐利且布满血丝，机械侧为光滑钛合金面甲。",
+                            search_query="赛博朋克 半脸机械人 义眼 面部特写",
+                        ),
+                        "fake",
+                    )
+
+            provider = FakeProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="赛博朋克世界观里的一个半人半机器人的医生",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                extra="赛博朋克，人机结合",
+                model_name="fake",
+            )
+            head_node = next(node for node in store.list_creative_nodes(project_id) if node.title == "头面部")
+            window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
+            self.app.processEvents()
+            window.creative_node_query_input.setText("秃顶，老年斑")
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with (
+                patch.object(window, "_make_llm_provider", return_value=provider),
+                patch.object(window, "_start_background_task", side_effect=run_immediately),
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+            ):
+                window._generate_creative_children_for_selected_node()
+                window._poll_events()
+
+            self.assertEqual(provider.calls[0]["current_note"], "秃顶，老年斑")
+            updated_head = store.get_creative_node(head_node.id)
+            self.assertIsNotNone(updated_head)
+            assert updated_head is not None
+            self.assertTrue(updated_head.note.startswith("秃顶，老年斑"))
+            self.assertIn("人类侧面容消瘦", updated_head.note)
+            window.close()
+
+    def test_complete_current_creative_node_preserves_user_note_over_existing_ai_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+
+                def generate_creative_node_note(self, **kwargs: object) -> tuple[SimpleNamespace, str]:
+                    self.calls.append(dict(kwargs))
+                    return (
+                        SimpleNamespace(
+                            note="头面部：模型自行生成了冷静专注的面容和机械头盔。",
+                            search_query="朋克 半机械人 头面部特写 义眼 机械接口",
+                        ),
+                        "fake",
+                    )
+
+            provider = FakeProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="赛博朋克世界观里的一个半人半机器人的医生",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                extra="赛博朋克，人机结合",
+                model_name="fake",
+            )
+            head_node = next(node for node in store.list_creative_nodes(project_id) if node.title == "头面部")
+            store.update_creative_node(
+                head_node.id,
+                note="头面部：旧 AI 已经写过冷静专注、机械头盔和发光义眼。",
+                search_query="朋克 半机械人 头面部特写 义眼 机械接口",
+            )
+            window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
+            self.app.processEvents()
+            window.creative_node_note_input.setPlainText("秃顶，老年斑")
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with (
+                patch.object(window, "_make_llm_provider", return_value=provider),
+                patch.object(window, "_start_background_task", side_effect=run_immediately),
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+            ):
+                window._generate_creative_children_for_selected_node()
+                window._poll_events()
+
+            self.assertEqual(len(provider.calls), 1)
+            self.assertTrue(str(provider.calls[0]["current_note"]).startswith("秃顶，老年斑"))
+            updated_head = store.get_creative_node(head_node.id)
+            self.assertIsNotNone(updated_head)
+            assert updated_head is not None
+            self.assertTrue(updated_head.note.startswith("秃顶，老年斑"))
+            self.assertIn("老年斑", updated_head.note)
+            self.assertIn("模型自行生成", updated_head.note)
+            window.close()
+
+    def test_complete_all_creative_nodes_merges_query_constraint_with_existing_ai_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeBatchProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+                    self.single_calls: list[dict[str, object]] = []
+
+                def generate_creative_node_notes(self, **kwargs: object) -> tuple[dict[str, SimpleNamespace], str]:
+                    self.calls.append(dict(kwargs))
+                    result: dict[str, SimpleNamespace] = {}
+                    for raw in list(kwargs["nodes"]):  # type: ignore[index]
+                        node = dict(raw)
+                        title = str(node["node_title"])
+                        result[str(node["node_id"])] = SimpleNamespace(
+                            note=f"{title}：模型没有主动保留新的搜索词约束。",
+                            search_query=f"{title} 模板测试 搜图",
+                        )
+                    return result, "fake"
+
+                def generate_creative_node_note(self, **kwargs: object) -> tuple[SimpleNamespace, str]:
+                    self.single_calls.append(dict(kwargs))
+                    title = str(kwargs["node_title"])
+                    return (
+                        SimpleNamespace(
+                            note=f"{title}：模型没有主动保留新的搜索词约束。",
+                            search_query=f"{title} 搜图",
+                        ),
+                        "fake",
+                    )
+
+            provider = FakeBatchProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="赛博朋克世界观里的一个半人半机器人的医生",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                extra="赛博朋克，人机结合",
+                model_name="fake",
+            )
+            head_node = next(node for node in store.list_creative_nodes(project_id) if node.title == "头面部")
+            store.update_creative_node(
+                head_node.id,
+                note="头面部：旧 AI 已经写过冷静专注、机械头盔和发光义眼。",
+                search_query="朋克 半机械人 头面部特写 义眼 机械接口",
+            )
+            window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
+            self.app.processEvents()
+            window.creative_node_query_input.setText("秃顶，老年斑")
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+
+            head_request = next(call for call in provider.single_calls if call["node_title"] == "头面部")
+            self.assertIn("旧 AI 已经写过", str(head_request["current_note"]))
+            self.assertIn("秃顶，老年斑", str(head_request["current_note"]))
+            updated_head = store.get_creative_node(head_node.id)
+            self.assertIsNotNone(updated_head)
+            assert updated_head is not None
+            self.assertIn("旧 AI 已经写过", updated_head.note)
+            self.assertIn("秃顶，老年斑", updated_head.note)
+            self.assertIn("没有主动保留新的搜索词约束", updated_head.note)
+            window.close()
+
+    def test_complete_all_creative_nodes_saves_every_edited_node_before_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeBatchProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+                    self.single_calls: list[dict[str, object]] = []
+
+                def generate_creative_node_notes(self, **kwargs: object) -> tuple[dict[str, SimpleNamespace], str]:
+                    self.calls.append(dict(kwargs))
+                    result: dict[str, SimpleNamespace] = {}
+                    for raw in list(kwargs["nodes"]):  # type: ignore[index]
+                        node = dict(raw)
+                        title = str(node["node_title"])
+                        result[str(node["node_id"])] = SimpleNamespace(
+                            note=f"{title}：模型故意不复述用户多节点约束。",
+                            search_query=f"{title} 搜图",
+                        )
+                    return result, "fake"
+
+                def generate_creative_node_note(self, **kwargs: object) -> tuple[SimpleNamespace, str]:
+                    self.single_calls.append(dict(kwargs))
+                    title = str(kwargs["node_title"])
+                    return (
+                        SimpleNamespace(
+                            note=f"{title}：模型故意不复述用户多节点约束。",
+                            search_query=f"{title} 搜图",
+                        ),
+                        "fake",
+                    )
+
+            provider = FakeBatchProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="赛博朋克世界观里的一个半人半机器人的医生",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                extra="赛博朋克，人机结合",
+                model_name="fake",
+            )
+            nodes = {node.title: node for node in store.list_creative_nodes(project_id)}
+            head_node = nodes["头面部"]
+            body_node = nodes["身体结构"]
+            wear_node = nodes["穿戴"]
+            window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
+            self.app.processEvents()
+            window.creative_node_note_input.setPlainText("秃顶，老年斑")
+            self.app.processEvents()
+            body_item = window._find_creative_node_tree_item(body_node.id)
+            self.assertIsNotNone(body_item)
+            window.creative_node_tree.setCurrentItem(body_item)
+            self.app.processEvents()
+            window.creative_node_note_input.setPlainText("左臂机械义肢，脊背外露管线")
+            self.app.processEvents()
+            wear_item = window._find_creative_node_tree_item(wear_node.id)
+            self.assertIsNotNone(wear_item)
+            window.creative_node_tree.setCurrentItem(wear_item)
+            self.app.processEvents()
+            window.creative_node_query_input.setText("白色旧医师袍，红色补丁")
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+
+            current_notes = {
+                str(item["node_title"]): str(item["current_note"])
+                for item in provider.single_calls
+            }
+            self.assertIn("秃顶，老年斑", current_notes["头面部"])
+            self.assertIn("左臂机械义肢，脊背外露管线", current_notes["身体结构"])
+            self.assertIn("白色旧医师袍，红色补丁", current_notes["穿戴"])
+            for title, expected in {
+                "头面部": "秃顶，老年斑",
+                "身体结构": "左臂机械义肢，脊背外露管线",
+                "穿戴": "白色旧医师袍，红色补丁",
+            }.items():
+                updated = store.get_creative_node(nodes[title].id)
+                self.assertIsNotNone(updated, title)
+                assert updated is not None
+                self.assertIn(expected, updated.note, title)
+                self.assertIn("模型故意不复述用户多节点约束", updated.note, title)
+            window.close()
+
+    def test_creative_node_editor_preserves_each_node_note_across_selection_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="赛博朋克医生节点切换测试",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                extra="人机结合",
+                model_name="fake",
+            )
+            nodes = {node.title: node for node in store.list_creative_nodes(project_id)}
+            head_node = nodes["头面部"]
+            body_node = nodes["身体结构"]
+            wear_node = nodes["穿戴"]
+
+            window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
+            self.app.processEvents()
+            window.creative_node_note_input.setPlainText("脏辫，右脸烧伤")
+            self.app.processEvents()
+
+            body_item = window._find_creative_node_tree_item(body_node.id)
+            self.assertIsNotNone(body_item)
+            window.creative_node_tree.setCurrentItem(body_item)
+            self.app.processEvents()
+            window.creative_node_note_input.setPlainText("左臂透明机械骨架")
+            self.app.processEvents()
+
+            wear_item = window._find_creative_node_tree_item(wear_node.id)
+            self.assertIsNotNone(wear_item)
+            window.creative_node_tree.setCurrentItem(wear_item)
+            self.app.processEvents()
+            window.creative_node_note_input.setPlainText("旧白大褂，蓝色袖标")
+            self.app.processEvents()
+
+            head_item = window._find_creative_node_tree_item(head_node.id)
+            self.assertIsNotNone(head_item)
+            window.creative_node_tree.setCurrentItem(head_item)
+            self.app.processEvents()
+            self.assertEqual(window.creative_node_note_input.toPlainText(), "脏辫，右脸烧伤")
+
+            body_item = window._find_creative_node_tree_item(body_node.id)
+            self.assertIsNotNone(body_item)
+            window.creative_node_tree.setCurrentItem(body_item)
+            self.app.processEvents()
+            self.assertEqual(window.creative_node_note_input.toPlainText(), "左臂透明机械骨架")
+
+            wear_item = window._find_creative_node_tree_item(wear_node.id)
+            self.assertIsNotNone(wear_item)
+            window.creative_node_tree.setCurrentItem(wear_item)
+            self.app.processEvents()
+            self.assertEqual(window.creative_node_note_input.toPlainText(), "旧白大褂，蓝色袖标")
+
+            for node, expected in [
+                (head_node, "脏辫，右脸烧伤"),
+                (body_node, "左臂透明机械骨架"),
+                (wear_node, "旧白大褂，蓝色袖标"),
+            ]:
+                stored = store.get_creative_node(node.id)
+                self.assertIsNotNone(stored)
+                assert stored is not None
+                self.assertEqual(stored.note, expected)
+            window.close()
+
+    def test_complete_all_creative_nodes_uses_notes_typed_then_switched_away(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+
+                def generate_creative_node_note(self, **kwargs: object) -> tuple[SimpleNamespace, str]:
+                    self.calls.append(dict(kwargs))
+                    title = str(kwargs["node_title"])
+                    return (
+                        SimpleNamespace(
+                            note=f"{title}：模型补充，但故意不主动复述用户词。",
+                            search_query=f"{title} 搜图",
+                        ),
+                        "fake",
+                    )
+
+            provider = FakeProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="赛博朋克医生补全切换测试",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                extra="人机结合",
+                model_name="fake",
+            )
+            nodes = {node.title: node for node in store.list_creative_nodes(project_id)}
+            typed_notes = {
+                "头面部": "脏辫，右脸烧伤",
+                "身体结构": "左臂透明机械骨架",
+                "穿戴": "旧白大褂，蓝色袖标",
+            }
+
+            for title, text in typed_notes.items():
+                item = window._find_creative_node_tree_item(nodes[title].id)
+                self.assertIsNotNone(item, title)
+                window.creative_node_tree.setCurrentItem(item)
+                self.app.processEvents()
+                window.creative_node_note_input.setPlainText(text)
+                self.app.processEvents()
+
+            root_item = window._find_creative_node_tree_item(store.creative_root_node_id(project_id))
+            self.assertIsNotNone(root_item)
+            window.creative_node_tree.setCurrentItem(root_item)
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+
+            current_notes = {
+                str(call["node_title"]): str(call["current_note"])
+                for call in provider.calls
+            }
+            for title, expected in typed_notes.items():
+                self.assertIn(expected, current_notes[title], title)
+                updated = store.get_creative_node(nodes[title].id)
+                self.assertIsNotNone(updated, title)
+                assert updated is not None
+                self.assertTrue(updated.note.startswith(expected), title)
+                self.assertIn("模型补充", updated.note, title)
+            window.close()
+
+    def test_complete_all_creative_nodes_seeds_blank_existing_project_before_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeProvider:
+                def __init__(self) -> None:
+                    self.seed_calls = 0
+                    self.note_calls: list[dict[str, object]] = []
+
+                def generate_creative_project_seed(self, **_kwargs: object) -> tuple[SimpleNamespace, str]:
+                    self.seed_calls += 1
+                    return (
+                        SimpleNamespace(
+                            title="自动拟题的荒原医生",
+                            brief="荒原聚落里修补机械义肢的流浪医生",
+                            extra="干旱、临时诊所、旧医疗器械",
+                        ),
+                        "fake",
+                    )
+
+                def generate_creative_node_notes(self, **kwargs: object) -> tuple[dict[str, SimpleNamespace], str]:
+                    self.note_calls.append(dict(kwargs))
+                    assert kwargs["project_brief"] == "荒原聚落里修补机械义肢的流浪医生"
+                    result: dict[str, SimpleNamespace] = {}
+                    for raw in list(kwargs["nodes"]):  # type: ignore[index]
+                        node = dict(raw)
+                        title = str(node["node_title"])
+                        result[str(node["node_id"])] = SimpleNamespace(
+                            note=f"{title}：围绕荒原医生主题生成的具体节点内容。",
+                            search_query=f"荒原医生 {title} 参考",
+                        )
+                    return result, "fake"
+
+            provider = FakeProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="空项目",
+                brief="",
+                extra="",
+                model_name="fake",
+            )
+            window.inspiration_brief_input.clear()
+            window.inspiration_answers_input.clear()
+            window._load_creative_project(project_id, show_board=False)
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with (
+                patch.object(window, "_make_llm_provider", return_value=provider),
+                patch.object(window, "_start_background_task", side_effect=run_immediately),
+                patch.object(QMessageBox, "warning") as warning,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+                window._poll_events()
+
+            self.assertFalse(warning.called)
+            self.assertEqual(provider.seed_calls, 1)
+            self.assertEqual(len(provider.note_calls), 1)
+            updated_project = store.get_creative_project(project_id)
+            self.assertIsNotNone(updated_project)
+            assert updated_project is not None
+            self.assertEqual(updated_project.title, "自动拟题的荒原医生")
+            self.assertEqual(updated_project.brief, "荒原聚落里修补机械义肢的流浪医生")
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            root = store.get_creative_node(int(root_id))
+            self.assertIsNotNone(root)
+            assert root is not None
+            self.assertIn("荒原聚落", root.note)
+            head_node = next(node for node in store.list_creative_nodes(project_id) if node.title == "头面部")
+            self.assertIn("荒原医生主题", head_node.note)
+            window.close()
+
+    def test_complete_all_creative_nodes_preserves_user_notes_for_every_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeBatchProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+
+                def generate_creative_node_notes(self, **kwargs: object) -> tuple[dict[str, SimpleNamespace], str]:
+                    self.calls.append(dict(kwargs))
+                    result: dict[str, SimpleNamespace] = {}
+                    for raw in list(kwargs["nodes"]):  # type: ignore[index]
+                        node = dict(raw)
+                        title = str(node["node_title"])
+                        current_note = str(node["current_note"])
+                        result[str(node["node_id"])] = SimpleNamespace(
+                            note=(
+                                f"{title}：模型试图改写用户内容后的补充。"
+                                if current_note
+                                else f"{title}：当前模板下的 AI 视觉补充。"
+                            ),
+                            search_query=f"{title} 模板测试 搜图",
+                        )
+                    return result, "fake"
+
+            provider = FakeBatchProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                for template in CREATIVE_TEMPLATES:
+                    template_index = window.creative_template_combo.findData(template.id)
+                    self.assertGreaterEqual(template_index, 0, template.label)
+                    window.creative_template_combo.setCurrentIndex(template_index)
+                    project_id = window._create_creative_project_from_seed(
+                        title=f"{template.label} 用户内容保护",
+                        brief=f"{template.label} 模板下的测试项目",
+                        extra="测试补充信息",
+                        model_name="fake",
+                    )
+                    nodes = store.list_creative_nodes(project_id)
+                    protected_node = next(node for node in nodes if node.parent_id is not None)
+                    user_note = f"用户已定内容：{template.label} 节点不可覆盖。"
+                    window._load_creative_project(project_id, select_node_id=protected_node.id, show_board=False)
+                    self.app.processEvents()
+                    window.creative_node_note_input.setPlainText(user_note)
+                    self.app.processEvents()
+
+                    window._generate_all_creative_node_notes()
+                    window._poll_events()
+
+                    call = provider.calls[-1]
+                    batch_nodes = [dict(item) for item in call["nodes"]]  # type: ignore[index]
+                    protected_request = next(
+                        item for item in batch_nodes if str(item["node_id"]) == str(protected_node.id)
+                    )
+                    self.assertEqual(protected_request["current_note"], user_note, template.label)
+                    self.assertTrue(
+                        any(item["node_template_hint"] for item in batch_nodes if item is not protected_request),
+                        template.label,
+                    )
+                    updated = store.get_creative_node(protected_node.id)
+                    self.assertIsNotNone(updated, template.label)
+                    assert updated is not None
+                    self.assertTrue(updated.note.startswith(user_note), template.label)
+                    self.assertIn("模型试图改写用户内容后的补充", updated.note, template.label)
+                    self.assertFalse(window._creative_all_nodes_in_progress, template.label)
+
+            self.assertEqual(len(provider.calls), len(CREATIVE_TEMPLATES))
+            window.close()
+
+    def test_complete_all_creative_nodes_preserves_query_constraints_for_every_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeBatchProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+
+                def generate_creative_node_notes(self, **kwargs: object) -> tuple[dict[str, SimpleNamespace], str]:
+                    self.calls.append(dict(kwargs))
+                    result: dict[str, SimpleNamespace] = {}
+                    for raw in list(kwargs["nodes"]):  # type: ignore[index]
+                        node = dict(raw)
+                        title = str(node["node_title"])
+                        result[str(node["node_id"])] = SimpleNamespace(
+                            note=f"{title}：AI 按模板生成但没有主动复述搜索短语。",
+                            search_query=f"{title} 模板测试 搜图",
+                        )
+                    return result, "fake"
+
+            provider = FakeBatchProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with patch.object(window, "_make_llm_provider", return_value=provider), patch.object(
+                window,
+                "_start_background_task",
+                side_effect=run_immediately,
+            ):
+                for template in CREATIVE_TEMPLATES:
+                    template_index = window.creative_template_combo.findData(template.id)
+                    self.assertGreaterEqual(template_index, 0, template.label)
+                    window.creative_template_combo.setCurrentIndex(template_index)
+                    project_id = window._create_creative_project_from_seed(
+                        title=f"{template.label} 搜索短语保护",
+                        brief=f"{template.label} 模板下的测试项目",
+                        extra="测试补充信息",
+                        model_name="fake",
+                    )
+                    nodes = store.list_creative_nodes(project_id)
+                    protected_node = next(node for node in nodes if node.parent_id is not None)
+                    user_query = f"用户搜索约束：{template.label} 不可覆盖"
+                    window._load_creative_project(project_id, select_node_id=protected_node.id, show_board=False)
+                    self.app.processEvents()
+                    window.creative_node_query_input.setText(user_query)
+                    self.app.processEvents()
+
+                    window._generate_all_creative_node_notes()
+                    window._poll_events()
+
+                    call = provider.calls[-1]
+                    batch_nodes = [dict(item) for item in call["nodes"]]  # type: ignore[index]
+                    protected_request = next(
+                        item for item in batch_nodes if str(item["node_id"]) == str(protected_node.id)
+                    )
+                    self.assertEqual(protected_request["current_note"], user_query, template.label)
+                    updated = store.get_creative_node(protected_node.id)
+                    self.assertIsNotNone(updated, template.label)
+                    assert updated is not None
+                    self.assertTrue(updated.note.startswith(user_query), template.label)
+                    self.assertIn("没有主动复述搜索短语", updated.note, template.label)
+                    self.assertFalse(window._creative_all_nodes_in_progress, template.label)
+
+            self.assertEqual(len(provider.calls), len(CREATIVE_TEMPLATES))
+            window.close()
+
+    def test_apply_creative_node_note_suggestion_preserves_stored_user_note_when_original_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="角色测试",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            node_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="头面部",
+                note="秃头，老人，老年斑",
+                search_query="秃头 老人 老年斑",
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            updated = window._apply_creative_node_note_suggestion(
+                node_id,
+                "",
+                SimpleNamespace(note="AI生成的新头面部说明。", search_query="赛博朋克医生 头面部"),
+            )
+
+            self.assertIsNotNone(updated)
+            assert updated is not None
+            self.assertTrue(updated.note.startswith("秃头，老人，老年斑"))
+            self.assertIn("AI生成的新头面部说明", updated.note)
+            window.close()
+
+    def test_apply_creative_node_note_suggestion_preserves_live_editor_text_when_original_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="角色测试",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            node_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="头面部",
+                note="头面部：旧 AI 写过短发和义眼。",
+                search_query="赛博朋克 半机械人 脸部特写 义眼 电路纹 短发",
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            window._load_creative_project(project_id, select_node_id=node_id, show_board=False)
+            self.app.processEvents()
+            window.creative_node_note_input.setPlainText("秃顶")
+            self.app.processEvents()
+
+            updated = window._apply_creative_node_note_suggestion(
+                node_id,
+                "",
+                SimpleNamespace(
+                    note="头面部：面容清瘦，皮肤苍白带有细微电路纹路，左眼为红色光学义眼，短发凌乱。",
+                    search_query="赛博朋克 半机械人 脸部特写 义眼 电路纹 短发 手术疤",
+                ),
+            )
+
+            self.assertIsNotNone(updated)
+            assert updated is not None
+            self.assertTrue(updated.note.startswith("秃顶"))
+            self.assertIn("面容清瘦", updated.note)
+            self.assertNotIn("短发", updated.note)
+            self.assertIn("秃顶", updated.search_query)
+            self.assertNotIn("短发", updated.search_query)
+            window.close()
+
+    def test_apply_creative_node_note_suggestion_keeps_request_snapshot_over_later_live_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="角色测试",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            node_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="头面部",
+                note="脏辫",
+                search_query="脏辫 赛博朋克 医生 头部",
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            window._load_creative_project(project_id, select_node_id=node_id, show_board=False)
+            self.app.processEvents()
+            window.creative_node_note_input.setPlainText(
+                "头面部：后续界面状态里只有短发、机械头盔和冷峻表情。"
+            )
+            self.app.processEvents()
+
+            updated = window._apply_creative_node_note_suggestion(
+                node_id,
+                "脏辫",
+                SimpleNamespace(
+                    note="头面部：短发略显凌乱，左眼为发光义眼，表情严肃专注。",
+                    search_query="赛博朋克 角色 头部特写 义眼 短发",
+                ),
+            )
+
+            self.assertIsNotNone(updated)
+            assert updated is not None
+            self.assertTrue(updated.note.startswith("脏辫"))
+            self.assertNotIn("后续界面状态", updated.note)
+            self.assertNotIn("短发", updated.note)
+            self.assertIn("左眼为发光义眼", updated.note)
+            self.assertIn("脏辫", updated.search_query)
+            self.assertNotIn("短发", updated.search_query)
+            window.close()
+
+    def test_apply_creative_node_note_suggestion_filters_known_contradictions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="角色测试",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            node_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="头面部",
+                note="秃头，老人，老年斑",
+                search_query="秃头 老人 老年斑",
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            updated = window._apply_creative_node_note_suggestion(
+                node_id,
+                "秃头，老人，老年斑",
+                SimpleNamespace(
+                    note=(
+                        "秃头，老人，老年斑\n"
+                        "半边机械面颊有金属骨骼和发光义眼。\n"
+                        "年轻光滑皮肤，浓密头发，面容像青年。"
+                    ),
+                    search_query="年轻 浓密头发 赛博朋克医生 头面部",
+                ),
+            )
+
+            self.assertIsNotNone(updated)
+            assert updated is not None
+            self.assertTrue(updated.note.startswith("秃头，老人，老年斑"))
+            self.assertIn("半边机械面颊", updated.note)
+            self.assertNotIn("年轻光滑皮肤", updated.note)
+            self.assertNotIn("浓密头发", updated.note)
+            self.assertNotIn("青年", updated.note)
+            self.assertIn("秃头", updated.search_query)
+            self.assertIn("老人", updated.search_query)
+            self.assertIn("老年斑", updated.search_query)
+            self.assertIn("赛博朋克医生", updated.search_query)
+            self.assertNotIn("年轻", updated.search_query)
+            self.assertNotIn("浓密头发", updated.search_query)
+            window.close()
+
+    def test_apply_creative_node_note_suggestion_preserves_dreadlocks_and_filters_short_hair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="角色测试",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            node_id = store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="头面部",
+                note="脏辫",
+                search_query="脏辫 赛博朋克 医生 头部",
+            )
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            updated = window._apply_creative_node_note_suggestion(
+                node_id,
+                "脏辫",
+                SimpleNamespace(
+                    note="头面部：短发略显凌乱，左眼为发光义眼，表情严肃专注。",
+                    search_query="赛博朋克 角色 头部特写 义眼",
+                ),
+            )
+
+            self.assertIsNotNone(updated)
+            assert updated is not None
+            self.assertTrue(updated.note.startswith("脏辫"))
+            self.assertNotIn("短发", updated.note)
+            self.assertIn("左眼为发光义眼", updated.note)
+            self.assertIn("表情严肃专注", updated.note)
+            self.assertIn("脏辫", updated.search_query)
+            self.assertNotIn("短发", updated.search_query)
+            window.close()
+
+    def test_complete_current_creative_node_preserves_dreadlocks_from_user_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class FakeProvider:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+
+                def generate_creative_node_note(self, **kwargs: object) -> tuple[SimpleNamespace, str]:
+                    self.calls.append(dict(kwargs))
+                    return (
+                        SimpleNamespace(
+                            note="头面部：短发略显凌乱，左眼为发光义眼，表情严肃专注。",
+                            search_query="赛博朋克 角色 头部特写 义眼",
+                        ),
+                        "fake",
+                    )
+
+            provider = FakeProvider()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="赛博朋克世界观里的一个半人半机器人的医生",
+                brief="赛博朋克世界观里的一个半人半机器人的医生",
+                extra="赛博朋克，人机结合",
+                model_name="fake",
+            )
+            head_node = next(node for node in store.list_creative_nodes(project_id) if node.title == "头面部")
+            window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
+            self.app.processEvents()
+            window.creative_node_note_input.setPlainText("脏辫")
+            self.app.processEvents()
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with (
+                patch.object(window, "_make_llm_provider", return_value=provider),
+                patch.object(window, "_start_background_task", side_effect=run_immediately),
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+            ):
+                window._generate_creative_children_for_selected_node()
+                window._poll_events()
+
+            self.assertEqual(provider.calls[0]["current_note"], "脏辫")
+            updated = store.get_creative_node(head_node.id)
+            self.assertIsNotNone(updated)
+            assert updated is not None
+            self.assertTrue(updated.note.startswith("脏辫"))
+            self.assertNotIn("短发", updated.note)
+            self.assertIn("脏辫", updated.search_query)
+            self.assertNotIn("短发", updated.search_query)
+            window.close()
+
+    def test_creative_node_completion_shows_busy_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            project_id = window._create_creative_project_from_seed(
+                title="进度提示测试",
+                brief="进度提示测试",
+                extra="",
+                model_name="fake",
+            )
+            head_node = next(node for node in store.list_creative_nodes(project_id) if node.title == "头面部")
+            window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
+            self.app.processEvents()
+
+            def hold_background_task(_target, **_kwargs):
+                return True
+
+            with (
+                patch.object(window, "_make_llm_provider", return_value=object()),
+                patch.object(window, "_start_background_task", side_effect=hold_background_task),
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+            ):
+                window._generate_creative_children_for_selected_node()
+
+            self.assertTrue(window._creative_node_note_in_progress)
+            self.assertTrue(window.creative_node_progress_bar.isVisible())
+            self.assertFalse(window.generate_creative_children_button.isEnabled())
+            self.assertIn("正在补全", window.creative_node_status_label.text())
+            window._set_creative_node_completion_busy(False)
+            window.close()
+
+    def test_complete_all_creative_nodes_rejects_template_placeholder_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            class PlaceholderBatchProvider:
+                def generate_creative_node_notes(self, **kwargs: object) -> tuple[dict[str, SimpleNamespace], str]:
+                    result: dict[str, SimpleNamespace] = {}
+                    for raw in list(kwargs["nodes"]):  # type: ignore[index]
+                        node = dict(raw)
+                        result[str(node["node_id"])] = SimpleNamespace(
+                            note="脸型、五官、发型、年龄感、表情、伤痕、妆容、义眼或其他识别点。",
+                            search_query="五官、发型、年龄感、表情、伤痕、妆容、义眼",
+                        )
+                    return result, "fake"
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            character_index = window.creative_template_combo.findData("character")
+            self.assertGreaterEqual(character_index, 0)
+            window.creative_template_combo.setCurrentIndex(character_index)
+            window.inspiration_brief_input.setPlainText("赛博朋克世界观里的一个半人半机器人的医生")
+            window.inspiration_answers_input.setPlainText("赛博朋克，人机结合")
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with (
+                patch.object(window, "_make_llm_provider", return_value=PlaceholderBatchProvider()),
+                patch.object(window, "_start_background_task", side_effect=run_immediately),
+                patch.object(QMessageBox, "warning") as warning,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+
+            self.assertTrue(warning.called)
+            self.assertIn("AI没有返回可用节点补充内容", str(warning.call_args.args[2]))
+            project = store.list_creative_projects()[0]
+            nodes = store.list_creative_nodes(project.id)
+            head = next(node for node in nodes if node.title == "头面部")
+            self.assertEqual(head.note, "脸型、五官、发型、年龄感、表情、伤痕、妆容、义眼或其他识别点。")
+            window.close()
+
+    def test_complete_all_creative_nodes_reports_all_failed_node_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            project_id = store.create_creative_project(
+                title="角色测试",
+                brief="赛博朋克世界观里的一个医生",
+                language="zh",
+                provider_name="LM Studio",
+                model_name="fake",
+            )
+            root_id = store.creative_root_node_id(project_id)
+            self.assertIsNotNone(root_id)
+            store.create_creative_node(
+                project_id=project_id,
+                parent_id=int(root_id),
+                title="头面部",
+                note="脸型、五官、发型、年龄感、表情、伤痕、妆容、义眼或其他识别点。",
+                search_query="头面部",
+            )
+
+            class FailingProvider:
+                def generate_creative_node_note(self, **_kwargs: str) -> tuple[SimpleNamespace, str]:
+                    raise RuntimeError("模拟解析失败")
+
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            window._load_creative_project(project_id, select_node_id=int(root_id), show_board=False)
+
+            def run_immediately(target, **_kwargs):
+                target()
+                return True
+
+            with (
+                patch.object(window, "_make_llm_provider", return_value=FailingProvider()),
+                patch.object(window, "_start_background_task", side_effect=run_immediately),
+                patch.object(QMessageBox, "warning") as warning,
+            ):
+                window._generate_all_creative_node_notes()
+                window._poll_events()
+
+            self.assertTrue(warning.called)
+            message = str(warning.call_args.args[2])
+            self.assertIn("AI没有补全任何节点", message)
+            self.assertIn("头面部", message)
+            self.assertIn("模拟解析失败", message)
             self.assertFalse(window._creative_all_nodes_in_progress)
             window.close()
 

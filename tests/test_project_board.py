@@ -10,9 +10,9 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QUrl
-from PySide6.QtGui import QColor, QKeyEvent, QPixmap
+from PySide6.QtGui import QColor, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QGraphicsScene
 
 from eidory.models import ImageItem
 from eidory.ui.project_board import BoardImageItem, ProjectBoardView, _cached_pixmap
@@ -68,6 +68,81 @@ class ProjectBoardViewTest(unittest.TestCase):
             self.assertEqual(board._view_mode, "fit_selection")
             self.assertGreater(board._zoom, 4.0)
             self.assertGreaterEqual(displayed_width, viewport_width - 30)
+
+    def test_space_focus_upgrades_selected_image_from_thumbnail_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path = Path(tmp) / "source.png"
+            thumbnail_path = Path(tmp) / "thumb.png"
+            source = QPixmap(1800, 1200)
+            source.fill(QColor("#667788"))
+            thumbnail = QPixmap(180, 120)
+            thumbnail.fill(QColor("#667788"))
+            self.assertTrue(source.save(str(source_path)))
+            self.assertTrue(thumbnail.save(str(thumbnail_path)))
+
+            board = ProjectBoardView()
+            board.resize(1200, 800)
+            board.show()
+            self.app.processEvents()
+            board.set_images(
+                [
+                    self._image(
+                        1,
+                        file_path=str(source_path),
+                        thumbnail_path=str(thumbnail_path),
+                        width=1800,
+                        height=1200,
+                    )
+                ]
+            )
+            item = board._image_items[1]
+            self.assertIsInstance(item, BoardImageItem)
+            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 180)
+
+            board._select_image_id(1)
+            board.toggle_fit_selection_or_restore()
+
+            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 1800)
+            self.assertEqual(board._view_mode, "fit_selection")
+
+    def test_small_zoom_does_not_upgrade_selected_image_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path = Path(tmp) / "source.png"
+            thumbnail_path = Path(tmp) / "thumb.png"
+            source = QPixmap(1800, 1200)
+            source.fill(QColor("#667788"))
+            thumbnail = QPixmap(560, 373)
+            thumbnail.fill(QColor("#667788"))
+            self.assertTrue(source.save(str(source_path)))
+            self.assertTrue(thumbnail.save(str(thumbnail_path)))
+
+            board = ProjectBoardView()
+            board.resize(1200, 800)
+            board.show()
+            self.app.processEvents()
+            board.set_images(
+                [
+                    self._image(
+                        1,
+                        file_path=str(source_path),
+                        thumbnail_path=str(thumbnail_path),
+                        width=1800,
+                        height=1200,
+                    )
+                ]
+            )
+            item = board._image_items[1]
+            self.assertIsInstance(item, BoardImageItem)
+            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 560)
+
+            board._select_image_id(1)
+            board._zoom_by(1.2)
+
+            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 560)
+
+            board.toggle_fit_selection_or_restore()
+
+            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 1800)
 
     def test_default_board_layout_uses_item_edges_to_avoid_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -239,6 +314,32 @@ class ProjectBoardViewTest(unittest.TestCase):
         image = item.pixmap().toImage()
         self.assertEqual(image.pixelColor(5, 5).alpha(), 255)
         self.assertEqual(image.pixelColor(95, 95).alpha(), 0)
+
+    def test_selected_board_image_renders_blue_outline(self) -> None:
+        pixmap = QPixmap(80, 50)
+        pixmap.fill(QColor("#f8f8f8"))
+        item = BoardImageItem(image_id=1, pixmap=pixmap, file_path="/tmp/source.png")
+        item.setPos(10, 10)
+
+        scene = QGraphicsScene()
+        scene.setSceneRect(0, 0, 110, 80)
+        scene.addItem(item)
+        item.setSelected(True)
+
+        output = QImage(110, 80, QImage.Format.Format_ARGB32)
+        output.fill(QColor("#101820"))
+        painter = QPainter(output)
+        scene.render(painter)
+        painter.end()
+
+        blue_pixels = 0
+        for y in range(output.height()):
+            for x in range(output.width()):
+                color = output.pixelColor(x, y)
+                if color.blue() > 210 and color.green() > 90 and color.red() < 90:
+                    blue_pixels += 1
+
+        self.assertGreater(blue_pixels, 120)
 
     def test_delete_key_requests_selected_image_removal(self) -> None:
         board = ProjectBoardView()

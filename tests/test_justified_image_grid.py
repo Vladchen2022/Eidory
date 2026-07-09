@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QMimeData, QPoint, QUrl
-from PySide6.QtGui import QColor, QImage, QPixmap
+from PySide6.QtCore import QMimeData, QPoint, QSize, QUrl
+from PySide6.QtGui import QColor, QImage, QPixmap, QResizeEvent
 from PySide6.QtWidgets import QApplication
 
 from eidory.models import ImageItem
@@ -176,6 +176,44 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
             self.app.processEvents()
 
         self.assertEqual(update.call_count, 1)
+
+    def test_scroll_repaints_are_coalesced(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        grid.resize(360, 240)
+        grid.show()
+        self.app.processEvents()
+        grid.set_images([self._image(image_id) for image_id in range(1, 120)])
+        grid.verticalScrollBar().setRange(0, 2000)
+
+        with patch.object(grid.viewport(), "update") as update:
+            grid.verticalScrollBar().setValue(120)
+            grid.verticalScrollBar().setValue(260)
+            grid.verticalScrollBar().setValue(420)
+            self.app.processEvents()
+
+        self.assertEqual(update.call_count, 1)
+
+    def test_height_only_resize_updates_scrollbar_without_full_layout_rebuild(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        grid.resize(360, 240)
+        grid.show()
+        self.app.processEvents()
+        grid.set_images([self._image(image_id) for image_id in range(1, 80)])
+        grid._layout_viewport_width = grid.viewport().width()
+
+        with patch.object(grid, "_rebuild_layout") as rebuild_layout:
+            event = QResizeEvent(QSize(grid.width(), grid.height() + 80), QSize(grid.width(), grid.height()))
+            grid.resizeEvent(event)
+
+        rebuild_layout.assert_not_called()
+
+    def test_same_thumbnail_size_does_not_rebuild_layout(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+
+        with patch.object(grid, "_rebuild_layout") as rebuild_layout:
+            grid.set_thumbnail_size(90)
+
+        rebuild_layout.assert_not_called()
 
     def test_set_images_clears_stale_pending_pixmap_loads_when_layout_changes(self) -> None:
         grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)

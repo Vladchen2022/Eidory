@@ -85,6 +85,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._loaded_pixmap_flush_pending = False
         self._layout_signature: tuple[tuple[object, ...], ...] = ()
         self._viewport_update_pending = False
+        self._content_height = 0
+        self._layout_viewport_width = -1
         self._pixmap_load_signals = _PixmapLoadSignals()
         self._pixmap_load_signals.loaded.connect(self._handle_async_pixmap_loaded)
         self._thread_pool = QThreadPool(self)
@@ -99,7 +101,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self.viewport().setAcceptDrops(True)
         self.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.viewport().installEventFilter(self)
-        self.verticalScrollBar().valueChanged.connect(lambda _value: self.viewport().update())
+        self.verticalScrollBar().valueChanged.connect(self._handle_scroll_value_changed)
 
     def eventFilter(self, watched, event) -> bool:
         if watched is self.viewport():
@@ -218,7 +220,10 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._ensure_index_visible(index)
 
     def set_thumbnail_size(self, size: int) -> None:
-        self._target_height = max(80, min(420, size))
+        next_size = max(80, min(420, size))
+        if next_size == self._target_height:
+            return
+        self._target_height = next_size
         self._pending_pixmap_loads.clear()
         self._loaded_pixmap_results.clear()
         self._rebuild_layout()
@@ -226,7 +231,13 @@ class JustifiedImageGridView(QAbstractScrollArea):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._rebuild_layout()
+        if self.viewport().width() != self._layout_viewport_width:
+            self._rebuild_layout()
+        else:
+            self._update_scroll_range()
+
+    def _handle_scroll_value_changed(self, _value: int) -> None:
+        self._schedule_viewport_update()
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self.viewport())
@@ -568,6 +579,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
 
     def _rebuild_layout_from(self, start_index: int) -> None:
         viewport_width = max(1, self.viewport().width())
+        self._layout_viewport_width = viewport_width
         available_width = max(1, viewport_width)
         start_index = max(0, min(int(start_index), len(self._images)))
         if start_index <= 0 or not self._row_ranges or not self._rects:
@@ -628,10 +640,13 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._rects = rects
         self._row_ranges = row_ranges
         self._row_tops = [row[0] for row in row_ranges]
-        content_height = max(0, y - self._spacing)
+        self._content_height = max(0, y - self._spacing)
+        self._update_scroll_range()
+
+    def _update_scroll_range(self) -> None:
         bar = self.verticalScrollBar()
         bar.setPageStep(self.viewport().height())
-        bar.setRange(0, max(0, content_height - self.viewport().height()))
+        bar.setRange(0, max(0, self._content_height - self.viewport().height()))
 
     def _rebuild_index_map(self) -> None:
         self._indexes_by_image_id = {image.id: index for index, image in enumerate(self._images)}

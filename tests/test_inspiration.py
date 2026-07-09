@@ -5,16 +5,20 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import requests
+
 from eidory.core.inspiration import InspirationTerm, mix_inspiration_search_results
 from eidory.core.creative_templates import STORY_ILLUSTRATION_TEMPLATE
 from eidory.core.llm_provider import (
     LLMProviderError,
     LMStudioProvider,
     _build_creative_node_note_prompt,
+    _build_creative_node_notes_prompt,
     _build_creative_project_seed_prompt,
     _terms_from_plain_text,
     parse_creative_project_copy_suggestion,
     parse_creative_project_seed_suggestion,
+    parse_creative_node_note_batch_suggestions,
     parse_creative_node_note_suggestion,
     parse_creative_node_suggestions,
     parse_group_name_suggestions,
@@ -200,6 +204,22 @@ class InspirationTest(unittest.TestCase):
         self.assertEqual([item.title for item in suggestions], ["凌乱工作台", "特殊摩托车"])
         self.assertEqual(suggestions[1].search_query, "特殊摩托车 复古摩托和改装结构。")
 
+    def test_parse_creative_node_suggestions_accepts_chinese_json_keys(self) -> None:
+        suggestions = parse_creative_node_suggestions(
+            """
+{
+  "nodes": [
+    {"节点名称":"头面部","节点说明":"脸型、发型、年龄感和义眼细节。","搜索短语":"赛博医生 面部特写 义眼 发型"},
+    {"标题":"穿戴","说明":"医生外套、护具、污渍和身份标识。","检索词":"赛博朋克 医生服装 护具 污渍"}
+  ]
+}
+            """
+        )
+
+        self.assertEqual([item.title for item in suggestions], ["头面部", "穿戴"])
+        self.assertIn("义眼", suggestions[0].note)
+        self.assertEqual(suggestions[1].search_query, "赛博朋克 医生服装 护具 污渍")
+
     def test_parse_creative_node_note_suggestion(self) -> None:
         suggestion = parse_creative_node_note_suggestion(
             '{"note":"雨夜小巷、潮湿地面和低位霓虹反光。","search_query":"雨夜潮湿小巷 霓虹反光"}'
@@ -207,6 +227,32 @@ class InspirationTest(unittest.TestCase):
 
         self.assertEqual(suggestion.note, "雨夜小巷、潮湿地面和低位霓虹反光。")
         self.assertEqual(suggestion.search_query, "雨夜潮湿小巷 霓虹反光")
+
+    def test_parse_creative_node_note_suggestion_accepts_chinese_json_keys(self) -> None:
+        suggestion = parse_creative_node_note_suggestion(
+            '{"节点说明":"角色头面部需要体现赛博朋克医生的疲惫、义眼、短发和消毒面罩压痕。",'
+            '"搜索短语":"赛博朋克 医生 面部特写 义眼 疲惫表情"}'
+        )
+
+        self.assertIn("赛博朋克医生", suggestion.note)
+        self.assertEqual(suggestion.search_query, "赛博朋克 医生 面部特写 义眼 疲惫表情")
+
+    def test_parse_creative_node_note_batch_suggestions_accepts_chinese_json_keys(self) -> None:
+        suggestions = parse_creative_node_note_batch_suggestions(
+            """
+{
+  "nodes": [
+    {"节点ID":"12","节点说明":"半人半机器医生的头面部应有疲惫人类皮肤、义眼接口和消毒面罩压痕。","搜索短语":"赛博朋克 医生 义眼 面部特写"},
+    {"node_id":"13","note":"穿戴以旧白色医用外套、外露机械固定带和随身工具袋为核心。","search_query":"赛博朋克 医生外套 机械固定带 工具袋"}
+  ]
+}
+            """
+        )
+
+        self.assertIn("12", suggestions)
+        self.assertIn("13", suggestions)
+        self.assertIn("半人半机器", suggestions["12"].note)
+        self.assertEqual(suggestions["13"].search_query, "赛博朋克 医生外套 机械固定带 工具袋")
 
     def test_parse_creative_node_note_suggestion_accepts_plain_text(self) -> None:
         suggestion = parse_creative_node_note_suggestion(
@@ -284,7 +330,7 @@ class InspirationTest(unittest.TestCase):
         self.assertTrue(all("本次随机创意抽签" in prompt for prompt in prompts))
         self.assertTrue(all("随机编号" in prompt for prompt in prompts))
 
-    def test_generate_creative_node_note_uses_single_relaxed_json_request(self) -> None:
+    def test_generate_creative_node_note_uses_structured_json_request(self) -> None:
         provider = LMStudioProvider(model_name="fake")
         model_output = (
             '{"note":"白天的空间站餐区应以舱内柔和人工照明表现日间作息，窗外仍是黑色太空，可见飞船轮廓和冷色星光。",'
@@ -304,12 +350,53 @@ class InspirationTest(unittest.TestCase):
         self.assertEqual(model_name, "fake")
         self.assertEqual(chat.call_count, 1)
         kwargs = chat.call_args.kwargs
-        self.assertFalse(kwargs["prefer_json"])
+        self.assertTrue(kwargs["prefer_json"])
+        self.assertEqual(kwargs["response_format"]["json_schema"]["name"], "eidory_creative_node_note")
         self.assertEqual(kwargs["reasoning_effort"], "none")
+        self.assertTrue(kwargs["allow_reasoning_content"])
         self.assertEqual(kwargs["temperature"], 0.35)
         self.assertEqual(kwargs["max_tokens"], 900)
         self.assertIn("黑色太空", suggestion.note)
         self.assertNotIn("thinking process", suggestion.note.lower())
+
+    def test_generate_creative_node_note_accepts_json_from_reasoning_content(self) -> None:
+        provider = LMStudioProvider(model_name="fake")
+
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "reasoning_content": (
+                                    '{"note":"半人半机器医生的头面部有疲惫皮肤、义眼接口和消毒面罩压痕。",'
+                                    '"search_query":"赛博朋克 医生 义眼 面部特写"}'
+                                ),
+                            }
+                        }
+                    ]
+                }
+
+        with patch("eidory.core.llm_provider.requests.post", return_value=FakeResponse()):
+            suggestion, _model_name = provider.generate_creative_node_note(
+                project_brief="赛博朋克世界观里的一个半人半机器人的医生",
+                project_extra="赛博朋克，人机结合",
+                project_outline="- 赛博朋克世界观里的一个半人半机器人的医生\n  - 头面部",
+                node_title="头面部",
+                current_note="",
+                node_path="赛博朋克世界观里的一个半人半机器人的医生 / 头面部",
+                node_template_hint="脸型、五官、发型、年龄感、表情、伤痕、妆容、义眼或其他识别点。",
+                language="zh",
+            )
+
+        self.assertIn("半人半机器医生", suggestion.note)
+        self.assertIn("义眼", suggestion.search_query)
 
     def test_generate_creative_node_note_retries_without_reasoning_effort_when_unsupported(self) -> None:
         provider = LMStudioProvider(model_name="fake")
@@ -361,6 +448,100 @@ class InspirationTest(unittest.TestCase):
         self.assertEqual(calls[0].get("reasoning_effort"), "none")
         self.assertNotIn("reasoning_effort", calls[1])
         self.assertIn("黑色太空", suggestion.note)
+
+    def test_chat_completion_handles_chunked_encoding_error(self) -> None:
+        provider = LMStudioProvider(model_name="fake", timeout_seconds=1)
+        with patch("eidory.core.llm_provider.requests.post", side_effect=requests.exceptions.ChunkedEncodingError):
+            with self.assertRaises(LLMProviderError) as context:
+                provider.generate_creative_node_note(
+                    project_brief="赛博朋克世界观里的一个医生",
+                    project_extra="",
+                    project_outline="- 赛博朋克世界观里的一个医生\n  - 头面部",
+                    node_title="头面部",
+                    current_note="",
+                    node_path="赛博朋克世界观里的一个医生 / 头面部",
+                    node_template_hint="脸型、五官、发型、年龄感、表情、伤痕、妆容、义眼或其他识别点。",
+                    language="zh",
+                )
+
+        self.assertIn("连接被中断", str(context.exception))
+        self.assertNotIn("ChunkedEncodingError", str(context.exception))
+
+    def test_generate_creative_node_note_preserves_current_note_after_model_rewrite(self) -> None:
+        provider = LMStudioProvider(model_name="fake")
+        model_output = """
+{
+  "note": "秃头老人，面部有明显老年斑，半机械义眼和金属接口，表情疲惫且专注。",
+  "search_query": "赛博朋克 老人 秃头 老年斑 半机械脸 特写"
+}
+        """
+        with patch.object(provider, "_chat_completion", return_value=model_output):
+            suggestion, model_name = provider.generate_creative_node_note(
+                project_brief="赛博朋克世界观里的一个半人半机器人的医生",
+                project_extra="赛博朋克，人机结合",
+                project_outline="- 赛博朋克世界观里的一个半人半机器人的医生\n  - 当前节点：头面部",
+                node_title="头面部",
+                current_note="秃头，老人，老年斑",
+                node_path="赛博朋克世界观里的一个半人半机器人的医生 / 头面部",
+                node_template_hint="脸型、五官、发型、年龄感、表情、伤痕、妆容、义眼或其他识别点。",
+                language="zh",
+            )
+
+        self.assertEqual(model_name, "fake")
+        self.assertTrue(suggestion.note.startswith("秃头，老人，老年斑"))
+        self.assertIn("半机械义眼", suggestion.note)
+
+    def test_generate_creative_node_notes_uses_single_batch_request(self) -> None:
+        provider = LMStudioProvider(model_name="fake")
+        model_output = """
+{
+  "nodes": [
+    {"node_id":"1","note":"半人半机器医生的世界观强调赛博朋克地下诊所、人机结合伦理和高压医疗系统。","search_query":"赛博朋克 地下诊所 人机结合 医疗系统"},
+    {"node_id":"2","note":"头面部以疲惫人类皮肤、义眼接口、短发和消毒面罩压痕形成识别点。","search_query":"赛博朋克 医生 义眼 面部特写 疲惫表情"}
+  ]
+}
+        """
+        with patch.object(provider, "_chat_completion", return_value=model_output) as chat:
+            suggestions, model_name = provider.generate_creative_node_notes(
+                project_brief="赛博朋克世界观里的一个半人半机器人的医生",
+                project_extra="赛博朋克，人机结合",
+                project_outline="- 赛博朋克世界观里的一个半人半机器人的医生\n  - 世界观\n  - 头面部",
+                nodes=[
+                    {
+                        "node_id": "1",
+                        "node_title": "世界观",
+                        "node_path": "赛博朋克世界观里的一个半人半机器人的医生 / 世界观",
+                        "current_note": "",
+                        "node_template_hint": "角色所属时代、种族/文明、技术或魔法规则、社会阶层和环境压力。",
+                    },
+                    {
+                        "node_id": "2",
+                        "node_title": "头面部",
+                        "node_path": "赛博朋克世界观里的一个半人半机器人的医生 / 头面部",
+                        "current_note": "秃头，老人，老年斑",
+                        "node_template_hint": "脸型、五官、发型、年龄感、表情、伤痕、妆容、义眼或其他识别点。",
+                    },
+                ],
+                language="zh",
+            )
+
+        self.assertEqual(model_name, "fake")
+        self.assertEqual(chat.call_count, 1)
+        kwargs = chat.call_args.kwargs
+        self.assertTrue(kwargs["prefer_json"])
+        self.assertEqual(kwargs["response_format"]["json_schema"]["name"], "eidory_creative_node_notes")
+        self.assertTrue(kwargs["allow_reasoning_content"])
+        prompt = kwargs["messages"][1]["content"]
+        self.assertIn("赛博朋克世界观里的一个半人半机器人的医生", prompt)
+        self.assertIn("赛博朋克，人机结合", prompt)
+        self.assertIn("template_guidance", prompt)
+        self.assertIn('"existing_user_note": "秃头，老人，老年斑"', prompt)
+        self.assertIn("note 必须以 existing_user_note 原文开头", prompt)
+        self.assertIn("禁止把 template_guidance 原句", prompt)
+        self.assertIn("1", suggestions)
+        self.assertIn("2", suggestions)
+        self.assertTrue(suggestions["2"].note.startswith("秃头，老人，老年斑"))
+        self.assertIn("义眼接口", suggestions["2"].note)
 
     def test_generate_creative_node_note_refines_scoped_search_query(self) -> None:
         provider = LMStudioProvider(model_name="fake")
@@ -429,14 +610,14 @@ class InspirationTest(unittest.TestCase):
         self.assertIn("空间站外有飞船和太空设备", prompt)
         self.assertIn("现有节点说明（如果有，优先级最高）", prompt)
         self.assertIn("不得推翻、删除、替换或违背", prompt)
-        self.assertIn("约束和出发点", prompt)
+        self.assertIn("note 必须以这段原文原样开头", prompt)
         self.assertIn("合理联想并补充相关的环境、物件、光线", prompt)
         self.assertIn("当前项目节点树", prompt)
         self.assertIn("当前节点：时间", prompt)
         self.assertIn("搜索范围建议", prompt)
         self.assertIn("search_query 的用途是给当前节点找参考图", prompt)
         self.assertIn("search_query 必须使用简体中文短语", prompt)
-        self.assertNotIn("围绕这句话扩写", prompt)
+        self.assertNotIn("围绕原句扩写", prompt)
         self.assertIn("不要输出“...”“待补充”“同上”", prompt)
         self.assertIn("/no_think", prompt)
 
@@ -458,6 +639,60 @@ class InspirationTest(unittest.TestCase):
         self.assertIn("多人围坐吃饭", prompt)
         self.assertIn("造型锚点 + 通用动作/体态", prompt)
         self.assertIn("不要写：空间站、太空舱背景、太空、失重", prompt)
+
+    def test_creative_node_note_prompt_handles_character_design_nodes(self) -> None:
+        base_kwargs = {
+            "project_brief": "赛博朋克世界观里的一个医生",
+            "project_extra": "医生，赛博朋克，长期在地下诊所工作",
+            "project_outline": "- 赛博朋克世界观里的一个医生\n  - 世界观\n  - 身份\n  - 身体结构\n  - 头面部\n  - 穿戴\n  - 物件",
+            "current_note": "",
+            "language": "zh",
+        }
+
+        identity_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="身份",
+            node_path="赛博朋克世界观里的一个医生 / 身份",
+        )
+        body_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="身体结构",
+            node_path="赛博朋克世界观里的一个医生 / 身体结构",
+        )
+        face_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="头面部",
+            node_path="赛博朋克世界观里的一个医生 / 头面部",
+        )
+        clothing_prompt = _build_creative_node_note_prompt(
+            **base_kwargs,
+            node_title="穿戴",
+            node_path="赛博朋克世界观里的一个医生 / 穿戴",
+        )
+
+        self.assertIn("角色身份节点", identity_prompt)
+        self.assertIn("职业、阵营、社会阶层", identity_prompt)
+        self.assertIn("身体结构节点", body_prompt)
+        self.assertIn("剪影、身高比例、体量", body_prompt)
+        self.assertIn("头面部节点", face_prompt)
+        self.assertIn("脸型、五官比例、发型", face_prompt)
+        self.assertIn("穿戴节点", clothing_prompt)
+        self.assertIn("服装剪裁、层次、材质", clothing_prompt)
+
+    def test_creative_node_note_prompt_handles_object_design_nodes(self) -> None:
+        prompt = _build_creative_node_note_prompt(
+            project_brief="荒漠医生使用的便携诊疗箱",
+            project_extra="旧金属，皮革绑带，临时维修痕迹",
+            project_outline="- 荒漠医生使用的便携诊疗箱\n  - 使用者与用途\n  - 整体轮廓\n  - 结构拆解\n  - 材质工艺",
+            node_title="结构拆解",
+            current_note="",
+            node_path="荒漠医生使用的便携诊疗箱 / 结构拆解",
+            language="zh",
+        )
+
+        self.assertIn("物件设计节点", prompt)
+        self.assertIn("用途、剪影比例、结构拆解", prompt)
+        self.assertIn("搜索物件本身的造型层", prompt)
 
     def test_creative_node_note_prompt_broadens_event_and_composition_search_scope(self) -> None:
         event_prompt = _build_creative_node_note_prompt(

@@ -19,6 +19,7 @@ import urllib.request
 import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
@@ -27,6 +28,7 @@ import numpy as np
 from PySide6.QtCore import (
     QFile,
     QBuffer,
+    QEvent,
     QFileSystemWatcher,
     QIODevice,
     QObject,
@@ -176,7 +178,10 @@ from eidory.core.search_service import SearchService
 from eidory.core.thumbnailer import Thumbnailer
 from eidory.core.vector_index import VectorIndex
 from eidory.models import CreativeNodeItem, ImageItem
-from eidory.ui.accessibility import disable_qt_accessibility, hide_macos_accessibility_tree
+from eidory.ui.accessibility import (
+    disable_qt_accessibility,
+    hide_macos_accessibility_tree,
+)
 from eidory.ui.collection_tree import CollectionTreeWidget
 from eidory.ui.image_preview_dialog import ImagePreviewDialog
 from eidory.ui.justified_image_grid import JustifiedImageGridView
@@ -218,6 +223,17 @@ COLLECTION_SEARCH_EXCLUDED_MATCH_ROLE = Qt.ItemDataRole.UserRole + 21
 CREATIVE_NODE_HAS_NOTE_ROLE = Qt.ItemDataRole.UserRole + 30
 TAG_GROUP_ID_ROLE = Qt.ItemDataRole.UserRole + 40
 TAG_GROUP_HEADER_ROLE = Qt.ItemDataRole.UserRole + 41
+
+
+@dataclass
+class CreativeNodeEditorDraft:
+    node_id: int
+    note: str
+    search_query: str
+    note_user_edited: bool = False
+    query_user_edited: bool = False
+
+
 SAVED_VIEW_SAVE_ACTION = "__eidory_save_current_filter_preset__"
 SAVED_VIEW_RENAME_ACTION = "__eidory_rename_current_filter_preset__"
 SAVED_VIEW_DELETE_ACTION = "__eidory_delete_current_filter_preset__"
@@ -376,7 +392,7 @@ class ProjectSidebarListWidget(QListWidget):
 
 
 class FolderTreeItemDelegate(QStyledItemDelegate):
-    EXCLUDED_NAME_COLOR = QColor("#965c5f")
+    EXCLUDED_NAME_COLOR = QColor("#4f83ff")
 
     @staticmethod
     def _is_excluded_index(index, text: str | None = None) -> bool:
@@ -456,6 +472,282 @@ def _creative_template_note_texts() -> frozenset[str]:
 
 
 CREATIVE_TEMPLATE_NOTE_TEXTS = _creative_template_note_texts()
+
+
+def _is_creative_template_placeholder_text(text: str) -> bool:
+    clean = " ".join(str(text or "").strip().split())
+    if not clean:
+        return False
+    if clean in CREATIVE_TEMPLATE_NOTE_TEXTS:
+        return True
+    comparable = clean.rstrip("。.;；")
+    for placeholder in CREATIVE_TEMPLATE_NOTE_TEXTS:
+        base = placeholder.rstrip("。.;；")
+        if len(comparable) >= 8 and comparable in base:
+            return True
+        if len(base) >= 8 and base in comparable and len(comparable) <= len(base) + 12:
+            return True
+    return False
+
+
+_CREATIVE_NOTE_CONTRADICTION_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        ("秃头", "秃顶", "谢顶", "光头", "无发", "脱发", "bald"),
+        (
+            "浓密头发",
+            "头发浓密",
+            "满头头发",
+            "满头浓发",
+            "长发",
+            "短发",
+            "刘海",
+            "辫子",
+            "发髻",
+            "发量",
+            "thick hair",
+            "full hair",
+            "long hair",
+            "short hair",
+        ),
+    ),
+    (
+        ("老人", "老年", "年迈", "年老", "老者", "elderly", "old man", "old woman"),
+        ("年轻", "青年", "少年", "儿童", "孩童", "child", "teen", "young", "youth"),
+    ),
+    (
+        ("老年斑", "age spots", "age spot"),
+        (
+            "光滑皮肤",
+            "皮肤光滑",
+            "无瑕皮肤",
+            "年轻皮肤",
+            "smooth skin",
+            "flawless skin",
+            "young skin",
+        ),
+    ),
+    (
+        ("脏辫", "辫发", "dreadlocks", "dreadlock"),
+        (
+            "短发",
+            "寸头",
+            "光头",
+            "秃头",
+            "秃顶",
+            "无发",
+            "short hair",
+            "bald",
+            "shaved head",
+        ),
+    ),
+    (
+        ("瘦高", "高瘦", "纤细", "瘦削", "slender", "lean", "tall and thin"),
+        (
+            "标准体型",
+            "健壮",
+            "魁梧",
+            "矮胖",
+            "standard build",
+            "stocky",
+            "muscular",
+        ),
+    ),
+    (
+        ("机械义肢", "义肢", "机械手臂", "左臂机械", "右臂机械", "prosthetic", "cybernetic arm"),
+        (
+            "双臂自然完整",
+            "完整双臂",
+            "双臂完整",
+            "自然完整",
+            "正常双臂",
+            "普通手臂",
+            "双臂完好",
+            "intact arms",
+            "natural arms",
+        ),
+    ),
+    (
+        ("脊背外露管线", "背部外露管线", "外露管线", "外露线路", "exposed cables", "exposed wiring"),
+        (
+            "背部干净",
+            "没有外露结构",
+            "无外露结构",
+            "整洁背部",
+            "clean back",
+            "no exposed",
+        ),
+    ),
+)
+
+
+def _compact_creative_constraint_text(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "").lower())
+
+
+def _creative_text_has_known_contradiction(original_note: str, candidate: str) -> bool:
+    original = _compact_creative_constraint_text(original_note)
+    text = _compact_creative_constraint_text(candidate)
+    if not original or not text:
+        return False
+    for triggers, blocked_terms in _CREATIVE_NOTE_CONTRADICTION_RULES:
+        if any(_compact_creative_constraint_text(trigger) in original for trigger in triggers):
+            if any(_compact_creative_constraint_text(term) in text for term in blocked_terms):
+                return True
+    return False
+
+
+def _strip_creative_note_prefix_separator(text: str) -> str:
+    clean = str(text or "").strip().lstrip("，,。.;；:：、\n\r\t ")
+    clean = re.sub(r"^[\w\u4e00-\u9fff（）() /｜|·-]{1,32}[：:]\s*", "", clean)
+    return clean.lstrip("，,。.;；:：、\n\r\t ")
+
+
+def _filter_known_contradictory_creative_note_fragments(original_note: str, generated_note: str) -> str:
+    text = str(generated_note or "").strip()
+    if not text or not original_note.strip():
+        return text
+    fragments = [
+        fragment.strip()
+        for fragment in re.split(r"(?<=[。！？!?；;])\s*|\n+", text)
+        if fragment.strip()
+    ]
+    if not fragments:
+        fragments = [text]
+    kept: list[str] = []
+    for fragment in fragments:
+        if not _creative_text_has_known_contradiction(original_note, fragment):
+            kept.append(fragment)
+            continue
+        subfragments = [
+            subfragment.strip()
+            for subfragment in re.split(r"[，,、；;。]+", fragment)
+            if subfragment.strip()
+        ]
+        safe_subfragments = [
+            subfragment
+            for subfragment in subfragments
+            if not _creative_text_has_known_contradiction(original_note, subfragment)
+        ]
+        if safe_subfragments:
+            kept.append("，".join(safe_subfragments))
+    return "\n".join(kept).strip()
+
+
+def _merge_creative_user_note_with_ai_note(original_note: str, generated_note: str) -> str:
+    original = str(original_note or "").strip()
+    generated = str(generated_note or "").strip()
+    if not original:
+        return generated
+    if generated.startswith(original):
+        suffix = generated[len(original) :]
+    elif original in generated:
+        suffix = generated.replace(original, "", 1)
+    else:
+        suffix = generated
+    suffix = _strip_creative_note_prefix_separator(suffix)
+    suffix = _filter_known_contradictory_creative_note_fragments(original, suffix)
+    if suffix:
+        return f"{original}\n{suffix}".strip()
+    return original
+
+
+def _creative_note_has_meaningful_expansion(original_note: str, merged_note: str) -> bool:
+    original = str(original_note or "").strip()
+    merged = str(merged_note or "").strip()
+    if not original:
+        return bool(merged)
+    if merged.startswith(original):
+        suffix = merged[len(original) :]
+    elif original in merged:
+        suffix = merged.replace(original, "", 1)
+    else:
+        suffix = merged
+    suffix = _strip_creative_note_prefix_separator(suffix)
+    return len(re.findall(r"[\w\u4e00-\u9fff]", suffix)) >= 8
+
+
+def _fallback_creative_node_note_expansion(
+    original_note: str,
+    generated_query: str,
+    node_title: str,
+) -> str:
+    original = str(original_note or "").strip()
+    if not original:
+        return ""
+    terms = [
+        term.strip()
+        for term in re.split(r"[\s，,。.;；:：、/|｜]+", str(generated_query or ""))
+        if term.strip()
+    ]
+    normalized_original = _compact_creative_constraint_text(original)
+    useful_terms: list[str] = []
+    for term in terms:
+        if _creative_text_has_known_contradiction(original, term):
+            continue
+        normalized_term = _compact_creative_constraint_text(term)
+        if not normalized_term or normalized_term in normalized_original or term in useful_terms:
+            continue
+        useful_terms.append(term)
+        if len(useful_terms) >= 5:
+            break
+    visible_terms = "、".join(useful_terms) if useful_terms else str(node_title or "该节点").strip()
+    return (
+        f"{original}\n"
+        f"{str(node_title or '该节点').strip()}进一步具体化为{visible_terms}等可见特征，"
+        "所有新增细节都围绕用户已写内容展开。"
+    ).strip()
+
+
+def _creative_user_note_search_query(original_note: str, node_title: str) -> str:
+    seed = re.sub(r"[\s，,。.;；:：、/|]+", " ", str(original_note or "")).strip()
+    title = str(node_title or "").strip()
+    return f"{seed} {title}".strip() or title
+
+
+_CREATIVE_USER_QUERY_STOP_TERMS = {
+    "用户确认",
+    "用户已定",
+    "用户已定内容",
+    "用户搜索约束",
+    "不可覆盖",
+    "当前节点",
+    "节点",
+    "说明",
+}
+
+
+def _merge_creative_user_note_with_search_query(
+    original_note: str,
+    generated_query: str,
+    node_title: str,
+) -> str:
+    original = str(original_note or "").strip()
+    generated = str(generated_query or "").strip()
+    if not original:
+        return generated
+    original_terms = [
+        term.strip()
+        for term in re.split(r"[\s，,。.;；:：、/|｜]+", original)
+        if term.strip() and term.strip() not in _CREATIVE_USER_QUERY_STOP_TERMS
+    ]
+    generated_terms = [
+        term.strip()
+        for term in re.split(r"[\s，,。.;；:：、/|｜]+", generated)
+        if term.strip() and not _creative_text_has_known_contradiction(original, term)
+    ]
+    title = str(node_title or "").strip()
+    ordered_terms = original_terms + generated_terms
+    if not ordered_terms and title:
+        ordered_terms.append(title)
+    merged_terms: list[str] = []
+    seen: set[str] = set()
+    for term in ordered_terms:
+        normalized = _compact_creative_constraint_text(term)
+        if not normalized or normalized in seen:
+            continue
+        merged_terms.append(term)
+        seen.add(normalized)
+    return " ".join(merged_terms)[:240] or _creative_user_note_search_query(original, node_title)
 
 
 def _creative_node_note_marker_icon() -> QIcon:
@@ -1255,6 +1547,10 @@ class MainWindow(QMainWindow):
         self.current_creative_node_candidate_limit = 0
         self.current_creative_node_badges: dict[int, list[str]] = {}
         self._refreshing_creative_projects = False
+        self._creative_node_editor_drafts: dict[int, CreativeNodeEditorDraft] = {}
+        self._creative_node_editor_node_id: int | None = None
+        self._creative_node_manual_note_edits: dict[int, str] = {}
+        self._creative_node_manual_query_edits: dict[int, str] = {}
         self._creative_node_undo_stack: list[dict[str, object]] = []
         self._board_removal_undo_stack: list[dict[str, object]] = []
         self._pending_board_import_node_id: int | None = None
@@ -1339,6 +1635,7 @@ class MainWindow(QMainWindow):
         self._database_maintenance_active = False
         self._preview_dialogs: set[ImagePreviewDialog] = set()
         self._creative_all_nodes_in_progress = False
+        self._creative_node_note_in_progress = False
         self._background_threads: set[threading.Thread] = set()
         self._background_threads_lock = threading.Lock()
         self._near_duplicate_hash_records_cache: list[ImageDHashRecord] | None = None
@@ -2514,6 +2811,12 @@ class MainWindow(QMainWindow):
         self.creative_node_auto_save_timer.setSingleShot(True)
         self.creative_node_auto_save_timer.setInterval(700)
         self._suppress_creative_node_auto_save = False
+        self._pending_creative_node_detail_id: int | None = None
+        self._pending_creative_node_note_text: str | None = None
+        self._pending_creative_node_query_text: str | None = None
+        self._loaded_creative_node_detail_id: int | None = None
+        self._loaded_creative_node_note_text: str = ""
+        self._loaded_creative_node_query_text: str = ""
         self.delete_source_button = QPushButton("删除/移除图片")
         self.delete_source_button.setToolTip("选择删除源文件，或只从 Eidory 移除索引")
         self.play_pause_button = QPushButton("播放", panel)
@@ -2541,6 +2844,11 @@ class MainWindow(QMainWindow):
         self.save_creative_node_button.hide()
         self.generate_creative_children_button = QPushButton("当前节点信息补全")
         self.generate_all_creative_nodes_button = QPushButton("补全所有节点信息")
+        self.creative_node_progress_bar = QProgressBar()
+        self.creative_node_progress_bar.setRange(0, 0)
+        self.creative_node_progress_bar.setTextVisible(True)
+        self.creative_node_progress_bar.setFormat("AI 正在补全节点...")
+        self.creative_node_progress_bar.hide()
         self.open_creative_copy_button = QPushButton("文案")
         self.back_creative_nodes_button = QPushButton("返回节点树")
         self.generate_creative_copy_button = QPushButton("生成文案")
@@ -2780,6 +3088,7 @@ class MainWindow(QMainWindow):
         creative_node_button_row.addWidget(self.generate_creative_children_button)
         creative_node_button_row.addWidget(self.generate_all_creative_nodes_button)
         node_tab_layout.addLayout(creative_node_button_row)
+        node_tab_layout.addWidget(self.creative_node_progress_bar)
         creative_node_action_row = QHBoxLayout()
         creative_node_action_row.setContentsMargins(0, 0, 0, 0)
         creative_node_action_row.addWidget(self.search_creative_node_button)
@@ -3118,7 +3427,7 @@ class MainWindow(QMainWindow):
         self.creative_project_list.itemSelectionChanged.connect(self._on_creative_project_list_changed)
         self.creative_project_list.customContextMenuRequested.connect(self._show_creative_project_context_menu)
         self.creative_node_tree.customContextMenuRequested.connect(self._show_creative_node_context_menu)
-        self.creative_node_tree.itemSelectionChanged.connect(self._on_creative_node_selection_changed)
+        self.creative_node_tree.currentItemChanged.connect(self._on_creative_node_selection_changed)
         self.creative_template_combo.currentIndexChanged.connect(self._on_creative_template_changed)
         self.creative_new_project_button.clicked.connect(self._create_creative_project_from_current_brief)
         self.creative_ai_project_button.clicked.connect(self._generate_ai_creative_project)
@@ -3186,6 +3495,7 @@ class MainWindow(QMainWindow):
         self.creative_node_note_input.textChanged.connect(self._queue_creative_node_auto_save)
         self.creative_node_query_input.textChanged.connect(self._queue_creative_node_auto_save)
         self.creative_node_auto_save_timer.timeout.connect(self._save_pending_creative_node_details)
+        self._install_creative_node_editor_commit_guards()
         self.delete_source_button.clicked.connect(self._delete_selected_source_files)
         self.undo_removal_action = QAction("撤销删除/移除", self)
         self.undo_removal_action.setShortcut(QKeySequence.StandardKey.Undo)
@@ -3320,6 +3630,42 @@ class MainWindow(QMainWindow):
         self.apply_view_button.clicked.connect(self._apply_selected_saved_view)
         self.rename_view_button.clicked.connect(self._rename_selected_saved_view)
         self.delete_view_button.clicked.connect(self._delete_selected_saved_view)
+
+    def _install_creative_node_editor_commit_guards(self) -> None:
+        for widget in (
+            self,
+            self.creative_node_note_input,
+            self.creative_node_query_input,
+            self.creative_node_tree.viewport(),
+            self.creative_project_list.viewport(),
+            self.temp_project_list.viewport(),
+            self.right_tab_widget.tabBar(),
+        ):
+            widget.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if self._creative_node_editor_should_commit_for_event(watched, event):
+            self._save_current_creative_node_editor_snapshot()
+        return super().eventFilter(watched, event)
+
+    def _creative_node_editor_should_commit_for_event(self, watched: QObject, event: QEvent) -> bool:
+        if not hasattr(self, "creative_node_note_input"):
+            return False
+        if self.current_creative_project_id is None or self._creative_node_editor_node_id is None:
+            return False
+        event_type = event.type()
+        if event_type == QEvent.Type.FocusOut:
+            return watched in {self.creative_node_note_input, self.creative_node_query_input}
+        if event_type == QEvent.Type.MouseButtonPress:
+            return watched in {
+                self.creative_node_tree.viewport(),
+                self.creative_project_list.viewport(),
+                self.temp_project_list.viewport(),
+                self.right_tab_widget.tabBar(),
+            }
+        if event_type in {QEvent.Type.WindowDeactivate, QEvent.Type.Close}:
+            return watched is self
+        return False
 
     def _minimize_window(self) -> None:
         self.showMinimized()
@@ -13054,8 +13400,16 @@ class MainWindow(QMainWindow):
                 node_id, exc = payload
                 self._handle_creative_node_note_error(node_id, exc)
             elif kind == "creative_project_seed_done":
-                seed, model_name = payload
-                self._handle_creative_project_seed_done(seed, str(model_name))
+                if isinstance(payload, tuple) and len(payload) == 3:
+                    seed, model_name, target_project_id = payload
+                else:
+                    seed, model_name = payload
+                    target_project_id = None
+                self._handle_creative_project_seed_done(
+                    seed,
+                    str(model_name),
+                    int(target_project_id) if target_project_id is not None else None,
+                )
             elif kind == "creative_project_seed_error":
                 self._handle_creative_project_seed_error(payload)
             elif kind == "creative_all_node_notes_done":
@@ -13066,6 +13420,14 @@ class MainWindow(QMainWindow):
                     list(results),
                     list(errors),
                     str(model_name),
+                )
+            elif kind == "creative_all_node_notes_progress":
+                project_id, value, total, title = payload
+                self._handle_creative_all_node_notes_progress(
+                    int(project_id),
+                    int(value),
+                    int(total),
+                    str(title),
                 )
             elif kind == "creative_all_node_notes_error":
                 project_id, exc = payload
@@ -13733,7 +14095,12 @@ class MainWindow(QMainWindow):
             finally:
                 list_widget.blockSignals(previous)
 
-    def _refresh_creative_projects(self, select_project_id: int | None = None) -> None:
+    def _refresh_creative_projects(
+        self,
+        select_project_id: int | None = None,
+        *,
+        save_current_editor: bool = True,
+    ) -> None:
         if not hasattr(self, "creative_project_combo"):
             return
         projects = self.store.list_creative_projects()
@@ -13771,7 +14138,10 @@ class MainWindow(QMainWindow):
         )
         if selected_index == 0:
             self._clear_temporary_project_selection()
-        self._load_creative_project(target_id if selected_index > 0 else None)
+        self._load_creative_project(
+            target_id if selected_index > 0 else None,
+            save_current_editor=save_current_editor,
+        )
 
     def _show_creative_project_context_menu(self, pos) -> None:
         item = self.creative_project_list.itemAt(pos)
@@ -13835,7 +14205,16 @@ class MainWindow(QMainWindow):
         *,
         select_node_id: int | None = None,
         show_board: bool = False,
+        save_current_editor: bool = True,
     ) -> None:
+        previous_project_id = self.current_creative_project_id
+        if save_current_editor:
+            if self._pending_creative_node_detail_id is not None:
+                self._save_pending_creative_node_details()
+            elif self.current_creative_node_id is not None:
+                self._save_current_creative_node_editor_snapshot()
+        if project_id != previous_project_id:
+            self._clear_creative_node_editor_state()
         self.current_creative_project_id = project_id
         if project_id is None:
             self.current_creative_node_id = None
@@ -13862,7 +14241,10 @@ class MainWindow(QMainWindow):
             self.creative_project_copy_input.blockSignals(False)
         if select_node_id is None:
             select_node_id = self.current_creative_node_id or self.store.creative_root_node_id(project_id)
-        self._refresh_creative_node_tree(select_node_id=select_node_id)
+        self._refresh_creative_node_tree(
+            select_node_id=select_node_id,
+            save_current_editor=save_current_editor,
+        )
         self._sync_creative_node_panel()
         self._refresh_project_sidebar(select_kind="creative", select_id=project_id)
         if show_board and self.current_creative_node_id is not None:
@@ -13906,7 +14288,17 @@ class MainWindow(QMainWindow):
         self.creative_node_tree.blockSignals(False)
         self.current_creative_node_id = None
 
-    def _refresh_creative_node_tree(self, select_node_id: int | None = None) -> None:
+    def _refresh_creative_node_tree(
+        self,
+        select_node_id: int | None = None,
+        *,
+        save_current_editor: bool = True,
+    ) -> None:
+        if save_current_editor:
+            if self._pending_creative_node_detail_id is not None:
+                self._save_pending_creative_node_details()
+            elif self.current_creative_node_id is not None:
+                self._save_current_creative_node_editor_snapshot()
         self.creative_node_tree.blockSignals(True)
         self.creative_node_tree.clear()
         if self.current_creative_project_id is None:
@@ -13979,13 +14371,27 @@ class MainWindow(QMainWindow):
                 return found
         return None
 
-    def _on_creative_node_selection_changed(self) -> None:
+    def _on_creative_node_selection_changed(
+        self,
+        current: QTreeWidgetItem | None = None,
+        previous: QTreeWidgetItem | None = None,
+    ) -> None:
+        self._save_current_creative_node_editor_snapshot()
         if self.current_creative_project_id is None:
             self.current_creative_node_id = None
             self._sync_creative_node_panel()
             return
-        item = self.creative_node_tree.currentItem()
+        previous_node_id = (
+            previous.data(0, Qt.ItemDataRole.UserRole)
+            if previous is not None
+            else self.current_creative_node_id
+        )
+        item = current if current is not None else self.creative_node_tree.currentItem()
         node_id = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
+        if previous_node_id is not None and (
+            node_id is None or int(node_id) != int(previous_node_id)
+        ):
+            self._save_current_creative_node_editor_snapshot(int(previous_node_id))
         node = self.store.get_creative_node(int(node_id)) if node_id is not None else None
         self.current_creative_node_id = (
             node.id
@@ -14000,6 +14406,92 @@ class MainWindow(QMainWindow):
         if self.current_creative_node_id is None:
             return None
         return self.store.get_creative_node(self.current_creative_node_id)
+
+    def _clear_creative_node_editor_state(self) -> None:
+        self.creative_node_auto_save_timer.stop()
+        self._creative_node_editor_drafts.clear()
+        self._creative_node_editor_node_id = None
+        self._creative_node_manual_note_edits.clear()
+        self._creative_node_manual_query_edits.clear()
+        self._clear_pending_creative_node_details()
+
+    def _creative_node_editor_draft(self, node: CreativeNodeItem) -> CreativeNodeEditorDraft:
+        draft = self._creative_node_editor_drafts.get(node.id)
+        if draft is None:
+            draft = CreativeNodeEditorDraft(
+                node_id=node.id,
+                note=node.note,
+                search_query=node.search_query,
+                note_user_edited=node.id in self._creative_node_manual_note_edits,
+                query_user_edited=node.id in self._creative_node_manual_query_edits,
+            )
+            if node.id in self._creative_node_manual_note_edits:
+                draft.note = self._creative_node_manual_note_edits[node.id]
+            if node.id in self._creative_node_manual_query_edits:
+                draft.search_query = self._creative_node_manual_query_edits[node.id]
+            self._creative_node_editor_drafts[node.id] = draft
+        return draft
+
+    def _creative_node_editor_text_pair(self, node: CreativeNodeItem) -> tuple[str, str]:
+        draft = self._creative_node_editor_draft(node)
+        return draft.note, draft.search_query
+
+    def _set_creative_node_editor_draft(
+        self,
+        node_id: int,
+        *,
+        note: str,
+        search_query: str,
+        note_user_edited: bool = True,
+        query_user_edited: bool = True,
+    ) -> None:
+        draft = self._creative_node_editor_drafts.get(node_id)
+        if draft is None:
+            draft = CreativeNodeEditorDraft(
+                node_id=node_id,
+                note=note,
+                search_query=search_query,
+                note_user_edited=note_user_edited,
+                query_user_edited=query_user_edited,
+            )
+            self._creative_node_editor_drafts[node_id] = draft
+        else:
+            draft.note = note
+            draft.search_query = search_query
+            draft.note_user_edited = draft.note_user_edited or note_user_edited
+            draft.query_user_edited = draft.query_user_edited or query_user_edited
+        if draft.note_user_edited:
+            self._creative_node_manual_note_edits[node_id] = draft.note.strip()
+        if draft.query_user_edited:
+            self._creative_node_manual_query_edits[node_id] = draft.search_query.strip()
+
+    def _flush_creative_node_editor_draft(
+        self,
+        node_id: int,
+        *,
+        status_message: str = "",
+    ) -> CreativeNodeItem | None:
+        draft = self._creative_node_editor_drafts.get(node_id)
+        if draft is None:
+            return None
+        updated = self._save_creative_node_details(
+            node_id,
+            note=draft.note,
+            search_query=draft.search_query,
+            status_message=status_message,
+        )
+        if updated is not None:
+            draft.note = updated.note
+            draft.search_query = updated.search_query
+            if draft.note_user_edited:
+                self._creative_node_manual_note_edits[node_id] = updated.note.strip()
+            if draft.query_user_edited:
+                self._creative_node_manual_query_edits[node_id] = updated.search_query.strip()
+            if self._creative_node_editor_node_id == node_id:
+                self._loaded_creative_node_detail_id = updated.id
+                self._loaded_creative_node_note_text = updated.note
+                self._loaded_creative_node_query_text = updated.search_query
+        return updated
 
     def _creative_node_path_text(self, node_id: int) -> str:
         if self.current_creative_project_id is None:
@@ -14042,30 +14534,38 @@ class MainWindow(QMainWindow):
                 self.creative_node_status_label.setText("未选择创作节点。")
             self.creative_node_note_input.clear()
             self.creative_node_query_input.clear()
+            self._creative_node_editor_node_id = None
+            self._loaded_creative_node_detail_id = None
+            self._loaded_creative_node_note_text = ""
+            self._loaded_creative_node_query_text = ""
         else:
             assert node is not None and project is not None
             self.creative_node_status_label.setText(
                 f"项目：{project.title}\n节点：{node.title} ｜ 已存 {node.image_count} 张"
             )
-            self.creative_node_note_input.setPlainText(node.note)
-            self.creative_node_query_input.setText(node.search_query)
+            note_text, query_text = self._creative_node_editor_text_pair(node)
+            self.creative_node_note_input.setPlainText(note_text)
+            self.creative_node_query_input.setText(query_text)
+            self._creative_node_editor_node_id = node.id
+            self._loaded_creative_node_detail_id = node.id
+            self._loaded_creative_node_note_text = note_text
+            self._loaded_creative_node_query_text = query_text
         self.creative_node_note_input.blockSignals(False)
         self.creative_node_query_input.blockSignals(False)
         self._suppress_creative_node_auto_save = False
-        self.generate_creative_children_button.setEnabled(
-            has_node and not self._creative_all_nodes_in_progress
-        )
-        self.generate_all_creative_nodes_button.setEnabled(
-            not self._creative_all_nodes_in_progress
-        )
+        creative_generation_busy = self._creative_all_nodes_in_progress or self._creative_node_note_in_progress
+        if hasattr(self, "creative_content_tabs"):
+            self.creative_content_tabs.setEnabled(has_node)
+        self.generate_creative_children_button.setEnabled(has_node and not creative_generation_busy)
+        self.generate_all_creative_nodes_button.setEnabled(has_node and not creative_generation_busy)
         self.creative_new_project_button.setEnabled(
-            not self._creative_all_nodes_in_progress
+            not creative_generation_busy
         )
         self.creative_template_combo.setEnabled(
-            not self._creative_all_nodes_in_progress
+            not creative_generation_busy
         )
         self.creative_ai_project_button.setEnabled(
-            not self._creative_all_nodes_in_progress
+            not creative_generation_busy
         )
         for button in [
             self.generate_creative_copy_button,
@@ -14115,7 +14615,10 @@ class MainWindow(QMainWindow):
                 project_brief=brief or title,
                 template_root=template.root,
             )
-        self._refresh_creative_projects(select_project_id=project_id)
+        self._refresh_creative_projects(
+            select_project_id=project_id,
+            save_current_editor=False,
+        )
         self.right_tab_widget.setCurrentIndex(1)
         self.statusBar().showMessage(f"已新建创作项目：{title} / {template.label}")
 
@@ -14160,7 +14663,10 @@ class MainWindow(QMainWindow):
         self.inspiration_answers_input.setPlainText(clean_extra)
         self.inspiration_brief_input.blockSignals(False)
         self.inspiration_answers_input.blockSignals(False)
-        self._refresh_creative_projects(select_project_id=project_id)
+        self._refresh_creative_projects(
+            select_project_id=project_id,
+            save_current_editor=False,
+        )
         self.right_tab_widget.setCurrentIndex(1)
         return project_id
 
@@ -14390,10 +14896,191 @@ class MainWindow(QMainWindow):
         visit(template_root, 0)
         return "\n".join(lines)[:4000]
 
+    @staticmethod
+    def _normalized_creative_constraint_text(text: str) -> str:
+        return re.sub(r"[\s，,。.;；:：、/|｜\-—_]+", "", str(text or "").strip().lower())
+
+    def _creative_node_query_is_default_template_text(
+        self,
+        node: CreativeNodeItem,
+        project,
+        query_text: str,
+    ) -> bool:
+        query = str(query_text or "").strip()
+        if not query:
+            return True
+        normalized_query = self._normalized_creative_constraint_text(query)
+        if not normalized_query:
+            return True
+        if normalized_query == self._normalized_creative_constraint_text(node.title):
+            return True
+        project_contexts = {
+            "",
+            (getattr(project, "brief", "") or "").strip(),
+            (getattr(project, "title", "") or "").strip(),
+        }
+        for placeholder in CREATIVE_TEMPLATE_NOTE_TEXTS:
+            normalized_placeholder = self._normalized_creative_constraint_text(placeholder)
+            if not normalized_placeholder:
+                continue
+            for context in project_contexts:
+                default_query = template_search_query(node.title, placeholder, context)
+                if normalized_query == self._normalized_creative_constraint_text(default_query):
+                    return True
+            if (
+                self._normalized_creative_constraint_text(node.title) in normalized_query
+                and normalized_placeholder in normalized_query
+            ):
+                return True
+        note = node.note.strip()
+        if not _is_creative_template_placeholder_text(note):
+            return False
+        normalized_note = self._normalized_creative_constraint_text(note)
+        normalized_title = self._normalized_creative_constraint_text(node.title)
+        default_query = template_search_query(
+            node.title,
+            note,
+            (getattr(project, "brief", "") or getattr(project, "title", "") or "").strip(),
+        )
+        if normalized_query == self._normalized_creative_constraint_text(default_query):
+            return True
+        if normalized_note and normalized_title and normalized_note in normalized_query and normalized_title in normalized_query:
+            return True
+        return False
+
+    def _creative_node_user_constraint_text(
+        self,
+        node: CreativeNodeItem,
+        project,
+        *,
+        note_text: str | None = None,
+        query_text: str | None = None,
+    ) -> str:
+        note = node.note if note_text is None else note_text
+        query = node.search_query if query_text is None else query_text
+        clean_note = str(note or "").strip()
+        usable_note = clean_note if clean_note and not _is_creative_template_placeholder_text(clean_note) else ""
+        clean_query = str(query or "").strip()
+        usable_query = (
+            clean_query
+            if clean_query and not self._creative_node_query_is_default_template_text(node, project, clean_query)
+            else ""
+        )
+        if usable_note and usable_query:
+            normalized_note = self._normalized_creative_constraint_text(usable_note)
+            normalized_query = self._normalized_creative_constraint_text(usable_query)
+            if normalized_query and normalized_query not in normalized_note:
+                return f"{usable_note}\n{usable_query}".strip()
+            return usable_note
+        return usable_note or usable_query
+
+    def _creative_node_ai_constraint_text(
+        self,
+        node: CreativeNodeItem,
+        project,
+        *,
+        note_text: str | None = None,
+        query_text: str | None = None,
+    ) -> str:
+        draft = self._creative_node_editor_drafts.get(node.id)
+        note = (draft.note if draft is not None else node.note) if note_text is None else note_text
+        query = (draft.search_query if draft is not None else node.search_query) if query_text is None else query_text
+        note_manually_edited = (
+            (draft.note_user_edited if draft is not None else False)
+            or node.id in self._creative_node_manual_note_edits
+        )
+        query_manually_edited = (
+            (draft.query_user_edited if draft is not None else False)
+            or node.id in self._creative_node_manual_query_edits
+        )
+        if note_manually_edited and not query_manually_edited:
+            return self._creative_node_user_constraint_text(
+                node,
+                project,
+                note_text=note,
+                query_text="",
+            )
+        if query_manually_edited and not note_manually_edited:
+            return self._creative_node_user_constraint_text(
+                node,
+                project,
+                note_text=node.note,
+                query_text=query,
+            )
+        return self._creative_node_user_constraint_text(
+            node,
+            project,
+            note_text=note,
+            query_text=query,
+        )
+
+    def _creative_node_live_constraint_text(
+        self,
+        node: CreativeNodeItem,
+        project,
+        original_note: str,
+    ) -> str:
+        candidates: list[str] = []
+        if node.id == self._creative_node_editor_node_id:
+            live_note = self.creative_node_note_input.toPlainText().strip()
+            live_query = self.creative_node_query_input.text().strip()
+            note_changed = live_note != node.note.strip()
+            query_changed = live_query != node.search_query.strip()
+            if note_changed:
+                candidates.append(
+                    self._creative_node_user_constraint_text(
+                        node,
+                        project,
+                        note_text=live_note,
+                        query_text=live_query if query_changed else "",
+                    )
+                )
+            elif query_changed:
+                candidates.append(
+                    self._creative_node_user_constraint_text(
+                        node,
+                        project,
+                        note_text=node.note,
+                        query_text=live_query,
+                    )
+                )
+        draft = self._creative_node_editor_drafts.get(node.id)
+        manual_note = draft.note.strip() if draft is not None and draft.note_user_edited else self._creative_node_manual_note_edits.get(node.id, "")
+        manual_query = draft.search_query.strip() if draft is not None and draft.query_user_edited else self._creative_node_manual_query_edits.get(node.id, "")
+        if manual_note:
+            candidates.append(
+                self._creative_node_user_constraint_text(
+                    node,
+                    project,
+                    note_text=manual_note,
+                    query_text=manual_query if manual_query else "",
+                )
+            )
+        elif manual_query:
+            candidates.append(
+                self._creative_node_user_constraint_text(
+                    node,
+                    project,
+                    note_text=node.note,
+                    query_text=manual_query,
+                )
+            )
+        clean_original = str(original_note or "").strip()
+        if clean_original:
+            candidates.append(clean_original)
+        candidates.append(self._creative_node_user_constraint_text(node, project))
+        for candidate in candidates:
+            clean = " ".join(str(candidate or "").strip().split())
+            if not clean or _is_creative_template_placeholder_text(clean):
+                continue
+            return clean
+        return ""
+
     def _creative_project_outline_text(self, project_id: int, *, selected_node_id: int | None = None) -> str:
         nodes = self.store.list_creative_nodes(project_id)
         if not nodes:
             return ""
+        project = self.store.get_creative_project(project_id)
         children_by_parent: dict[int | None, list[CreativeNodeItem]] = {}
         for node in nodes:
             children_by_parent.setdefault(node.parent_id, []).append(node)
@@ -14403,7 +15090,18 @@ class MainWindow(QMainWindow):
         def visit(parent_id: int | None, depth: int) -> None:
             for node in children_by_parent.get(parent_id, []):
                 marker = "当前节点：" if node.id == selected_node_id else ""
-                note = " ".join(node.note.split())
+                note_text, query_text = self._creative_node_editor_text_pair(node)
+                note = (
+                    self._creative_node_user_constraint_text(
+                        node,
+                        project,
+                        note_text=note_text,
+                        query_text=query_text,
+                    )
+                    if project is not None
+                    else note_text.strip()
+                )
+                note = " ".join(note.split())
                 note_part = f"：{note[:180]}" if note else ""
                 lines.append(f"{'  ' * depth}- {marker}{node.title}{note_part}")
                 if len(lines) >= 80:
@@ -14416,43 +15114,199 @@ class MainWindow(QMainWindow):
     def _queue_creative_node_auto_save(self) -> None:
         if self._suppress_creative_node_auto_save:
             return
-        if self.current_creative_node_id is None:
-            return
-        self.creative_node_auto_save_timer.start()
-
-    def _save_pending_creative_node_details(self) -> None:
-        self.creative_node_auto_save_timer.stop()
-        node_id = self.current_creative_node_id
+        node_id = self._creative_node_editor_node_id
         if node_id is None:
             return
+        note_text = self.creative_node_note_input.toPlainText()
+        query_text = self.creative_node_query_input.text()
+        sender = self.sender()
+        self._set_creative_node_editor_draft(
+            node_id,
+            note=note_text,
+            search_query=query_text,
+            note_user_edited=sender is self.creative_node_note_input,
+            query_user_edited=sender is self.creative_node_query_input,
+        )
+        self._pending_creative_node_detail_id = node_id
+        self._pending_creative_node_note_text = note_text
+        self._pending_creative_node_query_text = query_text
+        updated = self._flush_creative_node_editor_draft(node_id, status_message="")
+        if updated is not None:
+            self._clear_pending_creative_node_details(node_id)
+        self.creative_node_auto_save_timer.stop()
+
+    def _clear_pending_creative_node_details(self, node_id: int | None = None) -> None:
+        if node_id is not None and self._pending_creative_node_detail_id != node_id:
+            return
+        self._pending_creative_node_detail_id = None
+        self._pending_creative_node_note_text = None
+        self._pending_creative_node_query_text = None
+
+    def _save_creative_node_details(
+        self,
+        node_id: int,
+        *,
+        note: str,
+        search_query: str,
+        status_message: str = "节点说明已自动保存",
+    ) -> CreativeNodeItem | None:
         updated = self.store.update_creative_node(
             node_id,
-            note=self.creative_node_note_input.toPlainText(),
-            search_query=self.creative_node_query_input.text(),
+            note=note,
+            search_query=search_query,
         )
         if updated is None:
             self.statusBar().showMessage("节点不存在，无法保存说明")
-            return
+            return None
         item = self._find_creative_node_tree_item(updated.id)
         if item is not None:
             self._apply_creative_node_note_marker(item, updated)
-        self.statusBar().showMessage("节点说明已自动保存")
+        if status_message:
+            self.statusBar().showMessage(status_message)
+        return updated
+
+    def _creative_node_editor_is_dirty(self, node_id: int) -> bool:
+        if self._creative_node_editor_node_id != node_id or self._loaded_creative_node_detail_id != node_id:
+            return False
+        return (
+            self.creative_node_note_input.toPlainText() != self._loaded_creative_node_note_text
+            or self.creative_node_query_input.text() != self._loaded_creative_node_query_text
+        )
+
+    def _capture_visible_creative_node_editor(
+        self,
+        *,
+        only_if_dirty: bool = False,
+        status_message: str = "",
+    ) -> CreativeNodeItem | None:
+        node_id = self._creative_node_editor_node_id
+        if node_id is None or self._suppress_creative_node_auto_save:
+            return None
+        is_dirty = self._creative_node_editor_is_dirty(node_id)
+        if only_if_dirty and not is_dirty:
+            return None
+        note_text = self.creative_node_note_input.toPlainText()
+        query_text = self.creative_node_query_input.text()
+        note_user_edited = (
+            is_dirty and note_text != self._loaded_creative_node_note_text
+        ) or node_id in self._creative_node_manual_note_edits
+        query_user_edited = (
+            is_dirty and query_text != self._loaded_creative_node_query_text
+        ) or node_id in self._creative_node_manual_query_edits
+        self._set_creative_node_editor_draft(
+            node_id,
+            note=note_text,
+            search_query=query_text,
+            note_user_edited=note_user_edited,
+            query_user_edited=query_user_edited,
+        )
+        updated = self._flush_creative_node_editor_draft(
+            node_id,
+            status_message=status_message,
+        )
+        if updated is not None:
+            self.creative_node_auto_save_timer.stop()
+            self._clear_pending_creative_node_details(node_id)
+        return updated
+
+    def _save_current_creative_node_editor_snapshot(
+        self,
+        node_id: int | None = None,
+        *,
+        only_if_dirty: bool = False,
+    ) -> CreativeNodeItem | None:
+        node_id = node_id if node_id is not None else self._creative_node_editor_node_id
+        if node_id is None:
+            return None
+        if node_id != self._creative_node_editor_node_id:
+            return self._flush_creative_node_editor_draft(node_id, status_message="")
+        return self._capture_visible_creative_node_editor(only_if_dirty=only_if_dirty)
+
+    def _save_pending_creative_node_details(self, expected_node_id: int | None = None) -> None:
+        self.creative_node_auto_save_timer.stop()
+        node_id = self._pending_creative_node_detail_id
+        if node_id is None:
+            return
+        if expected_node_id is not None and expected_node_id != node_id:
+            return
+        note_text = (
+            self._pending_creative_node_note_text
+            if self._pending_creative_node_note_text is not None
+            else self.creative_node_note_input.toPlainText()
+        )
+        query_text = (
+            self._pending_creative_node_query_text
+            if self._pending_creative_node_query_text is not None
+            else self.creative_node_query_input.text()
+        )
+        self._set_creative_node_editor_draft(
+            node_id,
+            note=note_text,
+            search_query=query_text,
+            note_user_edited=True,
+            query_user_edited=True,
+        )
+        self._flush_creative_node_editor_draft(node_id)
+        self._clear_pending_creative_node_details(node_id)
 
     def _save_current_creative_node_details(self) -> None:
         node = self._current_creative_node()
         if node is None:
             return
         self.creative_node_auto_save_timer.stop()
-        updated = self.store.update_creative_node(
+        self._set_creative_node_editor_draft(
             node.id,
             note=self.creative_node_note_input.toPlainText(),
             search_query=self.creative_node_query_input.text(),
+            note_user_edited=True,
+            query_user_edited=True,
         )
+        updated = self._flush_creative_node_editor_draft(node.id, status_message="节点已保存")
         if updated is None:
             self.statusBar().showMessage("节点不存在")
             return
-        self._load_creative_project(updated.project_id, select_node_id=updated.id)
+        self._clear_pending_creative_node_details(node.id)
+        self._load_creative_project(
+            updated.project_id,
+            select_node_id=updated.id,
+            save_current_editor=False,
+        )
         self.statusBar().showMessage("节点已保存")
+
+    def _set_creative_node_completion_busy(
+        self,
+        busy: bool,
+        status: str = "",
+        *,
+        value: int | None = None,
+        total: int | None = None,
+    ) -> None:
+        self._creative_node_note_in_progress = busy
+        if busy:
+            if total and total > 0 and value is not None:
+                self.creative_node_progress_bar.setRange(0, total)
+                self.creative_node_progress_bar.setValue(max(0, min(value, total)))
+                self.creative_node_progress_bar.setFormat(f"{status}  %v/%m")
+            else:
+                self.creative_node_progress_bar.setRange(0, 0)
+                self.creative_node_progress_bar.setFormat(status or "AI 正在补全节点...")
+            self.creative_node_progress_bar.show()
+        else:
+            self.creative_node_progress_bar.hide()
+            self.creative_node_progress_bar.setRange(0, 0)
+            self.creative_node_progress_bar.setValue(0)
+        creative_generation_busy = self._creative_all_nodes_in_progress or self._creative_node_note_in_progress
+        has_node = self._current_creative_node() is not None and self.current_creative_project_id is not None
+        if hasattr(self, "creative_content_tabs"):
+            self.creative_content_tabs.setEnabled(has_node)
+        self.generate_creative_children_button.setEnabled(has_node and not creative_generation_busy)
+        self.generate_all_creative_nodes_button.setEnabled(has_node and not creative_generation_busy)
+        self.creative_new_project_button.setEnabled(not creative_generation_busy)
+        self.creative_template_combo.setEnabled(not creative_generation_busy)
+        self.creative_ai_project_button.setEnabled(not creative_generation_busy)
+        if status:
+            self.creative_node_status_label.setText(status)
+            self.statusBar().showMessage(status)
 
     def _generate_creative_children_for_selected_node(self) -> None:
         self._set_ai_workflow_mode("project")
@@ -14465,8 +15319,29 @@ class MainWindow(QMainWindow):
         if node is None or project is None:
             self.statusBar().showMessage("先选择创作项目节点")
             return
-        current_note = self.creative_node_note_input.toPlainText().strip()
-        has_existing_note = bool(current_note) and " ".join(current_note.split()) not in CREATIVE_TEMPLATE_NOTE_TEXTS
+        if self._creative_node_editor_node_id == node.id:
+            raw_note = self.creative_node_note_input.toPlainText().strip()
+            raw_query = self.creative_node_query_input.text().strip()
+            self._set_creative_node_editor_draft(
+                node.id,
+                note=raw_note,
+                search_query=raw_query,
+                note_user_edited=True,
+                query_user_edited=True,
+            )
+        else:
+            raw_note, raw_query = self._creative_node_editor_text_pair(node)
+            raw_note = raw_note.strip()
+            raw_query = raw_query.strip()
+        node_template_hint = raw_note if _is_creative_template_placeholder_text(raw_note) else ""
+        initial_constraint = self._creative_node_ai_constraint_text(
+            node,
+            project,
+            note_text=raw_note,
+            query_text=raw_query,
+        )
+        ai_current_note = self._creative_node_live_constraint_text(node, project, initial_constraint)
+        has_existing_note = bool(ai_current_note)
         if has_existing_note:
             answer = QMessageBox.question(
                 self,
@@ -14478,16 +15353,12 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 self.statusBar().showMessage("已取消当前节点信息补全")
                 return
-        self.generate_creative_children_button.setEnabled(False)
-        self.creative_node_status_label.setText(f"正在补全“{node.title}”...")
+        self._set_creative_node_completion_busy(True, f"正在补全“{node.title}”...")
         provider = self._make_llm_provider()
         self.creative_node_auto_save_timer.stop()
-        if current_note != node.note or self.creative_node_query_input.text() != node.search_query:
-            self.store.update_creative_node(
-                node.id,
-                note=current_note,
-                search_query=self.creative_node_query_input.text(),
-            )
+        if raw_note != node.note or raw_query != node.search_query:
+            self._flush_creative_node_editor_draft(node.id, status_message="")
+        self._clear_pending_creative_node_details(node.id)
         project_brief, project_extra = self._creative_node_ai_context(project)
         node_path = self._creative_node_path_text(node.id)
         project_outline = self._creative_project_outline_text(project.id, selected_node_id=node.id)
@@ -14499,23 +15370,29 @@ class MainWindow(QMainWindow):
                     project_extra=project_extra,
                     project_outline=project_outline,
                     node_title=node.title,
-                    current_note=current_note,
+                    current_note=ai_current_note,
                     node_path=node_path,
+                    node_template_hint=node_template_hint,
                     language=self.current_language,
                 )
-                self.events.put(("creative_node_note_done", (node.id, current_note, suggestion, model_name)))
+                self.events.put(("creative_node_note_done", (node.id, ai_current_note, suggestion, model_name)))
             except Exception as exc:
                 self.events.put(("creative_node_note_error", (node.id, exc)))
 
         self._start_background_task(
             run,
-            on_rejected=lambda: self.generate_creative_children_button.setEnabled(True),
+            on_rejected=lambda: self._set_creative_node_completion_busy(False),
         )
 
     def _generate_all_creative_node_notes(self) -> None:
         self._set_ai_workflow_mode("project")
         if self._creative_all_nodes_in_progress:
             return
+        if self.current_creative_project_id is not None and self.current_creative_node_id is not None:
+            if self._pending_creative_node_detail_id is not None:
+                self._save_pending_creative_node_details()
+            else:
+                self._save_current_creative_node_editor_snapshot()
         project = (
             self.store.get_creative_project(self.current_creative_project_id)
             if self.current_creative_project_id is not None
@@ -14534,17 +15411,20 @@ class MainWindow(QMainWindow):
                 extra=extra,
             )
         else:
+            brief = self.inspiration_brief_input.toPlainText().strip()
+            extra = self.inspiration_answers_input.toPlainText().strip()
+            project_brief = (project.brief or "").strip()
+            if not brief and not extra and not project_brief:
+                self._generate_creative_project_seed_then_all_nodes(project.id)
+                return
             project_id = project.id
         self._generate_all_creative_node_notes_for_project(project_id)
 
     def _set_creative_all_nodes_busy(self, busy: bool, status: str = "") -> None:
         self._creative_all_nodes_in_progress = busy
-        self._sync_creative_node_panel()
-        if status:
-            self.creative_node_status_label.setText(status)
-            self.statusBar().showMessage(status)
+        self._set_creative_node_completion_busy(busy, status or "AI 正在补全节点...")
 
-    def _generate_creative_project_seed_then_all_nodes(self) -> None:
+    def _generate_creative_project_seed_then_all_nodes(self, target_project_id: int | None = None) -> None:
         template_id = str(self.creative_template_combo.currentData() or "story")
         template = creative_template_by_id(template_id)
         provider = self._make_llm_provider()
@@ -14557,7 +15437,7 @@ class MainWindow(QMainWindow):
                     template_outline=self._template_outline_text(template.root),
                     language=self.current_language,
                 )
-                self.events.put(("creative_project_seed_done", (seed, model_name)))
+                self.events.put(("creative_project_seed_done", (seed, model_name, target_project_id)))
             except Exception as exc:
                 self.events.put(("creative_project_seed_error", exc))
 
@@ -14567,7 +15447,12 @@ class MainWindow(QMainWindow):
             on_rejected=lambda: self._set_creative_all_nodes_busy(False),
         )
 
-    def _handle_creative_project_seed_done(self, seed: object, model_name: str) -> None:
+    def _handle_creative_project_seed_done(
+        self,
+        seed: object,
+        model_name: str,
+        target_project_id: int | None = None,
+    ) -> None:
         title = str(getattr(seed, "title", "")).strip()
         brief = str(getattr(seed, "brief", "")).strip()
         extra = str(getattr(seed, "extra", "")).strip()
@@ -14575,12 +15460,61 @@ class MainWindow(QMainWindow):
             self._set_creative_all_nodes_busy(False)
             self.statusBar().showMessage("AI没有返回可用创作主题")
             return
-        project_id = self._create_creative_project_from_seed(
-            title=title,
-            brief=brief,
-            extra=extra,
-            model_name=model_name,
-        )
+        if target_project_id is not None and self.store.get_creative_project(target_project_id) is not None:
+            project_id = target_project_id
+            old_project = self.store.get_creative_project(project_id)
+            old_project_markers = {
+                (old_project.title or "").strip() if old_project is not None else "",
+                (old_project.brief or "").strip() if old_project is not None else "",
+                "未命名创作项目",
+                "AI创作测试题",
+                "新创作项目",
+            }
+            updated_project = self.store.update_creative_project_details(
+                project_id,
+                title=title or None,
+                brief=brief,
+            )
+            root_id = self.store.creative_root_node_id(project_id)
+            if root_id is not None:
+                root = self.store.get_creative_node(root_id)
+                root_note = (root.note or "").strip() if root is not None else ""
+                should_update_root = root is not None and (
+                    not root_note
+                    or _is_creative_template_placeholder_text(root_note)
+                    or root_note in old_project_markers
+                )
+                if should_update_root:
+                    updated_root = self.store.update_creative_node(
+                        root_id,
+                        note=brief,
+                        search_query=brief or title or root.title,
+                    )
+                    if updated_root is not None:
+                        self._set_creative_node_editor_draft(
+                            root_id,
+                            note=updated_root.note,
+                            search_query=updated_root.search_query,
+                            note_user_edited=True,
+                            query_user_edited=True,
+                        )
+            self.inspiration_brief_input.blockSignals(True)
+            self.inspiration_answers_input.blockSignals(True)
+            self.inspiration_brief_input.setPlainText(brief)
+            self.inspiration_answers_input.setPlainText(extra)
+            self.inspiration_brief_input.blockSignals(False)
+            self.inspiration_answers_input.blockSignals(False)
+            self._refresh_creative_projects(
+                select_project_id=project_id,
+                save_current_editor=False,
+            )
+        else:
+            project_id = self._create_creative_project_from_seed(
+                title=title,
+                brief=brief,
+                extra=extra,
+                model_name=model_name,
+            )
         self._generate_all_creative_node_notes_for_project(project_id)
 
     def _handle_creative_project_seed_error(self, exc: Exception) -> None:
@@ -14594,7 +15528,10 @@ class MainWindow(QMainWindow):
             self._set_creative_all_nodes_busy(False)
             return
         if self.current_creative_project_id == project_id and self.current_creative_node_id is not None:
-            self._save_pending_creative_node_details()
+            if self._pending_creative_node_detail_id is not None:
+                self._save_pending_creative_node_details()
+            else:
+                self._save_current_creative_node_editor_snapshot()
         nodes = self.store.list_creative_nodes(project_id)
         if not nodes:
             self.statusBar().showMessage("当前项目没有可补全节点")
@@ -14602,16 +15539,21 @@ class MainWindow(QMainWindow):
             return
         previous_project_id = self.current_creative_project_id
         self.current_creative_project_id = project_id
+        batch_project_outline = ""
         try:
             requests = []
             for node in nodes:
-                normalized_note = " ".join(node.note.strip().split())
-                current_note = "" if normalized_note in CREATIVE_TEMPLATE_NOTE_TEXTS else node.note.strip()
+                raw_note, _raw_query = self._creative_node_editor_text_pair(node)
+                raw_note = raw_note.strip()
+                is_template_placeholder = _is_creative_template_placeholder_text(raw_note)
+                current_note = self._creative_node_ai_constraint_text(node, project)
+                node_template_hint = raw_note if is_template_placeholder else ""
                 requests.append(
                     {
                         "node_id": node.id,
                         "title": node.title,
                         "current_note": current_note,
+                        "node_template_hint": node_template_hint,
                         "node_path": self._creative_node_path_text(node.id),
                         "project_outline": self._creative_project_outline_text(
                             project_id,
@@ -14619,6 +15561,7 @@ class MainWindow(QMainWindow):
                         ),
                     }
                 )
+            batch_project_outline = self._creative_project_outline_text(project_id)
         finally:
             self.current_creative_project_id = previous_project_id
         selected_node_id = self.current_creative_node_id
@@ -14633,22 +15576,109 @@ class MainWindow(QMainWindow):
             results: list[tuple[int, str, object]] = []
             errors: list[str] = []
             model_name = ""
-            for index, request in enumerate(requests, 1):
+            batch_generator = getattr(provider, "generate_creative_node_notes", None)
+            single_generator = getattr(provider, "generate_creative_node_note", None)
+            total_requests = len(requests)
+
+            def append_single_result(index: int, request: dict[str, object]) -> None:
+                nonlocal model_name
                 try:
-                    suggestion, model_name = provider.generate_creative_node_note(
-                        project_brief=project_brief,
-                        project_extra=project_extra,
-                        project_outline=str(request["project_outline"]),
-                        node_title=str(request["title"]),
-                        current_note=str(request["current_note"]),
-                        node_path=str(request["node_path"]),
-                        language=self.current_language,
-                    )
+                    if callable(single_generator):
+                        suggestion, model_name_result = single_generator(
+                            project_brief=project_brief,
+                            project_extra=project_extra,
+                            project_outline=str(request["project_outline"]),
+                            node_title=str(request["title"]),
+                            current_note=str(request["current_note"]),
+                            node_path=str(request["node_path"]),
+                            node_template_hint=str(request["node_template_hint"]),
+                            language=self.current_language,
+                        )
+                    elif callable(batch_generator):
+                        batch_suggestions, model_name_result = batch_generator(
+                            project_brief=project_brief,
+                            project_extra=project_extra,
+                            project_outline=str(request["project_outline"]),
+                            nodes=[
+                                {
+                                    "node_id": str(request["node_id"]),
+                                    "node_title": str(request["title"]),
+                                    "current_note": str(request["current_note"]),
+                                    "node_template_hint": str(request["node_template_hint"]),
+                                    "node_path": str(request["node_path"]),
+                                }
+                            ],
+                            language=self.current_language,
+                        )
+                        suggestion = dict(batch_suggestions).get(str(request["node_id"]))
+                        if suggestion is None:
+                            raise RuntimeError("AI没有返回这个节点")
+                    else:
+                        raise RuntimeError("当前 AI provider 不支持节点补全")
+                    model_name = model_name_result
                     results.append((int(request["node_id"]), str(request["current_note"]), suggestion))
                 except Exception as exc:
                     errors.append(f"{index}. {request['title']}：{exc}")
+
+            if callable(single_generator):
+                for index, request in enumerate(requests, 1):
+                    self.events.put(
+                        (
+                            "creative_all_node_notes_progress",
+                            (project_id, index - 1, total_requests, str(request["title"])),
+                        )
+                    )
+                    append_single_result(index, request)
+                    self.events.put(
+                        (
+                            "creative_all_node_notes_progress",
+                            (project_id, index, total_requests, str(request["title"])),
+                        )
+                    )
+            elif callable(batch_generator):
+                try:
+                    batch_nodes = [
+                        {
+                            "node_id": str(request["node_id"]),
+                            "node_title": str(request["title"]),
+                            "current_note": str(request["current_note"]),
+                            "node_template_hint": str(request["node_template_hint"]),
+                            "node_path": str(request["node_path"]),
+                        }
+                        for request in requests
+                    ]
+                    batch_suggestions, model_name = batch_generator(
+                        project_brief=project_brief,
+                        project_extra=project_extra,
+                        project_outline=batch_project_outline,
+                        nodes=batch_nodes,
+                        language=self.current_language,
+                    )
+                except Exception as exc:
+                    errors.append(f"整批：{exc}")
+                    batch_suggestions = {}
+                suggestions_by_id = {str(key): value for key, value in dict(batch_suggestions).items()}
+                for index, request in enumerate(requests, 1):
+                    suggestion = suggestions_by_id.get(str(request["node_id"]))
+                    if suggestion is None:
+                        errors.append(f"{index}. {request['title']}：AI没有返回这个节点")
+                        continue
+                    results.append((int(request["node_id"]), str(request["current_note"]), suggestion))
+                    self.events.put(
+                        (
+                            "creative_all_node_notes_progress",
+                            (project_id, index, total_requests, str(request["title"])),
+                        )
+                    )
+            else:
+                errors.append("当前 AI provider 不支持节点补全")
             if not results:
-                self.events.put(("creative_all_node_notes_error", (project_id, RuntimeError("AI没有补全任何节点"))))
+                detail = "\n".join(errors[:5]).strip()
+                suffix = "\n..." if len(errors) > 5 else ""
+                message = "AI没有补全任何节点"
+                if detail:
+                    message = f"{message}。失败明细：\n{detail}{suffix}"
+                self.events.put(("creative_all_node_notes_error", (project_id, RuntimeError(message))))
                 return
             self.events.put(
                 (
@@ -14674,20 +15704,52 @@ class MainWindow(QMainWindow):
             return None
         note = str(getattr(suggestion, "note", "")).strip()
         query = str(getattr(suggestion, "search_query", "")).strip()
-        if note and not self._is_useful_creative_node_ai_text(note):
+        if note and (
+            not self._is_useful_creative_node_ai_text(note)
+            or _is_creative_template_placeholder_text(note)
+        ):
             note = ""
-        if query and not self._is_useful_creative_node_ai_text(query):
+        if query and (
+            not self._is_useful_creative_node_ai_text(query)
+            or _is_creative_template_placeholder_text(query)
+        ):
             query = ""
         if not note and not query:
             return None
         original_note = original_note.strip()
-        if original_note and original_note not in note:
-            note = f"{original_note}\n{note}".strip() if note else original_note
-        return self.store.update_creative_node(
+        stored_note = node.note.strip()
+        project = self.store.get_creative_project(node.project_id)
+        if project is not None and not original_note:
+            original_note = self._creative_node_live_constraint_text(node, project, original_note)
+        elif (
+            not original_note
+            and stored_note
+            and not _is_creative_template_placeholder_text(stored_note)
+        ):
+            original_note = stored_note
+        if original_note:
+            note = _merge_creative_user_note_with_ai_note(original_note, note)
+            query = _merge_creative_user_note_with_search_query(original_note, query, node.title)
+            if not _creative_note_has_meaningful_expansion(original_note, note):
+                note = _fallback_creative_node_note_expansion(original_note, query, node.title)
+        updated = self.store.update_creative_node(
             node.id,
             note=note or node.note,
             search_query=query or node.search_query or node.title,
         )
+        if updated is not None:
+            self._set_creative_node_editor_draft(
+                updated.id,
+                note=updated.note,
+                search_query=updated.search_query,
+                note_user_edited=True,
+                query_user_edited=True,
+            )
+            if self._creative_node_editor_node_id == updated.id:
+                self._loaded_creative_node_detail_id = updated.id
+                self._loaded_creative_node_note_text = updated.note
+                self._loaded_creative_node_query_text = updated.search_query
+        return updated
 
     def _handle_creative_node_note_done(
         self,
@@ -14699,15 +15761,20 @@ class MainWindow(QMainWindow):
         node = self.store.get_creative_node(node_id)
         if node is None:
             self.statusBar().showMessage("节点已不存在，AI补全结果已丢弃")
+            self._set_creative_node_completion_busy(False)
             self._sync_creative_node_panel()
             return
         updated = self._apply_creative_node_note_suggestion(node_id, original_note, suggestion)
         if updated is None:
             self.statusBar().showMessage("AI没有返回可用节点补充内容")
-            self.generate_creative_children_button.setEnabled(True)
+            self._set_creative_node_completion_busy(False)
             return
-        self._load_creative_project(node.project_id, select_node_id=node.id)
-        self.generate_creative_children_button.setEnabled(True)
+        self._load_creative_project(
+            node.project_id,
+            select_node_id=node.id,
+            save_current_editor=False,
+        )
+        self._set_creative_node_completion_busy(False)
         self.statusBar().showMessage(f"已补全节点“{updated.title}”")
 
     def _handle_creative_all_node_notes_done(
@@ -14723,8 +15790,24 @@ class MainWindow(QMainWindow):
             if self._apply_creative_node_note_suggestion(node_id, original_note, suggestion) is not None:
                 applied += 1
         self._set_creative_all_nodes_busy(False)
-        self._refresh_creative_projects(select_project_id=project_id)
-        self._load_creative_project(project_id, select_node_id=selected_node_id, show_board=False)
+        self._refresh_creative_projects(
+            select_project_id=project_id,
+            save_current_editor=False,
+        )
+        self._load_creative_project(
+            project_id,
+            select_node_id=selected_node_id,
+            show_board=False,
+            save_current_editor=False,
+        )
+        if applied == 0:
+            QMessageBox.warning(
+                self,
+                "Eidory",
+                "AI没有返回可用节点补充内容。模型可能只复述了模板说明，或没有结合创作主题生成具体内容。",
+            )
+            self.statusBar().showMessage("AI没有返回可用节点补充内容")
+            return
         if errors:
             preview = "\n".join(errors[:5])
             suffix = "\n..." if len(errors) > 5 else ""
@@ -14734,6 +15817,26 @@ class MainWindow(QMainWindow):
                 f"已补全 {applied} 个节点，但有 {len(errors)} 个节点失败：\n{preview}{suffix}",
             )
         self.statusBar().showMessage(f"已补全 {applied} 个节点")
+
+    def _handle_creative_all_node_notes_progress(
+        self,
+        project_id: int,
+        value: int,
+        total: int,
+        title: str,
+    ) -> None:
+        if not self._creative_all_nodes_in_progress:
+            return
+        if self.current_creative_project_id not in {None, project_id}:
+            return
+        clean_title = title.strip() or "节点"
+        status = f"正在补全节点：{clean_title}"
+        self._set_creative_node_completion_busy(
+            True,
+            status,
+            value=max(0, value),
+            total=max(1, total),
+        )
 
     def _handle_creative_all_node_notes_error(self, project_id: int, exc: Exception) -> None:
         if self.current_creative_project_id == project_id:
@@ -14767,7 +15870,7 @@ class MainWindow(QMainWindow):
 
     def _handle_creative_node_note_error(self, node_id: int, exc: Exception) -> None:
         if self.current_creative_node_id == node_id:
-            self.generate_creative_children_button.setEnabled(True)
+            self._set_creative_node_completion_busy(False)
             self._sync_creative_node_panel()
         QMessageBox.warning(self, "Eidory", f"AI补全当前节点失败：{exc}")
 
@@ -14783,12 +15886,13 @@ class MainWindow(QMainWindow):
                 visited.add(current.id)
                 parts.append(current.title)
                 current = by_id.get(current.parent_id) if current.parent_id is not None else None
+            note_text, query_text = self._creative_node_editor_text_pair(node)
             payload.append(
                 {
                     "title": node.title,
                     "path": " / ".join(reversed(parts)),
-                    "note": node.note,
-                    "search_query": node.search_query,
+                    "note": note_text,
+                    "search_query": query_text,
                 }
             )
         return payload
@@ -14891,15 +15995,23 @@ class MainWindow(QMainWindow):
         if node is None:
             self.statusBar().showMessage("先选择创作项目节点")
             return
-        note_text = self.creative_node_note_input.toPlainText()
-        query_text = self.creative_node_query_input.text().strip()
-        updated = self.store.update_creative_node(
+        if self._creative_node_editor_node_id == node.id:
+            note_text = self.creative_node_note_input.toPlainText()
+            query_text = self.creative_node_query_input.text().strip()
+        else:
+            note_text, query_text = self._creative_node_editor_text_pair(node)
+            query_text = query_text.strip()
+        self._set_creative_node_editor_draft(
             node.id,
             note=note_text,
             search_query=query_text,
+            note_user_edited=True,
+            query_user_edited=True,
         )
+        updated = self._flush_creative_node_editor_draft(node.id)
         if updated is not None:
             node = updated
+            self._clear_pending_creative_node_details(node.id)
         query = query_text or node.search_query or note_text.strip() or node.note or node.title
         if not query.strip():
             self.statusBar().showMessage("当前节点没有可搜索内容")
@@ -15046,7 +16158,8 @@ class MainWindow(QMainWindow):
         if not selected_images:
             self.statusBar().showMessage("先在图片墙选择要存入节点的图片")
             return
-        query = self.creative_node_query_input.text().strip() or node.search_query or node.title
+        note_text, query_text = self._creative_node_editor_text_pair(node)
+        query = query_text.strip() or node.search_query or node.title
         changed = self.store.add_images_to_creative_node(
             node.id,
             [image.id for image in selected_images],

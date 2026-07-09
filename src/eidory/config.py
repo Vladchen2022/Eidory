@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 
@@ -13,7 +14,12 @@ class AppPaths:
 
     @classmethod
     def default(cls) -> "AppPaths":
-        data_dir = Path.home() / "Library" / "Application Support" / "Eidory"
+        override = os.environ.get("EIDORY_DATA_DIR", "").strip()
+        data_dir = (
+            Path(override).expanduser()
+            if override
+            else Path.home() / "Library" / "Application Support" / "Eidory"
+        )
         return cls(
             data_dir=data_dir,
             thumbnail_dir=data_dir / "thumbnails",

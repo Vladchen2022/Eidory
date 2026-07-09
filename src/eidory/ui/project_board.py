@@ -5,7 +5,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, QSizeF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFontMetrics,
@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QApplication,
     QPushButton,
+    QStyle,
+    QStyleOptionGraphicsItem,
     QVBoxLayout,
     QWidget,
 )
@@ -48,6 +50,7 @@ GRID_SIZE = 36
 PIXMAP_CACHE_LIMIT = 512
 MAX_SOURCE_PIXMAP_SIDE = 2200
 MAX_BOARD_THUMBNAIL_SIDE = 560
+MAX_BOARD_FOCUS_PIXMAP_SIDE = 4096
 LAYOUT_CHANGED_IDLE_MS = 450
 DEFAULT_LAYOUT_LEFT = 80.0
 DEFAULT_LAYOUT_TOP = 110.0
@@ -243,6 +246,8 @@ def _copy_local_display_payload(payload: dict[str, Any] | None) -> dict[str, Any
 class BoardImageItem(QGraphicsPixmapItem):
     MIN_DISPLAY_WIDTH = 90.0
     RESIZE_MARGIN = 12.0
+    SELECTION_OUTLINE_COLOR = QColor("#2f80ff")
+    SELECTION_OUTLINE_WIDTH = 3
 
     def __init__(
         self,
@@ -441,6 +446,19 @@ class BoardImageItem(QGraphicsPixmapItem):
     def source_pixmap(self) -> QPixmap:
         return QPixmap(self._source_pixmap)
 
+    def replace_source_pixmap(self, pixmap: QPixmap) -> bool:
+        if pixmap.isNull():
+            return False
+        if (
+            pixmap.width() * pixmap.height()
+            < self._source_pixmap.width() * self._source_pixmap.height()
+        ):
+            return False
+        self._source_pixmap = QPixmap(pixmap)
+        self._display_variant_cache.clear()
+        self._refresh_display_pixmap()
+        return True
+
     def _apply_flags(self) -> None:
         flags = (
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
@@ -595,7 +613,19 @@ class BoardImageItem(QGraphicsPixmapItem):
             self._on_layout_changed()
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
-        super().paint(painter, option, widget)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        clean_option = QStyleOptionGraphicsItem(option)
+        if selected:
+            clean_option.state &= ~QStyle.StateFlag.State_Selected
+        super().paint(painter, clean_option, widget)
+        if selected:
+            painter.save()
+            pen = QPen(self.SELECTION_OUTLINE_COLOR, self.SELECTION_OUTLINE_WIDTH)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self.boundingRect().adjusted(0.5, 0.5, -0.5, -0.5))
+            painter.restore()
         text = self.badge_text
         if not text:
             return
@@ -1191,6 +1221,8 @@ class ProjectBoardView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setBackgroundBrush(QColor("#202830"))
         self._image_items: dict[int, QGraphicsItem] = {}
+        self._images_by_id: dict[int, ImageItem] = {}
+        self._focus_quality_image_ids: set[int] = set()
         self._title_item: QGraphicsTextItem | None = None
         self._zoom = 1.0
         self._space_pan_active = False
@@ -1238,6 +1270,8 @@ class ProjectBoardView(QGraphicsView):
         try:
             self._scene.clear()
             self._image_items.clear()
+            self._images_by_id = {int(image.id): image for image in images}
+            self._focus_quality_image_ids.clear()
             self._selected_image_ids_cache = []
             self._scene.setSceneRect(0, 0, BOARD_WIDTH, BOARD_HEIGHT)
             self.resetTransform()
@@ -1397,6 +1431,7 @@ class ProjectBoardView(QGraphicsView):
         selected = [item for item in self._selected_image_items() if isinstance(item, BoardImageItem)]
         if not selected:
             return False
+        self._ensure_focus_quality_for_items([selected[0]], force=True)
         return self._edit_local_display_item(selected[0])
 
     def toggle_selected_local_display(self) -> int:
@@ -1699,24 +1734,28 @@ class ProjectBoardView(QGraphicsView):
             return
         previous_delta = QPointF(self._manual_item_drag_delta)
         self._manual_item_drag_delta = QPointF(delta)
+        dirty_rects: list[QRectF] = []
         for _item, _start_pos, rect, _opacity in self._manual_item_drag_items:
-            self._update_scene_rect(rect.translated(previous_delta).adjusted(-8, -8, 8, 8))
-            self._update_scene_rect(rect.translated(self._manual_item_drag_delta).adjusted(-8, -8, 8, 8))
+            dirty_rects.append(rect.translated(previous_delta).adjusted(-8, -8, 8, 8))
+            dirty_rects.append(rect.translated(self._manual_item_drag_delta).adjusted(-8, -8, 8, 8))
+        self._update_scene_rects(dirty_rects)
 
     def _finish_manual_item_drag(self, *, commit: bool) -> None:
         if not self._manual_item_drag_active and not self._manual_item_drag_pending:
             return
         final_delta = QPointF(self._manual_item_drag_delta)
         items = list(self._manual_item_drag_items)
+        dirty_rects: list[QRectF] = []
         for item, start_pos, rect, opacity in items:
             if commit:
                 item.setPos(start_pos + final_delta)
             item.setOpacity(opacity)
             item._finish_layout_interaction()
-            self._update_scene_rect(rect.translated(final_delta).adjusted(-8, -8, 8, 8))
-            self._update_scene_rect(item.sceneBoundingRect().adjusted(-8, -8, 8, 8))
+            dirty_rects.append(rect.translated(final_delta).adjusted(-8, -8, 8, 8))
+            dirty_rects.append(item.sceneBoundingRect().adjusted(-8, -8, 8, 8))
         self._reset_manual_item_drag()
         self._finish_item_drag_layout_batch()
+        self._update_scene_rects(dirty_rects)
 
     def _reset_manual_item_drag(self) -> None:
         self._manual_item_drag_pending = False
@@ -1728,11 +1767,24 @@ class ProjectBoardView(QGraphicsView):
         self._manual_item_drag_items = []
 
     def _update_scene_rect(self, rect: QRectF) -> None:
-        if rect.isNull() or not rect.isValid():
-            return
-        polygon = self.mapFromScene(rect)
-        viewport_rect = polygon.boundingRect().adjusted(-4, -4, 4, 4)
-        self.viewport().update(viewport_rect.intersected(self.viewport().rect()))
+        self._update_scene_rects([rect])
+
+    def _update_scene_rects(self, rects: list[QRectF]) -> None:
+        dirty_rect = QRect()
+        has_dirty_rect = False
+        viewport_bounds = self.viewport().rect()
+        for rect in rects:
+            if rect.isNull() or not rect.isValid():
+                continue
+            polygon = self.mapFromScene(rect)
+            viewport_rect = polygon.boundingRect().adjusted(-4, -4, 4, 4)
+            viewport_rect = viewport_rect.intersected(viewport_bounds)
+            if viewport_rect.isNull() or not viewport_rect.isValid():
+                continue
+            dirty_rect = viewport_rect if not has_dirty_rect else dirty_rect.united(viewport_rect)
+            has_dirty_rect = True
+        if has_dirty_rect:
+            self.viewport().update(dirty_rect)
 
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         super().drawForeground(painter, rect)
@@ -1840,6 +1892,8 @@ class ProjectBoardView(QGraphicsView):
         next_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
         if abs(next_zoom - self._zoom) < 0.001:
             return
+        if factor > 1:
+            self._ensure_focus_quality_for_items(self._selected_image_items(), target_zoom=next_zoom)
         scale_factor = next_zoom / max(0.001, self._zoom)
         self.scale(scale_factor, scale_factor)
         self._zoom = next_zoom
@@ -1847,9 +1901,14 @@ class ProjectBoardView(QGraphicsView):
     def _fit_selected_items(self, items: list[QGraphicsItem]) -> None:
         if not items:
             return
+        target = self._fit_target_for_items(items, margin=10.0)
+        if target is None:
+            return
+        target_zoom, rect = target
+        self._ensure_focus_quality_for_items(items, target_zoom=target_zoom)
         self._view_mode = "fit_selection"
         self._last_fit_selection_ids = tuple(sorted(self.selected_image_ids()))
-        self._fit_items_to_view(items, margin=10.0)
+        self._apply_fit_target(target_zoom, rect)
 
     def _refit_current_view_mode(self) -> None:
         if self._view_mode == "fit_selection":
@@ -2006,6 +2065,7 @@ class ProjectBoardView(QGraphicsView):
         item = self._image_items.get(image_id)
         if not isinstance(item, BoardImageItem):
             return False
+        self._ensure_focus_quality_for_items([item], force=True)
         return self._edit_local_display_item(item)
 
     def _edit_local_display_item(self, item: BoardImageItem) -> bool:
@@ -2023,6 +2083,43 @@ class ProjectBoardView(QGraphicsView):
         item.set_local_display(payload, shrink_to_bounds=True)
         return True
 
+    def _ensure_focus_quality_for_items(
+        self,
+        items: list[QGraphicsItem],
+        *,
+        target_zoom: float | None = None,
+        force: bool = False,
+    ) -> None:
+        for item in items:
+            if not isinstance(item, BoardImageItem):
+                continue
+            image_id = int(item.image_id)
+            if image_id in self._focus_quality_image_ids:
+                continue
+            if not force and target_zoom is not None and not self._needs_focus_quality_upgrade(item, target_zoom):
+                continue
+            self._focus_quality_image_ids.add(image_id)
+            image = self._images_by_id.get(image_id)
+            if image is None:
+                continue
+            pixmap = self._pixmap_for(
+                image,
+                prefer_source=True,
+                max_side=MAX_BOARD_FOCUS_PIXMAP_SIDE,
+            )
+            if pixmap.isNull():
+                continue
+            item.replace_source_pixmap(pixmap)
+
+    @staticmethod
+    def _needs_focus_quality_upgrade(item: BoardImageItem, target_zoom: float) -> bool:
+        current_pixmap = item.source_pixmap()
+        if current_pixmap.isNull():
+            return True
+        rendered_side = max(item.sceneBoundingRect().width(), item.sceneBoundingRect().height()) * target_zoom
+        available_side = max(current_pixmap.width(), current_pixmap.height())
+        return rendered_side > available_side * 0.92
+
     def _emit_selection_changed(self) -> None:
         selected_ids = self._collect_selected_image_ids()
         if selected_ids == self._selected_image_ids_cache:
@@ -2034,20 +2131,29 @@ class ProjectBoardView(QGraphicsView):
         return [item for item in self._image_items.values() if item.isVisible()]
 
     def _fit_items_to_view(self, items: list[QGraphicsItem], *, margin: float) -> None:
-        if not items:
+        target = self._fit_target_for_items(items, margin=margin)
+        if target is None:
             return
-        rect = self._items_rect(items)
-        if not rect.isValid() or rect.width() <= 1 or rect.height() <= 1:
-            return
-        viewport_rect = self.viewport().rect()
-        available_width = max(1.0, float(viewport_rect.width()) - margin * 2)
-        available_height = max(1.0, float(viewport_rect.height()) - margin * 2)
-        next_zoom = min(available_width / rect.width(), available_height / rect.height())
-        next_zoom = max(MIN_ZOOM, min(MAX_ZOOM, next_zoom))
+        next_zoom, rect = target
+        self._apply_fit_target(next_zoom, rect)
+
+    def _apply_fit_target(self, next_zoom: float, rect: QRectF) -> None:
         self.resetTransform()
         self.scale(next_zoom, next_zoom)
         self._zoom = next_zoom
         self.centerOn(rect.center())
+
+    def _fit_target_for_items(self, items: list[QGraphicsItem], *, margin: float) -> tuple[float, QRectF] | None:
+        if not items:
+            return None
+        rect = self._items_rect(items)
+        if not rect.isValid() or rect.width() <= 1 or rect.height() <= 1:
+            return None
+        viewport_rect = self.viewport().rect()
+        available_width = max(1.0, float(viewport_rect.width()) - margin * 2)
+        available_height = max(1.0, float(viewport_rect.height()) - margin * 2)
+        next_zoom = min(available_width / rect.width(), available_height / rect.height())
+        return max(MIN_ZOOM, min(MAX_ZOOM, next_zoom)), rect
 
     def _image_id_at(self, viewport_pos) -> int | None:
         item = self.itemAt(viewport_pos)

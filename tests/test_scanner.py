@@ -156,6 +156,26 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(repaired.thumbnail_status, "ready")
             self.assertTrue(Path(repaired.thumbnail_path or "").exists())
 
+    def test_scan_reuses_media_metadata_for_unchanged_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            self._make_image(root / "a.jpg", "red")
+
+            store = MetadataStore(Path(tmp) / "eidory.sqlite3")
+            store.initialize()
+            scanner = ImageScanner(store, Thumbnailer(Path(tmp) / "thumbs"))
+            scanner.scan_folder(str(root))
+
+            with patch.object(
+                scanner,
+                "_read_media_metadata",
+                side_effect=AssertionError("unchanged media should use cached metadata"),
+            ):
+                result = scanner.scan_folder(str(root))
+
+            self.assertEqual(result.unchanged_files, 1)
+
     def test_scan_folder_new_only_does_not_mark_missing_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "library"

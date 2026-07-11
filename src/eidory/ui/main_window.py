@@ -253,6 +253,10 @@ RIGHT_TAB_SETTINGS = 4
 SELECTION_DETAIL_DEBOUNCE_MS = 120
 DETAIL_PREVIEW_LOAD_DEBOUNCE_MS = 180
 THUMBNAIL_SIZE_SETTING_DEBOUNCE_MS = 450
+SCORE_THRESHOLD_UPDATE_INTERVAL_MS = 50
+DETAIL_PREVIEW_CACHE_LIMIT = 64
+DETAIL_PREVIEW_CACHE_BYTE_LIMIT = 48 * 1024 * 1024
+SELECTION_DETAIL_CACHE_LIMIT = 2048
 
 
 class EqualWidthTabBar(QTabBar):
@@ -1586,7 +1590,10 @@ class MainWindow(QMainWindow):
         self.semantic_search_revision = 0
         self.selected_image: ImageItem | None = None
         self._detail_preview_cache: OrderedDict[tuple[str, int, int, int, int], QPixmap] = OrderedDict()
-        self._detail_preview_cache_limit = 64
+        self._detail_preview_cache_bytes: dict[tuple[str, int, int, int, int], int] = {}
+        self._detail_preview_cache_total_bytes = 0
+        self._detail_preview_cache_limit = DETAIL_PREVIEW_CACHE_LIMIT
+        self._detail_preview_cache_byte_limit = DETAIL_PREVIEW_CACHE_BYTE_LIMIT
         self._detail_preview_pending_token: tuple[int, int, int, int, int] | None = None
         self._detail_preview_pending_request: tuple[
             tuple[int, int, int, int, int],
@@ -1618,9 +1625,10 @@ class MainWindow(QMainWindow):
         self._detail_panel_dirty = False
         self._tag_assignment_dirty = False
         self._board_image_by_id: dict[int, ImageItem] = {}
-        self._image_collection_paths_cache: dict[int, list[str]] = {}
-        self._image_tags_cache: dict[int, list[str]] = {}
-        self._ai_vision_detail_cache: dict[int, str] = {}
+        self._image_collection_paths_cache: OrderedDict[int, list[str]] = OrderedDict()
+        self._image_tags_cache: OrderedDict[int, list[str]] = OrderedDict()
+        self._ai_vision_detail_cache: OrderedDict[int, str] = OrderedDict()
+        self._selection_detail_cache_limit = SELECTION_DETAIL_CACHE_LIMIT
         self._creative_direct_image_ids_cache: dict[int, set[int]] = {}
         self._result_status_counts_cache: tuple[float, int, int] | None = None
         self._collection_image_counts_status_cache: tuple[float, dict[int, int]] | None = None
@@ -1699,6 +1707,12 @@ class MainWindow(QMainWindow):
         self.thumbnail_size_setting_timer.setSingleShot(True)
         self.thumbnail_size_setting_timer.setInterval(THUMBNAIL_SIZE_SETTING_DEBOUNCE_MS)
         self.thumbnail_size_setting_timer.timeout.connect(self._persist_thumbnail_size_setting)
+        self.score_threshold_update_timer = QTimer(self)
+        self.score_threshold_update_timer.setSingleShot(True)
+        self.score_threshold_update_timer.setInterval(SCORE_THRESHOLD_UPDATE_INTERVAL_MS)
+        self.score_threshold_update_timer.timeout.connect(self._apply_pending_score_threshold_update)
+        self._pending_score_threshold_value: int | None = None
+        self._pending_score_threshold_recompute = False
 
         self.setWindowTitle("Eidory")
         self._configure_native_titlebar()
@@ -1873,6 +1887,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "thumbnail_size_setting_timer") and self.thumbnail_size_setting_timer.isActive():
             self.thumbnail_size_setting_timer.stop()
             self._persist_thumbnail_size_setting()
+        if hasattr(self, "score_threshold_update_timer"):
+            self.score_threshold_update_timer.stop()
+            self._pending_score_threshold_value = None
         self._save_pending_note()
         self._detail_preview_pending_token = None
         self._save_current_board_layout_if_needed()
@@ -2015,6 +2032,7 @@ class MainWindow(QMainWindow):
         self._file_watch_build_running = False
         self._file_watch_configured_count = 0
         self._pending_watch_scan_roots.clear()
+        self._watch_path_roots.clear()
         self._file_watch_clear_requested.emit()
 
     def _restart_index_workers_after_maintenance(
@@ -2519,7 +2537,7 @@ class MainWindow(QMainWindow):
         threshold_row.setSpacing(8)
         self.score_threshold_slider = QSlider(Qt.Orientation.Horizontal)
         self.score_threshold_slider.setRange(0, 100)
-        self.score_threshold_slider.setTracking(False)
+        self.score_threshold_slider.setTracking(True)
         self.score_threshold_slider.setValue(self.initial_score_threshold)
         self.score_threshold_label = QLabel(
             self._format_score_threshold_label(self.initial_score_threshold)
@@ -3457,7 +3475,8 @@ class MainWindow(QMainWindow):
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         self.sort_order_combo.currentIndexChanged.connect(self._on_sort_changed)
         self.score_threshold_slider.sliderMoved.connect(self._preview_score_threshold)
-        self.score_threshold_slider.valueChanged.connect(self._update_score_threshold)
+        self.score_threshold_slider.valueChanged.connect(self._queue_score_threshold_update)
+        self.score_threshold_slider.sliderReleased.connect(self._flush_score_threshold_update)
         self.thumbnail_size_slider.valueChanged.connect(self._update_thumbnail_size)
         self.show_gallery_button.clicked.connect(self._show_gallery_view)
         self.show_project_board_button.clicked.connect(self._show_current_project_board)
@@ -10214,6 +10233,7 @@ class MainWindow(QMainWindow):
             self._set_tags_display([], "标签载入中...")
         else:
             self._set_tags_display(tags)
+        self._touch_selection_detail_cache(image.id)
         self.note_input.setPlainText(image.note or "")
         self._suppress_detail_auto_save = False
         self._refresh_feedback_buttons(image)
@@ -10295,10 +10315,7 @@ class MainWindow(QMainWindow):
             pixmap = _load_scaled_qt_pixmap(image_path, max_width, max_height)
             if pixmap.isNull():
                 continue
-            self._detail_preview_cache[key] = QPixmap(pixmap)
-            self._detail_preview_cache.move_to_end(key)
-            while len(self._detail_preview_cache) > self._detail_preview_cache_limit:
-                self._detail_preview_cache.popitem(last=False)
+            self._cache_detail_preview_pixmap(key, pixmap)
             return pixmap
         return QPixmap()
 
@@ -10375,11 +10392,35 @@ class MainWindow(QMainWindow):
             self.preview_label.setText("无法预览")
             return
         if cache_key is not None:
-            self._detail_preview_cache[cache_key] = QPixmap(pixmap)
-            self._detail_preview_cache.move_to_end(cache_key)
-            while len(self._detail_preview_cache) > self._detail_preview_cache_limit:
-                self._detail_preview_cache.popitem(last=False)
+            self._cache_detail_preview_pixmap(cache_key, pixmap)
         self._apply_detail_preview_pixmap(pixmap)
+
+    def _cache_detail_preview_pixmap(
+        self,
+        key: tuple[str, int, int, int, int],
+        pixmap: QPixmap,
+    ) -> None:
+        existing_bytes = self._detail_preview_cache_bytes.pop(key, 0)
+        self._detail_preview_cache_total_bytes = max(
+            0,
+            self._detail_preview_cache_total_bytes - existing_bytes,
+        )
+        cached = QPixmap(pixmap)
+        self._detail_preview_cache[key] = cached
+        self._detail_preview_cache.move_to_end(key)
+        pixmap_bytes = max(0, cached.width()) * max(0, cached.height()) * 4
+        self._detail_preview_cache_bytes[key] = pixmap_bytes
+        self._detail_preview_cache_total_bytes += pixmap_bytes
+        while (
+            len(self._detail_preview_cache) > self._detail_preview_cache_limit
+            or self._detail_preview_cache_total_bytes > self._detail_preview_cache_byte_limit
+        ):
+            old_key, _old_pixmap = self._detail_preview_cache.popitem(last=False)
+            old_bytes = self._detail_preview_cache_bytes.pop(old_key, 0)
+            self._detail_preview_cache_total_bytes = max(
+                0,
+                self._detail_preview_cache_total_bytes - old_bytes,
+            )
 
     def _apply_detail_preview_pixmap(self, pixmap: QPixmap) -> None:
         self.preview_label.setText("")
@@ -10559,6 +10600,8 @@ class MainWindow(QMainWindow):
             scene_tags if isinstance(scene_tags, Mapping) else None,
             character_tags if isinstance(character_tags, Mapping) else None,
         )
+        self._touch_selection_detail_cache(clean_id)
+        self._trim_selection_detail_caches()
         if (
             self.selected_image is not None
             and self.selected_image.id == clean_id
@@ -10576,26 +10619,50 @@ class MainWindow(QMainWindow):
     def _collection_paths_for_image_cached(self, image_id: int) -> list[str]:
         cached = self._image_collection_paths_cache.get(image_id)
         if cached is not None:
+            self._image_collection_paths_cache.move_to_end(image_id)
             return list(cached)
         paths = self.store.collection_paths_for_image(image_id)
         self._image_collection_paths_cache[image_id] = list(paths)
+        self._trim_selection_detail_caches()
         return paths
 
     def _image_tags_cached(self, image_id: int) -> list[str]:
         cached = self._image_tags_cache.get(image_id)
         if cached is not None:
+            self._image_tags_cache.move_to_end(image_id)
             return list(cached)
         tags = self.store.get_image_tags(image_id)
         self._image_tags_cache[image_id] = list(tags)
+        self._trim_selection_detail_caches()
         return tags
 
     def _format_ai_vision_details_cached(self, image_id: int) -> str:
         cached = self._ai_vision_detail_cache.get(image_id)
         if cached is not None:
+            self._ai_vision_detail_cache.move_to_end(image_id)
             return cached
         text = self._format_ai_vision_details(image_id)
         self._ai_vision_detail_cache[image_id] = text
+        self._trim_selection_detail_caches()
         return text
+
+    def _touch_selection_detail_cache(self, image_id: int) -> None:
+        for cache in (
+            self._image_collection_paths_cache,
+            self._image_tags_cache,
+            self._ai_vision_detail_cache,
+        ):
+            if image_id in cache:
+                cache.move_to_end(image_id)
+
+    def _trim_selection_detail_caches(self) -> None:
+        for cache in (
+            self._image_collection_paths_cache,
+            self._image_tags_cache,
+            self._ai_vision_detail_cache,
+        ):
+            while len(cache) > self._selection_detail_cache_limit:
+                cache.popitem(last=False)
 
     def _clear_selection_detail_caches(self, image_ids: Sequence[int] | None = None) -> None:
         if image_ids is None:
@@ -12521,10 +12588,10 @@ class MainWindow(QMainWindow):
         self._file_watch_build_running = False
         self._pending_watch_paths_to_add.clear()
         self._pending_watch_path_total = 0
-        self._file_watch_configured_count = 0
-        self._file_watch_clear_requested.emit()
-        self._watch_path_roots.clear()
         if self._database_maintenance_active:
+            self._file_watch_configured_count = 0
+            self._watch_path_roots.clear()
+            self._file_watch_clear_requested.emit()
             return
         removed_roots, removed_images = self._cleanup_missing_active_scan_roots()
         if removed_images:
@@ -12535,6 +12602,9 @@ class MainWindow(QMainWindow):
             self._record_operation_history(message)
             self.statusBar().showMessage(message)
         if not self.file_watch_enabled:
+            self._file_watch_configured_count = 0
+            self._watch_path_roots.clear()
+            self._file_watch_clear_requested.emit()
             return
         roots_to_watch: list[str] = []
         for folder in self.store.list_folders_with_collection_images():
@@ -12543,6 +12613,9 @@ class MainWindow(QMainWindow):
                 continue
             roots_to_watch.append(root)
         if not roots_to_watch:
+            self._file_watch_configured_count = 0
+            self._watch_path_roots.clear()
+            self._file_watch_clear_requested.emit()
             return
 
         self._file_watch_build_running = True
@@ -12579,17 +12652,26 @@ class MainWindow(QMainWindow):
             for directory, root in pairs
             if isinstance(directory, str) and isinstance(root, str)
         ]
-        self._watch_path_roots = {directory: root for directory, root in watch_pairs}
+        next_watch_path_roots = {directory: root for directory, root in watch_pairs}
+        if next_watch_path_roots == self._watch_path_roots:
+            self._pending_watch_path_total = 0
+            return
+        self._watch_path_roots = next_watch_path_roots
         paths_to_watch = [directory for directory, _root in watch_pairs]
         if paths_to_watch:
             self._pending_watch_path_total = len(paths_to_watch)
             self._file_watch_configure_requested.emit(paths_to_watch)
+        else:
+            self._file_watch_configured_count = 0
+            self._file_watch_clear_requested.emit()
 
     def _handle_file_watch_configured(self, count: int) -> None:
         self._file_watch_configured_count = max(0, int(count))
         self._pending_watch_path_total = 0
 
     def _handle_file_watch_worker_failed(self, message: str) -> None:
+        self._file_watch_configured_count = 0
+        self._watch_path_roots.clear()
         self._record_error(f"文件监听失败：{message}")
         self.statusBar().showMessage("文件监听失败")
 
@@ -13347,9 +13429,9 @@ class MainWindow(QMainWindow):
             elif kind == "search_chain_done":
                 self.search_button.setEnabled(True)
                 revision, filters, result = payload
-                if revision != self.semantic_search_revision:
-                    continue
-                self._handle_search_chain_done(filters=filters, result=result)
+                if revision == self.semantic_search_revision:
+                    self._handle_search_chain_done(filters=filters, result=result)
+                self._run_pending_score_threshold_recompute()
             elif kind == "result_exclusion_filter_done":
                 self.search_button.setEnabled(True)
                 revision, search_filter, matches = payload
@@ -13527,6 +13609,7 @@ class MainWindow(QMainWindow):
                     self._finish_project_board_external_import_entry()
                     self._pending_board_import_node_id = None
                 QMessageBox.critical(self, "Eidory", str(payload))
+                self._run_pending_score_threshold_recompute()
         if processed >= max_events_per_tick and not self.events.empty():
             QTimer.singleShot(0, self._poll_events)
 
@@ -18962,9 +19045,43 @@ class MainWindow(QMainWindow):
                 return
         self.score_threshold_label.setText(self._format_score_threshold_label(value))
 
+    def _queue_score_threshold_update(self, value: int) -> None:
+        value = max(0, min(100, int(value)))
+        self._preview_score_threshold(value)
+        self._pending_score_threshold_value = value
+        if self.score_threshold_slider.isSliderDown():
+            if not self.score_threshold_update_timer.isActive():
+                self.score_threshold_update_timer.start()
+            return
+        self._flush_score_threshold_update()
+
+    def _apply_pending_score_threshold_update(self) -> None:
+        value = self._pending_score_threshold_value
+        self._pending_score_threshold_value = None
+        if value is None:
+            return
+        self._apply_score_threshold_value(
+            value,
+            persist=not self.score_threshold_slider.isSliderDown(),
+        )
+
+    def _flush_score_threshold_update(self) -> None:
+        self.score_threshold_update_timer.stop()
+        value = self._pending_score_threshold_value
+        self._pending_score_threshold_value = None
+        if value is None:
+            value = self.score_threshold_slider.value()
+        self._apply_score_threshold_value(value, persist=True)
+
     def _update_score_threshold(self) -> None:
-        value = self.score_threshold_slider.value()
-        self.store.set_setting("ui.score_threshold", str(value))
+        self.score_threshold_update_timer.stop()
+        self._pending_score_threshold_value = None
+        self._apply_score_threshold_value(self.score_threshold_slider.value(), persist=True)
+
+    def _apply_score_threshold_value(self, value: int, *, persist: bool) -> None:
+        value = max(0, min(100, int(value)))
+        if persist:
+            self.store.set_setting("ui.score_threshold", str(value))
         if self.search_filters:
             self._ensure_active_filter_index()
             if self.active_filter_index is None:
@@ -18976,7 +19093,10 @@ class MainWindow(QMainWindow):
                 self._refresh_score_threshold_controls()
                 return
             self._set_search_filter_score_threshold(active_index, value)
-            self._refresh_score_threshold_controls()
+            if self.score_threshold_slider.isSliderDown():
+                self._preview_score_threshold(value)
+            else:
+                self._refresh_score_threshold_controls()
             if active_index == self._last_score_filter_index():
                 self._apply_search_chain_filters()
                 images = self.current_chain_filtered_images
@@ -18984,7 +19104,7 @@ class MainWindow(QMainWindow):
                 self._set_search_chain_result_status(tuple(self.search_filters), images)
                 self._update_search_chain_diagnostics(tuple(self.search_filters), images)
             else:
-                self._execute_search_chain(operation_mode="recompute")
+                self._queue_score_threshold_recompute()
             return
         self.score_threshold_label.setText(self._format_score_threshold_label(value))
         if self.current_result_mode == "semantic":
@@ -19011,6 +19131,20 @@ class MainWindow(QMainWindow):
             self.grid_view.set_images(images, badges_by_image_id=self.current_creative_node_badges)
             self._set_creative_node_result_status(images)
             self._update_creative_node_search_diagnostics(images)
+
+    def _queue_score_threshold_recompute(self) -> None:
+        if not self.search_button.isEnabled():
+            self._pending_score_threshold_recompute = True
+            self.semantic_search_revision += 1
+            return
+        self._pending_score_threshold_recompute = False
+        self._execute_search_chain(operation_mode="recompute")
+
+    def _run_pending_score_threshold_recompute(self) -> None:
+        if not self._pending_score_threshold_recompute:
+            return
+        self._pending_score_threshold_recompute = False
+        QTimer.singleShot(0, self._queue_score_threshold_recompute)
 
     def _semantic_score_threshold(self, images: list[ImageItem], *, value: int | None = None) -> float | None:
         if value is None:

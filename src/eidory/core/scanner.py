@@ -117,6 +117,7 @@ class ImageScanner:
             )
 
         folder_id = self.store.add_folder(root)
+        existing_metadata = self.store.scan_metadata_for_folder(folder_id)
         seen_paths: list[str] = []
         scanned = 0
         new_files = 0
@@ -152,7 +153,12 @@ class ImageScanner:
             scanned += 1
             seen_paths.append(file_path)
             stat = os.stat(file_path, follow_symlinks=False)
-            width, height, duration_ms = self._read_media_metadata(file_path)
+            cached_metadata = existing_metadata.get(file_path)
+            if self._can_reuse_media_metadata(cached_metadata, stat):
+                assert cached_metadata is not None
+                width, height, duration_ms = cached_metadata[2:]
+            else:
+                width, height, duration_ms = self._read_media_metadata(file_path)
             pending_media.append(
                 _PendingMedia(
                     folder_id=folder_id,
@@ -331,6 +337,21 @@ class ImageScanner:
                     paths.append(os.path.abspath(file_path))
         paths.sort()
         return paths
+
+    @staticmethod
+    def _can_reuse_media_metadata(
+        metadata: tuple[int, int, int | None, int | None, int | None] | None,
+        stat: os.stat_result,
+    ) -> bool:
+        if metadata is None:
+            return False
+        file_size, modified_time_ns, width, height, _duration_ms = metadata
+        return (
+            file_size == stat.st_size
+            and modified_time_ns == stat.st_mtime_ns
+            and width is not None
+            and height is not None
+        )
 
     @staticmethod
     def _read_dimensions(file_path: str) -> tuple[int | None, int | None]:

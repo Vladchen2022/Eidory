@@ -67,6 +67,7 @@ LINETOP_OVERLAY_MAX_LONG_SIDE = 2400
 PREVIEW_SATURATION_DEFAULT = 100
 PREVIEW_SATURATION_MAX_FACTOR = 8.0
 PREVIEW_DISPLAY_CACHE_LIMIT = 8
+PREVIEW_RESIZE_RENDER_DELAY_MS = 70
 _DETACHED_LINETOP_OVERLAYS: set[QObject] = set()
 
 
@@ -385,6 +386,7 @@ class PreviewImageView(QGraphicsView):
         self._source_height = 1
         self._has_pixmap = False
         self._navigator_thumb = QPixmap()
+        self._navigator_update_pending = False
 
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setBackgroundBrush(QColor("#2d3138"))
@@ -404,8 +406,8 @@ class PreviewImageView(QGraphicsView):
         self._smooth_timer.timeout.connect(self._restore_smooth_transform)
         self._navigator = PreviewNavigator(self.viewport())
         self._navigator.centerRequested.connect(self._center_on_navigator_ratio)
-        self.horizontalScrollBar().valueChanged.connect(lambda _value: self._update_navigator())
-        self.verticalScrollBar().valueChanged.connect(lambda _value: self._update_navigator())
+        self.horizontalScrollBar().valueChanged.connect(lambda _value: self._schedule_navigator_update())
+        self.verticalScrollBar().valueChanged.connect(lambda _value: self._schedule_navigator_update())
         self.set_message("未选择图片")
 
     @property
@@ -595,7 +597,6 @@ class PreviewImageView(QGraphicsView):
         can_pan = self.can_pan()
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag if can_pan else QGraphicsView.DragMode.NoDrag)
         self.viewport().setCursor(Qt.CursorShape.OpenHandCursor if can_pan else Qt.CursorShape.ArrowCursor)
-        self._update_navigator()
         self._schedule_navigator_update()
 
     def _center_message(self) -> None:
@@ -664,7 +665,14 @@ class PreviewImageView(QGraphicsView):
         self._position_navigator()
 
     def _schedule_navigator_update(self) -> None:
-        QTimer.singleShot(0, self._update_navigator)
+        if self._navigator_update_pending:
+            return
+        self._navigator_update_pending = True
+        QTimer.singleShot(0, self._run_scheduled_navigator_update)
+
+    def _run_scheduled_navigator_update(self) -> None:
+        self._navigator_update_pending = False
+        self._update_navigator()
 
     def _clear_navigator_thumb(self) -> None:
         self._navigator_thumb = QPixmap()
@@ -1423,6 +1431,10 @@ class ImagePreviewDialog(QDialog):
         self._saturation_render_timer.setSingleShot(True)
         self._saturation_render_timer.setInterval(35)
         self._saturation_render_timer.timeout.connect(self._render_after_saturation_changed)
+        self._resize_render_timer = QTimer(self)
+        self._resize_render_timer.setSingleShot(True)
+        self._resize_render_timer.setInterval(PREVIEW_RESIZE_RENDER_DELAY_MS)
+        self._resize_render_timer.timeout.connect(self._render_after_resize)
 
         self.setWindowTitle("Eidory 预览")
         self.resize(1200, 820)
@@ -1622,6 +1634,7 @@ class ImagePreviewDialog(QDialog):
         self._zoom_refine_timer.stop()
         self._preview_refine_timer.stop()
         self._saturation_render_timer.stop()
+        self._resize_render_timer.stop()
         if self._app_event_filter_installed:
             app = QApplication.instance()
             if app is not None:
@@ -1649,8 +1662,19 @@ class ImagePreviewDialog(QDialog):
         super().resizeEvent(event)
         image = self.current_image()
         if self.fit_to_window and (image is None or not is_supported_video(image.file_path)):
-            self._render_current_image(use_thumbnail_first=True)
+            self._resize_render_timer.start()
             self._preview_refine_timer.start()
+
+    def _render_after_resize(self) -> None:
+        image = self.current_image()
+        if (
+            not self.isVisible()
+            or not self.fit_to_window
+            or image is None
+            or is_supported_video(image.file_path)
+        ):
+            return
+        self._render_current_image(use_thumbnail_first=True)
 
     def eventFilter(self, watched, event) -> bool:
         if (

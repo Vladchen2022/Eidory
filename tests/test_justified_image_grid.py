@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QMimeData, QPoint, QSize, QUrl
 from PySide6.QtGui import QColor, QImage, QPixmap, QResizeEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from eidory.models import ImageItem
@@ -206,6 +207,23 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
             grid.resizeEvent(event)
 
         rebuild_layout.assert_not_called()
+
+    def test_width_resize_layout_rebuilds_are_debounced(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
+        grid.resize(360, 240)
+        grid.show()
+        self.app.processEvents()
+        grid.set_images([self._image(image_id) for image_id in range(1, 80)])
+
+        with patch.object(grid, "_rebuild_layout", wraps=grid._rebuild_layout) as rebuild_layout:
+            for width in range(370, 471, 10):
+                grid.resize(width, 240)
+
+            self.assertEqual(rebuild_layout.call_count, 0)
+            QTest.qWait(grid._resize_layout_timer.interval() + 20)
+
+        self.assertEqual(rebuild_layout.call_count, 1)
+        self.assertEqual(grid._layout_viewport_width, grid.viewport().width())
 
     def test_same_thumbnail_size_does_not_rebuild_layout(self) -> None:
         grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)

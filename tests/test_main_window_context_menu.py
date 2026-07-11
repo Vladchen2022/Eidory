@@ -420,6 +420,39 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.statusBar().currentMessage(), "用户操作提示")
             window.close()
 
+    def test_file_watcher_does_not_reconfigure_unchanged_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+            watch_root = str(Path(tmp) / "library")
+            watch_pair = (watch_root, watch_root)
+            window._watch_path_roots = dict([watch_pair])
+            configured_paths: list[list[str]] = []
+            clear_requests: list[bool] = []
+            window._file_watch_configure_requested.connect(
+                lambda paths: configured_paths.append(list(paths))
+            )
+            window._file_watch_clear_requested.connect(lambda: clear_requests.append(True))
+
+            window._handle_file_watch_paths_ready(
+                (window._file_watch_refresh_generation, [watch_pair], "")
+            )
+
+            self.assertEqual(configured_paths, [])
+            self.assertEqual(clear_requests, [])
+            self.assertEqual(window._watch_path_roots, dict([watch_pair]))
+            window.close()
+
     def test_file_watcher_discards_stale_background_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(

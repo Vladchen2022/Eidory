@@ -1708,6 +1708,30 @@ class MetadataStore:
             ).fetchall()
         return [self._image_from_row(row) for row in rows]
 
+    def scan_metadata_for_folder(
+        self,
+        folder_id: int,
+    ) -> dict[str, tuple[int, int, int | None, int | None, int | None]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT file_path, file_size, modified_time_ns, width, height, duration_ms
+                FROM images
+                WHERE folder_id = ?
+                """,
+                (folder_id,),
+            ).fetchall()
+        return {
+            str(row["file_path"]): (
+                int(row["file_size"]),
+                int(row["modified_time_ns"]),
+                self._optional_int(row["width"]),
+                self._optional_int(row["height"]),
+                self._optional_int(row["duration_ms"]),
+            )
+            for row in rows
+        }
+
     def upsert_image(
         self,
         *,

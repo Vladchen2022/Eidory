@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
 from PySide6.QtCore import QEvent, QPointF, QRect, Qt
-from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QPixmap
+from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QPixmap, QResizeEvent
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from eidory.core.linetop_processor import LineTopSettings
@@ -22,6 +22,7 @@ from eidory.ui.image_preview_dialog import (
     ImagePreviewDialog,
     LineTopNativeOverlayWindow,
     LineTopOverlayWindow,
+    PreviewImageView,
     SOURCE_PREVIEW_REFINE_DELAY_MS,
     _DETACHED_LINETOP_OVERLAYS,
 )
@@ -546,6 +547,56 @@ class ImagePreviewDialogTest(unittest.TestCase):
 
             self.assertTrue(dialog.fit_to_window)
             self.assertFalse(dialog.image_view._navigator.isVisible())
+            dialog.close()
+
+    def test_preview_navigator_updates_are_coalesced(self) -> None:
+        image_view = PreviewImageView()
+        with patch.object(image_view, "_update_navigator") as update_navigator:
+            image_view._schedule_navigator_update()
+            image_view._schedule_navigator_update()
+            image_view._schedule_navigator_update()
+            self.app.processEvents()
+
+        self.assertEqual(update_navigator.call_count, 1)
+
+    def test_preview_resize_render_is_debounced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (800, 500), color="green").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=800,
+                height=500,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            dialog.show()
+            self.app.processEvents()
+
+            with patch.object(dialog, "_render_current_image") as render_current:
+                event = QResizeEvent(dialog.size(), dialog.size())
+                dialog.resizeEvent(event)
+                dialog.resizeEvent(event)
+                dialog.resizeEvent(event)
+
+                self.assertEqual(render_current.call_count, 0)
+                self.assertTrue(dialog._resize_render_timer.isActive())
+
             dialog.close()
 
     def test_fit_mode_scales_small_pixmap_up_to_preview_bounds(self) -> None:

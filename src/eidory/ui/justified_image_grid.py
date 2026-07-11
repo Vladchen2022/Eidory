@@ -28,6 +28,7 @@ from eidory.ui.drop_import_box import payload_from_mime_data, payload_supports_m
 
 
 PixmapCacheKey = tuple[str, int, int, int]
+RESIZE_LAYOUT_DELAY_MS = 35
 
 
 class _PixmapLoadSignals(QObject):
@@ -87,6 +88,10 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._viewport_update_pending = False
         self._content_height = 0
         self._layout_viewport_width = -1
+        self._resize_layout_timer = QTimer(self)
+        self._resize_layout_timer.setSingleShot(True)
+        self._resize_layout_timer.setInterval(RESIZE_LAYOUT_DELAY_MS)
+        self._resize_layout_timer.timeout.connect(self._run_scheduled_layout_rebuild)
         self._pixmap_load_signals = _PixmapLoadSignals()
         self._pixmap_load_signals.loaded.connect(self._handle_async_pixmap_loaded)
         self._thread_pool = QThreadPool(self)
@@ -232,7 +237,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self.viewport().width() != self._layout_viewport_width:
-            self._rebuild_layout()
+            self._resize_layout_timer.start()
         else:
             self._update_scroll_range()
 
@@ -575,7 +580,11 @@ class JustifiedImageGridView(QAbstractScrollArea):
         return -1
 
     def _rebuild_layout(self) -> None:
+        self._resize_layout_timer.stop()
         self._rebuild_layout_from(0)
+
+    def _run_scheduled_layout_rebuild(self) -> None:
+        self._rebuild_layout()
 
     def _rebuild_layout_from(self, start_index: int) -> None:
         viewport_width = max(1, self.viewport().width())

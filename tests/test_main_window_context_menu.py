@@ -96,6 +96,36 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window._selected_search_mode(), "semantic")
             window.close()
 
+    def test_creative_node_imagination_defaults_to_balance_and_restores_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            window = MainWindow(paths=paths, store=store)
+            self.assertEqual(window.creative_node_imagination_slider.value(), 50)
+            self.assertTrue(
+                window.creative_content_tabs.isAncestorOf(
+                    window.creative_node_imagination_slider
+                )
+            )
+            self.assertFalse(window.creative_node_imagination_slider.isEnabled())
+            self.assertIn("平衡", window.creative_node_imagination_value_label.text())
+            window.creative_node_imagination_slider.setValue(80)
+            window._persist_creative_node_imagination()
+            window.close()
+
+            restored = MainWindow(paths=paths, store=store)
+            self.assertEqual(restored.creative_node_imagination_slider.value(), 80)
+            self.assertIn("偏发散", restored.creative_node_imagination_value_label.text())
+            restored.close()
+
     def test_advanced_search_tools_are_collapsed_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -6793,6 +6823,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.creative_template_combo.setCurrentIndex(character_index)
             window.inspiration_brief_input.setPlainText("赛博朋克世界观里的一个半人半机器人的医生")
             window.inspiration_answers_input.setPlainText("赛博朋克，人机结合")
+            window.creative_node_imagination_slider.setValue(85)
 
             def run_immediately(target, **_kwargs):
                 target()
@@ -6808,6 +6839,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             self.assertEqual(len(provider.calls), 1)
             call = provider.calls[0]
+            self.assertEqual(call["imagination_level"], 85)
             self.assertNotIn("脸型、五官、发型", str(call["project_outline"]))
             batch_nodes = [dict(item) for item in call["nodes"]]  # type: ignore[index]
             head = next(item for item in batch_nodes if item["node_title"] == "头面部")
@@ -8021,7 +8053,9 @@ class MainWindowContextMenuTest(unittest.TestCase):
             head_node = next(node for node in store.list_creative_nodes(project_id) if node.title == "头面部")
             window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
             self.app.processEvents()
+            self.assertTrue(window.creative_node_imagination_slider.isEnabled())
             window.creative_node_note_input.setPlainText("脏辫")
+            window.creative_node_imagination_slider.setValue(15)
             self.app.processEvents()
 
             def run_immediately(target, **_kwargs):
@@ -8037,6 +8071,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 window._poll_events()
 
             self.assertEqual(provider.calls[0]["current_note"], "脏辫")
+            self.assertEqual(provider.calls[0]["imagination_level"], 15)
             updated = store.get_creative_node(head_node.id)
             self.assertIsNotNone(updated)
             assert updated is not None
@@ -8086,8 +8121,10 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(window._creative_node_note_in_progress)
             self.assertTrue(window.creative_node_progress_bar.isVisible())
             self.assertFalse(window.generate_creative_children_button.isEnabled())
+            self.assertFalse(window.creative_node_imagination_slider.isEnabled())
             self.assertIn("正在补全", window.creative_node_status_label.text())
             window._set_creative_node_completion_busy(False)
+            self.assertTrue(window.creative_node_imagination_slider.isEnabled())
             window.close()
 
     def test_complete_all_creative_nodes_rejects_template_placeholder_results(self) -> None:

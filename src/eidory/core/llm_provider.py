@@ -92,6 +92,50 @@ class LLMProviderError(RuntimeError):
 _CREATIVE_PROJECT_RANDOM = random.SystemRandom()
 
 
+def _normalize_creative_node_imagination(value: int) -> int:
+    return max(0, min(100, int(value)))
+
+
+def _creative_node_imagination_temperature(value: int) -> float:
+    level = _normalize_creative_node_imagination(value)
+    if level <= 50:
+        return round(0.20 + (level / 50.0) * 0.15, 2)
+    return round(0.35 + ((level - 50) / 50.0) * 0.45, 2)
+
+
+def _creative_node_imagination_guidance(value: int, *, language: str) -> str:
+    level = _normalize_creative_node_imagination(value)
+    if language == "en":
+        if level <= 20:
+            mode = "Strict: add only directly supported, conventional, highly plausible visual details. Avoid speculative new facts."
+        elif level <= 40:
+            mode = "Conservative: allow small plausible inferences that stay close to the supplied context."
+        elif level <= 60:
+            mode = "Balanced: combine grounded plausibility with a few distinctive, project-specific visual decisions."
+        elif level <= 80:
+            mode = "Exploratory: allow unusual but coherent visual combinations and stronger extrapolation from the context."
+        else:
+            mode = "Divergent: make bold, surprising, visually exaggerated associations while keeping them usable as reference-planning details."
+        return (
+            f"Imagination level: {level}/100. {mode} "
+            "At every level, the project brief, extra context, and existing user note remain hard constraints; never contradict them."
+        )
+    if level <= 20:
+        mode = "严谨：只补充输入信息直接支持、常规且高度可信的视觉细节，避免推测新的事实。"
+    elif level <= 40:
+        mode = "偏严谨：允许少量合理推断，但整体紧贴用户提供的语境。"
+    elif level <= 60:
+        mode = "平衡：兼顾可信度与辨识度，加入少量当前项目专属的视觉决策。"
+    elif level <= 80:
+        mode = "偏发散：允许不常见但自洽的视觉组合，并根据已有语境做更明显的延伸。"
+    else:
+        mode = "发散：允许大胆、意外和视觉夸张的联想，但结果仍须能用于寻找参考图。"
+    return (
+        f"联想程度：{level}/100。{mode}"
+        "无论处于哪一档，项目主题、补充信息和用户已有节点说明始终是硬约束，绝对不得违背。"
+    )
+
+
 class LMStudioProvider:
     def __init__(
         self,
@@ -328,6 +372,7 @@ class LMStudioProvider:
         current_note: str = "",
         node_path: str = "",
         node_template_hint: str = "",
+        imagination_level: int = 50,
         language: str = "zh",
     ) -> tuple[CreativeNodeNoteSuggestion, str]:
         clean_title = node_title.strip()
@@ -356,6 +401,7 @@ class LMStudioProvider:
                     current_note=current_note.strip(),
                     node_path=node_path.strip(),
                     node_template_hint=node_template_hint.strip(),
+                    imagination_level=imagination_level,
                     language=language,
                 ),
             },
@@ -366,7 +412,7 @@ class LMStudioProvider:
             prefer_json=True,
             response_format=_creative_node_note_response_format(),
             reasoning_effort="none",
-            temperature=0.35,
+            temperature=_creative_node_imagination_temperature(imagination_level),
             max_tokens=900,
             allow_reasoning_content=True,
         )
@@ -391,6 +437,7 @@ class LMStudioProvider:
                 node_path=node_path.strip(),
                 node_template_hint=node_template_hint.strip(),
                 first_suggestion=refined,
+                imagination_level=imagination_level,
                 language=language,
             )
         return refined, model_name
@@ -402,6 +449,7 @@ class LMStudioProvider:
         project_extra: str = "",
         project_outline: str = "",
         nodes: list[dict[str, str]],
+        imagination_level: int = 50,
         language: str = "zh",
     ) -> tuple[dict[str, CreativeNodeNoteSuggestion], str]:
         clean_brief = project_brief.strip()
@@ -443,6 +491,7 @@ class LMStudioProvider:
                     project_extra=project_extra.strip(),
                     project_outline=project_outline.strip(),
                     nodes=clean_nodes,
+                    imagination_level=imagination_level,
                     language=language,
                 ),
             },
@@ -453,7 +502,7 @@ class LMStudioProvider:
             prefer_json=True,
             response_format=_creative_node_notes_response_format(),
             reasoning_effort="none",
-            temperature=0.35,
+            temperature=_creative_node_imagination_temperature(imagination_level),
             max_tokens=min(5200, max(1400, 520 * len(clean_nodes) + 600)),
             allow_reasoning_content=True,
         )
@@ -501,6 +550,7 @@ class LMStudioProvider:
         node_path: str,
         node_template_hint: str,
         first_suggestion: CreativeNodeNoteSuggestion,
+        imagination_level: int,
         language: str,
     ) -> CreativeNodeNoteSuggestion:
         retry_messages = [
@@ -523,6 +573,7 @@ class LMStudioProvider:
                     node_path=node_path,
                     node_template_hint=node_template_hint,
                     previous_note=first_suggestion.note,
+                    imagination_level=imagination_level,
                     language=language,
                 ),
             },
@@ -534,7 +585,10 @@ class LMStudioProvider:
                 prefer_json=True,
                 response_format=_creative_node_note_response_format(),
                 reasoning_effort="none",
-                temperature=0.45,
+                temperature=min(
+                    0.90,
+                    _creative_node_imagination_temperature(imagination_level) + 0.10,
+                ),
                 max_tokens=900,
                 allow_reasoning_content=True,
             )
@@ -2484,6 +2538,7 @@ def _build_creative_node_notes_prompt(
     project_extra: str,
     project_outline: str,
     nodes: list[dict[str, str]],
+    imagination_level: int = 50,
     language: str,
 ) -> str:
     clean_nodes: list[dict[str, str]] = []
@@ -2514,6 +2569,10 @@ def _build_creative_node_notes_prompt(
     outline_block = project_outline if project_outline else (
         "No project node tree has been provided." if language == "en" else "未提供项目节点树。"
     )
+    imagination_guidance = _creative_node_imagination_guidance(
+        imagination_level,
+        language=language,
+    )
     if language == "en":
         return f"""
 Project brief:
@@ -2524,6 +2583,9 @@ Extra project context:
 
 Current project node tree. Treat empty/template nodes as not yet completed:
 {outline_block}
+
+Completion style:
+{imagination_guidance}
 
 Nodes to complete as JSON:
 {nodes_json}
@@ -2555,6 +2617,9 @@ Rules:
 
 当前项目节点树（空节点/模板占位节点视为尚未完成）：
 {outline_block}
+
+节点补全风格：
+{imagination_guidance}
 
 需要补全的节点 JSON：
 {nodes_json}
@@ -2588,6 +2653,7 @@ def _build_creative_node_note_prompt(
     current_note: str,
     node_path: str,
     node_template_hint: str = "",
+    imagination_level: int = 50,
     language: str,
 ) -> str:
     current_note_block = current_note if current_note else (
@@ -2610,6 +2676,10 @@ def _build_creative_node_note_prompt(
         node_path=node_path,
         language=language,
     )
+    imagination_guidance = _creative_node_imagination_guidance(
+        imagination_level,
+        language=language,
+    )
     if language == "en":
         return f"""
 Project brief:
@@ -2629,6 +2699,9 @@ Template guidance for this node. Use it only to understand the node's job; do no
 
 Current project node tree:
 {outline_block}
+
+Completion style:
+{imagination_guidance}
 
 Complete this node as an illustrator's reference-planning field. If existing node detail is provided, the returned note must begin with that exact existing detail unchanged, then add missing visual decisions after it. Do not merely rewrite the existing sentence. Returning only the existing detail is invalid.
 
@@ -2673,6 +2746,9 @@ Rules:
 当前项目节点树：
 {outline_block}
 
+节点补全风格：
+{imagination_guidance}
+
 请把这个节点补成插画师能直接拿来找参考图的规划内容。如果用户已经写了节点说明，返回的 note 必须以用户原文原样开头，再补充用户没有写出的相关视觉信息；不是替换原句，也不是只重复、改写或输出占位符。只返回用户原文视为失败。
 
 搜索范围建议：
@@ -2710,8 +2786,13 @@ def _build_creative_node_note_retry_prompt(
     node_path: str,
     node_template_hint: str,
     previous_note: str,
+    imagination_level: int = 50,
     language: str,
 ) -> str:
+    imagination_guidance = _creative_node_imagination_guidance(
+        imagination_level,
+        language=language,
+    )
     if language == "en":
         return f"""
 The previous answer was rejected because it did not add a meaningful expansion after the user's existing node detail.
@@ -2733,6 +2814,9 @@ Template guidance:
 
 Rejected previous note:
 {previous_note or "-"}
+
+Completion style:
+{imagination_guidance}
 
 Return JSON:
 {{"note":"must start with the exact existing detail, then add concrete visible expansion","search_query":"concrete English reference-search phrase"}}
@@ -2766,6 +2850,9 @@ Rules:
 
 被拒绝的上一次 note：
 {previous_note or "-"}
+
+节点补全风格：
+{imagination_guidance}
 
 输出 JSON：
 {{"note":"必须以用户已有节点说明原文开头，然后追加具体可见的扩展","search_query":"具体的中文参考图搜索短语"}}

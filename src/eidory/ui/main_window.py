@@ -1445,6 +1445,12 @@ class MainWindow(QMainWindow):
         self.store = store
         self.initial_thumbnail_size = self._setting_int("ui.thumbnail_size", 180, 96, 320)
         self.initial_score_threshold = self._setting_int("ui.score_threshold", 0, 0, 100)
+        self.initial_creative_node_imagination = self._setting_int(
+            "ui.creative_node_imagination",
+            50,
+            0,
+            100,
+        )
         self.initial_status_filter = self._setting_choice(
             "ui.status_filter",
             "all",
@@ -1713,6 +1719,12 @@ class MainWindow(QMainWindow):
         self.score_threshold_update_timer.timeout.connect(self._apply_pending_score_threshold_update)
         self._pending_score_threshold_value: int | None = None
         self._pending_score_threshold_recompute = False
+        self.creative_node_imagination_setting_timer = QTimer(self)
+        self.creative_node_imagination_setting_timer.setSingleShot(True)
+        self.creative_node_imagination_setting_timer.setInterval(300)
+        self.creative_node_imagination_setting_timer.timeout.connect(
+            self._persist_creative_node_imagination
+        )
 
         self.setWindowTitle("Eidory")
         self._configure_native_titlebar()
@@ -1890,6 +1902,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "score_threshold_update_timer"):
             self.score_threshold_update_timer.stop()
             self._pending_score_threshold_value = None
+        if (
+            hasattr(self, "creative_node_imagination_setting_timer")
+            and self.creative_node_imagination_setting_timer.isActive()
+        ):
+            self.creative_node_imagination_setting_timer.stop()
+            self._persist_creative_node_imagination()
         self._save_pending_note()
         self._detail_preview_pending_token = None
         self._save_current_board_layout_if_needed()
@@ -2899,6 +2917,23 @@ class MainWindow(QMainWindow):
         self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
         self.inspiration_answers_input.setAcceptRichText(False)
         self.inspiration_answers_input.setFixedHeight(60)
+        self.creative_node_imagination_title_label = QLabel("节点补全联想")
+        self.creative_node_imagination_value_label = QLabel(
+            self._format_creative_node_imagination(self.initial_creative_node_imagination)
+        )
+        self.creative_node_imagination_value_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.creative_node_imagination_strict_label = QLabel("严谨")
+        self.creative_node_imagination_divergent_label = QLabel("发散")
+        self.creative_node_imagination_slider = QSlider(Qt.Orientation.Horizontal)
+        self.creative_node_imagination_slider.setRange(0, 100)
+        self.creative_node_imagination_slider.setSingleStep(5)
+        self.creative_node_imagination_slider.setPageStep(10)
+        self.creative_node_imagination_slider.setTickInterval(25)
+        self.creative_node_imagination_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.creative_node_imagination_slider.setValue(self.initial_creative_node_imagination)
+        self.creative_node_imagination_slider.setToolTip(
+            "控制节点补全从严谨推断到发散联想；用户已有内容始终是不可违背的约束"
+        )
         self.inspiration_questions_label = QLabel("AI 追问：-")
         self.inspiration_questions_label.setWordWrap(True)
         self.inspiration_history_list = QListWidget()
@@ -3066,6 +3101,17 @@ class MainWindow(QMainWindow):
         inspiration_layout.addWidget(self.inspiration_brief_input)
         inspiration_layout.addWidget(QLabel("补充信息"))
         inspiration_layout.addWidget(self.inspiration_answers_input)
+        imagination_header = QHBoxLayout()
+        imagination_header.setContentsMargins(0, 0, 0, 0)
+        imagination_header.addWidget(self.creative_node_imagination_title_label)
+        imagination_header.addStretch(1)
+        imagination_header.addWidget(self.creative_node_imagination_value_label)
+        imagination_row = QHBoxLayout()
+        imagination_row.setContentsMargins(0, 0, 0, 0)
+        imagination_row.setSpacing(7)
+        imagination_row.addWidget(self.creative_node_imagination_strict_label)
+        imagination_row.addWidget(self.creative_node_imagination_slider, 1)
+        imagination_row.addWidget(self.creative_node_imagination_divergent_label)
         ai_mode_row = QHBoxLayout()
         ai_mode_row.setContentsMargins(0, 0, 0, 0)
         ai_mode_row.setSpacing(0)
@@ -3101,6 +3147,9 @@ class MainWindow(QMainWindow):
         node_tab_layout.addWidget(QLabel("当前节点说明"))
         node_tab_layout.addWidget(self.creative_node_note_input)
         node_tab_layout.addWidget(self.creative_node_query_input)
+        node_tab_layout.addSpacing(2)
+        node_tab_layout.addLayout(imagination_header)
+        node_tab_layout.addLayout(imagination_row)
         creative_node_button_row = QHBoxLayout()
         creative_node_button_row.setContentsMargins(0, 0, 0, 0)
         creative_node_button_row.addWidget(self.generate_creative_children_button)
@@ -3545,6 +3594,9 @@ class MainWindow(QMainWindow):
         self.tag_panel_remove_button.clicked.connect(self._tag_panel_remove_selected_tag)
         self.tag_panel_clear_button.clicked.connect(self._tag_panel_clear_tags)
         self.ai_workflow_mode_group.idClicked.connect(self._on_ai_workflow_mode_clicked)
+        self.creative_node_imagination_slider.valueChanged.connect(
+            self._update_creative_node_imagination
+        )
         self.generate_inspiration_button.clicked.connect(self._generate_inspiration_terms_from_panel)
         self.save_creative_node_button.clicked.connect(self._save_current_creative_node_details)
         self.generate_creative_children_button.clicked.connect(self._generate_creative_children_for_selected_node)
@@ -4235,6 +4287,17 @@ class MainWindow(QMainWindow):
             self.creative_selection_remove_button.setText("Remove from Node")
             self.inspiration_brief_input.setPlaceholderText("Describe the image concept in one sentence")
             self.inspiration_answers_input.setPlaceholderText("Extra context: era, weather, lighting, mood, optional")
+            self.creative_node_imagination_title_label.setText("Node Completion Style")
+            self.creative_node_imagination_strict_label.setText("Strict")
+            self.creative_node_imagination_divergent_label.setText("Divergent")
+            self.creative_node_imagination_slider.setToolTip(
+                "Controls grounded versus divergent node completion; existing user content always remains a hard constraint"
+            )
+            self.creative_node_imagination_value_label.setText(
+                self._format_creative_node_imagination(
+                    self.creative_node_imagination_slider.value()
+                )
+            )
             self.inspiration_questions_label.setText("AI questions: -")
             self.inspiration_status_label.setText("Select up to 7 semantic probes.")
             self.use_ai_scene_tags_checkbox.setText("Generate AI scene tags with probes")
@@ -4387,6 +4450,17 @@ class MainWindow(QMainWindow):
             self.creative_selection_remove_button.setText("移出当前节点")
             self.inspiration_brief_input.setPlaceholderText("用一句话描述画面的创作主题")
             self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
+            self.creative_node_imagination_title_label.setText("节点补全联想")
+            self.creative_node_imagination_strict_label.setText("严谨")
+            self.creative_node_imagination_divergent_label.setText("发散")
+            self.creative_node_imagination_slider.setToolTip(
+                "控制节点补全从严谨推断到发散联想；用户已有内容始终是不可违背的约束"
+            )
+            self.creative_node_imagination_value_label.setText(
+                self._format_creative_node_imagination(
+                    self.creative_node_imagination_slider.value()
+                )
+            )
             self.inspiration_questions_label.setText("AI 追问：-")
             self.inspiration_status_label.setText("生成后最多选择 7 个语义探针。")
             self.use_ai_scene_tags_checkbox.setText("生成探针时同时生成 AI 场景标签")
@@ -15387,6 +15461,7 @@ class MainWindow(QMainWindow):
         self.creative_new_project_button.setEnabled(not creative_generation_busy)
         self.creative_template_combo.setEnabled(not creative_generation_busy)
         self.creative_ai_project_button.setEnabled(not creative_generation_busy)
+        self.creative_node_imagination_slider.setEnabled(not creative_generation_busy)
         if status:
             self.creative_node_status_label.setText(status)
             self.statusBar().showMessage(status)
@@ -15445,6 +15520,7 @@ class MainWindow(QMainWindow):
         project_brief, project_extra = self._creative_node_ai_context(project)
         node_path = self._creative_node_path_text(node.id)
         project_outline = self._creative_project_outline_text(project.id, selected_node_id=node.id)
+        imagination_level = self.creative_node_imagination_slider.value()
 
         def run() -> None:
             try:
@@ -15456,6 +15532,7 @@ class MainWindow(QMainWindow):
                     current_note=ai_current_note,
                     node_path=node_path,
                     node_template_hint=node_template_hint,
+                    imagination_level=imagination_level,
                     language=self.current_language,
                 )
                 self.events.put(("creative_node_note_done", (node.id, ai_current_note, suggestion, model_name)))
@@ -15653,6 +15730,7 @@ class MainWindow(QMainWindow):
             selected_node_id = self.store.creative_root_node_id(project_id)
         project_brief, project_extra = self._creative_node_ai_context(project)
         provider = self._make_llm_provider()
+        imagination_level = self.creative_node_imagination_slider.value()
         self._set_creative_all_nodes_busy(True, f"正在补全全部节点：{project.title}")
 
         def run() -> None:
@@ -15675,6 +15753,7 @@ class MainWindow(QMainWindow):
                             current_note=str(request["current_note"]),
                             node_path=str(request["node_path"]),
                             node_template_hint=str(request["node_template_hint"]),
+                            imagination_level=imagination_level,
                             language=self.current_language,
                         )
                     elif callable(batch_generator):
@@ -15691,6 +15770,7 @@ class MainWindow(QMainWindow):
                                     "node_path": str(request["node_path"]),
                                 }
                             ],
+                            imagination_level=imagination_level,
                             language=self.current_language,
                         )
                         suggestion = dict(batch_suggestions).get(str(request["node_id"]))
@@ -15735,6 +15815,7 @@ class MainWindow(QMainWindow):
                         project_extra=project_extra,
                         project_outline=batch_project_outline,
                         nodes=batch_nodes,
+                        imagination_level=imagination_level,
                         language=self.current_language,
                     )
                 except Exception as exc:
@@ -18388,6 +18469,43 @@ class MainWindow(QMainWindow):
         if value <= 0:
             return f"{prefix}：不限"
         return f"{prefix}：{value}%"
+
+    def _format_creative_node_imagination(self, value: int) -> str:
+        level = max(0, min(100, int(value)))
+        if self.current_language == "en":
+            if level <= 20:
+                label = "Strict"
+            elif level <= 40:
+                label = "Conservative"
+            elif level <= 60:
+                label = "Balanced"
+            elif level <= 80:
+                label = "Exploratory"
+            else:
+                label = "Divergent"
+        elif level <= 20:
+            label = "严谨"
+        elif level <= 40:
+            label = "偏严谨"
+        elif level <= 60:
+            label = "平衡"
+        elif level <= 80:
+            label = "偏发散"
+        else:
+            label = "发散"
+        return f"{label} · {level}"
+
+    def _update_creative_node_imagination(self, value: int) -> None:
+        self.creative_node_imagination_value_label.setText(
+            self._format_creative_node_imagination(value)
+        )
+        self.creative_node_imagination_setting_timer.start()
+
+    def _persist_creative_node_imagination(self) -> None:
+        self.store.set_setting(
+            "ui.creative_node_imagination",
+            str(self.creative_node_imagination_slider.value()),
+        )
 
     def _score_threshold_label_prefix(self, search_filter: SearchFilter) -> str:
         if search_filter.kind == "color":

@@ -1643,6 +1643,7 @@ class MainWindow(QMainWindow):
         self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
         self.error_log_messages: list[str] = []
         self.operation_history_messages: list[str] = []
+        self._background_task_summaries: dict[str, tuple[int, int]] = {}
         self._last_removal_undo: dict[str, object] | None = None
         self._macos_titlebar_applied = False
         self._macos_accessibility_guard_applied = False
@@ -2267,12 +2268,25 @@ class MainWindow(QMainWindow):
         self.rename_view_button = QPushButton("重命名")
         self.delete_view_button = QPushButton("删除")
 
-        layout.addWidget(QLabel("文件夹"))
-        layout.addWidget(self.add_collection_button)
-        layout.addWidget(self.add_folder_button)
-        layout.addWidget(self.import_folder_tree_button)
+        self.resource_panel_title = QLabel("资源")
+        self.resource_panel_title.setObjectName("sidebarSectionTitle")
+        self.resource_add_button = QPushButton("＋ 添加")
+        self.resource_add_menu = QMenu(self.resource_add_button)
+        self.resource_add_image_action = self.resource_add_menu.addAction("导入图片")
+        self.resource_add_folder_action = self.resource_add_menu.addAction("导入文件夹")
+        self.resource_add_menu.addSeparator()
+        self.resource_new_folder_action = self.resource_add_menu.addAction("新建文件夹")
+        self.resource_add_button.setMenu(self.resource_add_menu)
+        self.resource_add_image_action.triggered.connect(self.add_folder_button.click)
+        self.resource_add_folder_action.triggered.connect(self.import_folder_tree_button.click)
+        self.resource_new_folder_action.triggered.connect(self.add_collection_button.click)
+
+        self.project_panel_title = QLabel("项目")
+        self.project_panel_title.setObjectName("sidebarSectionTitle")
+        layout.addWidget(self.resource_panel_title)
+        layout.addWidget(self.resource_add_button)
         layout.addWidget(self.collection_tree, 3)
-        layout.addWidget(QLabel("项目"))
+        layout.addWidget(self.project_panel_title)
         layout.addWidget(self.temp_project_list, 2)
         return panel
 
@@ -2307,6 +2321,70 @@ class MainWindow(QMainWindow):
         button.setToolTip(tooltip)
         button.setAccessibleName(accessible_name)
         button.setAccessibleDescription(tooltip)
+
+    def _build_filter_menu(self) -> None:
+        previous_menu = self.filter_menu_button.menu()
+        menu = QMenu(self.filter_menu_button)
+        english = self.current_language == "en"
+        mode_menu = menu.addMenu("Search Mode" if english else "搜索方式")
+        self.filter_search_mode_actions: dict[str, QAction] = {}
+        for mode, label, button in [
+            ("semantic", "Semantic" if english else "语义", self.semantic_mode_button),
+            ("keyword", "Keyword" if english else "关键词", self.keyword_mode_button),
+            ("color", "Color" if english else "颜色", self.color_mode_button),
+        ]:
+            action = mode_menu.addAction(label)
+            action.setCheckable(True)
+            action.triggered.connect(
+                lambda _checked=False, target=button: target.click()
+            )
+            self.filter_search_mode_actions[mode] = action
+        menu.addSeparator()
+        self.filter_collection_action = menu.addAction("Folders…" if english else "文件夹…")
+        self.filter_tag_action = menu.addAction("Tags…" if english else "标签…")
+        self.filter_similar_action = menu.addAction(
+            "Find Similar Image" if english else "查找相似图"
+        )
+        self.filter_collection_action.triggered.connect(
+            lambda _checked=False: self.collection_filter_button.click()
+        )
+        self.filter_tag_action.triggered.connect(
+            lambda _checked=False: self.tag_filter_button.click()
+        )
+        self.filter_similar_action.triggered.connect(
+            lambda _checked=False: self.similar_image_button.click()
+        )
+        menu.addSeparator()
+        self.filter_reverse_action = menu.addAction("Exclude Matches" if english else "反向排除")
+        self.filter_reverse_action.setCheckable(True)
+        self.filter_reverse_action.triggered.connect(
+            lambda checked=False: self.reverse_exclusion_button.setChecked(checked)
+        )
+        self.filter_advanced_action = menu.addAction(
+            "More Filters & Sorting…" if english else "更多条件与排序…"
+        )
+        self.filter_advanced_action.setCheckable(True)
+        self.filter_advanced_action.triggered.connect(
+            lambda checked=False: self.advanced_search_toggle_button.setChecked(checked)
+        )
+        menu.aboutToShow.connect(self._sync_filter_menu_state)
+        self.filter_menu_button.setMenu(menu)
+        if previous_menu is not None and previous_menu is not menu:
+            previous_menu.deleteLater()
+        self._sync_filter_menu_state()
+
+    def _sync_filter_menu_state(self) -> None:
+        if not hasattr(self, "filter_search_mode_actions"):
+            return
+        checked_mode = "semantic"
+        if self.keyword_mode_button.isChecked():
+            checked_mode = "keyword"
+        elif self.color_mode_button.isChecked():
+            checked_mode = "color"
+        for mode, action in self.filter_search_mode_actions.items():
+            action.setChecked(mode == checked_mode)
+        self.filter_reverse_action.setChecked(self.reverse_exclusion_button.isChecked())
+        self.filter_advanced_action.setChecked(self.advanced_search_toggle_button.isChecked())
 
     def _build_library_panel(self) -> QWidget:
         panel = QWidget()
@@ -2351,6 +2429,15 @@ class MainWindow(QMainWindow):
         self.advanced_search_toggle_button.setCheckable(True)
         self.advanced_search_toggle_button.setToolTip("展开更多筛选条件和排序方式")
         self.advanced_search_toggle_button.setFixedWidth(32)
+        self.filter_menu_button = QPushButton("筛选")
+        self.filter_menu_button.setMinimumWidth(TOP_TOOL_BUTTON_MIN_WIDTH)
+        self.details_toggle_button = QPushButton("详情")
+        self.details_toggle_button.setMinimumWidth(TOP_TOOL_BUTTON_MIN_WIDTH)
+        self.background_tasks_button = QPushButton("后台任务")
+        self.background_tasks_button.setObjectName("backgroundTasksButton")
+        self.background_tasks_button.setMinimumWidth(TOP_TOOL_BUTTON_MIN_WIDTH)
+        self.workspace_entry_button = QPushButton("工具")
+        self.workspace_entry_button.setMinimumWidth(TOP_TOOL_BUTTON_MIN_WIDTH)
         for search_action_button in [
             self.reverse_exclusion_button,
             self.color_mode_button,
@@ -2368,19 +2455,14 @@ class MainWindow(QMainWindow):
         self._update_color_swatch()
         search_row.addWidget(self.search_input, 1)
         search_row.addSpacing(8)
-        search_row.addWidget(self.reverse_exclusion_button)
-        search_row.addSpacing(12)
         search_row.addWidget(self.search_button)
         search_row.addWidget(self.clear_search_button)
-        search_row.addWidget(self.advanced_search_toggle_button)
-        mode_filter_row.addWidget(self.color_mode_button)
-        mode_filter_row.addWidget(self.keyword_mode_button)
-        mode_filter_row.addWidget(self.semantic_mode_button)
-        mode_filter_row.addSpacing(8)
-        mode_filter_row.addWidget(self.collection_filter_button)
-        mode_filter_row.addWidget(self.tag_filter_button)
-        mode_filter_row.addWidget(self.similar_image_button)
-        mode_filter_row.addStretch(1)
+        search_row.addWidget(self.filter_menu_button)
+        search_row.addSpacing(8)
+        search_row.addWidget(self.background_tasks_button)
+        search_row.addWidget(self.workspace_entry_button)
+        search_row.addWidget(self.details_toggle_button)
+        self._build_filter_menu()
 
         search_operation_row = QHBoxLayout()
         search_operation_row.setContentsMargins(0, 0, 0, 0)
@@ -2544,13 +2626,15 @@ class MainWindow(QMainWindow):
         self.filter_chain_label = QLabel("筛选：无")
         self.filter_chain_layout.addWidget(self.filter_chain_label)
         self.filter_chain_layout.addStretch(1)
+        self.filter_chain_widget.hide()
 
         self.save_result_set_button = QPushButton("保存当前搜索结果集")
         self.save_result_set_button.setToolTip("把当前图片墙结果保存为搜索结果集")
         self.save_result_set_button.setMinimumWidth(TOOL_BUTTON_MIN_WIDTH)
         self.save_result_set_button.setEnabled(False)
 
-        threshold_row = QHBoxLayout()
+        self.score_threshold_widget = QWidget()
+        threshold_row = QHBoxLayout(self.score_threshold_widget)
         threshold_row.setContentsMargins(0, 0, 0, 0)
         threshold_row.setSpacing(8)
         self.score_threshold_slider = QSlider(Qt.Orientation.Horizontal)
@@ -2564,6 +2648,7 @@ class MainWindow(QMainWindow):
         self.score_threshold_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         threshold_row.addWidget(self.score_threshold_label)
         threshold_row.addWidget(self.score_threshold_slider, 1)
+        self.score_threshold_widget.hide()
 
         self.result_state_label = QLabel("全部图库")
         self.result_state_label.setWordWrap(False)
@@ -2692,10 +2777,9 @@ class MainWindow(QMainWindow):
         compact_status_row.addWidget(self.search_diagnostics_label)
 
         layout.addLayout(search_row)
-        layout.addLayout(mode_filter_row)
         layout.addWidget(self.advanced_search_widget)
         layout.addWidget(self.filter_chain_widget)
-        layout.addLayout(threshold_row)
+        layout.addWidget(self.score_threshold_widget)
         layout.addLayout(compact_status_row)
         layout.addWidget(self.center_result_stack, 1)
         layout.addLayout(thumbnail_size_row)
@@ -2708,6 +2792,20 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+
+        self.workspace_title_label = QLabel("详情")
+        self.workspace_title_label.setObjectName("workspacePanelTitle")
+        self.workspace_menu_button = QPushButton("其他")
+        self.workspace_collapse_button = QPushButton("收起")
+        self.workspace_menu_button.setFixedWidth(62)
+        self.workspace_collapse_button.setFixedWidth(62)
+        workspace_header = QHBoxLayout()
+        workspace_header.setContentsMargins(0, 0, 0, 0)
+        workspace_header.setSpacing(6)
+        workspace_header.addWidget(self.workspace_title_label, 1)
+        workspace_header.addWidget(self.workspace_menu_button)
+        workspace_header.addWidget(self.workspace_collapse_button)
+        layout.addLayout(workspace_header)
 
         self.preview_label = QLabel("未选择图片")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3477,13 +3575,113 @@ class MainWindow(QMainWindow):
         tab_bar.setMinimumWidth(
             EqualWidthTabBar.minimum_width_for_tab_count(self.right_tab_widget.count())
         )
+        tab_bar.hide()
         self.right_tab_widget.setCurrentIndex(
             self._setting_int("ui.right_tab_index", 0, 0, self.right_tab_widget.count() - 1)
         )
+        self._build_workspace_menu()
+        self._update_workspace_header(self.right_tab_widget.currentIndex())
 
-        layout.addSpacing(10)
         layout.addWidget(self.right_tab_widget, 1)
         return panel
+
+    def _build_workspace_menu(self) -> None:
+        if self.current_language == "en":
+            entries = [
+                (RIGHT_TAB_DETAIL, "Details"),
+                (RIGHT_TAB_AI, "AI Workspace"),
+                (RIGHT_TAB_TAGS, "Tag Manager"),
+                (RIGHT_TAB_INDEX, "Background Tasks"),
+                (RIGHT_TAB_SETTINGS, "Settings & Maintenance"),
+            ]
+        else:
+            entries = [
+                (RIGHT_TAB_DETAIL, "详情"),
+                (RIGHT_TAB_AI, "AI 创作"),
+                (RIGHT_TAB_TAGS, "标签管理"),
+                (RIGHT_TAB_INDEX, "后台任务"),
+                (RIGHT_TAB_SETTINGS, "设置与维护"),
+            ]
+
+        def make_menu(parent: QPushButton) -> tuple[QMenu, dict[int, QAction]]:
+            menu = QMenu(parent)
+            actions: dict[int, QAction] = {}
+            for index, label in entries:
+                if index == RIGHT_TAB_INDEX:
+                    menu.addSeparator()
+                action = menu.addAction(label)
+                action.triggered.connect(
+                    lambda _checked=False, page=index: self._open_workspace_page(page)
+                )
+                actions[index] = action
+            return menu, actions
+
+        previous_header_menu = self.workspace_menu_button.menu()
+        header_menu, self.workspace_page_actions = make_menu(self.workspace_menu_button)
+        self.workspace_menu_button.setMenu(header_menu)
+        if previous_header_menu is not None and previous_header_menu is not header_menu:
+            previous_header_menu.deleteLater()
+
+        previous_entry_menu = self.workspace_entry_button.menu()
+        entry_menu, self.workspace_entry_actions = make_menu(self.workspace_entry_button)
+        self.workspace_entry_button.setMenu(entry_menu)
+        if previous_entry_menu is not None and previous_entry_menu is not entry_menu:
+            previous_entry_menu.deleteLater()
+
+    def _right_panel_is_expanded(self) -> bool:
+        return (
+            hasattr(self, "root_splitter")
+            and len(self.root_splitter.sizes()) == 3
+            and self.root_splitter.sizes()[2] > SIDEBAR_COLLAPSE_THRESHOLD
+        )
+
+    def _set_right_panel_expanded(self, expanded: bool) -> None:
+        if not hasattr(self, "root_splitter"):
+            return
+        sizes = self.root_splitter.sizes()
+        if len(sizes) != 3:
+            return
+        total = max(1, sum(sizes))
+        left = 0 if sizes[0] <= SIDEBAR_COLLAPSE_THRESHOLD else LEFT_SIDEBAR_WIDTH
+        right = RIGHT_SIDEBAR_WIDTH if expanded else 0
+        self.root_splitter.setSizes([left, max(1, total - left - right), right])
+        self._enforce_fixed_sidebar_widths()
+
+    def _open_workspace_page(self, index: int) -> None:
+        if not 0 <= index < self.right_tab_widget.count():
+            return
+        self.right_tab_widget.setCurrentIndex(index)
+        self._set_right_panel_expanded(True)
+
+    def _open_detail_panel(self) -> None:
+        self._open_workspace_page(RIGHT_TAB_DETAIL)
+
+    def _open_background_tasks(self) -> None:
+        self._open_workspace_page(RIGHT_TAB_INDEX)
+
+    def _collapse_workspace_panel(self) -> None:
+        self._set_right_panel_expanded(False)
+
+    def _workspace_page_title(self, index: int) -> str:
+        if self.current_language == "en":
+            return {
+                RIGHT_TAB_DETAIL: "Details",
+                RIGHT_TAB_AI: "AI Workspace",
+                RIGHT_TAB_TAGS: "Tag Manager",
+                RIGHT_TAB_INDEX: "Background Tasks",
+                RIGHT_TAB_SETTINGS: "Settings & Maintenance",
+            }.get(index, "Workspace")
+        return {
+            RIGHT_TAB_DETAIL: "详情",
+            RIGHT_TAB_AI: "AI 创作",
+            RIGHT_TAB_TAGS: "标签管理",
+            RIGHT_TAB_INDEX: "后台任务",
+            RIGHT_TAB_SETTINGS: "设置与维护",
+        }.get(index, "工作区")
+
+    def _update_workspace_header(self, index: int) -> None:
+        if hasattr(self, "workspace_title_label"):
+            self.workspace_title_label.setText(self._workspace_page_title(index))
 
     def _connect_signals(self) -> None:
         self.add_folder_button.clicked.connect(self._choose_folder)
@@ -3502,6 +3700,9 @@ class MainWindow(QMainWindow):
         self.creative_delete_node_button.clicked.connect(self._delete_selected_creative_node)
         self.shuffle_results_button.clicked.connect(self._shuffle_current_grid_images)
         self.advanced_search_toggle_button.toggled.connect(self._toggle_advanced_search_tools)
+        self.details_toggle_button.clicked.connect(self._open_detail_panel)
+        self.background_tasks_button.clicked.connect(self._open_background_tasks)
+        self.workspace_collapse_button.clicked.connect(self._collapse_workspace_panel)
         self.search_button.clicked.connect(self._run_search)
         self.clear_search_button.clicked.connect(self._clear_search)
         self.save_result_set_button.clicked.connect(self._save_current_visible_results_as_search_result_set)
@@ -3744,6 +3945,9 @@ class MainWindow(QMainWindow):
     def _toggle_advanced_search_tools(self, checked: bool) -> None:
         self.advanced_search_widget.setVisible(checked)
         self.advanced_search_toggle_button.setText("▴" if checked else "▾")
+        if hasattr(self, "filter_advanced_action"):
+            self.filter_advanced_action.setChecked(checked)
+        self._refresh_score_threshold_controls()
         if self.current_language == "en":
             self.advanced_search_toggle_button.setToolTip(
                 "Hide advanced filters" if checked else "Show advanced filters"
@@ -4564,9 +4768,28 @@ class MainWindow(QMainWindow):
             self.right_tab_widget.setTabText(2, "标签")
             self.right_tab_widget.setTabText(3, "索引")
             self.right_tab_widget.setTabText(4, "设置")
+        self._refresh_workspace_navigation_text()
         self._update_color_swatch()
         self._refresh_ai_vision_value_filter_combo()
         self._refresh_ai_character_vision_value_filter_combo()
+
+    def _refresh_workspace_navigation_text(self) -> None:
+        english = self.current_language == "en"
+        self.resource_panel_title.setText("Resources" if english else "资源")
+        self.project_panel_title.setText("Projects" if english else "项目")
+        self.resource_add_button.setText("＋ Add" if english else "＋ 添加")
+        self.resource_add_image_action.setText("Import Images" if english else "导入图片")
+        self.resource_add_folder_action.setText("Import Folder" if english else "导入文件夹")
+        self.resource_new_folder_action.setText("New Folder" if english else "新建文件夹")
+        self.filter_menu_button.setText("Filters" if english else "筛选")
+        self.details_toggle_button.setText("Details" if english else "详情")
+        self.workspace_entry_button.setText("Tools" if english else "工具")
+        self.workspace_menu_button.setText("Switch" if english else "切换")
+        self.workspace_collapse_button.setText("Collapse" if english else "收起")
+        self._build_filter_menu()
+        self._build_workspace_menu()
+        self._update_workspace_header(self.right_tab_widget.currentIndex())
+        self._update_background_task_entry()
 
     def _choose_folder(self) -> None:
         collection_id = self._selected_collection_id()
@@ -7688,6 +7911,7 @@ class MainWindow(QMainWindow):
         if not has_filter:
             self.filter_chain_layout.addWidget(QLabel("无"))
         self.filter_chain_layout.addStretch(1)
+        self.filter_chain_widget.setVisible(has_filter)
         self._refresh_score_threshold_controls()
         self._refresh_result_management_buttons()
 
@@ -10059,6 +10283,7 @@ class MainWindow(QMainWindow):
 
     def _on_right_tab_changed(self, index: int) -> None:
         self._save_right_tab_index(index)
+        self._update_workspace_header(index)
         if index != RIGHT_TAB_DETAIL:
             self._cancel_pending_detail_preview_load()
         if index == RIGHT_TAB_DETAIL:
@@ -16732,6 +16957,10 @@ class MainWindow(QMainWindow):
             self.search_button,
             self.clear_search_button,
             self.advanced_search_toggle_button,
+            self.filter_menu_button,
+            self.background_tasks_button,
+            self.workspace_entry_button,
+            self.details_toggle_button,
             self.advanced_search_widget,
             self.filter_chain_widget,
             self.score_threshold_label,
@@ -18519,6 +18748,7 @@ class MainWindow(QMainWindow):
     def _refresh_score_threshold_controls(self) -> None:
         if not hasattr(self, "score_threshold_slider"):
             return
+        show_threshold = False
         if self.search_filters:
             self._ensure_active_filter_index()
             search_filter = (
@@ -18530,11 +18760,18 @@ class MainWindow(QMainWindow):
             if search_filter is None:
                 self.score_threshold_slider.setEnabled(False)
                 self.score_threshold_label.setText("相似度筛选：无")
+                self.score_threshold_widget.setVisible(
+                    self.advanced_search_toggle_button.isChecked()
+                )
                 return
             if search_filter.kind not in SCORED_FILTER_KINDS:
                 self.score_threshold_slider.setEnabled(False)
                 self.score_threshold_label.setText(f"{self._filter_label(search_filter)}：无相似度")
+                self.score_threshold_widget.setVisible(
+                    self.advanced_search_toggle_button.isChecked()
+                )
                 return
+            show_threshold = True
             value = self._score_threshold_value_for_filter(search_filter)
             previous = self.score_threshold_slider.blockSignals(True)
             self.score_threshold_slider.setValue(value)
@@ -18546,11 +18783,22 @@ class MainWindow(QMainWindow):
                     self._score_threshold_label_prefix(search_filter),
                 )
             )
+            self.score_threshold_widget.setVisible(show_threshold)
             return
+        show_threshold = (
+            self.advanced_search_toggle_button.isChecked()
+            or self.current_result_mode in {
+                "semantic",
+                "color",
+                "inspiration",
+                "creative_node",
+            }
+        )
         self.score_threshold_slider.setEnabled(True)
         self.score_threshold_label.setText(
             self._format_score_threshold_label(self.score_threshold_slider.value())
         )
+        self.score_threshold_widget.setVisible(show_threshold)
 
     def _set_search_filter_score_threshold(self, index: int, value: int) -> bool:
         if index < 0 or index >= len(self.search_filters):
@@ -19414,6 +19662,11 @@ class MainWindow(QMainWindow):
             f"剩余：{pending}    处理中：{processing}\n"
             f"失败：{failed}    进度：{percent}%"
         )
+        self._set_background_task_summary(
+            "embedding",
+            failed=failed,
+            processing=processing,
+        )
 
     def _refresh_ai_vision_stats(self) -> None:
         if not hasattr(self, "ai_vision_progress_bar"):
@@ -19437,6 +19690,11 @@ class MainWindow(QMainWindow):
             f"已完成：{ready} / {total}\n"
             f"剩余：{pending}    处理中：{processing}\n"
             f"失败：{failed}    进度：{percent}%"
+        )
+        self._set_background_task_summary(
+            "ai_scene",
+            failed=failed,
+            processing=processing,
         )
         self.ai_vision_rule_tree.blockSignals(True)
         self.ai_vision_rule_tree.clear()
@@ -19487,6 +19745,11 @@ class MainWindow(QMainWindow):
             f"已完成：{ready} / {total}\n"
             f"剩余：{pending}    处理中：{processing}\n"
             f"失败：{failed}    进度：{percent}%"
+        )
+        self._set_background_task_summary(
+            "ai_character",
+            failed=failed,
+            processing=processing,
         )
         self.ai_character_vision_rule_tree.blockSignals(True)
         self.ai_character_vision_rule_tree.clear()
@@ -19541,7 +19804,9 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self.index_health_label.setText(f"索引健康读取失败：{exc}")
+            self._set_background_task_summary("health", failed=1, processing=0)
             return
+        self._set_background_task_summary("health", failed=0, processing=0)
         self.index_health_label.setText(
             "\n".join(
                 [
@@ -19553,6 +19818,54 @@ class MainWindow(QMainWindow):
                 ]
             )
         )
+
+    def _set_background_task_summary(
+        self,
+        key: str,
+        *,
+        failed: int,
+        processing: int,
+    ) -> None:
+        self._background_task_summaries[key] = (
+            max(0, int(failed)),
+            max(0, int(processing)),
+        )
+        self._update_background_task_entry()
+
+    def _update_background_task_entry(self) -> None:
+        if not hasattr(self, "background_tasks_button"):
+            return
+        failed = sum(summary[0] for summary in self._background_task_summaries.values())
+        processing = sum(summary[1] for summary in self._background_task_summaries.values())
+        if self.current_language == "en":
+            if failed:
+                text = f"Tasks · {failed} issue{'s' if failed != 1 else ''}"
+            elif processing:
+                text = "Tasks · Running"
+            else:
+                text = "Background Tasks"
+        elif failed:
+            text = f"后台任务 · {failed} 个异常"
+        elif processing:
+            text = "后台任务 · 运行中"
+        else:
+            text = "后台任务"
+        self.background_tasks_button.setText(text)
+        self.background_tasks_button.setProperty("attention", failed > 0)
+        if failed:
+            self.background_tasks_button.setStyleSheet(
+                "QPushButton { color: #ff8f8f; border-color: #9c4d55; }"
+            )
+            self.background_tasks_button.setToolTip(
+                "后台任务存在失败项，点击查看" if self.current_language != "en"
+                else "Background tasks have failures. Open to review."
+            )
+        else:
+            self.background_tasks_button.setStyleSheet("")
+            self.background_tasks_button.setToolTip(
+                "查看索引、AI 标签和任务进度" if self.current_language != "en"
+                else "View indexing, AI tagging, and task progress"
+            )
 
     @staticmethod
     def _format_index_health_line(label: str, stats: Mapping[str, int]) -> str:

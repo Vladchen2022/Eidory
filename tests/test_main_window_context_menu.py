@@ -56,6 +56,11 @@ from eidory.ui.main_window import (
     PROJECT_LIST_KIND_ROLE,
     PROJECT_LIST_SECTION_ID_ROLE,
     RIGHT_SIDEBAR_WIDTH,
+    RIGHT_TAB_AI,
+    RIGHT_TAB_DETAIL,
+    RIGHT_TAB_INDEX,
+    RIGHT_TAB_SETTINGS,
+    RIGHT_TAB_TAGS,
     SAVED_VIEW_DELETE_ACTION,
     SAVED_VIEW_RENAME_ACTION,
     SAVED_VIEW_SAVE_ACTION,
@@ -160,6 +165,158 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.app.processEvents()
             self.assertTrue(window.advanced_search_widget.isHidden())
             self.assertEqual(window.advanced_search_toggle_button.text(), "▾")
+            window.close()
+
+    def test_primary_toolbar_consolidates_search_filters_without_removing_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.show()
+            self.app.processEvents()
+
+            self.assertTrue(window.filter_menu_button.isVisible())
+            self.assertTrue(window.details_toggle_button.isVisible())
+            self.assertTrue(window.background_tasks_button.isVisible())
+            self.assertFalse(window.semantic_mode_button.isVisible())
+            self.assertFalse(window.collection_filter_button.isVisible())
+            self.assertFalse(window.reverse_exclusion_button.isVisible())
+            self.assertTrue(window.filter_search_mode_actions["semantic"].isChecked())
+
+            for action, target in [
+                (window.filter_collection_action, window.collection_filter_button),
+                (window.filter_tag_action, window.tag_filter_button),
+                (window.filter_similar_action, window.similar_image_button),
+            ]:
+                with patch.object(target, "click") as click:
+                    action.trigger()
+                    click.assert_called_once_with()
+
+            window.filter_search_mode_actions["keyword"].trigger()
+            self.assertTrue(window.keyword_mode_button.isChecked())
+            window.filter_reverse_action.trigger()
+            self.assertTrue(window.reverse_exclusion_button.isChecked())
+            window.filter_advanced_action.trigger()
+            self.app.processEvents()
+            self.assertTrue(window.advanced_search_widget.isVisible())
+            self.assertTrue(window.score_threshold_widget.isVisible())
+            window.close()
+
+    def test_resource_add_menu_preserves_all_import_and_folder_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+
+            triggered: list[str] = []
+            for action, target, label in [
+                (window.resource_add_image_action, window.add_folder_button, "images"),
+                (
+                    window.resource_add_folder_action,
+                    window.import_folder_tree_button,
+                    "folder",
+                ),
+                (
+                    window.resource_new_folder_action,
+                    window.add_collection_button,
+                    "collection",
+                ),
+            ]:
+                target.clicked.disconnect()
+                target.clicked.connect(
+                    lambda _checked=False, value=label: triggered.append(value)
+                )
+                action.trigger()
+
+            self.assertEqual(triggered, ["images", "folder", "collection"])
+            window.close()
+
+    def test_workspace_drawer_defaults_to_details_and_keeps_background_tools_on_demand(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+            window.resize(1500, 900)
+            window.show()
+            self.app.processEvents()
+
+            self.assertEqual(window.right_tab_widget.currentIndex(), RIGHT_TAB_DETAIL)
+            self.assertTrue(window.right_tab_widget.tabBar().isHidden())
+            self.assertEqual(window.workspace_title_label.text(), "详情")
+            self.assertEqual(
+                set(window.workspace_entry_actions),
+                {
+                    RIGHT_TAB_DETAIL,
+                    RIGHT_TAB_AI,
+                    RIGHT_TAB_TAGS,
+                    RIGHT_TAB_INDEX,
+                    RIGHT_TAB_SETTINGS,
+                },
+            )
+
+            window.workspace_collapse_button.click()
+            self.app.processEvents()
+            self.assertEqual(window.root_splitter.sizes()[2], 0)
+
+            window.background_tasks_button.click()
+            self.app.processEvents()
+            self.assertEqual(window.right_tab_widget.currentIndex(), RIGHT_TAB_INDEX)
+            self.assertEqual(window.root_splitter.sizes()[2], RIGHT_SIDEBAR_WIDTH)
+            self.assertEqual(window.workspace_title_label.text(), "后台任务")
+
+            for page in [
+                RIGHT_TAB_AI,
+                RIGHT_TAB_TAGS,
+                RIGHT_TAB_SETTINGS,
+                RIGHT_TAB_DETAIL,
+            ]:
+                window.workspace_entry_actions[page].trigger()
+                self.app.processEvents()
+                self.assertEqual(window.right_tab_widget.currentIndex(), page)
+                self.assertEqual(window.root_splitter.sizes()[2], RIGHT_SIDEBAR_WIDTH)
+            window.close()
+
+    def test_background_task_entry_only_highlights_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+            window = MainWindow(paths=paths, store=store)
+
+            window._set_background_task_summary("embedding", failed=0, processing=2)
+            self.assertIn("运行中", window.background_tasks_button.text())
+            self.assertEqual(window.background_tasks_button.styleSheet(), "")
+
+            window._set_background_task_summary("embedding", failed=3, processing=0)
+            self.assertIn("3 个异常", window.background_tasks_button.text())
+            self.assertIn("color:", window.background_tasks_button.styleSheet())
             window.close()
 
     def test_image_preview_opens_modelessly(self) -> None:

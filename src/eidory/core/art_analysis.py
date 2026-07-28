@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image, ImageOps
+
+from eidory.core.image_loader import open_local_image
+
+
+ART_ANALYSIS_VERSION = "art-analysis-v1"
+DEFAULT_PALETTE_SIZE = 8
+DEFAULT_MAX_EDGE = 448
+_FIT_SAMPLE_LIMIT = 60_000
+_VISIBLE_ALPHA_THRESHOLD = 16
+_PALETTE_MERGE_DELTA_E = 7.0
+
+
+@dataclass(frozen=True)
+class PaletteEntry:
+    rgb: tuple[int, int, int]
+    proportion: float
+
+    @property
+    def hex_code(self) -> str:
+        return "#{:02X}{:02X}{:02X}".format(*self.rgb)
+
+
+@dataclass(frozen=True)
+class DistributionEntry:
+    label: str
+    proportion: float
+
+
+@dataclass(frozen=True)
+class ArtAnalysisResult:
+    palette: tuple[PaletteEntry, ...]
+    lightness_distribution: tuple[DistributionEntry, ...]
+    saturation_distribution: tuple[DistributionEntry, ...]
+    temperature_distribution: tuple[DistributionEntry, ...]
+    average_lightness: float
+    tonal_range: float
+    lightness_stddev: float
+    contrast_label: str
+    shadow_clipping: float
+    highlight_clipping: float
+    sampled_pixels: int
+    sampled_width: int
+    sampled_height: int
+
+
+def analyze_image_art(
+    image_path: str,
+    *,
+    palette_size: int = DEFAULT_PALETTE_SIZE,
+    max_edge: int = DEFAULT_MAX_EDGE,
+) -> ArtAnalysisResult:
+    path = Path(image_path)
+    with open_local_image(str(path)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGBA")
+        image.thumbnail((max(32, int(max_edge)), max(32, int(max_edge))), Image.Resampling.LANCZOS)
+        rgba = np.asarray(image, dtype=np.uint8)
+
+    if rgba.size == 0:
+        raise ValueError(f"empty image: {path.name}")
+
+    visible = rgba[..., 3] >= _VISIBLE_ALPHA_THRESHOLD
+    rgb = rgba[..., :3][visible]
+    if rgb.size == 0:
+        raise ValueError(f"image has no visible pixels: {path.name}")
+
+    rgb_float = rgb.astype(np.float32) / 255.0
+    lab = cv2.cvtColor(rgb_float.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+    palette = _extract_palette(lab, palette_size=max(1, int(palette_size)))
+
+    lightness = np.clip(lab[:, 0], 0.0, 100.0)
+    lightness_distribution = _make_distribution(
+        lightness,
+        bins=(0.0, 15.0, 32.0, 50.0, 68.0, 85.0, 100.01),
+        labels=("极暗", "暗部", "中暗", "中间调", "亮部", "高光"),
+    )
+
+    channel_max = rgb_float.max(axis=1)
+    channel_min = rgb_float.min(axis=1)
+    saturation = np.divide(
+        channel_max - channel_min,
+        channel_max,
+        out=np.zeros_like(channel_max),
+        where=channel_max > 1e-6,
+    )
+    saturation_distribution = _make_distribution(
+        saturation,
+        bins=(0.0, 0.18, 0.55, 1.001),
+        labels=("低饱和", "中饱和", "高饱和"),
+    )
+    temperature_distribution = _temperature_distribution(lab, saturation)
+
+    average_lightness = float(np.mean(lightness))
+    low, high = np.percentile(lightness, (5.0, 95.0))
+    tonal_range = float(max(0.0, high - low))
+    lightness_stddev = float(np.std(lightness))
+    contrast_label = (
+        "低对比"
+        if lightness_stddev < 12.0
+        else "中对比"
+        if lightness_stddev < 24.0
+        else "高对比"
+    )
+
+    return ArtAnalysisResult(
+        palette=palette,
+        lightness_distribution=lightness_distribution,
+        saturation_distribution=saturation_distribution,
+        temperature_distribution=temperature_distribution,
+        average_lightness=average_lightness,
+        tonal_range=tonal_range,
+        lightness_stddev=lightness_stddev,
+        contrast_label=contrast_label,
+        shadow_clipping=float(np.mean(lightness <= 2.0)),
+        highlight_clipping=float(np.mean(lightness >= 98.0)),
+        sampled_pixels=int(rgb.shape[0]),
+        sampled_width=int(rgba.shape[1]),
+        sampled_height=int(rgba.shape[0]),
+    )
+
+
+def _extract_palette(lab: np.ndarray, *, palette_size: int) -> tuple[PaletteEntry, ...]:
+    centers = _deterministic_lab_centers(lab, palette_size)
+    distances = _squared_distances(lab, centers)
+    labels = np.argmin(distances, axis=1)
+    counts = np.bincount(labels, minlength=len(centers)).astype(np.int64)
+    clusters = [
+        [centers[index].astype(np.float64), int(count)]
+        for index, count in enumerate(counts)
+        if count > 0
+    ]
+    clusters.sort(key=lambda entry: entry[1], reverse=True)
+
+    merged: list[list[object]] = []
+    for center, count in clusters:
+        nearest_index = None
+        nearest_distance = float("inf")
+        for index, (existing_center, _existing_count) in enumerate(merged):
+            distance = float(np.linalg.norm(center - existing_center))
+            if distance < nearest_distance:
+                nearest_index = index
+                nearest_distance = distance
+        if nearest_index is not None and nearest_distance < _PALETTE_MERGE_DELTA_E:
+            existing_center, existing_count = merged[nearest_index]
+            total = int(existing_count) + int(count)
+            merged[nearest_index] = [
+                (existing_center * int(existing_count) + center * int(count)) / total,
+                total,
+            ]
+        else:
+            merged.append([center, int(count)])
+
+    merged.sort(key=lambda entry: int(entry[1]), reverse=True)
+    lab_centers = np.asarray([entry[0] for entry in merged], dtype=np.float32).reshape(1, -1, 3)
+    rgb_centers = cv2.cvtColor(lab_centers, cv2.COLOR_LAB2RGB).reshape(-1, 3)
+    rgb_centers = np.clip(np.rint(rgb_centers * 255.0), 0, 255).astype(np.uint8)
+    total_pixels = float(sum(int(entry[1]) for entry in merged))
+    return tuple(
+        PaletteEntry(
+            rgb=(int(rgb[0]), int(rgb[1]), int(rgb[2])),
+            proportion=int(entry[1]) / total_pixels,
+        )
+        for rgb, entry in zip(rgb_centers, merged, strict=False)
+    )
+
+
+def _deterministic_lab_centers(lab: np.ndarray, palette_size: int) -> np.ndarray:
+    if lab.shape[0] > _FIT_SAMPLE_LIMIT:
+        indices = np.linspace(0, lab.shape[0] - 1, _FIT_SAMPLE_LIMIT, dtype=np.int64)
+        sample = lab[indices]
+    else:
+        sample = lab
+
+    mean = np.mean(sample, axis=0)
+    first_index = int(np.argmin(np.sum((sample - mean) ** 2, axis=1)))
+    centers = [sample[first_index].astype(np.float64)]
+    closest = np.sum((sample - centers[0]) ** 2, axis=1)
+
+    for _index in range(1, min(palette_size, sample.shape[0])):
+        farthest_index = int(np.argmax(closest))
+        if float(closest[farthest_index]) < 0.25:
+            break
+        center = sample[farthest_index].astype(np.float64)
+        centers.append(center)
+        closest = np.minimum(closest, np.sum((sample - center) ** 2, axis=1))
+
+    center_array = np.asarray(centers, dtype=np.float64)
+    for _iteration in range(18):
+        distances = _squared_distances(sample, center_array)
+        labels = np.argmin(distances, axis=1)
+        updated = center_array.copy()
+        for index in range(len(center_array)):
+            members = sample[labels == index]
+            if members.size:
+                updated[index] = np.mean(members, axis=0)
+        movement = float(np.max(np.linalg.norm(updated - center_array, axis=1)))
+        center_array = updated
+        if movement < 0.08:
+            break
+    return center_array.astype(np.float32)
+
+
+def _squared_distances(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    return np.sum((values[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+
+
+def _make_distribution(
+    values: np.ndarray,
+    *,
+    bins: tuple[float, ...],
+    labels: tuple[str, ...],
+) -> tuple[DistributionEntry, ...]:
+    counts, _edges = np.histogram(values, bins=np.asarray(bins, dtype=np.float32))
+    total = float(counts.sum())
+    if total <= 0:
+        return tuple(DistributionEntry(label=label, proportion=0.0) for label in labels)
+    return tuple(
+        DistributionEntry(label=label, proportion=float(count) / total)
+        for label, count in zip(labels, counts, strict=False)
+    )
+
+
+def _temperature_distribution(
+    lab: np.ndarray,
+    saturation: np.ndarray,
+) -> tuple[DistributionEntry, ...]:
+    chroma = np.hypot(lab[:, 1], lab[:, 2])
+    neutral = (chroma < 12.0) | (saturation < 0.12)
+    hue = (np.degrees(np.arctan2(lab[:, 2], lab[:, 1])) + 360.0) % 360.0
+    warm = ~neutral & ((hue <= 135.0) | (hue >= 315.0))
+    cool = ~neutral & ~warm
+    total = float(len(lab))
+    return (
+        DistributionEntry("暖色", float(np.count_nonzero(warm)) / total),
+        DistributionEntry("冷色", float(np.count_nonzero(cool)) / total),
+        DistributionEntry("中性色", float(np.count_nonzero(neutral)) / total),
+    )

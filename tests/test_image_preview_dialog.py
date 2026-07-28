@@ -798,6 +798,59 @@ class ImagePreviewDialogTest(unittest.TestCase):
             self.assertEqual(dialog.width(), original_window_width)
             dialog.close()
 
+    def test_art_analysis_page_keeps_processing_modes_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            Image.new("RGB", (64, 48), color="red").save(image_path)
+            store = MetadataStore(root / "eidory.sqlite3")
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id,
+                file_path=str(image_path),
+                file_size=image_path.stat().st_size,
+                width=64,
+                height=48,
+                created_time_ns=None,
+                modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)],
+                start_index=0,
+                store=store,
+                semantic_query=None,
+                model_name="fake-model",
+                model_revision="test",
+                embedding_dim=2,
+            )
+            dialog.show()
+            self.app.processEvents()
+
+            with patch.object(dialog, "_request_linetop_render"):
+                dialog._set_linetop_panel_visible(True)
+            self.assertTrue(dialog.linetop_line_mode_button.isChecked())
+            self.assertIs(dialog.linetop_page_stack.currentWidget(), dialog.linetop_processing_page)
+
+            with patch.object(dialog, "_request_art_analysis") as request_analysis:
+                dialog.linetop_art_analysis_button.setChecked(True)
+                self.app.processEvents()
+            self.assertTrue(request_analysis.called)
+            self.assertIs(dialog.linetop_page_stack.currentWidget(), dialog.art_analysis_widget)
+            self.assertFalse(dialog.compare_toggle_button.isEnabled())
+            self.assertFalse(dialog.save_render_button.isEnabled())
+            self.assertFalse(dialog.copy_render_button.isEnabled())
+
+            with patch.object(dialog, "_request_linetop_render") as request_render:
+                dialog.linetop_color_limit_mode_button.setChecked(True)
+                self.app.processEvents()
+            self.assertTrue(request_render.called)
+            self.assertIs(dialog.linetop_page_stack.currentWidget(), dialog.linetop_processing_page)
+            self.assertTrue(dialog.compare_toggle_button.isEnabled())
+            self.assertTrue(dialog.save_render_button.isEnabled())
+            self.assertTrue(dialog.copy_render_button.isEnabled())
+            dialog.close()
+
     def test_linetop_controls_build_expected_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

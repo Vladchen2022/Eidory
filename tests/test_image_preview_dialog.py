@@ -841,11 +841,17 @@ class ImagePreviewDialogTest(unittest.TestCase):
             self.assertFalse(dialog.save_render_button.isEnabled())
             self.assertFalse(dialog.copy_render_button.isEnabled())
 
+            with patch.object(dialog, "_render_current_image") as render_analysis_view:
+                dialog._set_art_analysis_view("detail")
+            self.assertEqual(dialog._art_analysis_view_mode, "detail")
+            render_analysis_view.assert_called_once_with(use_thumbnail_first=True)
+
             with patch.object(dialog, "_request_linetop_render") as request_render:
                 dialog.linetop_color_limit_mode_button.setChecked(True)
                 self.app.processEvents()
             self.assertTrue(request_render.called)
             self.assertIs(dialog.linetop_page_stack.currentWidget(), dialog.linetop_processing_page)
+            self.assertEqual(dialog._art_analysis_view_mode, "original")
             self.assertTrue(dialog.compare_toggle_button.isEnabled())
             self.assertTrue(dialog.save_render_button.isEnabled())
             self.assertTrue(dialog.copy_render_button.isEnabled())

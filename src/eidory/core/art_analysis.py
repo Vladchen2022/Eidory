@@ -10,18 +10,20 @@ from PIL import Image, ImageOps
 from eidory.core.image_loader import open_local_image
 
 
-ART_ANALYSIS_VERSION = "art-analysis-v1"
+ART_ANALYSIS_VERSION = "art-analysis-v2"
 DEFAULT_PALETTE_SIZE = 8
 DEFAULT_MAX_EDGE = 448
 _FIT_SAMPLE_LIMIT = 60_000
 _VISIBLE_ALPHA_THRESHOLD = 16
 _PALETTE_MERGE_DELTA_E = 7.0
+_MIN_PALETTE_PROPORTION = 0.005
 
 
 @dataclass(frozen=True)
 class PaletteEntry:
     rgb: tuple[int, int, int]
     proportion: float
+    spatial_distribution: tuple[float, ...]
 
     @property
     def hex_code(self) -> str:
@@ -46,6 +48,14 @@ class ArtAnalysisResult:
     contrast_label: str
     shadow_clipping: float
     highlight_clipping: float
+    harmony_label: str
+    harmony_description: str
+    detail_density: float
+    detail_label: str
+    detail_distribution: tuple[float, ...]
+    visual_center_x: float
+    visual_center_y: float
+    horizontal_similarity: float
     sampled_pixels: int
     sampled_width: int
     sampled_height: int
@@ -73,7 +83,25 @@ def analyze_image_art(
 
     rgb_float = rgb.astype(np.float32) / 255.0
     lab = cv2.cvtColor(rgb_float.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
-    palette = _extract_palette(lab, palette_size=max(1, int(palette_size)))
+    palette_rgb, palette_proportions, palette_labels = _extract_palette(
+        lab,
+        palette_size=max(1, int(palette_size)),
+    )
+    visible_y, visible_x = np.nonzero(visible)
+    cell_ids = np.minimum(visible_y * 3 // rgba.shape[0], 2) * 3 + np.minimum(
+        visible_x * 3 // rgba.shape[1],
+        2,
+    )
+    palette = tuple(
+        PaletteEntry(
+            rgb=rgb_value,
+            proportion=proportion,
+            spatial_distribution=_normalized_cells(cell_ids[palette_labels == index]),
+        )
+        for index, (rgb_value, proportion) in enumerate(
+            zip(palette_rgb, palette_proportions, strict=False)
+        )
+    )
 
     lightness = np.clip(lab[:, 0], 0.0, 100.0)
     lightness_distribution = _make_distribution(
@@ -108,6 +136,8 @@ def analyze_image_art(
         if lightness_stddev < 24.0
         else "高对比"
     )
+    harmony_label, harmony_description = _describe_harmony(palette)
+    detail_metrics = _detail_metrics(rgba[..., :3], visible)
 
     return ArtAnalysisResult(
         palette=palette,
@@ -120,13 +150,25 @@ def analyze_image_art(
         contrast_label=contrast_label,
         shadow_clipping=float(np.mean(lightness <= 2.0)),
         highlight_clipping=float(np.mean(lightness >= 98.0)),
+        harmony_label=harmony_label,
+        harmony_description=harmony_description,
+        detail_density=detail_metrics[0],
+        detail_label=detail_metrics[1],
+        detail_distribution=detail_metrics[2],
+        visual_center_x=detail_metrics[3],
+        visual_center_y=detail_metrics[4],
+        horizontal_similarity=detail_metrics[5],
         sampled_pixels=int(rgb.shape[0]),
         sampled_width=int(rgba.shape[1]),
         sampled_height=int(rgba.shape[0]),
     )
 
 
-def _extract_palette(lab: np.ndarray, *, palette_size: int) -> tuple[PaletteEntry, ...]:
+def _extract_palette(
+    lab: np.ndarray,
+    *,
+    palette_size: int,
+) -> tuple[tuple[tuple[int, int, int], ...], tuple[float, ...], np.ndarray]:
     centers = _deterministic_lab_centers(lab, palette_size)
     distances = _squared_distances(lab, centers)
     labels = np.argmin(distances, axis=1)
@@ -162,13 +204,81 @@ def _extract_palette(lab: np.ndarray, *, palette_size: int) -> tuple[PaletteEntr
     rgb_centers = cv2.cvtColor(lab_centers, cv2.COLOR_LAB2RGB).reshape(-1, 3)
     rgb_centers = np.clip(np.rint(rgb_centers * 255.0), 0, 255).astype(np.uint8)
     total_pixels = float(sum(int(entry[1]) for entry in merged))
-    return tuple(
-        PaletteEntry(
-            rgb=(int(rgb[0]), int(rgb[1]), int(rgb[2])),
-            proportion=int(entry[1]) / total_pixels,
-        )
-        for rgb, entry in zip(rgb_centers, merged, strict=False)
+    final_centers = np.asarray([entry[0] for entry in merged], dtype=np.float32)
+    final_labels = np.argmin(_squared_distances(lab, final_centers), axis=1)
+    final_counts = np.bincount(final_labels, minlength=len(final_centers)).astype(np.int64)
+    order = np.argsort(-final_counts)
+    remap = np.empty(len(order), dtype=np.int64)
+    remap[order] = np.arange(len(order))
+    final_labels = remap[final_labels]
+    rgb_centers = rgb_centers[order]
+    final_counts = final_counts[order]
+    final_centers = final_centers[order]
+    significant = final_counts >= max(1, int(np.ceil(total_pixels * _MIN_PALETTE_PROPORTION)))
+    if not np.all(significant):
+        final_centers = final_centers[significant]
+        rgb_centers = rgb_centers[significant]
+        final_labels = np.argmin(_squared_distances(lab, final_centers), axis=1)
+        final_counts = np.bincount(final_labels, minlength=len(final_centers)).astype(np.int64)
+        significant_order = np.argsort(-final_counts)
+        significant_remap = np.empty(len(significant_order), dtype=np.int64)
+        significant_remap[significant_order] = np.arange(len(significant_order))
+        final_labels = significant_remap[final_labels]
+        rgb_centers = rgb_centers[significant_order]
+        final_counts = final_counts[significant_order]
+    return (
+        tuple((int(rgb[0]), int(rgb[1]), int(rgb[2])) for rgb in rgb_centers),
+        tuple(float(count) / total_pixels for count in final_counts),
+        final_labels,
     )
+
+
+def render_art_analysis_view(
+    image_path: str,
+    result: ArtAnalysisResult,
+    *,
+    mode: str,
+    selected_palette_index: int = 0,
+    max_width: int,
+    max_height: int,
+) -> Image.Image:
+    with open_local_image(image_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGBA")
+        image.thumbnail((max(1, max_width), max(1, max_height)), Image.Resampling.LANCZOS)
+        rgba = np.asarray(image, dtype=np.uint8).copy()
+    rgb = rgba[..., :3].copy()
+    if mode == "detail":
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        magnitude = cv2.magnitude(gx, gy)
+        scale = max(float(np.percentile(magnitude, 96.0)), 1.0)
+        heat = np.clip(magnitude / scale * 255.0, 0, 255).astype(np.uint8)
+        heat_rgb = cv2.cvtColor(cv2.applyColorMap(heat, cv2.COLORMAP_TURBO), cv2.COLOR_BGR2RGB)
+        rgba[..., :3] = cv2.addWeighted(rgb, 0.38, heat_rgb, 0.62, 0)
+        return Image.fromarray(rgba, "RGBA")
+
+    palette = np.asarray([entry.rgb for entry in result.palette], dtype=np.uint8)
+    pixels = rgb.reshape(-1, 3).astype(np.float32) / 255.0
+    pixel_lab = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+    palette_lab = cv2.cvtColor(
+        (palette.astype(np.float32) / 255.0).reshape(-1, 1, 3),
+        cv2.COLOR_RGB2LAB,
+    ).reshape(-1, 3)
+    labels = np.argmin(_squared_distances(pixel_lab, palette_lab), axis=1)
+    if mode == "palette":
+        rgba[..., :3] = palette[labels].reshape(rgb.shape)
+        return Image.fromarray(rgba, "RGBA")
+    if mode == "highlight":
+        selected = int(np.clip(selected_palette_index, 0, len(palette) - 1))
+        mask = (labels == selected).reshape(rgb.shape[:2])
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        subdued = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        subdued = np.clip(subdued.astype(np.float32) * 0.34 + 18.0, 0, 255).astype(np.uint8)
+        rgba[..., :3] = subdued
+        rgba[mask, :3] = rgb[mask]
+        return Image.fromarray(rgba, "RGBA")
+    return Image.fromarray(rgba, "RGBA")
 
 
 def _deterministic_lab_centers(lab: np.ndarray, palette_size: int) -> np.ndarray:
@@ -241,4 +351,136 @@ def _temperature_distribution(
         DistributionEntry("暖色", float(np.count_nonzero(warm)) / total),
         DistributionEntry("冷色", float(np.count_nonzero(cool)) / total),
         DistributionEntry("中性色", float(np.count_nonzero(neutral)) / total),
+    )
+
+
+def _normalized_cells(cell_ids: np.ndarray) -> tuple[float, ...]:
+    counts = np.bincount(cell_ids.astype(np.int64), minlength=9).astype(np.float64)
+    total = float(counts.sum())
+    if total <= 0.0:
+        return (0.0,) * 9
+    return tuple(float(value / total) for value in counts[:9])
+
+
+def _describe_harmony(
+    palette: tuple[PaletteEntry, ...],
+) -> tuple[str, str]:
+    significant = [
+        entry
+        for entry in palette
+        if entry.proportion >= 0.025
+    ]
+    if not significant:
+        return "未识别", "有效色彩不足，无法判断配色关系。"
+
+    rgb = np.asarray([entry.rgb for entry in significant], dtype=np.float32) / 255.0
+    lab = cv2.cvtColor(rgb.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+    chroma = np.hypot(lab[:, 1], lab[:, 2])
+    colorful = lab[chroma >= 12.0]
+    if len(colorful) < 2:
+        return "单色 / 中性倾向", "主要颜色的色相差异较小，画面更多依靠明度层次组织。"
+
+    hues = (np.degrees(np.arctan2(colorful[:, 2], colorful[:, 1])) + 360.0) % 360.0
+    differences: list[float] = []
+    for first in range(len(hues)):
+        for second in range(first + 1, len(hues)):
+            raw = abs(float(hues[first]) - float(hues[second]))
+            differences.append(min(raw, 360.0 - raw))
+
+    if differences and max(differences) <= 55.0:
+        return "邻近色倾向", "主要色相彼此接近，整体统一，变化主要来自明度和饱和度。"
+    if any(145.0 <= difference <= 180.0 for difference in differences):
+        return "互补色倾向", "主要色相存在明显对置关系，容易形成色彩张力和视觉焦点。"
+    if len(hues) >= 3:
+        ordered = np.sort(hues)
+        gaps = np.diff(np.concatenate((ordered, ordered[:1] + 360.0)))
+        if bool(np.all((gaps >= 75.0) & (gaps <= 165.0))):
+            return "三角色倾向", "主要色相分布较均衡，画面具有多方向的色彩对比。"
+    return "多色相组合", "主要色相分布较分散，不属于单一的经典配色关系。"
+
+
+def _detail_metrics(
+    rgb: np.ndarray,
+    visible: np.ndarray,
+) -> tuple[float, str, tuple[float, ...], float, float, float]:
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    magnitude = cv2.magnitude(gx, gy) / 1020.0
+    valid_magnitude = magnitude[visible]
+    detail_density = (
+        float(np.mean(valid_magnitude >= 0.075))
+        if valid_magnitude.size
+        else 0.0
+    )
+    detail_label = (
+        "低细节"
+        if detail_density < 0.08
+        else "中等细节"
+        if detail_density < 0.22
+        else "高细节"
+    )
+
+    height, width = gray.shape
+    y_indices, x_indices = np.indices((height, width))
+    cell_ids = np.minimum(y_indices * 3 // max(height, 1), 2) * 3 + np.minimum(
+        x_indices * 3 // max(width, 1),
+        2,
+    )
+    detail_weight = np.where(visible, magnitude, 0.0)
+    detail_cells = np.bincount(
+        cell_ids.reshape(-1),
+        weights=detail_weight.reshape(-1),
+        minlength=9,
+    ).astype(np.float64)
+    cell_total = float(detail_cells.sum())
+    detail_distribution = (
+        tuple(float(value / cell_total) for value in detail_cells[:9])
+        if cell_total > 1e-9
+        else (0.0,) * 9
+    )
+
+    rgb_float = rgb.astype(np.float32) / 255.0
+    channel_max = rgb_float.max(axis=2)
+    channel_min = rgb_float.min(axis=2)
+    saturation = np.divide(
+        channel_max - channel_min,
+        channel_max,
+        out=np.zeros_like(channel_max),
+        where=channel_max > 1e-6,
+    )
+    luminance_contrast = np.abs(gray - float(np.median(gray[visible]))) / 255.0
+    saliency = np.where(
+        visible,
+        magnitude * 0.64 + saturation * 0.21 + luminance_contrast * 0.15,
+        0.0,
+    )
+    saliency_total = float(saliency.sum())
+    if saliency_total > 1e-9:
+        visual_center_x = float((saliency * x_indices).sum() / saliency_total) / max(width - 1, 1)
+        visual_center_y = float((saliency * y_indices).sum() / saliency_total) / max(height - 1, 1)
+    else:
+        visual_center_x = 0.5
+        visual_center_y = 0.5
+
+    half_width = width // 2
+    if half_width <= 0:
+        horizontal_similarity = 1.0
+    else:
+        left = gray[:, :half_width]
+        right = np.fliplr(gray[:, width - half_width :])
+        valid_pair = visible[:, :half_width] & np.fliplr(visible[:, width - half_width :])
+        difference = np.abs(left - right) / 255.0
+        horizontal_similarity = (
+            float(1.0 - np.mean(difference[valid_pair]))
+            if np.any(valid_pair)
+            else 0.0
+        )
+    return (
+        detail_density,
+        detail_label,
+        detail_distribution,
+        float(np.clip(visual_center_x, 0.0, 1.0)),
+        float(np.clip(visual_center_y, 0.0, 1.0)),
+        float(np.clip(horizontal_similarity, 0.0, 1.0)),
     )

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from eidory.core.art_analysis import analyze_image_art
+from eidory.core.art_analysis import analyze_image_art, render_art_analysis_view
 
 
 class ArtAnalysisTest(unittest.TestCase):
@@ -25,6 +25,8 @@ class ArtAnalysisTest(unittest.TestCase):
             self.assertAlmostEqual(first.palette[0].proportion, 0.75, places=3)
             self.assertAlmostEqual(first.palette[1].proportion, 0.25, places=3)
             self.assertAlmostEqual(sum(entry.proportion for entry in first.palette), 1.0, places=6)
+            for entry in first.palette:
+                self.assertAlmostEqual(sum(entry.spatial_distribution), 1.0, places=6)
 
     def test_transparent_pixels_do_not_pollute_palette(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -61,6 +63,75 @@ class ArtAnalysisTest(unittest.TestCase):
             )
             self.assertAlmostEqual(neutral.proportion, 1.0, places=6)
             self.assertEqual(result.contrast_label, "低对比")
+            self.assertEqual(result.detail_label, "低细节")
+            self.assertAlmostEqual(result.detail_density, 0.0, places=6)
+            self.assertAlmostEqual(result.visual_center_x, 0.5, places=6)
+            self.assertAlmostEqual(result.visual_center_y, 0.5, places=6)
+            self.assertAlmostEqual(result.horizontal_similarity, 1.0, places=6)
+
+    def test_palette_spatial_distribution_tracks_color_location(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "split.png"
+            image = Image.new("RGB", (90, 90), color=(230, 25, 20))
+            image.paste((20, 55, 225), (45, 0, 90, 90))
+            image.save(image_path)
+
+            result = analyze_image_art(str(image_path), max_edge=180)
+            red = max(result.palette, key=lambda entry: entry.rgb[0] - entry.rgb[2])
+            left_column = sum(red.spatial_distribution[index] for index in (0, 3, 6))
+            right_column = sum(red.spatial_distribution[index] for index in (2, 5, 8))
+
+            self.assertGreater(left_column, right_column)
+            self.assertAlmostEqual(sum(red.spatial_distribution), 1.0, places=6)
+
+    def test_rendered_analysis_views_preserve_size_and_use_palette(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "render.png"
+            image = Image.new("RGB", (120, 80), color=(220, 30, 25))
+            image.paste((20, 60, 220), (60, 0, 120, 80))
+            image.save(image_path)
+            result = analyze_image_art(str(image_path), max_edge=160)
+
+            palette_view = render_art_analysis_view(
+                str(image_path),
+                result,
+                mode="palette",
+                max_width=240,
+                max_height=160,
+            )
+            selected_index = max(
+                range(len(result.palette)),
+                key=lambda index: result.palette[index].rgb[0] - result.palette[index].rgb[2],
+            )
+            highlight_view = render_art_analysis_view(
+                str(image_path),
+                result,
+                mode="highlight",
+                selected_palette_index=selected_index,
+                max_width=240,
+                max_height=160,
+            )
+            detail_view = render_art_analysis_view(
+                str(image_path),
+                result,
+                mode="detail",
+                max_width=240,
+                max_height=160,
+            )
+
+            self.assertEqual(palette_view.size, image.size)
+            self.assertEqual(highlight_view.size, image.size)
+            self.assertEqual(detail_view.size, image.size)
+            colors = palette_view.convert("RGB").getcolors(
+                maxcolors=palette_view.width * palette_view.height
+            )
+            self.assertIsNotNone(colors)
+            self.assertLessEqual(len(colors or []), len(result.palette))
+            self.assertEqual(highlight_view.convert("RGB").getpixel((10, 10)), (220, 30, 25))
+            self.assertNotEqual(
+                highlight_view.convert("RGB").getpixel((10, 10)),
+                highlight_view.convert("RGB").getpixel((110, 10)),
+            )
 
 
 if __name__ == "__main__":

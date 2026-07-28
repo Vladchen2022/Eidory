@@ -84,6 +84,34 @@ class ArtAnalysisTest(unittest.TestCase):
             self.assertGreater(left_column, right_column)
             self.assertAlmostEqual(sum(red.spatial_distribution), 1.0, places=6)
 
+    def test_lightness_and_tone_distributions_include_spatial_locations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "bands.png"
+            image = Image.new("RGB", (90, 90), color=(12, 12, 12))
+            image.paste((120, 120, 120), (30, 0, 60, 90))
+            image.paste((255, 40, 20), (60, 0, 90, 45))
+            image.paste((20, 70, 255), (60, 45, 90, 90))
+            image.save(image_path)
+
+            result = analyze_image_art(str(image_path), max_edge=180)
+            for distribution in (
+                result.lightness_distribution,
+                result.saturation_distribution,
+                result.temperature_distribution,
+            ):
+                for entry in distribution:
+                    expected = 1.0 if entry.proportion > 0.0 else 0.0
+                    self.assertAlmostEqual(
+                        sum(entry.spatial_distribution),
+                        expected,
+                        places=6,
+                    )
+
+            darkest = result.lightness_distribution[0]
+            left_column = sum(darkest.spatial_distribution[index] for index in (0, 3, 6))
+            right_column = sum(darkest.spatial_distribution[index] for index in (2, 5, 8))
+            self.assertGreater(left_column, right_column)
+
     def test_rendered_analysis_views_preserve_size_and_use_palette(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             image_path = Path(tmp) / "render.png"
@@ -132,6 +160,48 @@ class ArtAnalysisTest(unittest.TestCase):
                 highlight_view.convert("RGB").getpixel((10, 10)),
                 highlight_view.convert("RGB").getpixel((110, 10)),
             )
+
+    def test_lightness_saturation_and_temperature_views_highlight_selected_band(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "classification.png"
+            image = Image.new("RGB", (120, 80), color=(10, 10, 10))
+            image.paste((245, 245, 245), (60, 0, 120, 40))
+            image.paste((235, 30, 20), (0, 40, 60, 80))
+            image.paste((20, 60, 230), (60, 40, 120, 80))
+            image.save(image_path)
+            result = analyze_image_art(str(image_path), max_edge=160)
+
+            lightness_view = render_art_analysis_view(
+                str(image_path),
+                result,
+                mode="lightness_highlight",
+                selected_palette_index=5,
+                max_width=240,
+                max_height=160,
+            ).convert("RGB")
+            saturation_view = render_art_analysis_view(
+                str(image_path),
+                result,
+                mode="saturation_highlight",
+                selected_palette_index=2,
+                max_width=240,
+                max_height=160,
+            ).convert("RGB")
+            temperature_view = render_art_analysis_view(
+                str(image_path),
+                result,
+                mode="temperature_highlight",
+                selected_palette_index=0,
+                max_width=240,
+                max_height=160,
+            ).convert("RGB")
+
+            self.assertEqual(lightness_view.getpixel((90, 20)), (245, 245, 245))
+            self.assertNotEqual(lightness_view.getpixel((20, 20)), (10, 10, 10))
+            self.assertEqual(saturation_view.getpixel((20, 60)), (235, 30, 20))
+            self.assertNotEqual(saturation_view.getpixel((90, 20)), (245, 245, 245))
+            self.assertEqual(temperature_view.getpixel((20, 60)), (235, 30, 20))
+            self.assertNotEqual(temperature_view.getpixel((90, 60)), (20, 60, 230))
 
 
 if __name__ == "__main__":

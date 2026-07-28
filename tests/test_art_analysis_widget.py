@@ -57,11 +57,17 @@ class ArtAnalysisWidgetTest(unittest.TestCase):
 
             widget.palette_buttons[-1].click()
             widget.palette_view_button.click()
+            widget.lightness_row_widgets[0].selected.emit(0)
+            widget.saturation_row_widgets[1].selected.emit(1)
+            widget.temperature_row_widgets[2].selected.emit(2)
             widget.detail_view_button.click()
             widget.original_view_button.click()
 
             self.assertEqual(requests[0], ("highlight", len(result.palette) - 1))
             self.assertIn(("palette", -1), requests)
+            self.assertIn(("lightness_highlight", 0), requests)
+            self.assertIn(("saturation_highlight", 1), requests)
+            self.assertIn(("temperature_highlight", 2), requests)
             self.assertIn(("detail", -1), requests)
             self.assertIn(("original", -1), requests)
             widget.close()

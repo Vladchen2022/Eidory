@@ -2733,7 +2733,15 @@ class ImagePreviewDialog(QDialog):
         self._start_queued_art_analysis_if_needed()
 
     def _set_art_analysis_view(self, mode: str, selected_palette_index: int = -1) -> None:
-        if mode not in {"original", "palette", "highlight", "detail"}:
+        if mode not in {
+            "original",
+            "palette",
+            "highlight",
+            "detail",
+            "lightness_highlight",
+            "saturation_highlight",
+            "temperature_highlight",
+        }:
             return
         if selected_palette_index >= 0:
             self._art_analysis_selected_palette = int(selected_palette_index)

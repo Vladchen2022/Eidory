@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, Qt, Signal
@@ -115,6 +115,42 @@ class ArtAnalysisSpatialGrid(QWidget):
             painter.drawEllipse(QRectF(marker_x - 6.0, marker_y - 6.0, 12.0, 12.0))
 
 
+class ArtAnalysisDistributionRow(QWidget):
+    selected = Signal(int)
+
+    def __init__(self, index: int, parent=None) -> None:
+        super().__init__(parent)
+        self.index = int(index)
+        self.setObjectName("artDistributionRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.set_selected(False)
+
+    def set_selected(self, selected: bool) -> None:
+        border = "2px solid #4f8ef7" if selected else "1px solid transparent"
+        background = "#303946" if selected else "transparent"
+        self.setStyleSheet(
+            "QWidget#artDistributionRow{"
+            f"border:{border};background:{background};border-radius:5px;"
+            "}"
+        )
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected.emit(self.index)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space}:
+            self.selected.emit(self.index)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class ArtAnalysisWidget(QWidget):
     viewRequested = Signal(str, int)
 
@@ -126,6 +162,9 @@ class ArtAnalysisWidget(QWidget):
         self.lightness_bars: list[QProgressBar] = []
         self.saturation_bars: list[QProgressBar] = []
         self.temperature_bars: list[QProgressBar] = []
+        self.lightness_row_widgets: list[ArtAnalysisDistributionRow] = []
+        self.saturation_row_widgets: list[ArtAnalysisDistributionRow] = []
+        self.temperature_row_widgets: list[ArtAnalysisDistributionRow] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -215,7 +254,7 @@ class ArtAnalysisWidget(QWidget):
         layout = QVBoxLayout(self.lightness_tab)
         layout.setContentsMargins(2, 8, 2, 2)
         layout.setSpacing(8)
-        layout.addWidget(self._section_title("明度分布 · L*"))
+        layout.addWidget(self._section_title("明度分布 · 点击任一档查看画面位置"))
         self.lightness_rows = QVBoxLayout()
         self.lightness_rows.setSpacing(6)
         layout.addLayout(self.lightness_rows)
@@ -228,17 +267,25 @@ class ArtAnalysisWidget(QWidget):
             "padding:9px;line-height:1.35;"
         )
         layout.addWidget(self.summary_label)
+        layout.addWidget(self._section_title("所选明度在画面中的位置"))
+        self.lightness_spatial_grid = ArtAnalysisSpatialGrid()
+        layout.addWidget(self.lightness_spatial_grid)
+        self.lightness_restore_button = QPushButton("恢复原图")
+        self.lightness_restore_button.clicked.connect(
+            lambda: self.viewRequested.emit("original", -1)
+        )
+        layout.addWidget(self.lightness_restore_button)
         layout.addStretch(1)
 
     def _build_tone_tab(self) -> None:
         layout = QVBoxLayout(self.tone_tab)
         layout.setContentsMargins(2, 8, 2, 2)
         layout.setSpacing(8)
-        layout.addWidget(self._section_title("饱和度结构"))
+        layout.addWidget(self._section_title("饱和度结构 · 点击任一档查看画面位置"))
         self.saturation_rows = QVBoxLayout()
         self.saturation_rows.setSpacing(6)
         layout.addLayout(self.saturation_rows)
-        layout.addWidget(self._section_title("冷暖比例"))
+        layout.addWidget(self._section_title("冷暖比例 · 点击任一档查看画面位置"))
         self.temperature_rows = QVBoxLayout()
         self.temperature_rows.setSpacing(6)
         layout.addLayout(self.temperature_rows)
@@ -248,6 +295,15 @@ class ArtAnalysisWidget(QWidget):
         self.tone_summary_label.setWordWrap(True)
         self.tone_summary_label.setStyleSheet("color:#aeb7c4;padding-top:6px;")
         layout.addWidget(self.tone_summary_label)
+        self.tone_selection_label = self._section_title("所选色调在画面中的位置")
+        layout.addWidget(self.tone_selection_label)
+        self.tone_spatial_grid = ArtAnalysisSpatialGrid()
+        layout.addWidget(self.tone_spatial_grid)
+        self.tone_restore_button = QPushButton("恢复原图")
+        self.tone_restore_button.clicked.connect(
+            lambda: self.viewRequested.emit("original", -1)
+        )
+        layout.addWidget(self.tone_restore_button)
         layout.addStretch(1)
 
     def _build_composition_tab(self) -> None:
@@ -321,20 +377,23 @@ class ArtAnalysisWidget(QWidget):
             self.palette_buttons.append(button)
 
         self.donut.set_palette(result.palette)
-        self.lightness_bars = self._set_distribution_rows(
+        self.lightness_bars, self.lightness_row_widgets = self._set_distribution_rows(
             self.lightness_rows,
             result.lightness_distribution,
             colors=("#171a20", "#333945", "#59616e", "#858d99", "#b9c0c8", "#eef2f5"),
+            on_selected=self._select_lightness,
         )
-        self.saturation_bars = self._set_distribution_rows(
+        self.saturation_bars, self.saturation_row_widgets = self._set_distribution_rows(
             self.saturation_rows,
             result.saturation_distribution,
             colors=("#66717f", "#4d7fb4", "#2f8be8"),
+            on_selected=lambda index: self._select_tone("saturation", index),
         )
-        self.temperature_bars = self._set_distribution_rows(
+        self.temperature_bars, self.temperature_row_widgets = self._set_distribution_rows(
             self.temperature_rows,
             result.temperature_distribution,
             colors=("#df795c", "#5c91d8", "#8d929a"),
+            on_selected=lambda index: self._select_tone("temperature", index),
         )
         self.summary_label.setText(
             f"平均明度：{result.average_lightness:.1f} / 100\n"
@@ -363,6 +422,10 @@ class ArtAnalysisWidget(QWidget):
                 first.spatial_distribution,
                 color=QColor(*first.rgb),
             )
+        dominant_lightness = self._dominant_entry_index(result.lightness_distribution)
+        dominant_saturation = self._dominant_entry_index(result.saturation_distribution)
+        self._select_lightness(dominant_lightness, emit_view=False)
+        self._select_tone("saturation", dominant_saturation, emit_view=False)
         self.sample_label.setText(
             f"本地采样 {result.sampled_width} × {result.sampled_height}，"
             f"{result.sampled_pixels:,} 个可见像素"
@@ -384,6 +447,69 @@ class ArtAnalysisWidget(QWidget):
             color=QColor(*entry.rgb),
         )
         self.viewRequested.emit("highlight", palette_index)
+
+    @staticmethod
+    def _dominant_entry_index(entries: tuple[DistributionEntry, ...]) -> int:
+        if not entries:
+            return 0
+        return max(range(len(entries)), key=lambda index: entries[index].proportion)
+
+    @staticmethod
+    def _set_selected_rows(
+        rows: list[ArtAnalysisDistributionRow],
+        selected_index: int | None,
+    ) -> None:
+        for index, row in enumerate(rows):
+            row.set_selected(selected_index is not None and index == selected_index)
+
+    def _select_lightness(self, index: int, *, emit_view: bool = True) -> None:
+        if self._result is None or not (0 <= index < len(self._result.lightness_distribution)):
+            return
+        self._set_selected_rows(self.lightness_row_widgets, index)
+        entry = self._result.lightness_distribution[index]
+        colors = ("#171a20", "#333945", "#59616e", "#858d99", "#b9c0c8", "#eef2f5")
+        self.lightness_spatial_grid.set_distribution(
+            entry.spatial_distribution,
+            color=QColor(colors[index]),
+        )
+        if emit_view:
+            self.viewRequested.emit("lightness_highlight", index)
+
+    def _select_tone(
+        self,
+        kind: str,
+        index: int,
+        *,
+        emit_view: bool = True,
+    ) -> None:
+        if self._result is None:
+            return
+        if kind == "saturation":
+            entries = self._result.saturation_distribution
+            colors = ("#66717f", "#4d7fb4", "#2f8be8")
+            mode = "saturation_highlight"
+            self._set_selected_rows(self.saturation_row_widgets, index)
+            self._set_selected_rows(self.temperature_row_widgets, None)
+            title_prefix = "饱和度"
+        elif kind == "temperature":
+            entries = self._result.temperature_distribution
+            colors = ("#df795c", "#5c91d8", "#8d929a")
+            mode = "temperature_highlight"
+            self._set_selected_rows(self.saturation_row_widgets, None)
+            self._set_selected_rows(self.temperature_row_widgets, index)
+            title_prefix = "冷暖"
+        else:
+            return
+        if not (0 <= index < len(entries)):
+            return
+        entry = entries[index]
+        self.tone_selection_label.setText(f"{title_prefix}：{entry.label}在画面中的位置")
+        self.tone_spatial_grid.set_distribution(
+            entry.spatial_distribution,
+            color=QColor(colors[index]),
+        )
+        if emit_view:
+            self.viewRequested.emit(mode, index)
 
     def _copy_palette(self) -> None:
         if self._result is None:
@@ -439,13 +565,18 @@ class ArtAnalysisWidget(QWidget):
         entries: Iterable[DistributionEntry],
         *,
         colors: tuple[str, ...],
-    ) -> list[QProgressBar]:
+        on_selected: Callable[[int], None],
+    ) -> tuple[list[QProgressBar], list[ArtAnalysisDistributionRow]]:
         self._clear_layout(layout)
         bars: list[QProgressBar] = []
-        for entry, color in zip(entries, colors, strict=False):
-            row = QWidget()
+        rows: list[ArtAnalysisDistributionRow] = []
+        for index, (entry, color) in enumerate(zip(entries, colors, strict=False)):
+            row = ArtAnalysisDistributionRow(index)
+            row.setAccessibleName(f"查看{entry.label}在画面中的位置")
+            row.setToolTip(f"点击在原图中高亮{entry.label}区域")
+            row.selected.connect(on_selected)
             row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setContentsMargins(4, 3, 4, 3)
             row_layout.setSpacing(6)
             name = QLabel(entry.label)
             name.setFixedWidth(48)
@@ -466,7 +597,8 @@ class ArtAnalysisWidget(QWidget):
             row_layout.addWidget(value)
             layout.addWidget(row)
             bars.append(bar)
-        return bars
+            rows.append(row)
+        return bars, rows
 
     @staticmethod
     def _clear_layout(layout) -> None:

@@ -10,7 +10,7 @@ from PIL import Image, ImageOps
 from eidory.core.image_loader import open_local_image
 
 
-ART_ANALYSIS_VERSION = "art-analysis-v2"
+ART_ANALYSIS_VERSION = "art-analysis-v3"
 DEFAULT_PALETTE_SIZE = 8
 DEFAULT_MAX_EDGE = 448
 _FIT_SAMPLE_LIMIT = 60_000
@@ -34,6 +34,7 @@ class PaletteEntry:
 class DistributionEntry:
     label: str
     proportion: float
+    spatial_distribution: tuple[float, ...] = (0.0,) * 9
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,7 @@ def analyze_image_art(
         lightness,
         bins=(0.0, 15.0, 32.0, 50.0, 68.0, 85.0, 100.01),
         labels=("极暗", "暗部", "中暗", "中间调", "亮部", "高光"),
+        cell_ids=cell_ids,
     )
 
     channel_max = rgb_float.max(axis=1)
@@ -122,8 +124,9 @@ def analyze_image_art(
         saturation,
         bins=(0.0, 0.18, 0.55, 1.001),
         labels=("低饱和", "中饱和", "高饱和"),
+        cell_ids=cell_ids,
     )
-    temperature_distribution = _temperature_distribution(lab, saturation)
+    temperature_distribution = _temperature_distribution(lab, saturation, cell_ids)
 
     average_lightness = float(np.mean(lightness))
     low, high = np.percentile(lightness, (5.0, 95.0))
@@ -258,6 +261,44 @@ def render_art_analysis_view(
         rgba[..., :3] = cv2.addWeighted(rgb, 0.38, heat_rgb, 0.62, 0)
         return Image.fromarray(rgba, "RGBA")
 
+    if mode in {
+        "lightness_highlight",
+        "saturation_highlight",
+        "temperature_highlight",
+    }:
+        pixels = rgb.reshape(-1, 3).astype(np.float32) / 255.0
+        pixel_lab = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+        selected = max(0, int(selected_palette_index))
+        if mode == "lightness_highlight":
+            values = np.clip(pixel_lab[:, 0], 0.0, 100.0)
+            bins = np.asarray((0.0, 15.0, 32.0, 50.0, 68.0, 85.0, 100.01))
+            selected = min(selected, len(bins) - 2)
+            mask = (values >= bins[selected]) & (values < bins[selected + 1])
+        else:
+            channel_max = pixels.max(axis=1)
+            channel_min = pixels.min(axis=1)
+            saturation = np.divide(
+                channel_max - channel_min,
+                channel_max,
+                out=np.zeros_like(channel_max),
+                where=channel_max > 1e-6,
+            )
+            if mode == "saturation_highlight":
+                bins = np.asarray((0.0, 0.18, 0.55, 1.001))
+                selected = min(selected, len(bins) - 2)
+                mask = (saturation >= bins[selected]) & (saturation < bins[selected + 1])
+            else:
+                chroma = np.hypot(pixel_lab[:, 1], pixel_lab[:, 2])
+                neutral = (chroma < 12.0) | (saturation < 0.12)
+                hue = (
+                    np.degrees(np.arctan2(pixel_lab[:, 2], pixel_lab[:, 1])) + 360.0
+                ) % 360.0
+                warm = ~neutral & ((hue <= 135.0) | (hue >= 315.0))
+                temperature_masks = (warm, ~neutral & ~warm, neutral)
+                selected = min(selected, len(temperature_masks) - 1)
+                mask = temperature_masks[selected]
+        return _render_highlight_mask(rgba, rgb, mask.reshape(rgb.shape[:2]))
+
     palette = np.asarray([entry.rgb for entry in result.palette], dtype=np.uint8)
     pixels = rgb.reshape(-1, 3).astype(np.float32) / 255.0
     pixel_lab = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
@@ -272,12 +313,20 @@ def render_art_analysis_view(
     if mode == "highlight":
         selected = int(np.clip(selected_palette_index, 0, len(palette) - 1))
         mask = (labels == selected).reshape(rgb.shape[:2])
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        subdued = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-        subdued = np.clip(subdued.astype(np.float32) * 0.34 + 18.0, 0, 255).astype(np.uint8)
-        rgba[..., :3] = subdued
-        rgba[mask, :3] = rgb[mask]
-        return Image.fromarray(rgba, "RGBA")
+        return _render_highlight_mask(rgba, rgb, mask)
+    return Image.fromarray(rgba, "RGBA")
+
+
+def _render_highlight_mask(
+    rgba: np.ndarray,
+    rgb: np.ndarray,
+    mask: np.ndarray,
+) -> Image.Image:
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    subdued = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    subdued = np.clip(subdued.astype(np.float32) * 0.34 + 18.0, 0, 255).astype(np.uint8)
+    rgba[..., :3] = subdued
+    rgba[mask, :3] = rgb[mask]
     return Image.fromarray(rgba, "RGBA")
 
 
@@ -326,20 +375,39 @@ def _make_distribution(
     *,
     bins: tuple[float, ...],
     labels: tuple[str, ...],
+    cell_ids: np.ndarray,
 ) -> tuple[DistributionEntry, ...]:
-    counts, _edges = np.histogram(values, bins=np.asarray(bins, dtype=np.float32))
+    bin_edges = np.asarray(bins, dtype=np.float32)
+    counts, _edges = np.histogram(values, bins=bin_edges)
     total = float(counts.sum())
     if total <= 0:
-        return tuple(DistributionEntry(label=label, proportion=0.0) for label in labels)
+        return tuple(
+            DistributionEntry(
+                label=label,
+                proportion=0.0,
+                spatial_distribution=(0.0,) * 9,
+            )
+            for label in labels
+        )
     return tuple(
-        DistributionEntry(label=label, proportion=float(count) / total)
-        for label, count in zip(labels, counts, strict=False)
+        DistributionEntry(
+            label=label,
+            proportion=float(count) / total,
+            spatial_distribution=_normalized_cells(
+                cell_ids[
+                    (values >= bin_edges[index])
+                    & (values < bin_edges[index + 1])
+                ]
+            ),
+        )
+        for index, (label, count) in enumerate(zip(labels, counts, strict=False))
     )
 
 
 def _temperature_distribution(
     lab: np.ndarray,
     saturation: np.ndarray,
+    cell_ids: np.ndarray,
 ) -> tuple[DistributionEntry, ...]:
     chroma = np.hypot(lab[:, 1], lab[:, 2])
     neutral = (chroma < 12.0) | (saturation < 0.12)
@@ -348,9 +416,21 @@ def _temperature_distribution(
     cool = ~neutral & ~warm
     total = float(len(lab))
     return (
-        DistributionEntry("暖色", float(np.count_nonzero(warm)) / total),
-        DistributionEntry("冷色", float(np.count_nonzero(cool)) / total),
-        DistributionEntry("中性色", float(np.count_nonzero(neutral)) / total),
+        DistributionEntry(
+            "暖色",
+            float(np.count_nonzero(warm)) / total,
+            _normalized_cells(cell_ids[warm]),
+        ),
+        DistributionEntry(
+            "冷色",
+            float(np.count_nonzero(cool)) / total,
+            _normalized_cells(cell_ids[cool]),
+        ),
+        DistributionEntry(
+            "中性色",
+            float(np.count_nonzero(neutral)) / total,
+            _normalized_cells(cell_ids[neutral]),
+        ),
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 from weakref import ref
 
 from PySide6.QtCore import QObject, Qt, QTimer
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QMenu, QPushButton,
     QScrollArea, QSizePolicy, QSplitter, QTabWidget, QVBoxLayout, QWidget,
@@ -160,6 +161,8 @@ class WorkspaceChrome(QObject):
         row.addWidget(brand)
         self.left_button = self._button("导航", lambda: self.toggle_sidebar(0), row)
         self.left_button.setCheckable(True)
+        self.exit_focus_button = self._button("退出专注", lambda: w._set_board_focus_mode(False), row, primary=True)
+        self.exit_focus_button.hide()
         w.creative_project_combo.setMaximumWidth(330)
         w.creative_project_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         w.creative_project_combo.setMinimumContentsLength(12)
@@ -220,7 +223,8 @@ class WorkspaceChrome(QObject):
         more = QPushButton("更多 ▾")
         menu = QMenu(more)
         for button, label in (
-            (w.board_pin_button, "窗口置顶"), (w.board_hide_selected_button, "专注看板（Tab）"),
+            (w.board_pin_button, "窗口置顶"),
+            (w.board_hide_selected_button, "专注看板（" + w.board_focus_shortcut.key().toString(QKeySequence.SequenceFormat.NativeText) + "）"),
             (w.board_flip_button, "左右翻转"), (w.board_grayscale_button, "黑白显示"),
             (w.board_edit_local_display_button, "编辑局部显示"),
             (w.board_toggle_local_display_button, "局部／全图切换"),
@@ -254,6 +258,8 @@ class WorkspaceChrome(QObject):
                 self.density_combo.currentIndexChanged.connect(self.change_density)
                 display.addWidget(self.density_combo)
                 display.addStretch(1)
+                self.restore_layout_button = self._button("恢复默认布局", w._restore_workspace_layout, display)
+                self.restore_layout_button.setToolTip("展开左右侧栏；保留当前项目、筛选、选中图片与看板内容")
                 layout.addLayout(display)
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
@@ -344,26 +350,23 @@ class WorkspaceChrome(QObject):
 
     def toggle_sidebar(self, index):
         w = self.w
-        show = w.root_splitter.sizes()[index] <= 48
-        if w._board_focus_mode:
-            w._set_board_focus_mode(False)
-        sizes = w.root_splitter.sizes()
-        total = sum(sizes)
-        sizes[index] = w.root_splitter.widget(index).maximumWidth() if show else 0
-        sizes[1] = max(1, total - sizes[0] - sizes[2])
-        w.root_splitter.setSizes(sizes)
-        w._enforce_fixed_sidebar_widths()
-        self.sync_sidebars()
-        w.store.set_setting("ui.root_splitter_sizes", ",".join(map(str, w._root_splitter_sizes_for_settings())))
+        show = w._board_focus_mode or not w._sidebar_visible[index]
+        w._set_sidebar_visible(index, show)
 
     def sync_sidebars(self, *_args):
-        sizes = self.w.root_splitter.sizes()
-        for index, button, label in ((0, self.left_button, "导航"), (2, self.right_button, "信息")):
-            visible = sizes[index] > 48
+        w = self.w
+        english = w.current_language == "en"
+        self.exit_focus_button.setVisible(w._board_focus_mode)
+        self.exit_focus_button.setText("Exit Focus" if english else "退出专注")
+        for index, button, label in ((0, self.left_button, "左"), (2, self.right_button, "右")):
+            visible = not w._board_focus_mode and w._sidebar_visible[index]
             button.setChecked(visible)
             action = ("收起" if visible else "显示") + label + "侧栏"
+            if english:
+                action = ("Hide " if visible else "Show ") + ("Navigation" if index == 0 else "Inspector")
+            button.setText(action)
             button.setAccessibleName(action)
-            button.setToolTip(action + "；此按钮始终保留")
+            button.setToolTip(action + ("; sidebars reopen on launch" if english else "；仅影响本次使用，重启后自动展开"))
 
     def record_collection(self, node, image_ids):
         if image_ids:

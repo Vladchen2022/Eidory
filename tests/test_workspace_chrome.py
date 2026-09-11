@@ -1,9 +1,11 @@
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
+import pytest
 
 from test_filter_workflow import app, library, window, apply
 from test_creative_workspace import project
 from eidory.core.search_filters import FilterGroup, FilterPlan, SearchFilter
+from eidory.ui.main_window import MainWindow, LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH
 
 
 def test_navigation_preserves_project_filters_and_selection(window, app):
@@ -37,6 +39,7 @@ def test_sidebars_can_be_restored_from_header_in_focus_mode(window, app):
         assert w.root_splitter.sizes()[index] == 0
         assert button.isVisible()
         assert not button.isChecked()
+        assert button.text() == ("显示左侧栏" if index == 0 else "显示右侧栏")
         button.click()
         app.processEvents()
         assert w.root_splitter.sizes()[index] == original[index]
@@ -47,6 +50,104 @@ def test_sidebars_can_be_restored_from_header_in_focus_mode(window, app):
     app.processEvents()
     assert not w._board_focus_mode
     assert w.root_splitter.sizes()[0] == original[0]
+
+
+@pytest.mark.parametrize("saved", ["0,1200,386", "0,1500,0", "20,900,30"])
+def test_startup_recovers_legacy_collapsed_sidebars(library, app, saved):
+    paths, store, _ = library
+    store.set_setting("ui.root_splitter_sizes", saved)
+    w = MainWindow(paths=paths, store=store)
+    try:
+        w.resize(1500, 900)
+        w.show()
+        app.processEvents()
+        assert w.root_splitter.sizes()[0] == LEFT_SIDEBAR_WIDTH
+        assert w.root_splitter.sizes()[2] == RIGHT_SIDEBAR_WIDTH
+        assert w.collection_tree.isVisible()
+    finally:
+        w.close()
+
+
+@pytest.mark.parametrize("mode", ["left", "both", "focus", "board_focus"])
+def test_restart_after_temporary_hiding_restores_sidebars(window, app, mode):
+    w = window
+    if mode in ("left", "both"):
+        w.workspace_chrome.left_button.click()
+        if mode == "both":
+            w.workspace_chrome.right_button.click()
+    else:
+        if mode == "board_focus":
+            w.center_result_stack.setCurrentWidget(w.project_board_view)
+        w._set_board_focus_mode(True)
+    app.processEvents()
+    assert w.root_splitter.sizes()[0] == 0
+    w.close()
+    saved = [int(value) for value in w.store.get_setting("ui.root_splitter_sizes").split(",")]
+    assert saved[0] == LEFT_SIDEBAR_WIDTH
+    assert saved[2] == RIGHT_SIDEBAR_WIDTH
+    reopened = MainWindow(paths=w.paths, store=w.store)
+    try:
+        reopened.resize(1500, 900)
+        reopened.show()
+        app.processEvents()
+        assert reopened.collection_tree.isVisible()
+        assert reopened.root_splitter.sizes()[0] == LEFT_SIDEBAR_WIDTH
+        assert reopened.root_splitter.sizes()[2] == RIGHT_SIDEBAR_WIDTH
+        assert not reopened._board_focus_mode
+    finally:
+        reopened.close()
+
+
+def test_tab_never_hides_sidebars_while_navigating_or_editing(window, app):
+    w = window
+    w.right_tab_widget.setCurrentIndex(2)
+    for target in (w.grid_view, w.tag_search_input, w.tag_list):
+        target.setFocus()
+        QTest.keyClick(target, Qt.Key.Key_Tab)
+        app.processEvents()
+        assert not w._board_focus_mode
+        assert w.root_splitter.sizes()[0] == LEFT_SIDEBAR_WIDTH
+        assert w.root_splitter.sizes()[2] == RIGHT_SIDEBAR_WIDTH
+    w.grid_view.setFocus()
+    QTest.keyClick(w.grid_view, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+    app.processEvents()
+    assert w._board_focus_mode
+    assert w.workspace_chrome.exit_focus_button.isVisible()
+    w.workspace_chrome.exit_focus_button.click()
+    app.processEvents()
+    assert not w._board_focus_mode
+    assert w.collection_tree.isVisible()
+
+
+def test_resize_and_splitter_drag_cannot_hide_navigation(window, app):
+    w = window
+    for width in (1000, 2300, 1200, 1500):
+        w.resize(width, 900)
+        app.processEvents()
+        w.root_splitter.moveSplitter(0, 1)
+        w.root_splitter.moveSplitter(w.root_splitter.width(), 2)
+        app.processEvents()
+        assert w.root_splitter.sizes()[0] >= 220
+        assert w.root_splitter.sizes()[2] >= 260
+        assert w.collection_tree.isVisible()
+        assert w.workspace_chrome.left_button.isChecked()
+
+
+def test_restore_layout_preserves_filter_and_selection(window, app):
+    w = window
+    plan = FilterPlan(include=(FilterGroup((SearchFilter('keyword', 'plane'),)),))
+    apply(w, plan)
+    w.grid_view.select_image_ids([w.grid_view.images()[0].id])
+    before = w.grid_view.selected_image_ids()
+    w.workspace_chrome.left_button.click()
+    w._set_board_focus_mode(True)
+    w.workspace_chrome.restore_layout_button.click()
+    app.processEvents()
+    assert not w._board_focus_mode
+    assert w.root_splitter.sizes()[0] == LEFT_SIDEBAR_WIDTH
+    assert w.root_splitter.sizes()[2] == RIGHT_SIDEBAR_WIDTH
+    assert w.filter_workflow.plan() == plan
+    assert w.grid_view.selected_image_ids() == before
 
 
 def test_global_panels_reuse_controls_without_replacing_results(window, app):

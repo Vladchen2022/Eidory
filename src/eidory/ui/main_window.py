@@ -1574,7 +1574,8 @@ class MainWindow(QMainWindow):
         self._board_external_import_active = False
         self._board_external_import_refresh_pending = False
         self._board_focus_mode = False
-        self._board_focus_previous_splitter_sizes: list[int] | None = None
+        # Visibility is session-only user intent, never inferred from geometry.
+        self._sidebar_visible = {0: True, 2: True}
         self._board_focus_widget_visibility: dict[QWidget, bool] = {}
         self._board_window_pinned = False
         self._board_layout_dirty = False
@@ -2076,9 +2077,11 @@ class MainWindow(QMainWindow):
         self.root_splitter.addWidget(self._build_sidebar())
         self.root_splitter.addWidget(self._build_library_panel())
         self.root_splitter.addWidget(self._build_detail_panel())
-        self.root_splitter.setCollapsible(0, True)
+        self.root_splitter.setCollapsible(0, False)
         self.root_splitter.setCollapsible(1, False)
-        self.root_splitter.setCollapsible(2, True)
+        self.root_splitter.setCollapsible(2, False)
+        self.root_splitter.widget(0).setMinimumWidth(220)
+        self.root_splitter.widget(2).setMinimumWidth(260)
         self.root_splitter.setStretchFactor(0, 0)
         self.root_splitter.setStretchFactor(1, 1)
         self.root_splitter.setStretchFactor(2, 0)
@@ -2091,19 +2094,31 @@ class MainWindow(QMainWindow):
 
     def _initial_root_splitter_sizes(self) -> list[int]:
         saved = self._setting_int_list("ui.root_splitter_sizes", [LEFT_SIDEBAR_WIDTH, 944, RIGHT_SIDEBAR_WIDTH], 3)
-        left = 0 if saved[0] <= SIDEBAR_COLLAPSE_THRESHOLD else LEFT_SIDEBAR_WIDTH
-        right = 0 if saved[2] <= SIDEBAR_COLLAPSE_THRESHOLD else RIGHT_SIDEBAR_WIDTH
         center = max(640, saved[1])
-        return [left, center, right]
+        # Recover legacy zero widths. Every launch starts with navigation visible.
+        return [LEFT_SIDEBAR_WIDTH, center, RIGHT_SIDEBAR_WIDTH]
 
     def _root_splitter_sizes_for_settings(self) -> list[int]:
         sizes = self.root_splitter.sizes()
         if len(sizes) != 3:
             return [LEFT_SIDEBAR_WIDTH, 944, RIGHT_SIDEBAR_WIDTH]
-        left = 0 if sizes[0] <= SIDEBAR_COLLAPSE_THRESHOLD else LEFT_SIDEBAR_WIDTH
-        right = 0 if sizes[2] <= SIDEBAR_COLLAPSE_THRESHOLD else RIGHT_SIDEBAR_WIDTH
-        center = max(1, sum(sizes) - left - right)
-        return [left, center, right]
+        # Closing while focused or temporarily collapsed must not poison startup.
+        center = max(640, sum(sizes) - LEFT_SIDEBAR_WIDTH - RIGHT_SIDEBAR_WIDTH)
+        return [LEFT_SIDEBAR_WIDTH, center, RIGHT_SIDEBAR_WIDTH]
+
+    def _set_sidebar_visible(self, index: int, visible: bool) -> None:
+        if index not in self._sidebar_visible:
+            raise ValueError("Only the navigation and information sidebars can be toggled")
+        if self._board_focus_mode:
+            self._set_board_focus_mode(False)
+        self._sidebar_visible[index] = bool(visible)
+        self._enforce_fixed_sidebar_widths()
+
+    def _restore_workspace_layout(self) -> None:
+        self._set_board_focus_mode(False)
+        self._sidebar_visible = {0: True, 2: True}
+        self._enforce_fixed_sidebar_widths()
+        self.statusBar().showMessage("已恢复左右侧栏，当前内容保持不变")
 
     def _enforce_fixed_sidebar_widths(self, _pos: int | None = None, _index: int | None = None) -> None:
         if getattr(self, "_enforcing_sidebar_widths", False):
@@ -2115,18 +2130,14 @@ class MainWindow(QMainWindow):
         sizes = self.root_splitter.sizes()
         if len(sizes) != 3:
             return
-        total = max(1, sum(sizes))
-        collapse_left = sizes[0] <= SIDEBAR_COLLAPSE_THRESHOLD
-        collapse_right = sizes[2] <= SIDEBAR_COLLAPSE_THRESHOLD
-        if _index == 1 and _pos is not None:
-            collapse_left = _pos <= SIDEBAR_COLLAPSE_THRESHOLD
-        if _index == 2 and _pos is not None:
-            collapse_right = (total - _pos) <= SIDEBAR_COLLAPSE_THRESHOLD
-        left = 0 if collapse_left else LEFT_SIDEBAR_WIDTH
-        right = 0 if collapse_right else RIGHT_SIDEBAR_WIDTH
-        center = max(1, total - left - right)
         self._enforcing_sidebar_widths = True
         try:
+            for index, visible in self._sidebar_visible.items():
+                self.root_splitter.widget(index).setVisible(visible)
+            total = max(1, sum(self.root_splitter.sizes()))
+            left = LEFT_SIDEBAR_WIDTH if self._sidebar_visible[0] else 0
+            right = RIGHT_SIDEBAR_WIDTH if self._sidebar_visible[2] else 0
+            center = max(1, total - left - right)
             self.root_splitter.setSizes([left, center, right])
         finally:
             self._enforcing_sidebar_widths = False
@@ -2622,7 +2633,7 @@ class MainWindow(QMainWindow):
             self.board_hide_selected_button,
             "focus",
             "隐藏界面",
-            "隐藏左右侧栏和非看板控件；按 Tab 可恢复",
+            "隐藏左右侧栏和非看板控件；点击顶部“退出专注”恢复",
         )
         self._configure_board_icon_button(
             self.board_fit_all_button,
@@ -3592,7 +3603,7 @@ class MainWindow(QMainWindow):
         self.minimize_window_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
         self.minimize_window_action.triggered.connect(self._minimize_window)
         self.addAction(self.minimize_window_action)
-        self.board_focus_shortcut = QShortcut(QKeySequence("Tab"), self)
+        self.board_focus_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
         self.board_focus_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         self.board_focus_shortcut.setEnabled(True)
         self.board_focus_shortcut.activated.connect(self._toggle_board_focus_mode)
@@ -4347,7 +4358,7 @@ class MainWindow(QMainWindow):
                 self.board_hide_selected_button,
                 "focus",
                 "Focus board",
-                "Hide sidebars and non-board controls; press Tab to restore",
+                "Hide sidebars and non-board controls; click Exit Focus in the header to restore",
             )
             self._configure_board_icon_button(
                 self.board_fit_all_button,
@@ -4510,7 +4521,7 @@ class MainWindow(QMainWindow):
                 self.board_hide_selected_button,
                 "focus",
                 "隐藏界面",
-                "隐藏左右侧栏和非看板控件；按 Tab 可恢复",
+                "隐藏左右侧栏和非看板控件；点击顶部“退出专注”恢复",
             )
             self._configure_board_icon_button(
                 self.board_fit_all_button,
@@ -16502,7 +16513,6 @@ class MainWindow(QMainWindow):
             return
         is_board_view = self.center_result_stack.currentWidget() is self.project_board_view
         if enabled:
-            self._board_focus_previous_splitter_sizes = self.root_splitter.sizes()
             self._board_focus_widget_visibility = {}
             if is_board_view:
                 self._board_focus_widget_visibility = {
@@ -16514,8 +16524,9 @@ class MainWindow(QMainWindow):
                 self.board_focus_shortcut.setEnabled(True)
             if is_board_view:
                 self._hide_board_focus_chrome_widgets()
-            total = max(1, sum(self.root_splitter.sizes()))
-            self.root_splitter.setSizes([0, total, 0])
+            self.root_splitter.widget(0).hide()
+            self.root_splitter.widget(2).hide()
+            self.root_splitter.setSizes([0, max(1, self.root_splitter.width()), 0])
             focus_widget = self.project_board_view if is_board_view else self.grid_view
             focus_widget.setFocus(Qt.FocusReason.ShortcutFocusReason)
             QTimer.singleShot(0, self._reapply_board_window_pin)
@@ -16528,10 +16539,7 @@ class MainWindow(QMainWindow):
         for widget, was_visible in list(self._board_focus_widget_visibility.items()):
             widget.setVisible(was_visible)
         self._board_focus_widget_visibility.clear()
-        if self._board_focus_previous_splitter_sizes is not None:
-            self.root_splitter.setSizes(self._board_focus_previous_splitter_sizes)
-            self._board_focus_previous_splitter_sizes = None
-            QTimer.singleShot(0, self._enforce_fixed_sidebar_widths)
+        self._enforce_fixed_sidebar_widths()
         if hasattr(self, "board_focus_shortcut"):
             self.board_focus_shortcut.setEnabled(True)
         if self.center_result_stack.currentWidget() is self.project_board_view:

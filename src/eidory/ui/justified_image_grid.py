@@ -648,6 +648,9 @@ class JustifiedImageGridView(QAbstractScrollArea):
 
     def _run_scheduled_layout_rebuild(self) -> None:
         self._rebuild_layout()
+        # The resize paint can precede the debounced layout. Repaint the whole
+        # viewport now; selection/thumbnail updates only invalidate small areas.
+        self.viewport().update()
 
     def _rebuild_layout_from(self, start_index: int) -> None:
         viewport_width = max(1, self.viewport().width())

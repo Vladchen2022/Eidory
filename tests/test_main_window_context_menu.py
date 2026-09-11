@@ -887,7 +887,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window._database_maintenance_active = False
             window.close()
 
-    def test_sidebars_have_fixed_visible_widths_and_can_collapse(self) -> None:
+    def test_sidebar_geometry_cannot_accidentally_collapse_panels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -925,11 +925,11 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window._enforce_fixed_sidebar_widths(10, 1)
             window._enforce_fixed_sidebar_widths(sum(window.root_splitter.sizes()) - 20, 2)
             left, _center, right = window.root_splitter.sizes()
-            self.assertEqual(left, 0)
-            self.assertEqual(right, 0)
+            self.assertEqual(left, LEFT_SIDEBAR_WIDTH)
+            self.assertEqual(right, RIGHT_SIDEBAR_WIDTH)
             window.close()
 
-    def test_tab_focus_mode_collapses_sidebars_in_gallery_view(self) -> None:
+    def test_explicit_focus_mode_collapses_sidebars_in_gallery_view(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -967,7 +967,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertIs(window.center_result_stack.currentWidget(), window.grid_view)
             window.close()
 
-    def test_tab_focus_mode_keeps_workspace_navigation_visible(self) -> None:
+    def test_focus_mode_keeps_workspace_navigation_visible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -4300,7 +4300,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 EqualWidthTabBar.MIN_TAB_WIDTH,
             )
             self.assertEqual(window.search_row.spacing(), TOP_TOOL_BUTTON_SPACING)
-            self.assertEqual(window.right_tab_widget.parentWidget().minimumWidth(), 0)
+            # A visible inspector retains a usable width; explicit hiding uses hide().
+            self.assertEqual(window.right_tab_widget.parentWidget().minimumWidth(), 260)
             self.assertEqual(window.right_tab_widget.parentWidget().maximumWidth(), RIGHT_SIDEBAR_WIDTH)
             self.assertGreaterEqual(
                 window.right_tab_widget.tabBar().minimumWidth(),

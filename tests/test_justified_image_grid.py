@@ -233,6 +233,27 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
 
         rebuild_layout.assert_not_called()
 
+    def test_debounced_resize_paints_the_new_layout(self) -> None:
+        class PaintTrackingGrid(JustifiedImageGridView):
+            last_painted_width = -1
+
+            def paintEvent(self, event):
+                self.last_painted_width = self._layout_viewport_width
+                super().paintEvent(event)
+
+        grid = PaintTrackingGrid(thumbnail_size=90, spacing=4)
+        grid.resize(360, 240)
+        grid.set_images([self._image(image_id) for image_id in range(1, 80)])
+        grid.show()
+        try:
+            QTest.qWait(grid._resize_layout_timer.interval() + 50)
+            for width in (700, 420):
+                grid.resize(width, 240)
+                QTest.qWait(grid._resize_layout_timer.interval() + 50)
+                self.assertEqual(grid.last_painted_width, grid.viewport().width())
+        finally:
+            grid.close()
+
     def test_set_images_clears_stale_pending_pixmap_loads_when_layout_changes(self) -> None:
         grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)
         stale_key = ("/tmp/stale.jpg", 1, 100, 270)

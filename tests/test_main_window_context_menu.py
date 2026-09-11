@@ -967,7 +967,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertIs(window.center_result_stack.currentWidget(), window.grid_view)
             window.close()
 
-    def test_tab_focus_mode_keeps_board_toolbar_visible(self) -> None:
+    def test_tab_focus_mode_keeps_workspace_navigation_visible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -994,13 +994,9 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(left, 0)
             self.assertEqual(right, 0)
             self.assertFalse(window.search_input.isVisible())
-            self.assertTrue(window.show_gallery_button.isVisible())
-            self.assertTrue(window.show_project_board_button.isVisible())
-            self.assertTrue(window.board_hide_selected_button.isVisible())
-            self.assertTrue(window.board_fit_all_button.isVisible())
-            self.assertTrue(window.board_grayscale_button.isVisible())
-            self.assertTrue(window.board_edit_local_display_button.isVisible())
-            self.assertTrue(window.board_toggle_local_display_button.isVisible())
+            self.assertTrue(window.workspace_chrome.stage_buttons[1].isVisible())
+            self.assertTrue(window.workspace_chrome.header.isVisible())
+            self.assertFalse(window.workspace_chrome.board_tools.isVisible())
             self.assertFalse(window.save_project_board_layout_button.isVisible())
             self.assertFalse(window.board_import_button.isVisible())
             self.assertFalse(window.board_show_all_button.isVisible())
@@ -4308,7 +4304,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.right_tab_widget.parentWidget().maximumWidth(), RIGHT_SIDEBAR_WIDTH)
             self.assertGreaterEqual(
                 window.right_tab_widget.tabBar().minimumWidth(),
-                EqualWidthTabBar.minimum_width_for_tab_count(window.right_tab_widget.count()),
+                EqualWidthTabBar.minimum_width_for_tab_count(sum(window.right_tab_widget.isTabVisible(i) for i in range(window.right_tab_widget.count()))),
             )
             for button in [
                 window.reverse_exclusion_button,

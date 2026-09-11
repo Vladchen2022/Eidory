@@ -1250,7 +1250,7 @@ class ProjectBoardView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self.setBackgroundBrush(QColor("#202830"))
+        self.setBackgroundBrush(QColor("#222427"))
         self._image_items: dict[int, QGraphicsItem] = {}
         self._note_items: list[BoardTextItem] = []
         self._undo_layouts = []
@@ -1624,7 +1624,7 @@ class ProjectBoardView(QGraphicsView):
         bounds = self._scene.itemsBoundingRect().adjusted(-30, -30, 30, 30)
         scale = min(1.0, 2400 / max(bounds.width(), bounds.height(), 1))
         image = QImage(max(1, int(bounds.width()*scale)), max(1, int(bounds.height()*scale)), QImage.Format.Format_ARGB32_Premultiplied)
-        image.fill(QColor("#202830"))
+        image.fill(QColor("#222427"))
         painter = QPainter(image)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self._scene.render(painter, QRectF(0, 0, image.width(), image.height()), bounds)
@@ -1965,12 +1965,12 @@ class ProjectBoardView(QGraphicsView):
         painter.restore()
 
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
-        painter.fillRect(rect, QColor("#202830"))
+        painter.fillRect(rect, QColor("#222427"))
         if self._manual_item_drag_active:
             return
-        minor_pen = QPen(QColor("#2b3440"))
+        minor_pen = QPen(QColor("#292c31"))
         minor_pen.setWidth(0)
-        major_pen = QPen(QColor("#364250"))
+        major_pen = QPen(QColor("#353940"))
         major_pen.setWidth(0)
 
         left = int(rect.left()) - (int(rect.left()) % GRID_SIZE)
@@ -2162,7 +2162,7 @@ class ProjectBoardView(QGraphicsView):
                 QRectF(0, 0, width, height),
                 on_layout_changed=self._schedule_layout_changed,
             )
-            frame.setBrush(QColor("#202830"))
+            frame.setBrush(QColor("#222427"))
             frame.setPen(QPen(QColor("#536071"), 1))
             item: QGraphicsItem = frame
             label = QGraphicsTextItem(image.file_name, frame)

@@ -230,14 +230,14 @@ class FilterPanel(QWidget):
         self._context_actions = []
         self.setStyleSheet("""
             FilterPanel QPushButton { padding: 3px 7px; min-height: 20px; }
-            FilterPanel QComboBox { padding: 3px 6px; min-height: 20px; }
-            QWidget#includeFilterBox { background: #28323f; border: 1px solid #617fa7; border-radius: 6px; }
-            QWidget#excludeFilterBox { background: #352f2b; border: 1px solid #a17d59; border-radius: 6px; }
+            FilterPanel QComboBox { padding: 3px 20px 3px 6px; min-height: 20px; }
+            QWidget#includeFilterBox { background: #282a2e; border: 1px solid #404247; border-radius: 6px; }
+            QWidget#excludeFilterBox { background: #282a2e; border: 1px solid #404247; border-radius: 6px; }
             QWidget#filterSectionHeader, QWidget#filterSectionContent { background: transparent; }
             QWidget#includeFilterBox QLabel, QWidget#excludeFilterBox QLabel { background: transparent; }
-            QWidget#filterCondition { background: #222a33; border: 1px solid #46515e; border-radius: 4px; }
+            QWidget#filterCondition { background: transparent; border: none; border-radius: 4px; }
             QWidget#filterCondition QPushButton { border: none; background: transparent; padding: 2px 3px; }
-            QWidget#filterCondition QPushButton:hover { background: #3c4b5e; }
+            QWidget#filterCondition QPushButton:hover { background: #35373c; }
             QPushButton#filterConditionName { text-align: left; }
         """)
         outer = QVBoxLayout(self)
@@ -324,7 +324,7 @@ class FilterPanel(QWidget):
         self.result_row.addWidget(self.clear_button)
         self.apply_button = QPushButton("应用筛选")
         self.apply_button.setObjectName("filterApplyButton")
-        self.apply_button.setStyleSheet("QPushButton { background: #386cce; color: white; padding: 3px 10px; } QPushButton:disabled { background: #414957; color: #a2a7af; }")
+        self.apply_button.setProperty("variant", "primary")
         self.apply_button.clicked.connect(self._apply_draft)
         self.result_row.addWidget(self.apply_button)
         outer.addLayout(self.result_row)
@@ -440,8 +440,8 @@ class FilterPanel(QWidget):
         title_label.setToolTip("从保留结果中移除命中的图片" if section == "exclude" else "留下命中条件的图片")
         header.addWidget(title_label)
         mode = QComboBox()
-        mode.addItem("全部（且）", "all")
-        mode.addItem("任一（或）", "any")
+        mode.addItem("全部满足", "all")
+        mode.addItem("任一满足", "any")
         mode.setCurrentIndex(mode.findData(group.match_mode))
         mode.setAccessibleName(f"{title}组匹配方式")
         mode.setToolTip("全部：同时满足本组所有条件。任一：满足其中一个就命中。不同组的命中图片会合并。")
@@ -453,10 +453,12 @@ class FilterPanel(QWidget):
         add.clicked.connect(lambda checked=False, s=section, i=index: self.edit_condition(s, i))
         header.addWidget(add)
         if index == 0:
-            add_group = QPushButton("＋ 组")
+            add_group = QPushButton("更多")
             add_group.setAccessibleName("新增" + title + "组")
             add_group.setToolTip("增加一组独立排除条件，各组分别排除" if section == "exclude" else "增加一组保留条件，合并各组命中结果")
-            add_group.clicked.connect(lambda checked=False, s=section: self.add_group(s))
+            menu = QMenu(add_group)
+            menu.addAction("再排除一批图片" if section == "exclude" else "或加一组条件", lambda s=section: self.add_group(s))
+            add_group.setMenu(menu)
             header.addWidget(add_group)
         remove = QPushButton("×")
         remove.setFixedWidth(22)

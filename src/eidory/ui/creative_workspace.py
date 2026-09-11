@@ -252,6 +252,8 @@ class CreativeWorkspace(QObject):
                     item.setText(0, other.title + suffix)
         self.refresh_project_references()
         self.refresh_reference()
+        if hasattr(w, "workspace_chrome"):
+            w.workspace_chrome.refresh()
 
     def refresh_project_references(self):
         """Membership survives result rebuilds, independently of search badges."""
@@ -295,6 +297,7 @@ class CreativeWorkspace(QObject):
         w.center_result_stack.setCurrentWidget(self.planning_scroll)
         w.right_tab_widget.setCurrentIndex(1)
         self.refresh()
+        w.statusBar().showMessage("构思 · " + self.context_label.text())
 
     def show_project_planning(self):
         self.w._set_ai_workflow_mode("project")

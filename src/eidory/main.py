@@ -27,7 +27,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     configure_qt_accessibility()
     app.setApplicationName("Eidory")
-    apply_dark_theme(app)
+    apply_dark_theme(app, density=store.get_setting("ui.density") or "compact")
     window = MainWindow(paths=paths, store=store)
     window.resize(
         _setting_int(store, "ui.window_width", 1320, 900, 2400),

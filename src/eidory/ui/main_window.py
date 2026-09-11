@@ -191,6 +191,7 @@ from eidory.ui.near_duplicate_dialog import NearDuplicateDecision, NearDuplicate
 from eidory.ui.project_board import ProjectBoardView
 from eidory.ui.filter_workflow import FilterWorkflow
 from eidory.ui.creative_workspace import CreativeWorkspace
+from eidory.ui.workspace_chrome import WorkspaceChrome
 
 
 LLM_SERVICE_OPTIONS = [
@@ -278,7 +279,7 @@ class EqualWidthTabBar(QTabBar):
 
     def tabSizeHint(self, index: int) -> QSize:
         size = super().tabSizeHint(index)
-        count = max(1, self.count())
+        count = max(1, sum(self.isTabVisible(i) for i in range(self.count())))
         parent_width = self.parentWidget().width() if self.parentWidget() is not None else 0
         available_width = max(self.width(), parent_width)
         if available_width > 0:
@@ -1738,6 +1739,7 @@ class MainWindow(QMainWindow):
         self._apply_runtime_language_settings()
         self._connect_signals()
         self.creative_workspace = CreativeWorkspace(self)
+        self.workspace_chrome = WorkspaceChrome(self)
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
         self._ensure_temporary_import_collection()
         self._refresh_folders()
@@ -2128,6 +2130,8 @@ class MainWindow(QMainWindow):
             self.root_splitter.setSizes([left, center, right])
         finally:
             self._enforcing_sidebar_widths = False
+        if hasattr(self, "workspace_chrome"):
+            self.workspace_chrome.sync_sidebars()
 
     def _build_sidebar(self) -> QWidget:
         panel = QWidget()
@@ -4583,6 +4587,8 @@ class MainWindow(QMainWindow):
         self._update_color_swatch()
         self._refresh_ai_vision_value_filter_combo()
         self._refresh_ai_character_vision_value_filter_combo()
+        if hasattr(self, "workspace_chrome"):
+            self.workspace_chrome.retranslate()
 
     def _choose_folder(self) -> None:
         collection_id = self._selected_collection_id()
@@ -16132,6 +16138,7 @@ class MainWindow(QMainWindow):
             return
         note_text, query_text = self._creative_node_editor_text_pair(node)
         query = query_text.strip() or node.search_query or node.title
+        previous_ids = set(self.store.creative_node_image_ids(node.id, include_descendants=False))
         changed = self.store.add_images_to_creative_node(
             node.id,
             [image.id for image in selected_images],
@@ -16156,6 +16163,8 @@ class MainWindow(QMainWindow):
         if changed:
             self._refresh_after_creative_node_images_changed(node)
         self._refresh_creative_selection_panel(selected_images)
+        if changed:
+            self.workspace_chrome.record_collection(node, [image.id for image in selected_images if image.id not in previous_ids])
         self.statusBar().showMessage(f"已存入 {changed} 张到节点“{node.title}”")
 
     def _refresh_after_creative_node_images_changed(self, node: CreativeNodeItem) -> None:
@@ -16512,6 +16521,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._reapply_board_window_pin)
             if is_board_view:
                 QTimer.singleShot(0, self.project_board_view.fit_all_images)
+            if hasattr(self, "workspace_chrome"):
+                self.workspace_chrome.refresh()
             return
         self._board_focus_mode = False
         for widget, was_visible in list(self._board_focus_widget_visibility.items()):
@@ -16529,6 +16540,8 @@ class MainWindow(QMainWindow):
         else:
             self.grid_view.setFocus(Qt.FocusReason.ShortcutFocusReason)
         QTimer.singleShot(0, self._reapply_board_window_pin)
+        if hasattr(self, "workspace_chrome"):
+            self.workspace_chrome.refresh()
 
     def _board_focus_chrome_widgets(self) -> list[QWidget]:
         widgets: list[QWidget] = [

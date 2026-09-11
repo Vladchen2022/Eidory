@@ -5,7 +5,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
-datas = collect_data_files("eidory", includes=["db/*.sql"])
+datas = collect_data_files("eidory", includes=["db/*.sql", "ui/icons/*.svg"])
 hiddenimports = []
 hiddenimports += collect_submodules("transformers.models.metaclip_2")
 helper_binaries = []

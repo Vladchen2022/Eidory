@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from eidory.core.ai_vision import ai_vision_label
 from eidory.models import ImageItem
@@ -18,6 +18,59 @@ class SearchFilter:
 
 
 @dataclass(frozen=True)
+class FilterGroup:
+    filters: tuple[SearchFilter, ...] = ()
+    match_mode: str = "all"
+
+    def __post_init__(self) -> None:
+        if self.match_mode not in {"all", "any"}:
+            raise ValueError("filter group mode must be all or any")
+
+
+@dataclass(frozen=True)
+class FilterPlan:
+    # Groups are OR-ed; conditions within a group use its explicit mode.
+    include: tuple[FilterGroup, ...] = ()
+    exclude: tuple[FilterGroup, ...] = ()
+
+    @property
+    def positive_filters(self) -> tuple[SearchFilter, ...]:
+        return tuple(f for group in self.include for f in group.filters)
+
+    @property
+    def negative_filters(self) -> tuple[SearchFilter, ...]:
+        return tuple(f for group in self.exclude for f in group.filters)
+
+    @property
+    def has_conditions(self) -> bool:
+        return bool(self.positive_filters or self.negative_filters)
+
+    def to_payload(self) -> dict[str, object]:
+        def groups(values):
+            return [{"match_mode": g.match_mode, "filters": [search_filter_to_payload(f) for f in g.filters]} for g in values]
+        return {"include": groups(self.include), "exclude": groups(self.exclude)}
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "FilterPlan":
+        if not isinstance(payload, dict):
+            raise ValueError("invalid filter plan")
+        def groups(key):
+            raw_groups = payload.get(key, [])
+            if not isinstance(raw_groups, list):
+                raise ValueError("invalid filter groups")
+            result = []
+            for raw in raw_groups:
+                if not isinstance(raw, dict) or not isinstance(raw.get("filters"), list):
+                    raise ValueError("invalid filter group")
+                filters = tuple(search_filter_from_payload(f) for f in raw["filters"])
+                if any(f is None for f in filters):
+                    raise ValueError("invalid filter condition")
+                result.append(FilterGroup(filters, str(raw.get("match_mode", "all"))))
+            return tuple(result)
+        return cls(groups("include"), groups("exclude"))
+
+
+@dataclass(frozen=True)
 class SearchChainResult:
     images: list[ImageItem]
     semantic_searchable_count: int = 0
@@ -27,6 +80,14 @@ class SearchChainResult:
     color_searchable_count: int = 0
     color_indexed_count: int = 0
     color_candidate_limit: int = 0
+    filters_applied: bool = False
+    excluded_image_ids: frozenset[int] = frozenset()
+    filter_matches: dict[SearchFilter, tuple[ImageItem, ...]] = field(default_factory=dict)
+    scope_count: int = 0
+    evaluated_plan: FilterPlan | None = None
+    # Full original scope in display rank order, before any strength cutoff.
+    # Keep it so loosening a slider can restore previously hidden pictures.
+    ranked_scope_images: tuple[ImageItem, ...] | None = None
 
 
 VALID_FILTER_KINDS = {
@@ -40,6 +101,7 @@ VALID_FILTER_KINDS = {
     "size",
     "ai_vision",
     "collection",
+    "status",
 }
 SCORED_FILTER_KINDS = {"semantic", "similar", "color"}
 
@@ -141,6 +203,8 @@ def filter_label(
         return f"文件夹：{search_filter.value}"
     if search_filter.kind == "file_type":
         return f"类型：{file_type_filter_label(str(search_filter.value))}"
+    if search_filter.kind == "status":
+        return "状态：" + {"favorite": "收藏", "unindexed": "未索引", "missing": "源文件丢失", "available": "文件可用"}.get(str(search_filter.value), str(search_filter.value))
     if search_filter.kind == "orientation":
         return f"方向：{orientation_filter_label(str(search_filter.value))}"
     if search_filter.kind == "size":

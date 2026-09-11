@@ -9,12 +9,19 @@ from eidory.ui.accessibility import disable_qt_accessibility, hide_macos_accessi
 
 
 class AccessibilityTest(unittest.TestCase):
-    def test_disable_qt_accessibility_forces_qt_widget_tree_off(self) -> None:
-        with patch.dict(os.environ, {"QT_ACCESSIBILITY": "1"}):
+    def test_accessibility_preserves_normal_controls(self) -> None:
+        with patch.dict(os.environ, {"QT_ACCESSIBILITY": "1", "QT_QPA_PLATFORM": "cocoa"}), patch("eidory.ui.accessibility._install_item_view_factory"), patch("PySide6.QtGui.QAccessible.setActive") as active:
             disable_qt_accessibility()
 
-            self.assertEqual(os.environ["QT_ACCESSIBILITY"], "0")
+            self.assertEqual(os.environ["QT_ACCESSIBILITY"], "1")
             self.assertIn("qt.accessibility.*=false", os.environ["QT_LOGGING_RULES"])
+            active.assert_called_once_with(True)
+
+    def test_headless_process_does_not_create_accessibility_cache(self) -> None:
+        with patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}), patch("PySide6.QtGui.QAccessible.setActive") as active:
+            disable_qt_accessibility()
+            self.assertEqual(os.environ["QT_ACCESSIBILITY"], "0")
+            active.assert_called_once_with(False)
 
     def test_hide_macos_accessibility_tree_ignores_non_macos(self) -> None:
         class Widget:

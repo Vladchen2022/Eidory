@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QGraphicsTextItem,
     QGraphicsView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMenu,
     QApplication,
@@ -1190,6 +1192,35 @@ class LocalDisplayEditorDialog(QDialog):
         self.accept()
 
 
+class BoardTextItem(QGraphicsTextItem):
+    def __init__(self, text, changed, *, heading=False):
+        super().__init__(text)
+        self.heading = bool(heading)
+        self.changed = changed
+        self.setTextWidth(360)
+        self.setDefaultTextColor(QColor("#f3dba4" if heading else "#e5ebf1"))
+        font = self.font()
+        font.setPointSize(22 if heading else 15)
+        font.setBold(heading)
+        self.setFont(font)
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setToolTip("拖动调整位置，双击编辑文字，选中后按 Delete 移除")
+        self.setZValue(5)
+
+    def itemChange(self, change, value):
+        result = super().itemChange(change, value)
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            self.changed()
+        return result
+
+    def mouseDoubleClickEvent(self, event):
+        text, ok = QInputDialog.getMultiLineText(None, "编辑看板文字", "内容", self.toPlainText())
+        if ok:
+            self.setPlainText(text)
+            self.changed()
+        event.accept()
+
+
 class ProjectBoardView(QGraphicsView):
     imageDoubleClicked = Signal(int)
     imagePreviewRequested = Signal(int)
@@ -1221,6 +1252,12 @@ class ProjectBoardView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setBackgroundBrush(QColor("#202830"))
         self._image_items: dict[int, QGraphicsItem] = {}
+        self._note_items: list[BoardTextItem] = []
+        self._undo_layouts = []
+        self._redo_layouts = []
+        self._last_layout = None
+        self._board_title = ""
+        self._board_badges = {}
         self._images_by_id: dict[int, ImageItem] = {}
         self._focus_quality_image_ids: set[int] = set()
         self._title_item: QGraphicsTextItem | None = None
@@ -1263,6 +1300,8 @@ class ProjectBoardView(QGraphicsView):
             int(image_id): [str(badge) for badge in badges]
             for image_id, badges in (badges_by_image_id or {}).items()
         }
+        self._board_title = title
+        self._board_badges = normalized_badges
         self.setUpdatesEnabled(False)
         previous_scene_signal_state = self._scene.blockSignals(True)
         previous_selected_ids = list(self._selected_image_ids_cache)
@@ -1270,6 +1309,7 @@ class ProjectBoardView(QGraphicsView):
         try:
             self._scene.clear()
             self._image_items.clear()
+            self._note_items.clear()
             self._images_by_id = {int(image.id): image for image in images}
             self._focus_quality_image_ids.clear()
             self._selected_image_ids_cache = []
@@ -1367,7 +1407,11 @@ class ProjectBoardView(QGraphicsView):
                 row_height = max(row_height, item_height)
                 default_x += item_width + DEFAULT_LAYOUT_GAP_X
 
-            if not images:
+            if isinstance(layout_payload, dict):
+                for raw_note in layout_payload.get("notes", []):
+                    if isinstance(raw_note, dict):
+                        self._add_text(str(raw_note.get("text", "")), _safe_float(raw_note.get("x"), 80), _safe_float(raw_note.get("y"), 80), heading=raw_note.get("heading", False))
+            if not images and not self._note_items:
                 text = self._scene.addText("当前节点没有保存图片")
                 text.setDefaultTextColor(QColor("#d8dee9"))
                 text.setPos(80, 110)
@@ -1375,6 +1419,10 @@ class ProjectBoardView(QGraphicsView):
             self.setUpdatesEnabled(True)
             self._scene.blockSignals(previous_scene_signal_state)
             self._finish_layout_reset()
+
+        self._undo_layouts.clear()
+        self._redo_layouts.clear()
+        self._last_layout = self._capture_layout_payload()
 
         if previous_selected_ids:
             self.selectionChanged.emit([])
@@ -1384,7 +1432,7 @@ class ProjectBoardView(QGraphicsView):
     def fit_all_images(self) -> None:
         self._view_mode = "fit_all"
         self._last_fit_selection_ids = ()
-        self._fit_items_to_view(self._visible_image_items(), margin=80.0)
+        self._fit_items_to_view(self._visible_image_items() + list(self._note_items), margin=80.0)
 
     def hide_selected_items(self) -> int:
         items = self._selected_image_items()
@@ -1460,6 +1508,9 @@ class ProjectBoardView(QGraphicsView):
 
     def layout_payload(self) -> dict[str, Any]:
         self.flush_pending_layout_change()
+        return self._capture_layout_payload()
+
+    def _capture_layout_payload(self) -> dict[str, Any]:
         items: dict[str, dict[str, Any]] = {}
         for image_id, item in self._image_items.items():
             if isinstance(item, BoardImageItem):
@@ -1487,7 +1538,99 @@ class ProjectBoardView(QGraphicsView):
                 local_display = item.local_display_payload()
                 if local_display is not None:
                     items[str(image_id)]["local_display"] = local_display
-        return {"version": 1, "items": items}
+        notes = [{"text": item.toPlainText(), "x": item.x(), "y": item.y(), "heading": item.heading} for item in self._note_items]
+        return {"version": 1, "items": items, "notes": notes}
+
+    def _add_text(self, text, x, y, *, heading=False):
+        item = BoardTextItem(text, self._schedule_layout_changed, heading=heading)
+        self._scene.addItem(item)
+        self._note_items.append(item)
+        item.setPos(x, y)
+        return item
+
+    def add_note(self, *, heading=False):
+        text, ok = QInputDialog.getMultiLineText(self, "添加区域标题" if heading else "添加看板便签", "内容")
+        if not ok or not text.strip():
+            return
+        existing = self._visible_image_items() + list(self._note_items)
+        bounds = self._items_rect(existing) if existing else QRectF(DEFAULT_LAYOUT_LEFT, DEFAULT_LAYOUT_TOP, 0, 0)
+        self._add_text(text.strip(), bounds.left(), bounds.bottom() + 40, heading=heading)
+        self._schedule_layout_changed()
+        self.flush_pending_layout_change()
+        self.fit_all_images()
+
+    def arrange_by_labels(self):
+        self.flush_pending_layout_change()
+        self._suppress_layout_changed = True
+        y = DEFAULT_LAYOUT_TOP
+        groups = {}
+        for image_id in self._image_items:
+            labels = self._board_badges.get(image_id, [])
+            groups.setdefault(labels[0] if labels else "参考图", []).append(image_id)
+        # Replace generated headings while keeping the user's free notes.
+        for item in list(self._note_items):
+            if item.heading:
+                self._scene.removeItem(item)
+                self._note_items.remove(item)
+        for label, image_ids in groups.items():
+            self._add_text(label, DEFAULT_LAYOUT_LEFT, y, heading=True)
+            y += 70
+            x, row_height = DEFAULT_LAYOUT_LEFT, 0
+            for image_id in image_ids:
+                item = self._image_items[image_id]
+                if x > DEFAULT_LAYOUT_LEFT and x + item.display_width > DEFAULT_LAYOUT_ROW_WIDTH:
+                    x = DEFAULT_LAYOUT_LEFT
+                    y += row_height + DEFAULT_LAYOUT_GAP_Y
+                    row_height = 0
+                item.setPos(x, y)
+                x += item.display_width + DEFAULT_LAYOUT_GAP_X
+                row_height = max(row_height, item.display_height)
+            y += row_height + 100
+        self._suppress_layout_changed = False
+        self._schedule_layout_changed()
+        self.flush_pending_layout_change()
+        self.fit_all_images()
+
+    def undo_layout(self):
+        self.flush_pending_layout_change()
+        if not self._undo_layouts:
+            return False
+        previous = self._undo_layouts.pop()
+        self._redo_layouts.append(self._capture_layout_payload())
+        self._restore_layout(previous)
+        return True
+
+    def redo_layout(self):
+        self.flush_pending_layout_change()
+        if not self._redo_layouts:
+            return False
+        following = self._redo_layouts.pop()
+        self._undo_layouts.append(self._capture_layout_payload())
+        self._restore_layout(following)
+        return True
+
+    def _restore_layout(self, payload):
+        undo, redo = list(self._undo_layouts), list(self._redo_layouts)
+        transform = self.transform()
+        center = self.mapToScene(self.viewport().rect().center())
+        self.set_images(list(self._images_by_id.values()), title=self._board_title, layout_payload=payload, badges_by_image_id=self._board_badges)
+        self._undo_layouts, self._redo_layouts = undo, redo
+        self.setTransform(transform)
+        self.centerOn(center)
+        self._view_mode = "manual"
+        self.layoutChanged.emit()
+
+    def render_to_png(self, path):
+        bounds = self._scene.itemsBoundingRect().adjusted(-30, -30, 30, 30)
+        scale = min(1.0, 2400 / max(bounds.width(), bounds.height(), 1))
+        image = QImage(max(1, int(bounds.width()*scale)), max(1, int(bounds.height()*scale)), QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QColor("#202830"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self._scene.render(painter, QRectF(0, 0, image.width(), image.height()), bounds)
+        painter.end()
+        if not image.save(str(path), "PNG"):
+            raise OSError("无法保存看板图片")
 
     def fit_visible_images(self) -> None:
         selected_items = self._selected_image_items()
@@ -1539,13 +1682,27 @@ class ProjectBoardView(QGraphicsView):
 
     def keyPressEvent(self, event) -> None:
         undo_modifier = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
+        if event.matches(QKeySequence.StandardKey.Redo):
+            self.redo_layout()
+            event.accept()
+            return
         if event.matches(QKeySequence.StandardKey.Undo) or (
             event.key() == Qt.Key.Key_Z and bool(event.modifiers() & undo_modifier)
         ):
-            self.undoRemovalRequested.emit()
+            if not self.undo_layout():
+                self.undoRemovalRequested.emit()
             event.accept()
             return
         if event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}:
+            selected_notes = [item for item in self._note_items if item.isSelected()]
+            if selected_notes:
+                for item in selected_notes:
+                    self._scene.removeItem(item)
+                    self._note_items.remove(item)
+                self._schedule_layout_changed()
+                self.flush_pending_layout_change()
+                event.accept()
+                return
             image_ids = self.selected_image_ids()
             if image_ids:
                 self.removeImagesRequested.emit(image_ids)
@@ -1834,6 +1991,9 @@ class ProjectBoardView(QGraphicsView):
             y += GRID_SIZE
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if isinstance(self.itemAt(event.position().toPoint()), BoardTextItem):
+            super().mouseDoubleClickEvent(event)
+            return
         image_id = self._image_id_at(event.position().toPoint())
         if image_id is not None:
             self._select_image_id(image_id)
@@ -1845,7 +2005,14 @@ class ProjectBoardView(QGraphicsView):
     def contextMenuEvent(self, event) -> None:
         image_id = self._image_id_at(event.pos())
         if image_id is None:
-            super().contextMenuEvent(event)
+            menu = QMenu(self)
+            menu.addAction("添加区域标题…", lambda: self.add_note(heading=True))
+            menu.addAction("添加便签…", self.add_note)
+            menu.addAction("按节点 / 标签分区排列", self.arrange_by_labels)
+            menu.addSeparator()
+            menu.addAction("撤销看板编辑", self.undo_layout)
+            menu.addAction("重做看板编辑", self.redo_layout)
+            menu.exec(event.globalPos())
             return
         if image_id not in self.selected_image_ids():
             self._select_image_id(image_id)
@@ -1917,7 +2084,7 @@ class ProjectBoardView(QGraphicsView):
                 self._fit_items_to_view(selected_items, margin=10.0)
                 return
         if self._view_mode == "fit_all":
-            self._fit_items_to_view(self._visible_image_items(), margin=80.0)
+            self._fit_items_to_view(self._visible_image_items() + list(self._note_items), margin=80.0)
 
     def _schedule_refit_current_view_mode(self) -> None:
         if self._refit_timer_pending:
@@ -1935,7 +2102,7 @@ class ProjectBoardView(QGraphicsView):
         self._layout_change_timer.stop()
 
     def _schedule_layout_changed(self) -> None:
-        if self._suppress_layout_changed or not self._image_items:
+        if self._suppress_layout_changed:
             return
         if self._item_drag_layout_batch_active:
             self._item_drag_layout_pending = True
@@ -1957,8 +2124,14 @@ class ProjectBoardView(QGraphicsView):
         if not self._layout_change_pending:
             return
         self._layout_change_pending = False
-        if self._suppress_layout_changed or not self._image_items:
+        if self._suppress_layout_changed:
             return
+        payload = self._capture_layout_payload()
+        if self._last_layout is not None and payload != self._last_layout:
+            self._undo_layouts.append(deepcopy(self._last_layout))
+            self._undo_layouts = self._undo_layouts[-40:]
+            self._redo_layouts.clear()
+        self._last_layout = payload
         self.layoutChanged.emit()
 
     def _begin_item_drag_layout_batch(self) -> None:

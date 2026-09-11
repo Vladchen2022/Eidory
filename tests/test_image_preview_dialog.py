@@ -1097,6 +1097,9 @@ class ImagePreviewDialogTest(unittest.TestCase):
             Qt.MouseButton.LeftButton,
             Qt.KeyboardModifier.NoModifier,
         )
+        # Deliver each event before constructing the next one: Qt 6.9 shares
+        # the pointing device's global-position state between synthetic events.
+        overlay.mousePressEvent(press)
         move = QMouseEvent(
             QEvent.Type.MouseMove,
             QPointF(278, 208),
@@ -1105,6 +1108,7 @@ class ImagePreviewDialogTest(unittest.TestCase):
             Qt.MouseButton.LeftButton,
             Qt.KeyboardModifier.NoModifier,
         )
+        overlay.mouseMoveEvent(move)
         release = QMouseEvent(
             QEvent.Type.MouseButtonRelease,
             QPointF(278, 208),
@@ -1114,8 +1118,6 @@ class ImagePreviewDialogTest(unittest.TestCase):
             Qt.KeyboardModifier.NoModifier,
         )
 
-        overlay.mousePressEvent(press)
-        overlay.mouseMoveEvent(move)
         overlay.mouseReleaseEvent(release)
 
         self.assertGreaterEqual(overlay.width(), 280)

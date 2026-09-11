@@ -5377,6 +5377,8 @@ class MetadataStore:
         self,
         project_id: int,
         image_ids: Sequence[int] | None = None,
+        *,
+        use_node_titles: bool = False,
     ) -> dict[int, list[str]]:
         filtered_image_ids: list[int] = []
         if image_ids is not None:
@@ -5395,10 +5397,11 @@ class MetadataStore:
             placeholders = ",".join("?" for _ in filtered_image_ids)
             image_filter_sql = f" AND cni.image_id IN ({placeholders})"
             params.extend(filtered_image_ids)
+        badge_sql = "n.title" if use_node_titles else "COALESCE(NULLIF(TRIM(cni.intent_label), ''), n.title)"
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT cni.image_id, COALESCE(NULLIF(TRIM(cni.intent_label), ''), n.title) AS badge
+                SELECT cni.image_id, {badge_sql} AS badge
                 FROM creative_node_images cni
                 JOIN creative_nodes n ON n.id = cni.node_id
                 WHERE n.project_id = ?

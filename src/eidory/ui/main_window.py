@@ -160,6 +160,8 @@ from eidory.core.metadata_store import MetadataStore
 from eidory.core.reference_grouping import ReferenceGroup, cluster_reference_vectors
 from eidory.core.scanner import ImageScanner, ScanResult
 from eidory.core.search_filters import (
+    FilterGroup,
+    FilterPlan,
     SCORED_FILTER_KINDS,
     SearchChainResult,
     SearchFilter,
@@ -175,18 +177,20 @@ from eidory.core.search_filters import (
     size_filter_label,
 )
 from eidory.core.search_service import SearchService
+from eidory.core.filter_engine import FilterEngine, matching_group_ids, threshold_matches
 from eidory.core.thumbnailer import Thumbnailer
 from eidory.core.vector_index import VectorIndex
 from eidory.models import CreativeNodeItem, ImageItem
 from eidory.ui.accessibility import (
-    disable_qt_accessibility,
-    hide_macos_accessibility_tree,
+    configure_qt_accessibility,
 )
 from eidory.ui.collection_tree import CollectionTreeWidget
 from eidory.ui.image_preview_dialog import ImagePreviewDialog
 from eidory.ui.justified_image_grid import JustifiedImageGridView
 from eidory.ui.near_duplicate_dialog import NearDuplicateDecision, NearDuplicateDialog
 from eidory.ui.project_board import ProjectBoardView
+from eidory.ui.filter_workflow import FilterWorkflow
+from eidory.ui.creative_workspace import CreativeWorkspace
 
 
 LLM_SERVICE_OPTIONS = [
@@ -1440,11 +1444,17 @@ class MainWindow(QMainWindow):
 
     def __init__(self, *, paths: AppPaths, store: MetadataStore):
         super().__init__()
-        disable_qt_accessibility()
+        configure_qt_accessibility()
         self.paths = paths
         self.store = store
         self.initial_thumbnail_size = self._setting_int("ui.thumbnail_size", 180, 96, 320)
         self.initial_score_threshold = self._setting_int("ui.score_threshold", 0, 0, 100)
+        self.initial_creative_node_imagination = self._setting_int(
+            "ui.creative_node_imagination",
+            50,
+            0,
+            100,
+        )
         self.initial_status_filter = self._setting_choice(
             "ui.status_filter",
             "all",
@@ -1639,7 +1649,6 @@ class MainWindow(QMainWindow):
         self.operation_history_messages: list[str] = []
         self._last_removal_undo: dict[str, object] | None = None
         self._macos_titlebar_applied = False
-        self._macos_accessibility_guard_applied = False
         self._database_maintenance_active = False
         self._preview_dialogs: set[ImagePreviewDialog] = set()
         self._creative_all_nodes_in_progress = False
@@ -1713,15 +1722,22 @@ class MainWindow(QMainWindow):
         self.score_threshold_update_timer.timeout.connect(self._apply_pending_score_threshold_update)
         self._pending_score_threshold_value: int | None = None
         self._pending_score_threshold_recompute = False
+        self.creative_node_imagination_setting_timer = QTimer(self)
+        self.creative_node_imagination_setting_timer.setSingleShot(True)
+        self.creative_node_imagination_setting_timer.setInterval(300)
+        self.creative_node_imagination_setting_timer.timeout.connect(
+            self._persist_creative_node_imagination
+        )
 
         self.setWindowTitle("Eidory")
         self._configure_native_titlebar()
         self.setStatusBar(QStatusBar())
         self._build_ui()
         self._configure_accessibility_labels()
-        disable_qt_accessibility(self._record_error)
+        configure_qt_accessibility(self._record_error)
         self._apply_runtime_language_settings()
         self._connect_signals()
+        self.creative_workspace = CreativeWorkspace(self)
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
         self._ensure_temporary_import_collection()
         self._refresh_folders()
@@ -1753,10 +1769,10 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._apply_macos_titlebar()
-        self._apply_macos_accessibility_guard()
 
     def _configure_native_titlebar(self) -> None:
-        if sys.platform != "darwin":
+        app = QApplication.instance()
+        if sys.platform != "darwin" or app is None or app.platformName().lower() != "cocoa":
             return
         self.setWindowFlag(Qt.WindowType.NoTitleBarBackgroundHint, True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -1764,18 +1780,6 @@ class MainWindow(QMainWindow):
             self.setUnifiedTitleAndToolBarOnMac(True)
         QTimer.singleShot(0, self._apply_macos_titlebar)
         QTimer.singleShot(250, self._apply_macos_titlebar)
-        QTimer.singleShot(0, self._apply_macos_accessibility_guard)
-        QTimer.singleShot(250, self._apply_macos_accessibility_guard)
-        QTimer.singleShot(1000, self._apply_macos_accessibility_guard)
-
-    def _apply_macos_accessibility_guard(self) -> None:
-        if self._macos_accessibility_guard_applied or sys.platform != "darwin":
-            return
-        app = QApplication.instance()
-        if app is None or app.platformName().lower() != "cocoa":
-            return
-        if hide_macos_accessibility_tree(self, self._record_error):
-            self._macos_accessibility_guard_applied = True
 
     def _apply_macos_titlebar(self) -> None:
         if self._macos_titlebar_applied or sys.platform != "darwin":
@@ -1876,6 +1880,10 @@ class MainWindow(QMainWindow):
         return True
 
     def closeEvent(self, event) -> None:
+        if hasattr(self, "filter_workflow"):
+            self.filter_workflow.cancel_strength()
+        if hasattr(self, "poll_timer"):
+            self.poll_timer.stop()
         for dialog in list(getattr(self, "_preview_dialogs", ())):
             dialog.close()
         if hasattr(self, "selection_detail_timer"):
@@ -1890,6 +1898,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, "score_threshold_update_timer"):
             self.score_threshold_update_timer.stop()
             self._pending_score_threshold_value = None
+        if (
+            hasattr(self, "creative_node_imagination_setting_timer")
+            and self.creative_node_imagination_setting_timer.isActive()
+        ):
+            self.creative_node_imagination_setting_timer.stop()
+            self._persist_creative_node_imagination()
+        self.creative_workspace.save_context()
+        self.creative_workspace.save_search()
         self._save_pending_note()
         self._detail_preview_pending_token = None
         self._save_current_board_layout_if_needed()
@@ -2551,6 +2567,7 @@ class MainWindow(QMainWindow):
         self.result_state_label.setWordWrap(False)
         self.result_state_label.setFixedHeight(20)
         self.result_state_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.result_state_label.hide()  # Counts are shown once in the rule panel.
         self.search_diagnostics_label = QLabel("搜索诊断：-")
         self.search_diagnostics_label.setWordWrap(False)
         self.search_diagnostics_label.setFixedHeight(20)
@@ -2673,11 +2690,24 @@ class MainWindow(QMainWindow):
         compact_status_row.addWidget(self.result_state_label, 1)
         compact_status_row.addWidget(self.search_diagnostics_label)
 
-        layout.addLayout(search_row)
-        layout.addLayout(mode_filter_row)
-        layout.addWidget(self.advanced_search_widget)
-        layout.addWidget(self.filter_chain_widget)
-        layout.addLayout(threshold_row)
+        # Retain the old control adapters for project/preview shortcuts while
+        # presenting one staged, grouped rule editor in the gallery.
+        self.legacy_search_controls = QWidget(panel)
+        legacy_layout = QVBoxLayout(self.legacy_search_controls)
+        legacy_layout.addLayout(search_row)
+        legacy_layout.addLayout(mode_filter_row)
+        legacy_layout.addLayout(search_operation_row)
+        legacy_layout.addWidget(self.advanced_search_widget)
+        legacy_layout.addWidget(self.filter_chain_widget)
+        legacy_layout.addLayout(threshold_row)
+        self.legacy_search_controls.hide()
+        self.filter_workflow = FilterWorkflow(self)
+        self.filter_panel = self.filter_workflow.panel
+        self.filter_panel.scope_row.addWidget(self.saved_view_combo)
+        self.filter_panel.scope_row.addWidget(QLabel("排序"))
+        self.filter_panel.scope_row.addWidget(self.sort_combo)
+        self.filter_panel.scope_row.addWidget(self.sort_order_combo)
+        layout.addWidget(self.filter_panel)
         layout.addLayout(compact_status_row)
         layout.addWidget(self.center_result_stack, 1)
         layout.addLayout(thumbnail_size_row)
@@ -2899,6 +2929,23 @@ class MainWindow(QMainWindow):
         self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
         self.inspiration_answers_input.setAcceptRichText(False)
         self.inspiration_answers_input.setFixedHeight(60)
+        self.creative_node_imagination_title_label = QLabel("节点补全联想")
+        self.creative_node_imagination_value_label = QLabel(
+            self._format_creative_node_imagination(self.initial_creative_node_imagination)
+        )
+        self.creative_node_imagination_value_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.creative_node_imagination_strict_label = QLabel("严谨")
+        self.creative_node_imagination_divergent_label = QLabel("发散")
+        self.creative_node_imagination_slider = QSlider(Qt.Orientation.Horizontal)
+        self.creative_node_imagination_slider.setRange(0, 100)
+        self.creative_node_imagination_slider.setSingleStep(5)
+        self.creative_node_imagination_slider.setPageStep(10)
+        self.creative_node_imagination_slider.setTickInterval(25)
+        self.creative_node_imagination_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.creative_node_imagination_slider.setValue(self.initial_creative_node_imagination)
+        self.creative_node_imagination_slider.setToolTip(
+            "控制节点补全从严谨推断到发散联想；用户已有内容始终是不可违背的约束"
+        )
         self.inspiration_questions_label = QLabel("AI 追问：-")
         self.inspiration_questions_label.setWordWrap(True)
         self.inspiration_history_list = QListWidget()
@@ -3066,6 +3113,17 @@ class MainWindow(QMainWindow):
         inspiration_layout.addWidget(self.inspiration_brief_input)
         inspiration_layout.addWidget(QLabel("补充信息"))
         inspiration_layout.addWidget(self.inspiration_answers_input)
+        imagination_header = QHBoxLayout()
+        imagination_header.setContentsMargins(0, 0, 0, 0)
+        imagination_header.addWidget(self.creative_node_imagination_title_label)
+        imagination_header.addStretch(1)
+        imagination_header.addWidget(self.creative_node_imagination_value_label)
+        imagination_row = QHBoxLayout()
+        imagination_row.setContentsMargins(0, 0, 0, 0)
+        imagination_row.setSpacing(7)
+        imagination_row.addWidget(self.creative_node_imagination_strict_label)
+        imagination_row.addWidget(self.creative_node_imagination_slider, 1)
+        imagination_row.addWidget(self.creative_node_imagination_divergent_label)
         ai_mode_row = QHBoxLayout()
         ai_mode_row.setContentsMargins(0, 0, 0, 0)
         ai_mode_row.setSpacing(0)
@@ -3101,6 +3159,9 @@ class MainWindow(QMainWindow):
         node_tab_layout.addWidget(QLabel("当前节点说明"))
         node_tab_layout.addWidget(self.creative_node_note_input)
         node_tab_layout.addWidget(self.creative_node_query_input)
+        node_tab_layout.addSpacing(2)
+        node_tab_layout.addLayout(imagination_header)
+        node_tab_layout.addLayout(imagination_row)
         creative_node_button_row = QHBoxLayout()
         creative_node_button_row.setContentsMargins(0, 0, 0, 0)
         creative_node_button_row.addWidget(self.generate_creative_children_button)
@@ -3545,6 +3606,9 @@ class MainWindow(QMainWindow):
         self.tag_panel_remove_button.clicked.connect(self._tag_panel_remove_selected_tag)
         self.tag_panel_clear_button.clicked.connect(self._tag_panel_clear_tags)
         self.ai_workflow_mode_group.idClicked.connect(self._on_ai_workflow_mode_clicked)
+        self.creative_node_imagination_slider.valueChanged.connect(
+            self._update_creative_node_imagination
+        )
         self.generate_inspiration_button.clicked.connect(self._generate_inspiration_terms_from_panel)
         self.save_creative_node_button.clicked.connect(self._save_current_creative_node_details)
         self.generate_creative_children_button.clicked.connect(self._generate_creative_children_for_selected_node)
@@ -3595,7 +3659,7 @@ class MainWindow(QMainWindow):
         self.remove_selected_index_button.clicked.connect(self._batch_remove_from_library)
         self.export_library_button.clicked.connect(self._export_library)
         self.export_selection_button.clicked.connect(self._export_selected_images)
-        self.folder_tree.itemSelectionChanged.connect(self._refresh_current_results_for_filters)
+        self.folder_tree.itemSelectionChanged.connect(self._on_folder_selection_changed)
         self.collection_tree.itemSelectionChanged.connect(self._on_collection_selection_changed)
         self.collection_tree.treeReordered.connect(self._save_collection_tree_order)
         self.collection_tree.imagesDropped.connect(self._assign_dropped_images_to_collection)
@@ -4034,6 +4098,8 @@ class MainWindow(QMainWindow):
                     widget.setEnabled(enabled)
 
     def _run_startup_self_check(self) -> None:
+        if self._database_maintenance_active:
+            return
         if not hasattr(self, "settings_status_label"):
             return
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
@@ -4167,6 +4233,8 @@ class MainWindow(QMainWindow):
             (self.search_merge_results_button, "Merge results", "Union a new search with current results"),
             (self.result_state_label, "Result status", "Unified library and search result status"),
             (self.grid_view, "Image wall", "Selectable image and video result grid"),
+            (self.inspiration_history_list, "灵感探索历史", "选择并恢复此前生成的灵感方向"),
+            (self.inspiration_term_list, "灵感方向列表", "使用空格勾选或取消当前灵感方向"),
             (self.collection_tree, "Library folders", "Nested Eidory folder tree"),
             (self.temp_project_list, "Project list", "Saved temporary reference groups and creative projects"),
             (self.right_tab_widget, "Right side panel", "Details, AI, tag, index and settings pages"),
@@ -4235,19 +4303,30 @@ class MainWindow(QMainWindow):
             self.creative_selection_remove_button.setText("Remove from Node")
             self.inspiration_brief_input.setPlaceholderText("Describe the image concept in one sentence")
             self.inspiration_answers_input.setPlaceholderText("Extra context: era, weather, lighting, mood, optional")
+            self.creative_node_imagination_title_label.setText("Node Completion Style")
+            self.creative_node_imagination_strict_label.setText("Strict")
+            self.creative_node_imagination_divergent_label.setText("Divergent")
+            self.creative_node_imagination_slider.setToolTip(
+                "Controls grounded versus divergent node completion; existing user content always remains a hard constraint"
+            )
+            self.creative_node_imagination_value_label.setText(
+                self._format_creative_node_imagination(
+                    self.creative_node_imagination_slider.value()
+                )
+            )
             self.inspiration_questions_label.setText("AI questions: -")
             self.inspiration_status_label.setText("Select up to 7 semantic probes.")
             self.use_ai_scene_tags_checkbox.setText("Generate AI scene tags with probes")
             self.ai_project_mode_button.setText("Project Nodes")
             self.ai_probe_mode_button.setText("Semantic Probes")
             self.creative_template_label.setText("New Project Template")
-            self.creative_new_project_button.setText("Create from Current Brief")
-            self.creative_ai_project_button.setText("AI Generate Project")
+            self.creative_new_project_button.setText("Create Project from This Topic")
+            self.creative_ai_project_button.setText("Give Me a New Creative Topic")
             self.creative_add_child_button.setText("New Child")
             self.creative_delete_node_button.setText("Delete Node")
             self.save_creative_node_button.setText("Save Node")
             self.generate_creative_children_button.setText("Complete Current Node")
-            self.generate_all_creative_nodes_button.setText("Complete All Nodes")
+            self.generate_all_creative_nodes_button.setText("Suggest for Unlocked Nodes")
             self.open_creative_copy_button.setText("Copy")
             self.back_creative_nodes_button.setText("Back to Nodes")
             self.generate_creative_copy_button.setText("Generate Copy")
@@ -4387,19 +4466,30 @@ class MainWindow(QMainWindow):
             self.creative_selection_remove_button.setText("移出当前节点")
             self.inspiration_brief_input.setPlaceholderText("用一句话描述画面的创作主题")
             self.inspiration_answers_input.setPlaceholderText("补充信息：时代、天气、光源、画面气质等，可留空")
+            self.creative_node_imagination_title_label.setText("节点补全联想")
+            self.creative_node_imagination_strict_label.setText("严谨")
+            self.creative_node_imagination_divergent_label.setText("发散")
+            self.creative_node_imagination_slider.setToolTip(
+                "控制节点补全从严谨推断到发散联想；用户已有内容始终是不可违背的约束"
+            )
+            self.creative_node_imagination_value_label.setText(
+                self._format_creative_node_imagination(
+                    self.creative_node_imagination_slider.value()
+                )
+            )
             self.inspiration_questions_label.setText("AI 追问：-")
             self.inspiration_status_label.setText("生成后最多选择 7 个语义探针。")
             self.use_ai_scene_tags_checkbox.setText("生成探针时同时生成 AI 场景标签")
             self.ai_project_mode_button.setText("创作节点")
             self.ai_probe_mode_button.setText("语义探针")
             self.creative_template_label.setText("新建项目模板")
-            self.creative_new_project_button.setText("按当前内容新建项目")
-            self.creative_ai_project_button.setText("AI 生成完整项目")
+            self.creative_new_project_button.setText("按此主题新建项目")
+            self.creative_ai_project_button.setText("给我一个新创作题目")
             self.creative_add_child_button.setText("新建子节点")
             self.creative_delete_node_button.setText("删除节点")
             self.save_creative_node_button.setText("保存节点")
             self.generate_creative_children_button.setText("当前节点信息补全")
-            self.generate_all_creative_nodes_button.setText("补全所有节点信息")
+            self.generate_all_creative_nodes_button.setText("补全未锁定、无待采纳建议的节点")
             self.open_creative_copy_button.setText("文案")
             self.back_creative_nodes_button.setText("返回节点树")
             self.generate_creative_copy_button.setText("生成文案")
@@ -4811,6 +4901,8 @@ class MainWindow(QMainWindow):
     def _set_ai_workflow_mode(self, mode: str) -> None:
         if not hasattr(self, "ai_workflow_stack"):
             return
+        if hasattr(self, "creative_workspace"):
+            self.creative_workspace.switch_ai_mode(mode)
         is_probe = mode == "probe"
         self.ai_project_mode_button.blockSignals(True)
         self.ai_probe_mode_button.blockSignals(True)
@@ -5913,6 +6005,8 @@ class MainWindow(QMainWindow):
         if not selected_terms:
             self.statusBar().showMessage("没有可搜索的语义探针")
             return
+        self.creative_workspace.save_search()
+        self._show_gallery_view()
         self.semantic_search_revision += 1
         self._clear_manual_result_order()
         self._clear_result_management_state()
@@ -6313,27 +6407,12 @@ class MainWindow(QMainWindow):
             self.search_replace_results_button.setChecked(True)
 
     def _start_search_with_filter(self, search_filter: SearchFilter) -> None:
-        operation_context = self._capture_search_operation_context()
-        operation_mode = self._search_operation_mode_for_new_filter(search_filter)
-        if operation_mode is None:
-            return
-        self._set_search_operation_mode(operation_mode)
-        if operation_mode in {"merge", "replace"}:
-            self.search_filters.clear()
-            self.active_filter_index = None
-        self._add_search_filter(
-            search_filter,
-            replace_same_kind=operation_mode == "replace",
-        )
-        self._execute_search_chain(
-            operation_mode=operation_mode,
-            operation_context=operation_context,
-        )
+        self.filter_workflow.append(search_filter)
+
 
     def _search_operation_mode_for_new_filter(self, search_filter: SearchFilter) -> str | None:
-        if not self._should_prompt_search_operation(search_filter):
-            return self._selected_search_operation_mode()
-        return self._prompt_search_operation_choice(search_filter)
+        # Direct search shortcuts refine; the panel exposes grouping explicitly.
+        return "refine" if self._has_visible_result_context() else "replace"
 
     def _should_prompt_search_operation(self, search_filter: SearchFilter) -> bool:
         if not self._has_visible_result_context():
@@ -6414,36 +6493,8 @@ class MainWindow(QMainWindow):
         return None
 
     def _start_reverse_exclusion_with_filter(self, search_filter: SearchFilter) -> None:
-        if search_filter.kind not in {"keyword", "semantic", "color", "tag"}:
-            self.statusBar().showMessage("反向排除暂只支持颜色、关键词、语义和标签")
-            return
-        if not self._has_visible_result_context():
-            self.statusBar().showMessage("先做一次正向筛选，再使用反向排除")
-            return
-        source_images = self._result_exclusion_source_images()
-        if not source_images:
-            self.statusBar().showMessage("当前结果为空，不能反向排除")
-            return
-        source_ids = {image.id for image in source_images}
-        self.semantic_search_revision += 1
-        revision = self.semantic_search_revision
-        self.search_button.setEnabled(False)
-        self._set_result_status(f"反向排除计算中：{self._filter_label(search_filter)}")
+        self.filter_workflow.append(search_filter, exclude=True)
 
-        def run() -> None:
-            try:
-                matches = self._compute_result_exclusion_filter_matches(
-                    search_filter,
-                    source_ids,
-                )
-                self.events.put(("result_exclusion_filter_done", (revision, search_filter, matches)))
-            except Exception as exc:
-                self.events.put(("error", f"反向排除失败：{exc}"))
-
-        self._start_background_task(
-            run,
-            on_rejected=lambda: self.search_button.setEnabled(True),
-        )
 
     def _add_search_filter(
         self,
@@ -6577,28 +6628,33 @@ class MainWindow(QMainWindow):
         return []
 
     def _result_exclusion_filter_image_ids(self) -> set[int]:
-        excluded: set[int] = set()
-        for search_filter in self.result_exclusion_filters:
-            matches = self.result_exclusion_filter_matches.get(search_filter, [])
-            threshold: float | None = None
-            if search_filter.kind == "semantic":
-                threshold = self._semantic_score_threshold(matches)
-            elif search_filter.kind == "color":
-                threshold = self._color_score_threshold(matches)
-            for image in matches:
-                if threshold is not None and (
-                    image.score is None or image.score < threshold
-                ):
-                    continue
-                excluded.add(image.id)
-        return excluded
+        plan = self.filter_workflow.plan()
+        if self.current_chain_result.evaluated_plan == plan or (
+            self.current_chain_result.filters_applied
+            and (not self.search_button.isEnabled() or self.filter_panel.error)
+        ):
+            return set(self.current_chain_result.excluded_image_ids)
+        matches = {
+            condition: {image.id for image in threshold_matches(
+                condition, self.result_exclusion_filter_matches.get(condition, []),
+            )}
+            for condition in plan.negative_filters
+        }
+        return set().union(*(matching_group_ids(group, matches) for group in plan.exclude))
 
     def _execute_search_chain(
         self,
         operation_mode: str = "refine",
         operation_context: tuple[list[ImageItem], list[ImageItem], set[int] | None, str | None] | None = None,
     ) -> None:
-        if not self.search_filters:
+        if (
+            not self.search_filters
+            and not self.result_exclusion_filters
+            and not self.result_excluded_image_ids
+            and not self.result_excluded_collection_ids
+            and self.filter_workflow.base_context() is None
+            and self.current_chain_base_image_ids is None
+        ):
             self._reload_images()
             return
         if operation_mode != "recompute":
@@ -6607,6 +6663,7 @@ class MainWindow(QMainWindow):
         self.semantic_search_revision += 1
         revision = self.semantic_search_revision
         filters = tuple(self.search_filters)
+        filter_plan = self.filter_workflow.plan()
         folder_path_prefix = self._selected_folder_path_prefix()
         collection_id = self._selected_collection_id()
         virtual_filter = self._selected_virtual_filter()
@@ -6624,9 +6681,7 @@ class MainWindow(QMainWindow):
         self.current_offset = 0
         self.load_more_button.setEnabled(False)
         self.search_button.setEnabled(False)
-        self.current_chain_images = []
-        self.current_chain_filtered_images = []
-        self.current_chain_result = SearchChainResult(images=[])
+        # Keep the last completed wall visible until this revision succeeds.
         self.current_chain_base_image_ids = base_image_ids
         self.current_chain_base_label = base_label
         self.current_chain_operation_mode = operation_mode
@@ -6650,10 +6705,11 @@ class MainWindow(QMainWindow):
                     excluded_collection_ids=excluded_collection_ids,
                     base_image_ids=base_image_ids,
                     merge_base_images=merge_base_images,
+                    filter_plan=filter_plan,
                 )
                 self.events.put(("search_chain_done", (revision, filters, result)))
             except Exception as exc:
-                self.events.put(("error", f"筛选失败：{exc}"))
+                self.events.put(("search_chain_error", (revision, str(exc))))
 
         self._start_background_task(
             run,
@@ -6661,6 +6717,9 @@ class MainWindow(QMainWindow):
         )
 
     def _search_chain_base_context(self) -> tuple[set[int] | None, str | None]:
+        explicit = self.filter_workflow.base_context()
+        if explicit is not None:
+            return explicit
         if self.current_result_mode == "temp_project" and self.current_temp_project_id is not None:
             project = self.store.get_temporary_project(self.current_temp_project_id)
             if project is None:
@@ -6700,6 +6759,11 @@ class MainWindow(QMainWindow):
                 return None, "合并当前结果", visible_images
             return None, None, None
 
+        if self.current_result_mode == "search_chain":
+            # Re-evaluate the edited rule tree from its original scope, not the
+            # surviving IDs of the previous step.
+            return snapshot_base_ids, snapshot_base_label, None
+
         if source_images:
             return {image.id for image in source_images}, "在当前结果中", None
         if visible_images:
@@ -6721,233 +6785,45 @@ class MainWindow(QMainWindow):
         excluded_collection_ids: Sequence[int] | None = None,
         base_image_ids: set[int] | None = None,
         merge_base_images: list[ImageItem] | None = None,
+        filter_plan: FilterPlan | None = None,
     ) -> SearchChainResult:
-        if base_image_ids is not None:
-            base_image_ids = self._filter_search_excluded_image_ids(
+        plan = filter_plan or FilterPlan((FilterGroup(filters),))
+        include_missing = any(f.kind == "status" and f.value == "missing" for f in (*plan.positive_filters, *plan.negative_filters))
+        if base_image_ids is None:
+            images = self.store.list_images(
+                folder_path_prefix=folder_path_prefix,
+                collection_id=collection_id,
+                virtual_filter=virtual_filter,
+                tag_ids=tag_ids,
+                tag_match_mode=tag_match_mode,
+                status_filter=status_filter,
+                include_missing=include_missing,
+                excluded_folder_path_prefixes=excluded_folder_path_prefixes,
+                excluded_collection_ids=excluded_collection_ids,
+                limit=None,
+            )
+        else:
+            allowed = self._filter_search_excluded_image_ids(
                 base_image_ids,
                 excluded_folder_path_prefixes=excluded_folder_path_prefixes,
                 excluded_collection_ids=excluded_collection_ids,
             )
-        images: list[ImageItem] = (
-            self.store.images_by_ids(sorted(base_image_ids))
-            if base_image_ids is not None
-            else []
-        )
-        allowed_image_ids: set[int] | None = set(base_image_ids) if base_image_ids is not None else None
-        semantic_searchable_count = 0
-        semantic_candidate_limit = 0
-        similar_searchable_count = 0
-        similar_candidate_limit = 0
-        color_searchable_count = 0
-        color_indexed_count = 0
-        color_candidate_limit = 0
-        last_scored_index = self._last_score_filter_index(filters)
-
-        for filter_index, search_filter in enumerate(filters):
-            if search_filter.kind == "semantic":
-                result = self.search_service.semantic_search(
-                    str(search_filter.value),
-                    folder_path_prefix=folder_path_prefix,
-                    collection_id=collection_id,
-                    virtual_filter=virtual_filter,
-                    tag_ids=tag_ids,
-                    tag_match_mode=tag_match_mode,
-                    status_filter=status_filter,
-                    allowed_image_ids=allowed_image_ids,
-                    excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                    excluded_collection_ids=excluded_collection_ids,
-                )
-                images = result.images
-                semantic_searchable_count = result.searchable_count
-                semantic_candidate_limit = result.candidate_limit
-            elif search_filter.kind == "similar":
-                result = self.search_service.similar_image_search(
-                    int(search_filter.value),
-                    folder_path_prefix=folder_path_prefix,
-                    collection_id=collection_id,
-                    virtual_filter=virtual_filter,
-                    tag_ids=tag_ids,
-                    tag_match_mode=tag_match_mode,
-                    status_filter=status_filter,
-                    allowed_image_ids=allowed_image_ids,
-                    excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                    excluded_collection_ids=excluded_collection_ids,
-                )
-                images = result.images
-                similar_searchable_count = result.searchable_count
-                similar_candidate_limit = result.candidate_limit
-            elif search_filter.kind == "color":
-                result = self.search_service.color_search(
-                    search_filter.value,  # type: ignore[arg-type]
-                    folder_path_prefix=folder_path_prefix,
-                    collection_id=collection_id,
-                    virtual_filter=virtual_filter,
-                    tag_ids=tag_ids,
-                    tag_match_mode=tag_match_mode,
-                    status_filter=status_filter,
-                    allowed_image_ids=allowed_image_ids,
-                    generate_missing_features=False,
-                    excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                    excluded_collection_ids=excluded_collection_ids,
-                )
-                images = result.images
-                color_searchable_count = result.searchable_count
-                color_indexed_count = result.indexed_count
-                color_candidate_limit = result.candidate_limit
-            elif search_filter.kind == "keyword":
-                query = str(search_filter.value)
-                if allowed_image_ids is None:
-                    images = self.store.list_images(
-                        text_query=query,
-                        status_filter=status_filter,
-                        tag_ids=tag_ids,
-                        tag_match_mode=tag_match_mode,
-                        folder_path_prefix=folder_path_prefix,
-                        collection_id=collection_id,
-                        virtual_filter=virtual_filter,
-                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                        excluded_collection_ids=excluded_collection_ids,
-                        limit=None,
-                    )
-                else:
-                    images = self._filter_images_by_keyword(images, query)
-            elif search_filter.kind == "file_type":
-                if allowed_image_ids is None:
-                    images = self._list_chain_base_images(
-                        folder_path_prefix=folder_path_prefix,
-                        collection_id=collection_id,
-                        virtual_filter=virtual_filter,
-                        tag_ids=tag_ids,
-                        tag_match_mode=tag_match_mode,
-                        status_filter=status_filter,
-                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                        excluded_collection_ids=excluded_collection_ids,
-                    )
-                images = [
-                    image
-                    for image in images
-                    if self._image_matches_file_type(image, str(search_filter.value))
-                ]
-            elif search_filter.kind == "orientation":
-                if allowed_image_ids is None:
-                    images = self._list_chain_base_images(
-                        folder_path_prefix=folder_path_prefix,
-                        collection_id=collection_id,
-                        virtual_filter=virtual_filter,
-                        tag_ids=tag_ids,
-                        tag_match_mode=tag_match_mode,
-                        status_filter=status_filter,
-                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                        excluded_collection_ids=excluded_collection_ids,
-                    )
-                images = [
-                    image
-                    for image in images
-                    if self._image_matches_orientation(image, str(search_filter.value))
-                ]
-            elif search_filter.kind == "size":
-                if allowed_image_ids is None:
-                    images = self._list_chain_base_images(
-                        folder_path_prefix=folder_path_prefix,
-                        collection_id=collection_id,
-                        virtual_filter=virtual_filter,
-                        tag_ids=tag_ids,
-                        tag_match_mode=tag_match_mode,
-                        status_filter=status_filter,
-                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                        excluded_collection_ids=excluded_collection_ids,
-                    )
-                images = [
-                    image
-                    for image in images
-                    if self._image_matches_size(image, str(search_filter.value))
-                ]
-            elif search_filter.kind == "ai_vision":
-                if allowed_image_ids is None:
-                    images = self._list_chain_base_images(
-                        folder_path_prefix=folder_path_prefix,
-                        collection_id=collection_id,
-                        virtual_filter=virtual_filter,
-                        tag_ids=tag_ids,
-                        tag_match_mode=tag_match_mode,
-                        status_filter=status_filter,
-                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                        excluded_collection_ids=excluded_collection_ids,
-                    )
-                field, value = ai_vision_filter_parts(str(search_filter.value))
-                matching_ids = self.store.image_ids_matching_ai_vision(field, value)
-                images = [
-                    image
-                    for image in images
-                    if image.id in matching_ids
-                ]
-            elif search_filter.kind == "collection":
-                selected_ids = self._collection_filter_ids(search_filter)
-                if allowed_image_ids is None:
-                    images = self._list_chain_base_images(
-                        folder_path_prefix=folder_path_prefix,
-                        collection_id=collection_id,
-                        virtual_filter=virtual_filter,
-                        tag_ids=tag_ids,
-                        tag_match_mode=tag_match_mode,
-                        status_filter=status_filter,
-                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                        excluded_collection_ids=excluded_collection_ids,
-                    )
-                matching_ids = self._image_ids_for_collections(selected_ids)
-                images = [
-                    image
-                    for image in images
-                    if image.id in matching_ids
-                ]
-            elif search_filter.kind == "tag":
-                selected_ids, match_mode = self._tag_filter_parts(search_filter)
-                if allowed_image_ids is None:
-                    images = self._list_chain_base_images(
-                        folder_path_prefix=folder_path_prefix,
-                        collection_id=collection_id,
-                        virtual_filter=virtual_filter,
-                        tag_ids=tag_ids,
-                        tag_match_mode=tag_match_mode,
-                        status_filter=status_filter,
-                        excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                        excluded_collection_ids=excluded_collection_ids,
-                    )
-                matching_ids = self._image_ids_for_tags(selected_ids, match_mode)
-                images = [
-                    image
-                    for image in images
-                    if image.id in matching_ids
-                ]
-            if (
-                search_filter.kind in SCORED_FILTER_KINDS
-                and filter_index != last_scored_index
-            ):
-                images = self._apply_score_threshold_for_filter(search_filter, images)
-            allowed_image_ids = {image.id for image in images}
-            if not allowed_image_ids:
-                break
-
+            images = self.store.images_by_ids(sorted(allowed))
+            if status_filter:
+                status_condition = SearchFilter("status", status_filter)
+                images = [image for image in images if FilterEngine._matches_metadata(image, status_condition)]
+        result = FilterEngine(self.store, self.search_service).evaluate(plan, images)
         if merge_base_images:
-            images = self._merge_search_result_images(
+            # Legacy callers can still explicitly union a frozen result set.
+            from dataclasses import replace
+            result = replace(result, images=self._merge_search_result_images(
                 self._filter_search_excluded_images(
                     merge_base_images,
                     excluded_folder_path_prefixes=excluded_folder_path_prefixes,
                     excluded_collection_ids=excluded_collection_ids,
-                ),
-                images,
-            )
-
-        return SearchChainResult(
-            images=images,
-            semantic_searchable_count=semantic_searchable_count,
-            semantic_candidate_limit=semantic_candidate_limit,
-            similar_searchable_count=similar_searchable_count,
-            similar_candidate_limit=similar_candidate_limit,
-            color_searchable_count=color_searchable_count,
-            color_indexed_count=color_indexed_count,
-            color_candidate_limit=color_candidate_limit,
-        )
+                ), result.images,
+            ))
+        return result
 
     def _filter_search_excluded_image_ids(
         self,
@@ -7131,6 +7007,7 @@ class MainWindow(QMainWindow):
         filters: tuple[SearchFilter, ...],
         result: SearchChainResult,
     ) -> None:
+        self.filter_panel.error = ""
         self.current_chain_result = result
         self.current_chain_images = list(result.images)
         self.current_semantic_searchable_count = result.semantic_searchable_count
@@ -7141,13 +7018,22 @@ class MainWindow(QMainWindow):
         self.current_color_indexed_count = result.color_indexed_count
         self.current_color_candidate_limit = result.color_candidate_limit
         self._sync_legacy_search_state_from_filters()
-        self._recompute_result_exclusion_filter_matches_for_current_source()
+        if result.filters_applied:
+            self.result_exclusion_filter_matches = {
+                condition: list(result.filter_matches.get(condition, ()))
+                for condition in self.result_exclusion_filters
+            }
+        else:
+            self._recompute_result_exclusion_filter_matches_for_current_source()
         self._apply_search_chain_filters()
         images = self.current_chain_filtered_images
         self.grid_view.set_images(images)
         self._set_search_chain_result_status(filters, images)
         self._update_search_chain_diagnostics(filters, images)
         self._refresh_feedback_buttons(self.selected_image)
+
+        if hasattr(self, "creative_workspace"):
+            self.creative_workspace.search_finished()
 
     def _handle_inspiration_done(
         self,
@@ -7349,14 +7235,16 @@ class MainWindow(QMainWindow):
 
     def _apply_search_chain_filters(self) -> None:
         images = self.current_chain_images
-        threshold = self._active_score_threshold(images)
+        threshold = None if self.current_chain_result.filters_applied else self._active_score_threshold(images)
         if threshold is not None:
             images = [
                 image
                 for image in images
                 if image.score is not None and image.score >= threshold
             ]
-        images = self._apply_result_management_filters(self._apply_sidebar_filters(images))
+        if not self.current_chain_result.filters_applied:
+            images = self._apply_sidebar_filters(images)
+        images = self._apply_result_management_filters(images)
         self.current_chain_filtered_images = self._sort_images(images)
 
     def _active_score_threshold(self, images: list[ImageItem]) -> float | None:
@@ -7616,6 +7504,8 @@ class MainWindow(QMainWindow):
         self.filter_chain_layout.addStretch(1)
         self._refresh_score_threshold_controls()
         self._refresh_result_management_buttons()
+        if hasattr(self, "filter_workflow"):
+            self.filter_workflow.sync()
 
     def _search_filter_chip(self, index: int, search_filter: SearchFilter) -> QWidget:
         chip = QWidget()
@@ -7685,7 +7575,7 @@ class MainWindow(QMainWindow):
         self._ensure_active_filter_index()
         self._sync_legacy_search_state_from_filters()
         self._refresh_filter_chain_ui()
-        if self.search_filters:
+        if self.search_filters or self.result_exclusion_filters or self.current_chain_base_image_ids is not None:
             self._execute_search_chain(operation_mode="recompute")
         else:
             self._reload_images()
@@ -7950,6 +7840,10 @@ class MainWindow(QMainWindow):
         return entries
 
     def _reload_images(self) -> None:
+        self.semantic_search_revision += 1
+        if hasattr(self, "filter_workflow"):
+            self.filter_workflow.follow_sidebar()
+        self.search_button.setEnabled(True)
         self._invalidate_result_status_count_cache()
         self.current_offset = 0
         self._clear_manual_result_order()
@@ -8114,7 +8008,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_current_results_for_filters(self) -> None:
         self._refresh_filter_chain_ui()
-        if self.search_filters:
+        if self.search_filters or self.result_exclusion_filters or self.current_result_mode == "search_chain":
             if self.search_button.isEnabled():
                 self._execute_search_chain(operation_mode="recompute")
             return
@@ -8294,6 +8188,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
         self._refresh_result_management_buttons()
         self._refresh_search_operation_controls()
+        if hasattr(self, "filter_workflow"):
+            self.filter_workflow.sync()
 
     def _format_unified_result_status(self, context: str) -> str:
         try:
@@ -8886,23 +8782,17 @@ class MainWindow(QMainWindow):
         self._expand_project_sidebar_section("temporary")
         self._refresh_temporary_projects()
         if error_message:
-            self.statusBar().showMessage(f"已创建 {created} 个 AI 分组；命名失败，使用备用名称：{error_message}")
+            self.statusBar().showMessage(f"已按预览创建 {created} 个分组；AI 命名未完成，可手动命名：{error_message}")
         else:
             self.statusBar().showMessage(f"已创建 {created} 个 AI 分组语义探针项目")
 
     def _confirm_reference_group_projects(self, group_pairs: list[tuple[ReferenceGroup, object]], error_message: str) -> bool:
-        preview = "\n".join(self._reference_group_preview_lines(group_pairs))
-        message = f"将创建 {len(group_pairs)} 个语义探针项目：\n\n{preview}\n\n继续？"
-        if error_message:
-            message += f"\n\nAI 命名失败时会使用备用名称：{error_message}"
-        answer = QMessageBox.question(
-            self,
-            "确认 AI 分组",
-            message,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        return answer == QMessageBox.StandardButton.Yes
+        from eidory.ui.reference_group_dialog import ReferenceGroupDialog
+        dialog = ReferenceGroupDialog(self.store, group_pairs, error_message, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        group_pairs[:] = dialog.result_pairs()
+        return bool(group_pairs)
 
     def _reference_group_preview_lines(self, group_pairs: list[tuple[ReferenceGroup, object]]) -> list[str]:
         image_ids = [
@@ -9994,7 +9884,22 @@ class MainWindow(QMainWindow):
             self._refresh_tag_panel_assignment(images)
             self._tag_assignment_dirty = False
 
+    def _on_folder_selection_changed(self) -> None:
+        if self._applying_view_payload:
+            return
+        previous = self.collection_tree.blockSignals(True)
+        self.collection_tree.setCurrentItem(self.collection_tree.topLevelItem(0))
+        self.collection_tree.blockSignals(previous)
+        self.current_virtual_filter = None
+        self.filter_workflow.follow_sidebar()
+        self._refresh_current_results_for_filters()
+
     def _on_collection_selection_changed(self) -> None:
+        if hasattr(self, "filter_workflow") and not self._applying_view_payload:
+            previous = self.folder_tree.blockSignals(True)
+            self.folder_tree.setCurrentItem(self.folder_tree.topLevelItem(0))
+            self.folder_tree.blockSignals(previous)
+            self.filter_workflow.follow_sidebar()
         item = self.collection_tree.currentItem()
         virtual_filter = item.data(0, COLLECTION_VIRTUAL_FILTER_ROLE) if item is not None else None
         if virtual_filter:
@@ -13427,10 +13332,19 @@ class MainWindow(QMainWindow):
                 self._set_color_result_status(images)
                 self._update_color_search_diagnostics(images)
             elif kind == "search_chain_done":
-                self.search_button.setEnabled(True)
                 revision, filters, result = payload
                 if revision == self.semantic_search_revision:
+                    self.search_button.setEnabled(True)
                     self._handle_search_chain_done(filters=filters, result=result)
+                self._run_pending_score_threshold_recompute()
+            elif kind == "search_chain_error":
+                revision, message = payload
+                if revision == self.semantic_search_revision:
+                    self.search_button.setEnabled(True)
+                    self.filter_panel.error = "筛选失败，仍显示上次结果；可修改条件后重试"
+                    self.filter_panel.set_busy(False)
+                    self._record_error(f"筛选失败：{message}")
+                    self.statusBar().showMessage(f"筛选失败：{message}")
                 self._run_pending_score_threshold_recompute()
             elif kind == "result_exclusion_filter_done":
                 self.search_button.setEnabled(True)
@@ -14290,6 +14204,8 @@ class MainWindow(QMainWindow):
         show_board: bool = False,
         save_current_editor: bool = True,
     ) -> None:
+        if hasattr(self, "creative_workspace"):
+            self.creative_workspace.before_project_load(project_id)
         previous_project_id = self.current_creative_project_id
         if save_current_editor:
             if self._pending_creative_node_detail_id is not None:
@@ -14299,6 +14215,8 @@ class MainWindow(QMainWindow):
         if project_id != previous_project_id:
             self._clear_creative_node_editor_state()
         self.current_creative_project_id = project_id
+        if hasattr(self, "creative_workspace"):
+            self.creative_workspace.load_project(project_id)
         if project_id is None:
             self.current_creative_node_id = None
             self._current_board_node_id = None
@@ -14483,7 +14401,8 @@ class MainWindow(QMainWindow):
         )
         self._sync_creative_node_panel()
         if self.current_creative_node_id is not None:
-            self._show_current_creative_board()
+            if self.center_result_stack.currentWidget() is not self.creative_workspace.planning_scroll:
+                self._show_current_creative_board()
 
     def _current_creative_node(self) -> CreativeNodeItem | None:
         if self.current_creative_node_id is None:
@@ -14623,8 +14542,12 @@ class MainWindow(QMainWindow):
             self._loaded_creative_node_query_text = ""
         else:
             assert node is not None and project is not None
+            branch_count = len(self.store.creative_node_image_ids(node.id, include_descendants=True))
+            count_text = f"本节点 {node.image_count} 张"
+            if branch_count != node.image_count:
+                count_text += f" · 含子节点 {branch_count} 张"
             self.creative_node_status_label.setText(
-                f"项目：{project.title}\n节点：{node.title} ｜ 已存 {node.image_count} 张"
+                f"项目：{project.title}\n节点：{node.title} ｜ {count_text}"
             )
             note_text, query_text = self._creative_node_editor_text_pair(node)
             self.creative_node_note_input.setPlainText(note_text)
@@ -14637,6 +14560,7 @@ class MainWindow(QMainWindow):
         self.creative_node_query_input.blockSignals(False)
         self._suppress_creative_node_auto_save = False
         creative_generation_busy = self._creative_all_nodes_in_progress or self._creative_node_note_in_progress
+        self.creative_node_tree.setEnabled(has_node)
         if hasattr(self, "creative_content_tabs"):
             self.creative_content_tabs.setEnabled(has_node)
         self.generate_creative_children_button.setEnabled(has_node and not creative_generation_busy)
@@ -14666,6 +14590,9 @@ class MainWindow(QMainWindow):
         if node is not None and node.parent_id is None:
             self.creative_delete_node_button.setEnabled(False)
 
+        if hasattr(self, "creative_workspace"):
+            self.creative_workspace.refresh()
+
     def _create_creative_project_from_current_brief(self) -> None:
         self._set_ai_workflow_mode("project")
         brief = self.inspiration_brief_input.toPlainText().strip()
@@ -14690,6 +14617,7 @@ class MainWindow(QMainWindow):
             provider_name=self._llm_service_label(service),
             model_name=self._llm_model(service),
         )
+        self.creative_workspace.store.save_project(project_id, extra=self.inspiration_answers_input.toPlainText().strip())
         root_id = self.store.creative_root_node_id(project_id)
         if root_id is not None:
             self._seed_creative_template(
@@ -14740,12 +14668,7 @@ class MainWindow(QMainWindow):
                 project_brief=clean_brief or clean_title,
                 template_root=template.root,
             )
-        self.inspiration_brief_input.blockSignals(True)
-        self.inspiration_answers_input.blockSignals(True)
-        self.inspiration_brief_input.setPlainText(clean_brief)
-        self.inspiration_answers_input.setPlainText(clean_extra)
-        self.inspiration_brief_input.blockSignals(False)
-        self.inspiration_answers_input.blockSignals(False)
+        self.creative_workspace.store.save_project(project_id, extra=clean_extra)
         self._refresh_creative_projects(
             select_project_id=project_id,
             save_current_editor=False,
@@ -14959,6 +14882,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已撤销删除节点")
 
     def _creative_node_ai_context(self, project) -> tuple[str, str]:
+        if hasattr(self, "creative_workspace"):
+            return self.creative_workspace.ai_context(project)
         topic = self.inspiration_brief_input.toPlainText().strip()
         if not topic:
             topic = (project.brief or project.title).strip()
@@ -15380,13 +15305,16 @@ class MainWindow(QMainWindow):
             self.creative_node_progress_bar.setValue(0)
         creative_generation_busy = self._creative_all_nodes_in_progress or self._creative_node_note_in_progress
         has_node = self._current_creative_node() is not None and self.current_creative_project_id is not None
+        node = self._current_creative_node()
+        locked = bool(node and hasattr(self, "creative_workspace") and self.creative_workspace.store.node(node.id)["locked"])
         if hasattr(self, "creative_content_tabs"):
             self.creative_content_tabs.setEnabled(has_node)
-        self.generate_creative_children_button.setEnabled(has_node and not creative_generation_busy)
+        self.generate_creative_children_button.setEnabled(has_node and not locked and not creative_generation_busy)
         self.generate_all_creative_nodes_button.setEnabled(has_node and not creative_generation_busy)
         self.creative_new_project_button.setEnabled(not creative_generation_busy)
         self.creative_template_combo.setEnabled(not creative_generation_busy)
         self.creative_ai_project_button.setEnabled(not creative_generation_busy)
+        self.creative_node_imagination_slider.setEnabled(not creative_generation_busy)
         if status:
             self.creative_node_status_label.setText(status)
             self.statusBar().showMessage(status)
@@ -15401,6 +15329,9 @@ class MainWindow(QMainWindow):
         )
         if node is None or project is None:
             self.statusBar().showMessage("先选择创作项目节点")
+            return
+        if self.creative_workspace.store.node(node.id)["locked"]:
+            self.statusBar().showMessage("当前节点已锁定；解除锁定后可生成新建议")
             return
         if self._creative_node_editor_node_id == node.id:
             raw_note = self.creative_node_note_input.toPlainText().strip()
@@ -15424,18 +15355,6 @@ class MainWindow(QMainWindow):
             query_text=raw_query,
         )
         ai_current_note = self._creative_node_live_constraint_text(node, project, initial_constraint)
-        has_existing_note = bool(ai_current_note)
-        if has_existing_note:
-            answer = QMessageBox.question(
-                self,
-                "重新生成节点说明",
-                f"节点“{node.title}”已经有说明。\n是否确认用 AI 重新补全并更新当前节点说明？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                self.statusBar().showMessage("已取消当前节点信息补全")
-                return
         self._set_creative_node_completion_busy(True, f"正在补全“{node.title}”...")
         provider = self._make_llm_provider()
         self.creative_node_auto_save_timer.stop()
@@ -15445,6 +15364,7 @@ class MainWindow(QMainWindow):
         project_brief, project_extra = self._creative_node_ai_context(project)
         node_path = self._creative_node_path_text(node.id)
         project_outline = self._creative_project_outline_text(project.id, selected_node_id=node.id)
+        imagination_level = self.creative_node_imagination_slider.value()
 
         def run() -> None:
             try:
@@ -15456,6 +15376,7 @@ class MainWindow(QMainWindow):
                     current_note=ai_current_note,
                     node_path=node_path,
                     node_template_hint=node_template_hint,
+                    imagination_level=imagination_level,
                     language=self.current_language,
                 )
                 self.events.put(("creative_node_note_done", (node.id, ai_current_note, suggestion, model_name)))
@@ -15562,7 +15483,7 @@ class MainWindow(QMainWindow):
             if root_id is not None:
                 root = self.store.get_creative_node(root_id)
                 root_note = (root.note or "").strip() if root is not None else ""
-                should_update_root = root is not None and (
+                should_update_root = root is not None and not self.creative_workspace.store.node(root_id)["locked"] and (
                     not root_note
                     or _is_creative_template_placeholder_text(root_note)
                     or root_note in old_project_markers
@@ -15581,14 +15502,11 @@ class MainWindow(QMainWindow):
                             note_user_edited=True,
                             query_user_edited=True,
                         )
-            self.inspiration_brief_input.blockSignals(True)
-            self.inspiration_answers_input.blockSignals(True)
-            self.inspiration_brief_input.setPlainText(brief)
-            self.inspiration_answers_input.setPlainText(extra)
-            self.inspiration_brief_input.blockSignals(False)
-            self.inspiration_answers_input.blockSignals(False)
+            self.creative_workspace.store.save_project(project_id, extra=extra)
+            if self.current_creative_project_id == project_id:
+                self.creative_workspace.load_context()
             self._refresh_creative_projects(
-                select_project_id=project_id,
+                select_project_id=self.current_creative_project_id,
                 save_current_editor=False,
             )
         else:
@@ -15626,6 +15544,9 @@ class MainWindow(QMainWindow):
         try:
             requests = []
             for node in nodes:
+                state = self.creative_workspace.store.node(node.id)
+                if state["locked"] or state["proposal_note"] or state["proposal_query"]:
+                    continue
                 raw_note, _raw_query = self._creative_node_editor_text_pair(node)
                 raw_note = raw_note.strip()
                 is_template_placeholder = _is_creative_template_placeholder_text(raw_note)
@@ -15647,12 +15568,17 @@ class MainWindow(QMainWindow):
             batch_project_outline = self._creative_project_outline_text(project_id)
         finally:
             self.current_creative_project_id = previous_project_id
+        if not requests:
+            self._set_creative_all_nodes_busy(False)
+            self.statusBar().showMessage("所有节点已锁定或已有待采纳建议")
+            return
         selected_node_id = self.current_creative_node_id
         selected_node = self.store.get_creative_node(selected_node_id) if selected_node_id is not None else None
         if selected_node is None or selected_node.project_id != project_id:
             selected_node_id = self.store.creative_root_node_id(project_id)
         project_brief, project_extra = self._creative_node_ai_context(project)
         provider = self._make_llm_provider()
+        imagination_level = self.creative_node_imagination_slider.value()
         self._set_creative_all_nodes_busy(True, f"正在补全全部节点：{project.title}")
 
         def run() -> None:
@@ -15675,6 +15601,7 @@ class MainWindow(QMainWindow):
                             current_note=str(request["current_note"]),
                             node_path=str(request["node_path"]),
                             node_template_hint=str(request["node_template_hint"]),
+                            imagination_level=imagination_level,
                             language=self.current_language,
                         )
                     elif callable(batch_generator):
@@ -15691,6 +15618,7 @@ class MainWindow(QMainWindow):
                                     "node_path": str(request["node_path"]),
                                 }
                             ],
+                            imagination_level=imagination_level,
                             language=self.current_language,
                         )
                         suggestion = dict(batch_suggestions).get(str(request["node_id"]))
@@ -15735,6 +15663,7 @@ class MainWindow(QMainWindow):
                         project_extra=project_extra,
                         project_outline=batch_project_outline,
                         nodes=batch_nodes,
+                        imagination_level=imagination_level,
                         language=self.current_language,
                     )
                 except Exception as exc:
@@ -15781,6 +15710,8 @@ class MainWindow(QMainWindow):
         node_id: int,
         original_note: str,
         suggestion: object,
+        *,
+        stage_only: bool = False,
     ) -> CreativeNodeItem | None:
         node = self.store.get_creative_node(node_id)
         if node is None:
@@ -15815,6 +15746,13 @@ class MainWindow(QMainWindow):
             query = _merge_creative_user_note_with_search_query(original_note, query, node.title)
             if not _creative_note_has_meaningful_expansion(original_note, note):
                 note = _fallback_creative_node_note_expansion(original_note, query, node.title)
+        if stage_only:
+            if self.creative_workspace.store.node(node.id)["locked"]:
+                return None
+            self.creative_workspace.store.save_node(
+                node.id, proposal_note=note or node.note, proposal_query=query or node.search_query or node.title,
+            )
+            return node
         updated = self.store.update_creative_node(
             node.id,
             note=note or node.note,
@@ -15847,18 +15785,15 @@ class MainWindow(QMainWindow):
             self._set_creative_node_completion_busy(False)
             self._sync_creative_node_panel()
             return
-        updated = self._apply_creative_node_note_suggestion(node_id, original_note, suggestion)
+        updated = self._apply_creative_node_note_suggestion(node_id, original_note, suggestion, stage_only=True)
         if updated is None:
             self.statusBar().showMessage("AI没有返回可用节点补充内容")
             self._set_creative_node_completion_busy(False)
             return
-        self._load_creative_project(
-            node.project_id,
-            select_node_id=node.id,
-            save_current_editor=False,
-        )
+        if self.current_creative_project_id == node.project_id:
+            self._sync_creative_node_panel()
         self._set_creative_node_completion_busy(False)
-        self.statusBar().showMessage(f"已补全节点“{updated.title}”")
+        self.statusBar().showMessage(f"“{updated.title}”的新建议已保存，采纳后才更新设定")
 
     def _handle_creative_all_node_notes_done(
         self,
@@ -15870,19 +15805,12 @@ class MainWindow(QMainWindow):
     ) -> None:
         applied = 0
         for node_id, original_note, suggestion in results:
-            if self._apply_creative_node_note_suggestion(node_id, original_note, suggestion) is not None:
+            if self._apply_creative_node_note_suggestion(node_id, original_note, suggestion, stage_only=True) is not None:
                 applied += 1
         self._set_creative_all_nodes_busy(False)
-        self._refresh_creative_projects(
-            select_project_id=project_id,
-            save_current_editor=False,
-        )
-        self._load_creative_project(
-            project_id,
-            select_node_id=selected_node_id,
-            show_board=False,
-            save_current_editor=False,
-        )
+        if self.current_creative_project_id == project_id:
+            self._sync_creative_node_panel()
+            self._refresh_project_sidebar(select_kind="creative", select_id=project_id)
         if applied == 0:
             QMessageBox.warning(
                 self,
@@ -15899,7 +15827,7 @@ class MainWindow(QMainWindow):
                 "Eidory",
                 f"已补全 {applied} 个节点，但有 {len(errors)} 个节点失败：\n{preview}{suffix}",
             )
-        self.statusBar().showMessage(f"已补全 {applied} 个节点")
+        self.statusBar().showMessage(f"已生成 {applied} 个节点的待采纳建议")
 
     def _handle_creative_all_node_notes_progress(
         self,
@@ -16052,19 +15980,18 @@ class MainWindow(QMainWindow):
                 node = by_title.get(title)
                 if node is None:
                     continue
+                if self.creative_workspace.store.node(node.id)["locked"]:
+                    continue
                 if fill_empty_only and (node.note.strip() or node.search_query.strip()):
                     continue
                 note = str(getattr(node_suggestion, "note", "")).strip()
                 search_query = str(getattr(node_suggestion, "search_query", "")).strip()
                 if note or search_query:
-                    self.store.update_creative_node(
-                        node.id,
-                        note=note or node.note,
-                        search_query=search_query or node.search_query or node.title,
-                    )
-        self._load_creative_project(project_id, select_node_id=selected_node_id)
-        if hasattr(self, "creative_content_tabs"):
-            self.creative_content_tabs.setCurrentIndex(1)
+                    self._apply_creative_node_note_suggestion(node.id, "", node_suggestion, stage_only=True)
+        if self.current_creative_project_id == project_id:
+            self._load_creative_project(project_id, select_node_id=selected_node_id)
+            if hasattr(self, "creative_content_tabs"):
+                self.creative_content_tabs.setCurrentIndex(1)
         self._set_creative_copy_buttons_enabled(True)
         self.statusBar().showMessage(f"已生成项目文案：{project.title}")
 
@@ -16099,45 +16026,7 @@ class MainWindow(QMainWindow):
         if not query.strip():
             self.statusBar().showMessage("当前节点没有可搜索内容")
             return
-        self.semantic_search_revision += 1
-        self._clear_manual_result_order()
-        self._clear_result_management_state()
-        revision = self.semantic_search_revision
-        self.current_result_mode = "creative_node"
-        self.current_creative_node_id = node.id
-        self.current_creative_node_images = []
-        self.current_creative_node_filtered_images = []
-        self.current_creative_node_searchable_count = 0
-        self.current_creative_node_candidate_limit = 0
-        self.current_creative_node_badges = {}
-        self.current_temp_project_id = None
-        self.current_search_result_set_project_id = None
-        self.current_temp_project_images = []
-        self.current_temp_project_badges = {}
-        self.search_filters.clear()
-        self.active_filter_index = None
-        self._refresh_filter_chain_ui()
-        self._show_gallery_view()
-        self.search_creative_node_button.setEnabled(False)
-        self._set_result_status(f"创作节点搜索中：{node.title}")
-        excluded_folder_path_prefixes = tuple(self._search_excluded_folder_prefixes())
-        excluded_collection_ids = tuple(self._search_excluded_collection_ids())
-
-        def run() -> None:
-            try:
-                result = self.search_service.semantic_search(
-                    query,
-                    excluded_folder_path_prefixes=excluded_folder_path_prefixes,
-                    excluded_collection_ids=excluded_collection_ids,
-                )
-                self.events.put(("creative_node_search_done", (revision, node.id, query, result)))
-            except Exception as exc:
-                self.events.put(("creative_node_search_error", (revision, exc)))
-
-        self._start_background_task(
-            run,
-            on_rejected=lambda: self.search_creative_node_button.setEnabled(True),
-        )
+        self.creative_workspace.start_node_search(node, query)
 
     def _handle_creative_node_search_done(self, revision: int, node_id: int, query: str, result) -> None:
         self.search_creative_node_button.setEnabled(self.current_creative_node_id is not None)
@@ -16417,7 +16306,10 @@ class MainWindow(QMainWindow):
         ]
         title = self._creative_node_path_text_from_nodes(node.id, nodes) or node.title
         raw_badges = board_data.get("badges", {})
-        badges = raw_badges if isinstance(raw_badges, dict) else {}
+        badges = {key: list(value) for key, value in raw_badges.items()} if isinstance(raw_badges, dict) else {}
+        for reference in self.creative_workspace.store.reference_notes(node.project_id):
+            if reference["note"].strip() and reference["image_id"] in image_ids:
+                badges.setdefault(reference["image_id"], []).append(reference["note"][:90])
         self._board_image_by_id = {image.id: image for image in images}
         self.project_board_view.set_images(
             images,
@@ -16640,6 +16532,7 @@ class MainWindow(QMainWindow):
 
     def _board_focus_chrome_widgets(self) -> list[QWidget]:
         widgets: list[QWidget] = [
+            self.filter_panel,
             self.search_input,
             self.reverse_exclusion_button,
             self.color_mode_button,
@@ -16655,6 +16548,7 @@ class MainWindow(QMainWindow):
             self.filter_chain_widget,
             self.score_threshold_label,
             self.score_threshold_slider,
+            self.folder_tree,
             self.result_state_label,
             self.search_diagnostics_label,
             self.load_more_button,
@@ -17119,7 +17013,8 @@ class MainWindow(QMainWindow):
 
     def _handle_undo_shortcut(self) -> None:
         if self._project_board_has_keyboard_focus():
-            self._undo_last_board_removal()
+            if not self.project_board_view.undo_layout():
+                self._undo_last_board_removal()
             return
         self._undo_last_library_removal()
 
@@ -17240,7 +17135,11 @@ class MainWindow(QMainWindow):
         selected_item: QListWidgetItem | None = None
 
         self.temp_project_list.blockSignals(True)
-        self.temp_project_list.clear()
+        # Release detached items through their Python wrappers so list rebuilds
+        # do not also delete them through the container's C++ ownership.
+        while self.temp_project_list.count():
+            removed_item = self.temp_project_list.takeItem(0)
+            del removed_item
 
         def section_expanded(section_id: str) -> bool:
             return bool(self.project_sidebar_expanded_sections.get(section_id, False))
@@ -18389,6 +18288,43 @@ class MainWindow(QMainWindow):
             return f"{prefix}：不限"
         return f"{prefix}：{value}%"
 
+    def _format_creative_node_imagination(self, value: int) -> str:
+        level = max(0, min(100, int(value)))
+        if self.current_language == "en":
+            if level <= 20:
+                label = "Strict"
+            elif level <= 40:
+                label = "Conservative"
+            elif level <= 60:
+                label = "Balanced"
+            elif level <= 80:
+                label = "Exploratory"
+            else:
+                label = "Divergent"
+        elif level <= 20:
+            label = "严谨"
+        elif level <= 40:
+            label = "偏严谨"
+        elif level <= 60:
+            label = "平衡"
+        elif level <= 80:
+            label = "偏发散"
+        else:
+            label = "发散"
+        return f"{label} · {level}"
+
+    def _update_creative_node_imagination(self, value: int) -> None:
+        self.creative_node_imagination_value_label.setText(
+            self._format_creative_node_imagination(value)
+        )
+        self.creative_node_imagination_setting_timer.start()
+
+    def _persist_creative_node_imagination(self) -> None:
+        self.store.set_setting(
+            "ui.creative_node_imagination",
+            str(self.creative_node_imagination_slider.value()),
+        )
+
     def _score_threshold_label_prefix(self, search_filter: SearchFilter) -> str:
         if search_filter.kind == "color":
             return "颜色相似度"
@@ -18621,7 +18557,14 @@ class MainWindow(QMainWindow):
 
     def _current_view_payload(self) -> dict[str, object]:
         return {
-            "version": 1,
+            "version": 2,
+            "filter_plan": self.filter_workflow.plan().to_payload(),
+            "filter_scope": self.filter_workflow.serialized_scope(),
+            "base_image_ids": sorted(self.current_chain_base_image_ids) if self.current_chain_base_image_ids is not None else None,
+            "base_label": self.current_chain_base_label,
+            "folder_path_prefix": self._selected_folder_path_prefix(),
+            "excluded_image_ids": sorted(self.result_excluded_image_ids),
+            "excluded_collection_ids": sorted(self.result_excluded_collection_ids),
             "status_filter": self._selected_status_filter() or "all",
             "selected_tag_ids": self._selected_tag_ids(),
             "tag_match_mode": self._selected_tag_match_mode(),
@@ -18648,6 +18591,27 @@ class MainWindow(QMainWindow):
         if not isinstance(payload, dict):
             QMessageBox.warning(self, "Eidory", "该筛选预设格式无效。")
             return
+        try:
+            if "filter_plan" in payload:
+                restored_plan = FilterPlan.from_payload(payload["filter_plan"])
+            else:
+                legacy = []
+                for raw in payload.get("search_filters", []):
+                    condition = self._search_filter_from_payload(raw)
+                    if condition is not None:
+                        if condition.kind in SCORED_FILTER_KINDS and condition.score_threshold is None:
+                            condition = SearchFilter(condition.kind, condition.value, int(payload.get("score_threshold", 0)))
+                        legacy.append(condition)
+                restored_plan = FilterPlan((FilterGroup(tuple(legacy)),)) if legacy else FilterPlan()
+            restored_scope = payload.get("filter_scope", {"kind": "sidebar"})
+            if not isinstance(restored_scope, dict) or restored_scope.get("kind") not in {"sidebar", "collections", "snapshot"}:
+                raise ValueError("invalid scope")
+            for key in ("collection_ids", "image_ids"):
+                if key in restored_scope and (not isinstance(restored_scope[key], list) or any(type(v) is not int or v <= 0 for v in restored_scope[key])):
+                    raise ValueError("invalid scope IDs")
+        except (ValueError, TypeError):
+            QMessageBox.warning(self, "Eidory", "筛选预设包含无效条件或范围，未载入。")
+            return
         signal_widgets = [
             self.status_filter_combo,
             self.tag_match_combo,
@@ -18660,10 +18624,13 @@ class MainWindow(QMainWindow):
         self.semantic_search_revision += 1
         self.search_button.setEnabled(True)
         try:
+            self._clear_result_management_state()
+            self.filter_workflow.scope = dict(restored_scope)
             self._apply_collection_from_payload(
                 payload.get("collection_id"),
                 payload.get("virtual_filter"),
             )
+            self._apply_folder_from_payload(payload.get("folder_path_prefix"))
             self._apply_status_from_payload(payload.get("status_filter"))
             self._apply_tags_from_payload(payload.get("selected_tag_ids"))
             self._set_combo_to_data(
@@ -18689,6 +18656,14 @@ class MainWindow(QMainWindow):
                 if (search_filter := self._search_filter_from_payload(raw_filter)) is not None
             ]
             self.active_filter_index = self._last_score_filter_index()
+            self.filter_workflow.set_plan(restored_plan)
+            self.result_excluded_image_ids = {int(v) for v in payload.get("excluded_image_ids", []) if type(v) is int and v > 0}
+            self.result_excluded_collection_ids = {int(v) for v in payload.get("excluded_collection_ids", []) if type(v) is int and v > 0}
+            self._rebuild_result_excluded_collection_image_ids()
+            raw_base = payload.get("base_image_ids")
+            self.current_chain_base_image_ids = {int(v) for v in raw_base if type(v) is int and v > 0} if isinstance(raw_base, list) else None
+            self.current_chain_base_label = str(payload.get("base_label") or "") or None
+            self.current_result_mode = "search_chain"
         finally:
             for widget, previous_state in zip(signal_widgets, previous_signal_states):
                 widget.blockSignals(previous_state)
@@ -18706,10 +18681,35 @@ class MainWindow(QMainWindow):
         self.store.set_setting("ui.score_threshold", str(self.score_threshold_slider.value()))
         self._sync_legacy_search_state_from_filters()
         self._refresh_filter_chain_ui()
-        if self.search_filters:
-            self._execute_search_chain()
+        if self.search_filters or self.result_exclusion_filters or self.result_excluded_image_ids or self.result_excluded_collection_ids or self.filter_workflow.base_context() is not None or self.current_chain_base_image_ids is not None:
+            self._execute_search_chain(operation_mode="recompute")
         else:
             self._reload_images()
+
+    def _apply_folder_from_payload(self, raw_prefix: object) -> None:
+        prefix = str(raw_prefix) if raw_prefix else None
+        def find(item):
+            if item.data(0, Qt.ItemDataRole.UserRole + 2) == prefix:
+                return item
+            for i in range(item.childCount()):
+                match = find(item.child(i))
+                if match is not None:
+                    return match
+            return None
+        for i in range(self.folder_tree.topLevelItemCount()):
+            match = find(self.folder_tree.topLevelItem(i))
+            if match is not None:
+                self.folder_tree.setCurrentItem(match)
+                return
+        # Preserve an unavailable disk scope explicitly; never broaden a preset
+        # to the whole library when its folder has disappeared from the tree.
+        if prefix:
+            item = QTreeWidgetItem([Path(prefix).name or prefix])
+            item.setData(0, Qt.ItemDataRole.UserRole + 2, prefix)
+            self.folder_tree.addTopLevelItem(item)
+            self.folder_tree.setCurrentItem(item)
+        else:
+            self.folder_tree.setCurrentItem(self.folder_tree.topLevelItem(0))
 
     def _apply_collection_from_payload(
         self,
@@ -18805,7 +18805,7 @@ class MainWindow(QMainWindow):
         self.current_sort_desc = self.sort_order_combo.currentData() != "asc"
         self.store.set_setting("ui.sort_key", self.current_sort_key)
         self.store.set_setting("ui.sort_order", "desc" if self.current_sort_desc else "asc")
-        if self.search_filters:
+        if self.search_filters or self.current_result_mode == "search_chain":
             self._apply_search_chain_filters()
             images = self.current_chain_filtered_images
             self.grid_view.set_images(images)
@@ -19093,6 +19093,9 @@ class MainWindow(QMainWindow):
                 self._refresh_score_threshold_controls()
                 return
             self._set_search_filter_score_threshold(active_index, value)
+            if self.current_chain_result.filters_applied:
+                self._queue_score_threshold_recompute()
+                return
             if self.score_threshold_slider.isSliderDown():
                 self._preview_score_threshold(value)
             else:

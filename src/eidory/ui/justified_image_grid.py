@@ -18,7 +18,7 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QColor, QDrag, QImage, QImageReader, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QDrag, QImage, QImageReader, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication
 
 from eidory.core.media_types import is_supported_video
@@ -75,6 +75,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._selected_index = -1
         self._selected_indexes: set[int] = set()
         self._badges_by_image_id: dict[int, list[str]] = {}
+        self._project_references: dict[int, list[str]] = {}
         self._selection_anchor = -1
         self._drag_start_position: QPoint | None = None
         self._drag_start_index = -1
@@ -153,6 +154,14 @@ class JustifiedImageGridView(QAbstractScrollArea):
     def selected_image_ids(self) -> list[int]:
         return [image.id for image in self.selected_images()]
 
+    def select_image_ids(self, image_ids: list[int]) -> None:
+        previous_indexes, previous_index = set(self._selected_indexes), self._selected_index
+        self._selected_indexes = {self._indexes_by_image_id[i] for i in image_ids if i in self._indexes_by_image_id}
+        self._selected_index = min(self._selected_indexes) if self._selected_indexes else -1
+        self._selection_anchor = self._selected_index
+        self._update_selection_change(previous_indexes, previous_index)
+        self._emit_selection()
+
     def set_images(
         self,
         images: list[ImageItem],
@@ -194,6 +203,27 @@ class JustifiedImageGridView(QAbstractScrollArea):
             self._rebuild_layout()
         self.viewport().update()
         self._emit_selection()
+
+    def set_project_references(self, references: dict[int, list[str]]) -> None:
+        """Set saved membership for the active project, not temporary selection.
+
+        Kept separate from result badges so filtering/sorting cannot erase it.
+        The project controller replaces this map when project links change.
+        """
+        references = {image_id: list(names) for image_id, names in references.items() if names}
+        if references != self._project_references:
+            self._project_references = references
+            self.viewport().update()
+
+    def image_tooltip(self, image: ImageItem) -> str:
+        parts = [image.file_path]
+        nodes = self._project_references.get(image.id, [])
+        if nodes:
+            parts.append("本项目已选 · 所属节点：" + "、".join(nodes))
+        badges = self._badges_by_image_id.get(image.id, [])
+        if badges:
+            parts.append("图片标记：" + "、".join(badges))
+        return "\n".join(parts)
 
     def append_images(self, images: list[ImageItem]) -> None:
         if not images:
@@ -287,6 +317,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
                     painter.setPen(focus_pen)
                     painter.drawRect(draw_rect.adjusted(0, 0, -1, -1))
                     painter.setPen(pen)
+                self._draw_project_reference_badge(painter, draw_rect, image)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -324,11 +355,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         index = self._index_at(event.position().toPoint())
         if index >= 0:
             image = self._images[index]
-            badges = self._badges_by_image_id.get(image.id, [])
-            tooltip = image.file_path
-            if badges:
-                tooltip = f"{tooltip}\n命中探针：" + "、".join(badges)
-            self.setToolTip(tooltip)
+            self.setToolTip(self.image_tooltip(image))
         else:
             self.setToolTip("")
         super().mouseMoveEvent(event)
@@ -368,6 +395,34 @@ class JustifiedImageGridView(QAbstractScrollArea):
         event.accept()
 
     def keyPressEvent(self, event) -> None:
+        if self._images and event.matches(QKeySequence.StandardKey.SelectAll):
+            self._selection_anchor = 0
+            self._select_range(len(self._images) - 1, additive=False)
+            event.accept()
+            return
+        navigation = {Qt.Key.Key_Home, Qt.Key.Key_End, Qt.Key.Key_Left, Qt.Key.Key_Right,
+                      Qt.Key.Key_Up, Qt.Key.Key_Down}
+        if self._images and event.key() in navigation:
+            index = max(0, self._selected_index)
+            key = event.key()
+            if key == Qt.Key.Key_Home:
+                index = 0
+            elif key == Qt.Key.Key_End:
+                index = len(self._images) - 1
+            elif key in {Qt.Key.Key_Left, Qt.Key.Key_Right}:
+                index += -1 if key == Qt.Key.Key_Left else 1
+            elif self._selected_index >= 0 and self._rects:
+                current = self._rects[index].center()
+                direction = -1 if key == Qt.Key.Key_Up else 1
+                candidates = [(i, r.center()) for i, r in enumerate(self._rects)
+                              if (r.center().y() - current.y()) * direction > 0]
+                if candidates:
+                    index = min(candidates, key=lambda pair: (abs(pair[1].y() - current.y()), abs(pair[1].x() - current.x())))[0]
+            index = max(0, min(index, len(self._images) - 1))
+            self._handle_selection_click(index, event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            self._ensure_index_visible(index)
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Space:
             image = self.current_image()
             if image is not None:
@@ -859,6 +914,27 @@ class JustifiedImageGridView(QAbstractScrollArea):
         else:
             text = "无缩略图"
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _draw_project_reference_badge(self, painter: QPainter, rect: QRect, image: ImageItem) -> None:
+        if image.id not in self._project_references or rect.width() < 12:
+            return
+        painter.save()
+        painter.setClipRect(rect)
+        metrics = painter.fontMetrics()
+        available = max(1, rect.width() - 8)
+        text = "✓ 本项目已选"
+        if metrics.horizontalAdvance(text) + 10 > available:
+            text = "✓ 已选"
+        if metrics.horizontalAdvance(text) + 10 > available:
+            text = "✓"
+        width = min(available, metrics.horizontalAdvance(text) + 10)
+        badge = QRect(rect.left() + 4, rect.top() + 4, width, metrics.height() + 6)
+        painter.setBrush(QColor(66, 48, 22, 240))
+        painter.setPen(QPen(QColor("#d5a14c"), 1))
+        painter.drawRoundedRect(badge, 3, 3)
+        painter.setPen(QColor("#ffe2a6"))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
 
     def _draw_badges(self, painter: QPainter, rect: QRect, image: ImageItem) -> None:
         badges = self._badges_by_image_id.get(image.id, [])

@@ -77,6 +77,16 @@ class MainWindowContextMenuTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def _adopt_suggestions(self, window):
+        # These legacy cases verify the contents after the user adopts a suggestion.
+        # Staging and non-mutation are independently covered in test_creative_workspace.
+        for project in window.store.list_creative_projects():
+            for node in window.store.list_creative_nodes(project.id):
+                state = window.creative_workspace.store.node(node.id)
+                if state['proposal_note'] or state['proposal_query']:
+                    window.creative_workspace.store.accept(node.id, note=state['proposal_note'], query=state['proposal_query'])
+                    window.creative_workspace.reload_node(node.id)
+
     def test_search_defaults_to_semantic_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
@@ -96,7 +106,37 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window._selected_search_mode(), "semantic")
             window.close()
 
-    def test_advanced_search_tools_are_collapsed_by_default(self) -> None:
+    def test_creative_node_imagination_defaults_to_balance_and_restores_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(
+                data_dir=Path(tmp) / "data",
+                thumbnail_dir=Path(tmp) / "data" / "thumbs",
+                database_path=Path(tmp) / "data" / "eidory.sqlite3",
+                log_dir=Path(tmp) / "data" / "logs",
+            )
+            paths.ensure()
+            store = MetadataStore(paths.database_path)
+            store.initialize()
+
+            window = MainWindow(paths=paths, store=store)
+            self.assertEqual(window.creative_node_imagination_slider.value(), 50)
+            self.assertTrue(
+                window.creative_content_tabs.isAncestorOf(
+                    window.creative_node_imagination_slider
+                )
+            )
+            self.assertFalse(window.creative_node_imagination_slider.isEnabled())
+            self.assertIn("平衡", window.creative_node_imagination_value_label.text())
+            window.creative_node_imagination_slider.setValue(80)
+            window._persist_creative_node_imagination()
+            window.close()
+
+            restored = MainWindow(paths=paths, store=store)
+            self.assertEqual(restored.creative_node_imagination_slider.value(), 80)
+            self.assertIn("偏发散", restored.creative_node_imagination_value_label.text())
+            restored.close()
+
+    def test_filter_panel_exposes_presets_without_legacy_toolbar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -111,13 +151,10 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
 
-            self.assertTrue(window.advanced_search_widget.isHidden())
-            self.assertEqual(window.advanced_search_toggle_button.text(), "▾")
-            self.assertIs(window.saved_view_combo.parentWidget(), window.advanced_search_widget)
-            window.advanced_search_toggle_button.click()
-            self.app.processEvents()
-            self.assertFalse(window.advanced_search_widget.isHidden())
-            self.assertEqual(window.advanced_search_toggle_button.text(), "▴")
+            self.assertTrue(window.filter_panel.isVisible())
+            self.assertFalse(window.search_input.isVisible())
+            self.assertFalse(window.advanced_search_widget.isVisible())
+            self.assertIs(window.saved_view_combo.parentWidget(), window.filter_panel)
             self.assertTrue(window.saved_view_combo.isVisible())
             self.assertEqual(window.saved_view_combo.currentText(), "未选择预设")
             self.assertEqual(window.saved_view_combo.contextMenuPolicy(), Qt.ContextMenuPolicy.NoContextMenu)
@@ -126,10 +163,6 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.saved_view_combo.itemText(1), "保存当前筛选为预设")
             self.assertEqual(window.saved_view_combo.findData(SAVED_VIEW_RENAME_ACTION), -1)
             self.assertEqual(window.saved_view_combo.findData(SAVED_VIEW_DELETE_ACTION), -1)
-            window.advanced_search_toggle_button.click()
-            self.app.processEvents()
-            self.assertTrue(window.advanced_search_widget.isHidden())
-            self.assertEqual(window.advanced_search_toggle_button.text(), "▾")
             window.close()
 
     def test_image_preview_opens_modelessly(self) -> None:
@@ -231,7 +264,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window._selected_saved_view_id(), saved_view_id)
             window.close()
 
-    def test_main_window_disables_qt_accessibility_backend(self) -> None:
+    def test_headless_main_window_disables_unused_accessibility_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -242,8 +275,6 @@ class MainWindowContextMenuTest(unittest.TestCase):
             paths.ensure()
             store = MetadataStore(paths.database_path)
             store.initialize()
-            QAccessible.setActive(True)
-
             window = MainWindow(paths=paths, store=store)
             window.show()
             self.app.processEvents()
@@ -926,7 +957,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(left, 0)
             self.assertEqual(right, 0)
             self.assertIs(window.center_result_stack.currentWidget(), window.grid_view)
-            self.assertTrue(window.search_input.isVisible())
+            self.assertTrue(window.filter_panel.isVisible())
 
             window._toggle_board_focus_mode()
             self.app.processEvents()
@@ -1003,7 +1034,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertTrue(window.search_merge_results_button.isEnabled())
             window.close()
 
-    def test_new_filter_kind_prompts_for_search_operation_choice(self) -> None:
+    def test_shortcut_appends_different_kind_to_current_group_without_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -1028,15 +1059,13 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._start_search_with_filter(SearchFilter("semantic", "水"))
 
-            prompt.assert_called_once_with(SearchFilter("semantic", "水"))
-            self.assertTrue(window.search_merge_results_button.isChecked())
-            self.assertEqual(window.search_filters, [SearchFilter("semantic", "水")])
-            execute_search_chain.assert_called_once()
-            self.assertEqual(execute_search_chain.call_args.kwargs["operation_mode"], "merge")
-            self.assertIn("operation_context", execute_search_chain.call_args.kwargs)
+            prompt.assert_not_called()
+            self.assertEqual(window.search_filters, [SearchFilter("color", (240, 152, 196)), SearchFilter("semantic", "水", 50)])
+            execute_search_chain.assert_called_once_with(operation_mode="recompute")
+            self.assertIsNone(window.current_chain_base_image_ids)
             window.close()
 
-    def test_same_filter_kind_prompts_for_search_operation_choice(self) -> None:
+    def test_shortcut_appends_same_kind_to_current_group_without_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -1061,11 +1090,10 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._start_search_with_filter(SearchFilter("color", (255, 0, 0)))
 
-            prompt.assert_called_once_with(SearchFilter("color", (255, 0, 0)))
-            self.assertEqual(window.search_filters, [SearchFilter("color", (255, 0, 0))])
-            execute_search_chain.assert_called_once()
-            self.assertEqual(execute_search_chain.call_args.kwargs["operation_mode"], "replace")
-            self.assertIn("operation_context", execute_search_chain.call_args.kwargs)
+            prompt.assert_not_called()
+            self.assertEqual(window.search_filters, [SearchFilter("color", (240, 152, 196)), SearchFilter("color", (255, 0, 0), 50)])
+            execute_search_chain.assert_called_once_with(operation_mode="recompute")
+            self.assertIsNone(window.current_chain_base_image_ids)
             window.close()
 
     def test_typing_query_after_color_search_switches_to_semantic_mode(self) -> None:
@@ -1160,7 +1188,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             )
             window.close()
 
-    def test_cancel_search_operation_prompt_keeps_current_results(self) -> None:
+    def test_cancel_condition_dialog_keeps_current_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -1180,13 +1208,13 @@ class MainWindowContextMenuTest(unittest.TestCase):
             original_filters = [SearchFilter("color", (240, 152, 196))]
             window.search_filters = list(original_filters)
 
+            window.filter_workflow.sync()
             with (
-                patch.object(window, "_prompt_search_operation_choice", return_value=None) as prompt,
+                patch("eidory.ui.filter_panel.FilterEditorDialog.exec", return_value=QDialog.DialogCode.Rejected),
                 patch.object(window, "_execute_search_chain") as execute_search_chain,
             ):
-                window._start_search_with_filter(SearchFilter("semantic", "水"))
+                window.filter_panel.edit_condition("include", 0)
 
-            prompt.assert_called_once_with(SearchFilter("semantic", "水"))
             self.assertEqual(window.search_filters, original_filters)
             execute_search_chain.assert_not_called()
             window.close()
@@ -3013,7 +3041,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertNotIn(outside_id, [image.id for image in result.images])
             window.close()
 
-    def test_search_operation_context_uses_visible_results_only_after_search(self) -> None:
+    def test_refining_search_preserves_original_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -3037,8 +3065,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             window.current_result_mode = "search_chain"
             base_ids, base_label, merge_base = window._search_operation_context("refine")
-            self.assertEqual(base_ids, {1, 2})
-            self.assertEqual(base_label, "在当前结果中")
+            self.assertIsNone(base_ids)
+            self.assertIsNone(base_label)
             self.assertIsNone(merge_base)
 
             base_ids, base_label, merge_base = window._search_operation_context("merge")
@@ -3563,8 +3591,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.app.processEvents()
 
             with patch(
-                "eidory.ui.main_window.QMessageBox.question",
-                return_value=QMessageBox.StandardButton.No,
+                "eidory.ui.reference_group_dialog.ReferenceGroupDialog.exec",
+                return_value=QDialog.DialogCode.Rejected,
             ):
                 window._create_reference_group_projects(
                     (
@@ -4670,7 +4698,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual([image.id for image in window.grid_view.images()], [5, 6, 7])
             window.close()
 
-    def test_search_chain_keeps_last_scored_filter_unthresholded_for_later_hard_filters(self) -> None:
+    def test_strict_color_rule_still_applies_alongside_keyword(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -4696,6 +4724,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 candidate_limit=2,
             )
 
+            store.list_images = lambda **kwargs: list(color_images)
+
             result = window._compute_search_chain(
                 filters=(
                     SearchFilter("color", (240, 152, 196), 100),
@@ -4709,9 +4739,9 @@ class MainWindowContextMenuTest(unittest.TestCase):
             )
 
             window.close()
-            self.assertEqual([image.id for image in result.images], [2])
+            self.assertEqual([image.id for image in result.images], [])
 
-    def test_search_chain_applies_non_last_scored_filter_before_next_scored_filter(self) -> None:
+    def test_each_scored_rule_uses_original_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -4750,6 +4780,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             window.search_service.semantic_search = semantic_search
 
+            store.list_images = lambda **kwargs: list(color_images)
+
             window._compute_search_chain(
                 filters=(
                     SearchFilter("color", (240, 152, 196), 50),
@@ -4763,7 +4795,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             )
 
             window.close()
-            self.assertEqual(captured_allowed_ids, [{1, 2}])
+            self.assertEqual(captured_allowed_ids, [{1, 2, 3}])
 
     def test_selected_search_filter_controls_score_threshold_slider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5196,7 +5228,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual([image.id for image in window.grid_view.images()], [anatomy_id, landscape_id])
             window.close()
 
-    def test_reverse_color_exclusion_tracks_score_threshold_slider(self) -> None:
+    def test_reverse_color_strength_does_not_follow_positive_slider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -5218,7 +5250,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 self._image(2, score=0.90),
                 self._image(3, score=0.90),
             ]
-            exclusion_filter = SearchFilter("color", (240, 152, 196))
+            exclusion_filter = SearchFilter("color", (240, 152, 196), 50)
             window.result_exclusion_filters = [exclusion_filter]
             window.result_exclusion_filter_matches = {
                 exclusion_filter: [
@@ -5232,7 +5264,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             window.score_threshold_slider.setValue(30)
             self.app.processEvents()
-            self.assertEqual([image.id for image in window.grid_view.images()], [3])
+            self.assertEqual([image.id for image in window.grid_view.images()], [2, 3])
             window.close()
 
     def test_tag_filter_search_chain_matches_selected_tags(self) -> None:
@@ -5838,6 +5870,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 search_query="空间站餐区 漂浮餐具 舱内灯 飞船剪影",
             )
             window._handle_creative_node_note_done(int(root_id), user_note, suggestion, "fake")
+            self._adopt_suggestions(window)
 
             node = store.get_creative_node(int(root_id))
             self.assertIsNotNone(node)
@@ -5880,6 +5913,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             suggestion = SimpleNamespace(note="...", search_query="...")
             window._handle_creative_node_note_done(int(root_id), user_note, suggestion, "fake")
+            self._adopt_suggestions(window)
 
             node = store.get_creative_node(int(root_id))
             self.assertIsNotNone(node)
@@ -5925,6 +5959,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 search_query="Analyze User Input space station",
             )
             window._handle_creative_node_note_done(int(root_id), user_note, suggestion, "fake")
+            self._adopt_suggestions(window)
 
             node = store.get_creative_node(int(root_id))
             self.assertIsNotNone(node)
@@ -6411,7 +6446,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(window.creative_content_tabs.currentIndex(), 1)
             window.close()
 
-    def test_creative_node_ai_completion_requires_confirm_when_note_exists(self) -> None:
+    def test_creative_node_ai_completion_stages_without_overwrite_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -6452,10 +6487,9 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_creative_children_for_selected_node()
 
-            question.assert_called_once()
-            start_task.assert_not_called()
-            self.assertTrue(window.generate_creative_children_button.isEnabled())
-            self.assertEqual(window.statusBar().currentMessage(), "已取消当前节点信息补全")
+            question.assert_not_called()
+            start_task.assert_called_once()
+            self.assertEqual(store.get_creative_node(node_id).note, "已经确认的人机交互动作。")
             window.close()
 
     def test_creative_node_completion_buttons_use_current_and_all_labels(self) -> None:
@@ -6474,10 +6508,10 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.app.processEvents()
 
             self.assertEqual(window.generate_creative_children_button.text(), "当前节点信息补全")
-            self.assertEqual(window.generate_all_creative_nodes_button.text(), "补全所有节点信息")
+            self.assertEqual(window.generate_all_creative_nodes_button.text(), "补全未锁定、无待采纳建议的节点")
             self.assertEqual(window.creative_template_label.text(), "新建项目模板")
-            self.assertEqual(window.creative_new_project_button.text(), "按当前内容新建项目")
-            self.assertEqual(window.creative_ai_project_button.text(), "AI 生成完整项目")
+            self.assertEqual(window.creative_new_project_button.text(), "按此主题新建项目")
+            self.assertEqual(window.creative_ai_project_button.text(), "给我一个新创作题目")
             self.assertEqual(window.open_creative_copy_button.text(), "文案")
             self.assertEqual(window.back_creative_nodes_button.text(), "返回节点树")
             self.assertFalse(hasattr(window, "open_creative_board_button"))
@@ -6669,6 +6703,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_all_creative_node_notes()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             self.assertGreaterEqual(len(provider.calls), 2)
             root_call = next(call for call in provider.calls if call["node_title"] == "空间站晚餐")
@@ -6738,6 +6773,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                     window.inspiration_answers_input.setPlainText("医生，赛博朋克，地下诊所")
                     window._generate_all_creative_node_notes()
                     window._poll_events()
+                    self._adopt_suggestions(window)
 
                     project = next(
                         item for item in store.list_creative_projects() if item.title == brief[:32].strip()
@@ -6793,6 +6829,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.creative_template_combo.setCurrentIndex(character_index)
             window.inspiration_brief_input.setPlainText("赛博朋克世界观里的一个半人半机器人的医生")
             window.inspiration_answers_input.setPlainText("赛博朋克，人机结合")
+            window.creative_node_imagination_slider.setValue(85)
 
             def run_immediately(target, **_kwargs):
                 target()
@@ -6805,9 +6842,11 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_all_creative_node_notes()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             self.assertEqual(len(provider.calls), 1)
             call = provider.calls[0]
+            self.assertEqual(call["imagination_level"], 85)
             self.assertNotIn("脸型、五官、发型", str(call["project_outline"]))
             batch_nodes = [dict(item) for item in call["nodes"]]  # type: ignore[index]
             head = next(item for item in batch_nodes if item["node_title"] == "头面部")
@@ -6889,6 +6928,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_all_creative_node_notes()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             head_request = next(call for call in provider.single_calls if call["node_title"] == "头面部")
             self.assertEqual(head_request["current_note"], "秃头，老人，老年斑")
@@ -6969,6 +7009,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_all_creative_node_notes()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             head_request = next(call for call in provider.single_calls if call["node_title"] == "头面部")
             self.assertEqual(head_request["current_note"], "秃顶，老年斑")
@@ -7035,6 +7076,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_creative_children_for_selected_node()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             self.assertEqual(provider.calls[0]["current_note"], "秃顶，老年斑")
             updated_head = store.get_creative_node(head_node.id)
@@ -7105,6 +7147,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_creative_children_for_selected_node()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             self.assertEqual(len(provider.calls), 1)
             self.assertTrue(str(provider.calls[0]["current_note"]).startswith("秃顶，老年斑"))
@@ -7191,6 +7234,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_all_creative_node_notes()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             head_request = next(call for call in provider.single_calls if call["node_title"] == "头面部")
             self.assertIn("旧 AI 已经写过", str(head_request["current_note"]))
@@ -7288,6 +7332,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_all_creative_node_notes()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             current_notes = {
                 str(item["node_title"]): str(item["current_note"])
@@ -7455,6 +7500,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_all_creative_node_notes()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             current_notes = {
                 str(call["node_title"]): str(call["current_note"])
@@ -7539,7 +7585,9 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_all_creative_node_notes()
                 window._poll_events()
+                self._adopt_suggestions(window)
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             self.assertFalse(warning.called)
             self.assertEqual(provider.seed_calls, 1)
@@ -7626,6 +7674,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
                     window._generate_all_creative_node_notes()
                     window._poll_events()
+                    self._adopt_suggestions(window)
 
                     call = provider.calls[-1]
                     batch_nodes = [dict(item) for item in call["nodes"]]  # type: ignore[index]
@@ -7709,6 +7758,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
                     window._generate_all_creative_node_notes()
                     window._poll_events()
+                    self._adopt_suggestions(window)
 
                     call = provider.calls[-1]
                     batch_nodes = [dict(item) for item in call["nodes"]]  # type: ignore[index]
@@ -8021,7 +8071,9 @@ class MainWindowContextMenuTest(unittest.TestCase):
             head_node = next(node for node in store.list_creative_nodes(project_id) if node.title == "头面部")
             window._load_creative_project(project_id, select_node_id=head_node.id, show_board=False)
             self.app.processEvents()
+            self.assertTrue(window.creative_node_imagination_slider.isEnabled())
             window.creative_node_note_input.setPlainText("脏辫")
+            window.creative_node_imagination_slider.setValue(15)
             self.app.processEvents()
 
             def run_immediately(target, **_kwargs):
@@ -8035,8 +8087,10 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_creative_children_for_selected_node()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             self.assertEqual(provider.calls[0]["current_note"], "脏辫")
+            self.assertEqual(provider.calls[0]["imagination_level"], 15)
             updated = store.get_creative_node(head_node.id)
             self.assertIsNotNone(updated)
             assert updated is not None
@@ -8084,10 +8138,13 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 window._generate_creative_children_for_selected_node()
 
             self.assertTrue(window._creative_node_note_in_progress)
+            window.creative_workspace.show_planning()
             self.assertTrue(window.creative_node_progress_bar.isVisible())
             self.assertFalse(window.generate_creative_children_button.isEnabled())
+            self.assertFalse(window.creative_node_imagination_slider.isEnabled())
             self.assertIn("正在补全", window.creative_node_status_label.text())
             window._set_creative_node_completion_busy(False)
+            self.assertTrue(window.creative_node_imagination_slider.isEnabled())
             window.close()
 
     def test_complete_all_creative_nodes_rejects_template_placeholder_results(self) -> None:
@@ -8133,6 +8190,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_all_creative_node_notes()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             self.assertTrue(warning.called)
             self.assertIn("AI没有返回可用节点补充内容", str(warning.call_args.args[2]))
@@ -8190,6 +8248,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             ):
                 window._generate_all_creative_node_notes()
                 window._poll_events()
+                self._adopt_suggestions(window)
 
             self.assertTrue(warning.called)
             message = str(warning.call_args.args[2])
@@ -8267,7 +8326,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertGreater(len(nodes), 3)
             self.assertGreaterEqual(provider.seed_calls, 1)
             self.assertEqual(provider.note_calls, len(nodes))
-            self.assertTrue(any("AI补全后的节点说明" in node.note for node in nodes))
+            self.assertTrue(any("AI补全后的节点说明" in window.creative_workspace.store.node(node.id)["proposal_note"] for node in nodes))
             self.assertFalse(window._creative_all_nodes_in_progress)
             window.close()
 

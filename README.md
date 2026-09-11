@@ -76,28 +76,60 @@ right-clicking `dist/Eidory.app` and choosing `Open`.
 4. Keep `自动监听文件变化` enabled in the settings panel for local file changes.
 5. Click `扫描全部`, `扫描新增`, or `扫描缺失` from the settings panel when you need a manual scan.
 6. Click `开始索引` if semantic search has not indexed the imported images yet.
-7. Use the search bar with `语义`, `关键词`, `相似图`, or `颜色`.
+7. Add conditions in the gallery's `保留` / `排除` panel, then click `应用筛选`.
 
 Eidory indexes files in place. Importing means “record these files in Eidory and
 assign them to the selected logical folder”; it does not copy the source files.
 
 ## Search
 
-Search modes:
+The filter panel separates scope, rules, and sorting. Choose the whole library,
+one or more folders (including descendants), or freeze the current wall as a
+fixed result scope. Selecting a folder in the sidebar changes the scope.
 
-- `关键词`: searches filename, tag, note, and stored text fields.
-- `语义`: encodes the text query and searches image embeddings.
-- `相似图`: searches by the selected image embedding.
-- `颜色`: searches by dominant color similarity.
+- `保留` groups default to `全部（且）`. For example, airplane plus landscape
+  keeps landscape airplane references. With no include conditions, all images
+  in the scope are eligible.
+- `排除` groups remove matches from those eligible images. Choose `任一（或）`
+  to remove red images **or** airplane images; choose `全部（且）` to remove
+  only images that match both red and airplane.
+- `＋ 组` inside either box adds another group. Exclusion groups remove their
+  matches independently; include groups merge their matches. Empty groups have
+  no effect.
+- Add, edit, remove, or clear conditions in the draft; click `应用筛选` to update
+  the wall. `撤销` restores the previous applied query, and `查看排除` previews
+  hidden matches without deleting files or library records.
 
-Search logic:
+Conditions cover semantic content, keywords, color, similar images, folders,
+user tags, file type, orientation, size, status, and existing AI vision tags.
+Keywords search filename, path, note, and user tags; use semantic content to
+recognize an airplane that is not mentioned in that text. Color describes the
+whole image's color tendency, not a particular object's color.
 
-- `重新搜索`: search the whole current scope again.
-- `在结果中搜`: narrow inside current results.
-- `合并结果`: search again and union the new results with current results.
+The panel has two permanently visible boxes: `保留` on the left and `排除` on
+the right. Every condition occupies one row, with its name and inline strength
+slider when applicable. Each box grows and shrinks to fit its own rows. Long
+lists scroll within the box to leave space for the gallery; five conditions
+remain visible together. Shared scope, sorting, and Apply controls sit outside
+the boxes. Scope restrictions and index-coverage details are in the footer.
 
-The minimum-similarity slider controls how many semantic/color/probe results are
-kept. Lower values are broader; higher values are stricter.
+Each semantic/color/similar-image condition has its own inline `宽松—严格` slider.
+After applying the rules, dragging a slider updates the wall and counts while
+the mouse is still moving, without another Apply or model search. Loosening an
+include condition can restore pictures from the full original scope; loosening
+an exclusion condition removes more pictures. One Undo reverses the whole drag.
+Changes to rule content, groups, or matching mode remain staged until Apply;
+sliders in that pending draft also take effect when those rules are applied.
+Strength is relative to that condition's scores across the original scope,
+not a recognition probability. Editing another rule does not move its threshold.
+Semantic and similar-image conditions only match indexed images; the panel
+reports incomplete index coverage. Removing a rule recomputes from the original
+scope, so previously filtered images can return.
+
+The preset menu saves and restores scope, include/exclude groups, their all/any
+modes, individual strengths, manual exclusions, and sorting. Existing presets
+remain readable. Global folder settings that disable search still apply and
+are identified in the panel.
 
 ## Library Maintenance
 
@@ -116,16 +148,49 @@ Right-click selected images and choose `对比查看` to compare 2-6 images side
 side. Double-click a single image for the existing large preview with zoom,
 source-file actions, and next/previous navigation.
 
+## Creative Workspace
+
+The central workspace follows `构思 → 找参考 → 已收集 → 看板`. Gallery images
+already collected by any node in the active project show a gold `本项目已选`
+badge; hovering lists their current node names. This survives live filtering
+and updates when references or projects change. Temporary mouse selection does
+not count as collection, and intentional reuse across nodes remains available.
+The right
+`创作` sidebar keeps the current project and node visible throughout this flow.
+
+- Each project keeps its own brief and extra constraints. Free exploration does
+  not overwrite those constraints when switching back to the project.
+- AI node expansions appear as editable proposals. Adopt, append a selected
+  passage, or discard them; restore the text from before the last adoption.
+  Lock confirmed nodes to keep later AI completion from changing them.
+- `围绕当前主题完善项目` continues the current idea; `给我一个新创作题目`
+  starts a different idea. Batch completion skips locked nodes and proposals
+  that have not yet been reviewed.
+- `为当前节点找参考` uses the visible search scope and existing filter panel.
+  Returning from collected references or the board restores that node's search
+  rules, scroll position, and selected candidates.
+- Select references and add them to the current node. A reference can have a
+  different usage note in each node, without changing its library-wide notes.
+- `AI 分组…` previews groups for four or more selected indexed images. Rename,
+  move, or merge the suggestions before saving them as reference projects.
+- Boards support node sections, text notes, and undo/redo for layout edits.
+  `适应全部` includes section headings and notes as well as images.
+- `导出创作参考包…` creates a folder with readable HTML, structured JSON,
+  original reference files, and board PNGs. The report identifies missing files.
+
 ## AI Semantic Probes
 
-Open the right sidebar `AI` tab:
+Choose `探索灵感方向` in the right `创作` sidebar:
 
 1. Write one sentence describing the creative topic.
 2. Add optional context such as time, weather, lighting, mood, era, or art direction.
 3. Click `生成语义探针`.
 4. Select up to 7 probes.
 5. Click `保存并搜索` to search mixed reference results.
-6. Save chosen results into inspiration projects for later review.
+6. Adjust the exposed `更多 / 更相近` slider to broaden or narrow the results.
+7. Save chosen results, or turn selected directions into nodes of the current
+   creative project. Selected images that match each direction are carried into
+   the corresponding node.
 
 Default local AI provider:
 
@@ -196,6 +261,8 @@ python -m pytest -q
 
 The test suite uses fake embedding providers where possible. It should not need
 to download the real semantic model.
+PySide6 is pinned to 6.9.3. Newer 6.10/6.11 runtimes intermittently crashed
+inside native object bindings during repeated-window regression tests.
 
 ## Development Notes
 

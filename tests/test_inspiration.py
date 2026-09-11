@@ -31,6 +31,18 @@ from eidory.models import ImageItem
 
 
 class InspirationTest(unittest.TestCase):
+    def test_group_names_accept_structured_answer_in_reasoning_field(self) -> None:
+        provider = LMStudioProvider(model_name="local-model")
+        with patch("eidory.core.llm_provider.requests.post") as post:
+            post.return_value.status_code = 200
+            post.return_value.json.return_value = {"choices": [{"message": {
+                "content": "",
+                "reasoning_content": '{"groups":[{"name":"风化墙面","summary":"材质参考"}]}',
+            }}]}
+            groups = provider.suggest_reference_group_names(groups=[{"file_names": ["wall.jpg"]}])
+        self.assertEqual(groups[0].name, "风化墙面")
+        self.assertEqual(post.call_args.kwargs["json"]["reasoning_effort"], "none")
+
     def test_parse_inspiration_proposal_from_markdown_json(self) -> None:
         proposal = parse_inspiration_proposal(
             """
@@ -359,6 +371,63 @@ class InspirationTest(unittest.TestCase):
         self.assertIn("黑色太空", suggestion.note)
         self.assertNotIn("thinking process", suggestion.note.lower())
 
+    def test_creative_node_imagination_changes_prompt_and_temperature(self) -> None:
+        provider = LMStudioProvider(model_name="fake")
+        model_output = (
+            '{"note":"潮湿维修棚以锈蚀钢梁、旧检修灯和积水地面形成明确视觉特征。",'
+            '"search_query":"潮湿 维修棚 锈蚀钢梁 检修灯 积水"}'
+        )
+
+        with patch.object(provider, "_chat_completion", return_value=model_output) as chat:
+            provider.generate_creative_node_note(
+                project_brief="潮湿维修棚里的机械师",
+                node_title="地点",
+                node_path="项目 / 地点",
+                imagination_level=0,
+                language="zh",
+            )
+            strict_kwargs = chat.call_args.kwargs
+            provider.generate_creative_node_note(
+                project_brief="潮湿维修棚里的机械师",
+                node_title="地点",
+                node_path="项目 / 地点",
+                imagination_level=100,
+                language="zh",
+            )
+            divergent_kwargs = chat.call_args.kwargs
+
+        self.assertEqual(strict_kwargs["temperature"], 0.20)
+        self.assertEqual(divergent_kwargs["temperature"], 0.80)
+        strict_prompt = strict_kwargs["messages"][1]["content"]
+        divergent_prompt = divergent_kwargs["messages"][1]["content"]
+        self.assertIn("联想程度：0/100", strict_prompt)
+        self.assertIn("只补充输入信息直接支持", strict_prompt)
+        self.assertIn("联想程度：100/100", divergent_prompt)
+        self.assertIn("大胆、意外和视觉夸张", divergent_prompt)
+        self.assertIn("绝对不得违背", divergent_prompt)
+
+    def test_batch_creative_node_prompt_uses_same_imagination_guidance(self) -> None:
+        prompt = _build_creative_node_notes_prompt(
+            project_brief="潮湿维修棚里的机械师",
+            project_extra="夜晚，冷色检修灯",
+            project_outline="- 项目\n  - 地点",
+            nodes=[
+                {
+                    "node_id": "1",
+                    "node_title": "地点",
+                    "node_path": "项目 / 地点",
+                    "current_note": "",
+                    "node_template_hint": "环境结构和材质",
+                }
+            ],
+            imagination_level=85,
+            language="zh",
+        )
+
+        self.assertIn("联想程度：85/100", prompt)
+        self.assertIn("大胆、意外和视觉夸张", prompt)
+        self.assertIn("绝对不得违背", prompt)
+
     def test_generate_creative_node_note_accepts_json_from_reasoning_content(self) -> None:
         provider = LMStudioProvider(model_name="fake")
 
@@ -506,6 +575,7 @@ class InspirationTest(unittest.TestCase):
                 project_brief="赛博朋克世界观里的一个半人半机器人的医生",
                 project_extra="赛博朋克，人机结合",
                 project_outline="- 赛博朋克世界观里的一个半人半机器人的医生\n  - 世界观\n  - 头面部",
+                imagination_level=85,
                 nodes=[
                     {
                         "node_id": "1",
@@ -531,7 +601,9 @@ class InspirationTest(unittest.TestCase):
         self.assertTrue(kwargs["prefer_json"])
         self.assertEqual(kwargs["response_format"]["json_schema"]["name"], "eidory_creative_node_notes")
         self.assertTrue(kwargs["allow_reasoning_content"])
+        self.assertEqual(kwargs["temperature"], 0.67)
         prompt = kwargs["messages"][1]["content"]
+        self.assertIn("联想程度：85/100", prompt)
         self.assertIn("赛博朋克世界观里的一个半人半机器人的医生", prompt)
         self.assertIn("赛博朋克，人机结合", prompt)
         self.assertIn("template_guidance", prompt)

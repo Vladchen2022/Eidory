@@ -374,6 +374,38 @@ CREATE TABLE IF NOT EXISTS creative_node_images (
 CREATE INDEX IF NOT EXISTS idx_creative_node_images_node_order
 ON creative_node_images(node_id, sort_order);
 
+CREATE TABLE IF NOT EXISTS creative_project_context (
+    project_id INTEGER PRIMARY KEY REFERENCES creative_projects(id) ON DELETE CASCADE,
+    extra TEXT NOT NULL DEFAULT '',
+    scope_json TEXT NOT NULL DEFAULT '',
+    probe_json TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS creative_node_workflow (
+    node_id INTEGER PRIMARY KEY REFERENCES creative_nodes(id) ON DELETE CASCADE,
+    locked INTEGER NOT NULL DEFAULT 0,
+    proposal_note TEXT NOT NULL DEFAULT '',
+    proposal_query TEXT NOT NULL DEFAULT '',
+    search_json TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS creative_node_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL REFERENCES creative_nodes(id) ON DELETE CASCADE,
+    note TEXT NOT NULL,
+    search_query TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_creative_node_versions_node ON creative_node_versions(node_id, id);
+
+CREATE TABLE IF NOT EXISTS creative_reference_notes (
+    node_id INTEGER NOT NULL,
+    image_id INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(node_id, image_id),
+    FOREIGN KEY(node_id, image_id) REFERENCES creative_node_images(node_id, image_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS creative_board_layouts (
     project_id INTEGER PRIMARY KEY,
     payload_json TEXT NOT NULL,

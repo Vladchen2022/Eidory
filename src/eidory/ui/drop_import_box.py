@@ -42,22 +42,12 @@ class DropImportBox(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setWordWrap(True)
         self.setMinimumHeight(118)
-        self.setStyleSheet(
-            "border: 1px dashed #7b8490; border-radius: 6px; "
-            "background: #252b33; color: #d8dee9; padding: 14px;"
-        )
 
     def set_drop_enabled(self, enabled: bool, text: str | None = None) -> None:
         self._drop_enabled = enabled
         self.setEnabled(enabled)
         if text is not None:
             self.setText(text)
-        opacity = "1.0" if enabled else "0.45"
-        self.setStyleSheet(
-            "border: 1px dashed #7b8490; border-radius: 6px; "
-            "background: #252b33; color: #d8dee9; padding: 14px; "
-            f"opacity: {opacity};"
-        )
 
     @staticmethod
     def _supports_mime(mime_data) -> bool:

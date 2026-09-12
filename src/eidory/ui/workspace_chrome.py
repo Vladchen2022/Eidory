@@ -10,7 +10,8 @@ from PySide6.QtWidgets import (
     QScrollArea, QSizePolicy, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from eidory.ui.theme import apply_dark_theme
+from eidory.ui.theme import apply_theme
+from eidory.ui.theme_colors import THEMES, get_theme
 
 
 class WorkspaceChrome(QObject):
@@ -249,6 +250,20 @@ class WorkspaceChrome(QObject):
             dialog.resize(760, 780)
             layout = QVBoxLayout(dialog)
             if index == 4:
+                appearance = QHBoxLayout()
+                appearance.addWidget(QLabel("主题配色"))
+                self.theme_combo = QComboBox()
+                self.theme_combo.setAccessibleName("主题配色")
+                for theme in THEMES:
+                    self.theme_combo.addItem(theme.name, theme.id)
+                self.theme_combo.setCurrentIndex(self.theme_combo.findData(get_theme(w.store.get_setting("ui.theme")).id))
+                self.theme_combo.currentIndexChanged.connect(self.change_theme)
+                appearance.addWidget(self.theme_combo)
+                hint = QLabel("立即生效，自动保存")
+                hint.setProperty("role", "muted")
+                appearance.addWidget(hint)
+                appearance.addStretch(1)
+                layout.addLayout(appearance)
                 display = QHBoxLayout()
                 display.addWidget(QLabel("界面密度"))
                 self.density_combo = QComboBox()
@@ -304,7 +319,12 @@ class WorkspaceChrome(QObject):
     def change_density(self):
         density = self.density_combo.currentData()
         self.w.store.set_setting("ui.density", density)
-        apply_dark_theme(QApplication.instance(), density=density)
+        apply_theme(QApplication.instance(), self.theme_combo.currentData(), density=density)
+
+    def change_theme(self):
+        theme_id = self.theme_combo.currentData()
+        self.w.store.set_setting("ui.theme", theme_id)
+        apply_theme(QApplication.instance(), theme_id, density=self.density_combo.currentData())
 
     def _refine_planning(self):
         w = self.w

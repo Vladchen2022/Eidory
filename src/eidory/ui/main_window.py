@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from eidory.ui.theme_colors import theme_color, set_theme_style, set_item_theme
+
 import os
 import queue
 import random
@@ -299,8 +301,8 @@ class ProjectListItemDelegate(QStyledItemDelegate):
         if kind == PROJECT_LIST_SECTION_KIND:
             painter.save()
             rect = option.rect.adjusted(2, self.SECTION_TOP_GAP, -2, -1)
-            painter.fillRect(rect, QColor("#343b44"))
-            painter.setPen(QColor("#d8dee9"))
+            painter.fillRect(rect, theme_color("raised"))
+            painter.setPen(theme_color("text"))
             expanded = bool(index.data(PROJECT_LIST_SECTION_EXPANDED_ROLE))
             section_text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
             text = option.fontMetrics.elidedText(
@@ -322,7 +324,7 @@ class ProjectListItemDelegate(QStyledItemDelegate):
         painter.save()
         rect = option.rect.adjusted(2, 1, -2, -1)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        foreground = QColor("#edf3fb")
+        foreground = theme_color("text")
         if selected:
             painter.fillRect(rect, option.palette.highlight().color())
             foreground = option.palette.highlightedText().color()
@@ -419,8 +421,8 @@ class FolderTreeItemDelegate(QStyledItemDelegate):
         if option.state & QStyle.StateFlag.State_Selected:
             return
         if index.column() == 0:
-            option.palette.setColor(QPalette.ColorRole.Text, self.EXCLUDED_NAME_COLOR)
-            option.palette.setColor(QPalette.ColorRole.WindowText, self.EXCLUDED_NAME_COLOR)
+            option.palette.setColor(QPalette.ColorRole.Text, theme_color("marker"))
+            option.palette.setColor(QPalette.ColorRole.WindowText, theme_color("marker"))
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
         if (
@@ -449,7 +451,7 @@ class FolderTreeItemDelegate(QStyledItemDelegate):
             max(1, text_rect.width()),
         )
         painter.save()
-        painter.setPen(self.EXCLUDED_NAME_COLOR)
+        painter.setPen(theme_color("marker"))
         painter.drawText(text_rect, alignment, text)
         painter.restore()
 
@@ -777,7 +779,7 @@ def _folder_search_excluded_marker_icon() -> QIcon:
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(FolderTreeItemDelegate.EXCLUDED_NAME_COLOR)
+    painter.setBrush(theme_color("marker"))
     painter.drawEllipse(2, 2, 8, 8)
     painter.end()
     return QIcon(pixmap)
@@ -788,9 +790,9 @@ def _board_control_icon(kind: str) -> QIcon:
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    line_color = QColor("#e4e9f1")
-    fill_color = QColor("#e4e9f1")
-    muted_color = QColor("#8792a0")
+    line_color = theme_color("text")
+    fill_color = theme_color("text")
+    muted_color = theme_color("muted")
     painter.setPen(QPen(line_color, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
     painter.setBrush(Qt.BrushStyle.NoBrush)
 
@@ -1408,7 +1410,7 @@ class ImageCompareDialog(QDialog):
             preview = QLabel()
             preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
             preview.setMinimumSize(260, 380)
-            preview.setStyleSheet("background: #20262e; border: 1px solid #47515d;")
+            preview.setProperty("role", "preview")
             pixmap = QPixmap()
             if not image.is_missing and Path(image.file_path).exists() and not is_supported_video(image.file_path):
                 pixmap = _load_scaled_qt_pixmap(image.file_path, 1040, 1040)
@@ -2314,12 +2316,28 @@ class MainWindow(QMainWindow):
         tooltip: str,
     ) -> None:
         button.setText("")
+        button.setProperty("eidoryBoardIcon", icon_name)
         button.setIcon(_board_control_icon(icon_name))
         button.setIconSize(BOARD_ICON_SIZE)
         button.setFixedSize(BOARD_ICON_BUTTON_SIZE)
         button.setToolTip(tooltip)
         button.setAccessibleName(accessible_name)
         button.setAccessibleDescription(tooltip)
+
+    def refresh_theme(self) -> None:
+        # Update presentation in place, preserving selection, drafts and undo.
+        for button in self.findChildren(QPushButton):
+            kind = button.property("eidoryBoardIcon")
+            if kind:
+                button.setIcon(_board_control_icon(kind))
+        if hasattr(self, "collection_tree"):
+            def visit(item):
+                if item.data(0, COLLECTION_SEARCH_EXCLUDED_MATCH_ROLE) is not None:
+                    item.setIcon(0, _folder_search_excluded_marker_icon())
+                for index in range(item.childCount()):
+                    visit(item.child(index))
+            for index in range(self.collection_tree.topLevelItemCount()):
+                visit(self.collection_tree.topLevelItem(index))
 
     def _build_library_panel(self) -> QWidget:
         panel = QWidget()
@@ -2739,7 +2757,7 @@ class MainWindow(QMainWindow):
         self.preview_label = QLabel("未选择图片")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumHeight(180)
-        self.preview_label.setStyleSheet("background:#2d3138;color:#d8dee9;")
+        self.preview_label.setProperty("role", "preview")
         self.video_widget: QVideoWidget | None = None
         self.video_player: QMediaPlayer | None = None
         self.video_audio_output: QAudioOutput | None = None
@@ -2806,9 +2824,9 @@ class MainWindow(QMainWindow):
         self.tags_display.setSpacing(6)
         self.tags_display.setMinimumHeight(58)
         self.tags_display.setMaximumHeight(96)
-        self.tags_display.setStyleSheet(
+        set_theme_style(self.tags_display,
             "QListWidget { background: transparent; border: 0; padding: 0; }"
-            "QListWidget::item { border: 1px solid #59616d; border-radius: 6px; padding: 4px 8px; }"
+            "QListWidget::item { border: 1px solid @border@; border-radius: 6px; padding: 4px 8px; }"
         )
 
         self.batch_tag_summary_label = QLabel("-")
@@ -10058,15 +10076,15 @@ class MainWindow(QMainWindow):
         if not clean_tags:
             item = QListWidgetItem(empty_text)
             item.setFlags(Qt.ItemFlag.NoItemFlags)
-            item.setForeground(QBrush(QColor("#9aa3ad")))
+            set_item_theme(item, foreground="muted")
             item.setSizeHint(QSize(max(86, min(240, len(empty_text) * 10 + 24)), 28))
             self.tags_display.addItem(item)
             return
         for tag in clean_tags:
             item = QListWidgetItem(tag)
             item.setFlags(Qt.ItemFlag.NoItemFlags)
-            item.setForeground(QBrush(QColor("#e6ebf2")))
-            item.setBackground(QBrush(QColor("#39414c")))
+            set_item_theme(item, foreground="text")
+            set_item_theme(item, background="raised")
             item.setToolTip(tag)
             item.setSizeHint(QSize(max(64, min(180, len(tag) * 12 + 26)), 28))
             self.tags_display.addItem(item)
@@ -10352,7 +10370,7 @@ class MainWindow(QMainWindow):
         if self.video_widget is None:
             self.video_widget = QVideoWidget()
             self.video_widget.setMinimumHeight(180)
-            self.video_widget.setStyleSheet("background:#2d3138;")
+            self.video_widget.setProperty("role", "preview")
             self.preview_stack.addWidget(self.video_widget)
         if self.video_player is None:
             self.video_player = QMediaPlayer(self)
@@ -14035,7 +14053,7 @@ class MainWindow(QMainWindow):
         item.setToolTip(0, self._virtual_filter_help(virtual_filter))
         item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         for column in range(item.columnCount()):
-            item.setBackground(column, QBrush(QColor("#343b44")))
+            set_item_theme(item, background="raised", column=column)
         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled & ~Qt.ItemFlag.ItemIsDropEnabled)
         return item
 
@@ -17171,7 +17189,7 @@ class MainWindow(QMainWindow):
             item.setData(PROJECT_LIST_KIND_ROLE, PROJECT_LIST_SECTION_KIND)
             item.setData(PROJECT_LIST_SECTION_ID_ROLE, section_id)
             item.setData(PROJECT_LIST_SECTION_EXPANDED_ROLE, section_expanded(section_id))
-            item.setBackground(QBrush(QColor("#2d343d")))
+            set_item_theme(item, background="raised")
             item.setToolTip("点击展开或收起")
             self.temp_project_list.addItem(item)
 
@@ -17225,7 +17243,7 @@ class MainWindow(QMainWindow):
                     "\n".join(["创作节点项目", project.title, f"{project.node_count} 个节点", f"{project.image_count} 张"])
                 )
                 if project.is_pinned:
-                    item.setForeground(QBrush(QColor("#f1d58a")))
+                    set_item_theme(item, foreground="warning")
                 self.temp_project_list.addItem(item)
                 if select_kind == "creative" and select_id == project.id:
                     selected_item = item
@@ -17826,7 +17844,7 @@ class MainWindow(QMainWindow):
         item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._apply_collection_tree_level_style(item, depth)
         if search_excluded_match_id is not None:
-            item.setForeground(0, QBrush(FolderTreeItemDelegate.EXCLUDED_NAME_COLOR))
+            set_item_theme(item, foreground="marker", column=0)
             item.setIcon(0, _folder_search_excluded_marker_icon())
             item.setToolTip(
                 0,
@@ -17858,17 +17876,9 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _apply_collection_tree_level_style(item: QTreeWidgetItem, depth: int) -> None:
-        colors = [
-            "#424852",
-            "#3b414a",
-            "#353b44",
-            "#303640",
-            "#2d333c",
-        ]
-        color = "#474e59" if depth < 0 else colors[min(depth, len(colors) - 1)]
-        brush = QBrush(QColor(color))
+        token = "level_" + str(max(0, min(5, depth + 1)))
         for column in range(item.columnCount()):
-            item.setBackground(column, brush)
+            set_item_theme(item, background=token, column=column)
 
     def _refresh_tags(self) -> None:
         self._image_tags_cache.clear()
@@ -17913,8 +17923,8 @@ class MainWindow(QMainWindow):
             header.setData(TAG_GROUP_ID_ROLE, group_id)
             header.setData(TAG_GROUP_HEADER_ROLE, True)
             header.setFlags(Qt.ItemFlag.NoItemFlags)
-            header.setForeground(QBrush(QColor("#d5dbe4")))
-            header.setBackground(QBrush(QColor("#303943")))
+            set_item_theme(header, foreground="muted")
+            set_item_theme(header, background="raised")
             self.tag_list.addItem(header)
             for tag, count in tag_rows:
                 item = QListWidgetItem(f"  {tag.tag_name}    {count}")
@@ -17924,7 +17934,7 @@ class MainWindow(QMainWindow):
                 item.setData(TAG_GROUP_ID_ROLE, tag.group_id)
                 item.setData(TAG_GROUP_HEADER_ROLE, False)
                 item.setToolTip(tag.tag_name)
-                item.setBackground(QBrush(QColor("#39414c")))
+                set_item_theme(item, background="raised")
                 self.tag_list.addItem(item)
                 if tag.id in current_ids:
                     item.setSelected(True)
@@ -18159,8 +18169,7 @@ class MainWindow(QMainWindow):
         item.setData(1, FOLDER_SEARCH_EXCLUDED_MATCH_ROLE, matched_prefix)
         item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if matched_prefix is not None:
-            excluded_foreground = QBrush(FolderTreeItemDelegate.EXCLUDED_NAME_COLOR)
-            item.setForeground(0, excluded_foreground)
+            set_item_theme(item, foreground="marker", column=0)
             item.setIcon(0, _folder_search_excluded_marker_icon())
             item.setToolTip(
                 0,

@@ -17,7 +17,8 @@ def main() -> int:
     from PySide6.QtWidgets import QApplication
 
     from eidory.ui.main_window import MainWindow
-    from eidory.ui.theme import apply_dark_theme
+    from eidory.ui.theme import apply_theme
+    from eidory.ui.theme_colors import DEFAULT_THEME
 
     paths = AppPaths.default()
     paths.ensure()
@@ -27,7 +28,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     configure_qt_accessibility()
     app.setApplicationName("Eidory")
-    apply_dark_theme(app, density=store.get_setting("ui.density") or "compact")
+    apply_theme(app, store.get_setting("ui.theme") or DEFAULT_THEME, density=store.get_setting("ui.density") or "compact")
     window = MainWindow(paths=paths, store=store)
     window.resize(
         _setting_int(store, "ui.window_width", 1320, 900, 2400),

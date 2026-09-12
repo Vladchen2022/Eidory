@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QMenu, QMessage
 from eidory.core.search_filters import FilterGroup, FilterPlan, SearchFilter, SCORED_FILTER_KINDS
 from eidory.core.filter_engine import rethreshold_result, same_filter_criteria
 from eidory.ui.filter_panel import FilterPanel
+from eidory.ui.theme_colors import set_theme_rich_text
 from eidory.ui.justified_image_grid import JustifiedImageGridView
 
 
@@ -84,6 +85,7 @@ class FilterWorkflow(QObject):
     def _can_adjust_strength(self, plan):
         w = self.window
         result = w.current_chain_result
+        self.panel.result_label.setProperty("eidoryThemeRichText", None)
         return (w.current_result_mode == "search_chain" and w.search_button.isEnabled()
                 and not self.panel.error and not self.panel.clear_context_on_apply
                 and result.ranked_scope_images is not None and result.evaluated_plan == self.plan()
@@ -282,7 +284,7 @@ class FilterWorkflow(QObject):
                     coverage.append(f"{name}索引覆盖 {indexed}/{result.scope_count} 张")
             if coverage:
                 details += "\n" + "；".join(coverage) + "，未索引图片不命中这些条件"
-                self.panel.result_label.setText(self.panel.result_label.text() + ' · <a href="index" style="color:#8eb8ff">有图片尚未索引，查看处理</a>')
+                set_theme_rich_text(self.panel.result_label, self.panel.result_label.text() + ' · <a href="index" style="color:@link@">有图片尚未索引，查看处理</a>')
             self.panel.result_label.setToolTip(details)
         else:
             self.panel.result_label.setText(f"图片墙 · 已加载 {count} 张")

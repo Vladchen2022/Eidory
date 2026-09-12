@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from eidory.ui.theme_colors import theme_color
+
 import json
 from collections import OrderedDict
 from copy import deepcopy
@@ -1198,7 +1200,7 @@ class BoardTextItem(QGraphicsTextItem):
         self.heading = bool(heading)
         self.changed = changed
         self.setTextWidth(360)
-        self.setDefaultTextColor(QColor("#f3dba4" if heading else "#e5ebf1"))
+        self.setDefaultTextColor(theme_color("warning" if heading else "text"))
         font = self.font()
         font.setPointSize(22 if heading else 15)
         font.setBold(heading)
@@ -1250,7 +1252,7 @@ class ProjectBoardView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self.setBackgroundBrush(QColor("#222427"))
+        self.setBackgroundBrush(theme_color("canvas"))
         self._image_items: dict[int, QGraphicsItem] = {}
         self._note_items: list[BoardTextItem] = []
         self._undo_layouts = []
@@ -1287,6 +1289,18 @@ class ProjectBoardView(QGraphicsView):
         self._layout_change_timer.timeout.connect(self._emit_pending_layout_changed)
         self._scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
         self._scene.selectionChanged.connect(self._emit_selection_changed)
+
+    def refresh_theme(self) -> None:
+        self.setBackgroundBrush(theme_color("canvas"))
+        for item in self._scene.items():
+            if isinstance(item, QGraphicsTextItem):
+                heading = isinstance(item, BoardTextItem) and item.heading
+                item.setDefaultTextColor(theme_color("warning" if heading else "text"))
+            elif isinstance(item, BoardPlaceholderItem):
+                item.setBrush(theme_color("canvas"))
+                item.setPen(QPen(theme_color("border"), 1))
+        self.resetCachedContent()
+        self.viewport().update()
 
     def set_images(
         self,
@@ -1328,7 +1342,7 @@ class ProjectBoardView(QGraphicsView):
             self._title_item = None
             if title:
                 self._title_item = self._scene.addText(title)
-                self._title_item.setDefaultTextColor(QColor("#eef2f8"))
+                self._title_item.setDefaultTextColor(theme_color("text"))
                 font = self._title_item.font()
                 font.setPointSize(18)
                 font.setBold(True)
@@ -1413,7 +1427,7 @@ class ProjectBoardView(QGraphicsView):
                         self._add_text(str(raw_note.get("text", "")), _safe_float(raw_note.get("x"), 80), _safe_float(raw_note.get("y"), 80), heading=raw_note.get("heading", False))
             if not images and not self._note_items:
                 text = self._scene.addText("当前节点没有保存图片")
-                text.setDefaultTextColor(QColor("#d8dee9"))
+                text.setDefaultTextColor(theme_color("text"))
                 text.setPos(80, 110)
         finally:
             self.setUpdatesEnabled(True)
@@ -1624,7 +1638,7 @@ class ProjectBoardView(QGraphicsView):
         bounds = self._scene.itemsBoundingRect().adjusted(-30, -30, 30, 30)
         scale = min(1.0, 2400 / max(bounds.width(), bounds.height(), 1))
         image = QImage(max(1, int(bounds.width()*scale)), max(1, int(bounds.height()*scale)), QImage.Format.Format_ARGB32_Premultiplied)
-        image.fill(QColor("#222427"))
+        image.fill(theme_color("canvas"))
         painter = QPainter(image)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self._scene.render(painter, QRectF(0, 0, image.width(), image.height()), bounds)
@@ -1965,12 +1979,12 @@ class ProjectBoardView(QGraphicsView):
         painter.restore()
 
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
-        painter.fillRect(rect, QColor("#222427"))
+        painter.fillRect(rect, theme_color("canvas"))
         if self._manual_item_drag_active:
             return
-        minor_pen = QPen(QColor("#292c31"))
+        minor_pen = QPen(theme_color("grid"))
         minor_pen.setWidth(0)
-        major_pen = QPen(QColor("#353940"))
+        major_pen = QPen(theme_color("grid_major"))
         major_pen.setWidth(0)
 
         left = int(rect.left()) - (int(rect.left()) % GRID_SIZE)
@@ -2162,11 +2176,11 @@ class ProjectBoardView(QGraphicsView):
                 QRectF(0, 0, width, height),
                 on_layout_changed=self._schedule_layout_changed,
             )
-            frame.setBrush(QColor("#222427"))
-            frame.setPen(QPen(QColor("#536071"), 1))
+            frame.setBrush(theme_color("canvas"))
+            frame.setPen(QPen(theme_color("border"), 1))
             item: QGraphicsItem = frame
             label = QGraphicsTextItem(image.file_name, frame)
-            label.setDefaultTextColor(QColor("#dfe6ef"))
+            label.setDefaultTextColor(theme_color("text"))
             label.setTextWidth(width - 18)
             label.setPos(9, height / 2 - 20)
         else:

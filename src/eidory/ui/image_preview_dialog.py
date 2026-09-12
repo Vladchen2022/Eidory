@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from eidory.ui.theme_colors import theme_color, set_theme_style
+
 import json
 import os
 import shutil
@@ -236,8 +238,8 @@ def _preview_transform_icon(kind: str) -> QIcon:
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    line_color = QColor("#e4e9f1")
-    fill_color = QColor("#e4e9f1")
+    line_color = theme_color("text")
+    fill_color = theme_color("text")
     painter.setPen(QPen(line_color, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
     painter.setBrush(Qt.BrushStyle.NoBrush)
 
@@ -260,6 +262,7 @@ def _preview_transform_icon(kind: str) -> QIcon:
 
 def _configure_preview_icon_button(button: QPushButton, icon_name: str, name: str, tooltip: str) -> None:
     button.setText("")
+    button.setProperty("eidoryPreviewIcon", icon_name)
     button.setIcon(_preview_transform_icon(icon_name))
     button.setIconSize(PREVIEW_ICON_SIZE)
     button.setFixedSize(PREVIEW_ICON_BUTTON_SIZE)
@@ -369,6 +372,11 @@ class PreviewImageView(QGraphicsView):
     zoomChanged = Signal(float, bool)
     doubleClicked = Signal()
 
+    def refresh_theme(self) -> None:
+        self.setBackgroundBrush(theme_color("canvas"))
+        self._message_item.setDefaultTextColor(theme_color("text"))
+        self.viewport().update()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
@@ -389,8 +397,8 @@ class PreviewImageView(QGraphicsView):
         self._navigator_update_pending = False
 
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setBackgroundBrush(QColor("#2d3138"))
-        self.setStyleSheet("background:#2d3138;color:#d8dee9;")
+        self.setBackgroundBrush(theme_color("canvas"))
+        set_theme_style(self, "background:@canvas@;color:@text@;")
         self.setMinimumHeight(420)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -399,7 +407,7 @@ class PreviewImageView(QGraphicsView):
         self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True)
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
         self._pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-        self._message_item.setDefaultTextColor(QColor("#d8dee9"))
+        self._message_item.setDefaultTextColor(theme_color("text"))
         self._smooth_timer = QTimer(self)
         self._smooth_timer.setSingleShot(True)
         self._smooth_timer.setInterval(90)
@@ -1326,6 +1334,12 @@ class ImagePreviewDialog(QDialog):
     feedbackSaved = Signal(object, str)
     indexRemoved = Signal(object)
 
+    def refresh_theme(self) -> None:
+        for button in self.findChildren(QPushButton):
+            kind = button.property("eidoryPreviewIcon")
+            if kind:
+                button.setIcon(_preview_transform_icon(kind))
+
     def __init__(
         self,
         *,
@@ -1908,7 +1922,7 @@ class ImagePreviewDialog(QDialog):
         if self.video_widget is None:
             self.video_widget = QVideoWidget()
             self.video_widget.setMinimumHeight(420)
-            self.video_widget.setStyleSheet("background:#2d3138;")
+            self.video_widget.setProperty("role", "preview")
             self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self.video_widget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
             self.video_widget.installEventFilter(self)
@@ -2074,54 +2088,54 @@ class ImagePreviewDialog(QDialog):
         panel.setFixedWidth(LINETOP_PANEL_WIDTH)
         panel.setObjectName("linetopAdvancedPanel")
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        panel.setStyleSheet(
+        set_theme_style(panel,
             """
             QWidget#linetopAdvancedPanel {
-                background: #2b3038;
+                background: @raised@;
                 border: none;
             }
             QWidget#linetopAdvancedContent,
             QWidget#linetopSliderRow {
-                background: #2b3038;
+                background: @raised@;
             }
             QWidget#linetopAdvancedPanel QLabel {
-                color: #e5eaf2;
-                background: #2b3038;
+                color: @text@;
+                background: @raised@;
             }
             QScrollArea#linetopAdvancedScroll {
                 border: none;
-                background: #2b3038;
+                background: @raised@;
             }
             QScrollArea#linetopAdvancedScroll > QWidget {
-                background: #2b3038;
+                background: @raised@;
             }
             QSlider::groove:horizontal {
                 height: 6px;
-                background: #44505d;
+                background: @border@;
                 border-radius: 3px;
             }
             QSlider::handle:horizontal {
                 width: 16px;
                 margin: -5px 0;
                 border-radius: 8px;
-                background: #f3f6fb;
+                background: @link@;
             }
             QPushButton {
-                background: #343c47;
-                color: #e5eaf2;
-                border: 1px solid #4c5663;
+                background: @button@;
+                color: @text@;
+                border: 1px solid @border@;
                 border-radius: 5px;
                 padding: 5px 9px;
             }
             QPushButton:checked {
-                background: #2f7df6;
-                border-color: #4f96ff;
-                color: white;
+                background: @accent@;
+                border-color: @accent@;
+                color: @accent_text@;
             }
             QWidget#linetopAdvancedPanel QCheckBox {
-                color: #e5eaf2;
+                color: @text@;
                 spacing: 8px;
-                background: #2b3038;
+                background: @raised@;
             }
             """
         )

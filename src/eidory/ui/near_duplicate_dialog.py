@@ -105,7 +105,7 @@ class NearDuplicateDialog(QDialog):
         image_label = QLabel()
         image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         image_label.setMinimumSize(360, 280)
-        image_label.setStyleSheet("background: #20262e; border: 1px solid #56616e;")
+        image_label.setProperty("role", "preview")
         meta_label = QLabel()
         meta_label.setWordWrap(True)
         meta_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)

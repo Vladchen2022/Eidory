@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor
+from eidory.ui.theme_colors import set_theme_style
 from PySide6.QtWidgets import (
     QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton,
@@ -95,7 +96,7 @@ class FilterEditorDialog(QDialog):
         layout.addWidget(self.help_label)
         self.error_label = QLabel()
         self.error_label.setWordWrap(True)
-        self.error_label.setStyleSheet("color: #e7a86c;")
+        self.error_label.setProperty("role", "warning")
         layout.addWidget(self.error_label)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定条件")
@@ -228,16 +229,16 @@ class FilterPanel(QWidget):
         self.section_layouts: dict[str, QVBoxLayout] = {}
         self.condition_rows: dict[tuple[str, int, int], QWidget] = {}
         self._context_actions = []
-        self.setStyleSheet("""
+        set_theme_style(self, """
             FilterPanel QPushButton { padding: 3px 7px; min-height: 20px; }
             FilterPanel QComboBox { padding: 3px 20px 3px 6px; min-height: 20px; }
-            QWidget#includeFilterBox { background: #282a2e; border: 1px solid #404247; border-radius: 6px; }
-            QWidget#excludeFilterBox { background: #282a2e; border: 1px solid #404247; border-radius: 6px; }
+            QWidget#includeFilterBox { background: @raised@; border: 1px solid @border@; border-radius: 6px; }
+            QWidget#excludeFilterBox { background: @raised@; border: 1px solid @border@; border-radius: 6px; }
             QWidget#filterSectionHeader, QWidget#filterSectionContent { background: transparent; }
             QWidget#includeFilterBox QLabel, QWidget#excludeFilterBox QLabel { background: transparent; }
             QWidget#filterCondition { background: transparent; border: none; border-radius: 4px; }
             QWidget#filterCondition QPushButton { border: none; background: transparent; padding: 2px 3px; }
-            QWidget#filterCondition QPushButton:hover { background: #35373c; }
+            QWidget#filterCondition QPushButton:hover { background: @hover@; }
             QPushButton#filterConditionName { text-align: left; }
         """)
         outer = QVBoxLayout(self)
@@ -436,7 +437,7 @@ class FilterPanel(QWidget):
             rows.addWidget(header_widget)
         title = ("保留" if section == "include" else "排除") + (f" {index+1}" if index else "")
         title_label = QLabel(title)
-        title_label.setStyleSheet("color: #edbd89; font-weight: bold; font-size: 14px;" if section == "exclude" else "color: #b4d2ff; font-weight: bold; font-size: 14px;")
+        title_label.setProperty("role", "filterExclude" if section == "exclude" else "filterInclude")
         title_label.setToolTip("从保留结果中移除命中的图片" if section == "exclude" else "留下命中条件的图片")
         header.addWidget(title_label)
         mode = QComboBox()
@@ -495,8 +496,7 @@ class FilterPanel(QWidget):
                 slider.setMaximumWidth(220)
                 slider.setValue(condition.score_threshold or 0)
                 slider.setAccessibleName(f"{title} · {text} · 匹配强度")
-                if section == "exclude":
-                    slider.setStyleSheet("QSlider::sub-page:horizontal { background: #bd925f; } QSlider::handle:horizontal { background: #f0c58f; }")
+                slider.setProperty("filterSection", section)
                 self.strength_sliders[section, index, ci] = slider
                 row_layout.addWidget(slider, 2)
                 row_layout.addWidget(QLabel("严格"))
@@ -517,7 +517,7 @@ class FilterPanel(QWidget):
             rows.addWidget(row_widget)
         if not group.filters:
             label = QLabel("未设条件，保留范围内全部图片" if section == "include" else "未设条件，不排除图片")
-            label.setStyleSheet("color: #a5afbd;")
+            label.setProperty("role", "muted")
             label.setFixedHeight(24)
             label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             rows.addWidget(label)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from eidory.ui.theme_colors import theme_color
+
 from bisect import bisect_right
 from collections import OrderedDict
 from pathlib import Path
@@ -916,8 +918,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         return max(0, pixmap.width()) * max(0, pixmap.height()) * 4
 
     def _draw_placeholder(self, painter: QPainter, rect: QRect, image: ImageItem) -> None:
-        painter.fillRect(rect, QColor("#242a31"))
-        painter.setPen(QColor("#dfe6ef"))
+        painter.fillRect(rect, theme_color("canvas"))
+        painter.setPen(theme_color("text"))
         if image.is_missing:
             text = "文件丢失"
         elif is_supported_video(image.file_path):

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Package the original PNG into every standard macOS icon representation.
+# Render the rounded icon and package every standard macOS representation.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 icon_source="src/eidory/ui/icons/app_icon.png"
+xcrun swift tools/render_app_icon.swift assets/app_icon_source.png "$icon_source"
 icon_workdir="$(mktemp -d "${TMPDIR:-/tmp}/eidory-icon.XXXXXX")"
 icon_set="$icon_workdir/Eidory.iconset"
 mkdir -p "$icon_set"

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from weakref import ref
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QMenu, QPushButton,
@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
 )
 
 from eidory.ui.theme import apply_theme
-from eidory.ui.branding import app_icon
 from eidory.ui.theme_colors import THEMES, get_theme
 
 
@@ -158,12 +157,6 @@ class WorkspaceChrome(QObject):
         row = QHBoxLayout(self.header)
         row.setContentsMargins(12, 6, 12, 6)
         row.setSpacing(8)
-        logo = QLabel()
-        logo.setObjectName("workspaceLogo")
-        logo.setAccessibleName("Eidory Logo")
-        logo.setFixedSize(24, 24)
-        logo.setPixmap(app_icon().pixmap(QSize(24, 24), self.header.devicePixelRatioF()))
-        row.addWidget(logo)
         brand = QLabel("Eidory")
         brand.setObjectName("workspaceBrand")
         row.addWidget(brand)

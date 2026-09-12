@@ -364,10 +364,10 @@ class InspirationTest(unittest.TestCase):
         kwargs = chat.call_args.kwargs
         self.assertTrue(kwargs["prefer_json"])
         self.assertEqual(kwargs["response_format"]["json_schema"]["name"], "eidory_creative_node_note")
-        self.assertEqual(kwargs["reasoning_effort"], "none")
+        self.assertEqual(kwargs["reasoning_effort"], "low")
         self.assertTrue(kwargs["allow_reasoning_content"])
         self.assertEqual(kwargs["temperature"], 0.35)
-        self.assertEqual(kwargs["max_tokens"], 900)
+        self.assertEqual(kwargs["max_tokens"], 4000)
         self.assertIn("黑色太空", suggestion.note)
         self.assertNotIn("thinking process", suggestion.note.lower())
 
@@ -401,9 +401,9 @@ class InspirationTest(unittest.TestCase):
         strict_prompt = strict_kwargs["messages"][1]["content"]
         divergent_prompt = divergent_kwargs["messages"][1]["content"]
         self.assertIn("联想程度：0/100", strict_prompt)
-        self.assertIn("只补充输入信息直接支持", strict_prompt)
+        self.assertIn("最多新增 2 项", strict_prompt)
         self.assertIn("联想程度：100/100", divergent_prompt)
-        self.assertIn("大胆、意外和视觉夸张", divergent_prompt)
+        self.assertIn("建议新增 5–8 项", divergent_prompt)
         self.assertIn("绝对不得违背", divergent_prompt)
 
     def test_batch_creative_node_prompt_uses_same_imagination_guidance(self) -> None:
@@ -425,7 +425,7 @@ class InspirationTest(unittest.TestCase):
         )
 
         self.assertIn("联想程度：85/100", prompt)
-        self.assertIn("大胆、意外和视觉夸张", prompt)
+        self.assertIn("建议新增 5–8 项", prompt)
         self.assertIn("绝对不得违背", prompt)
 
     def test_generate_creative_node_note_accepts_json_from_reasoning_content(self) -> None:
@@ -514,7 +514,7 @@ class InspirationTest(unittest.TestCase):
             )
 
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0].get("reasoning_effort"), "none")
+        self.assertEqual(calls[0].get("reasoning_effort"), "low")
         self.assertNotIn("reasoning_effort", calls[1])
         self.assertIn("黑色太空", suggestion.note)
 
@@ -606,10 +606,10 @@ class InspirationTest(unittest.TestCase):
         self.assertIn("联想程度：85/100", prompt)
         self.assertIn("赛博朋克世界观里的一个半人半机器人的医生", prompt)
         self.assertIn("赛博朋克，人机结合", prompt)
-        self.assertIn("template_guidance", prompt)
-        self.assertIn('"existing_user_note": "秃头，老人，老年斑"', prompt)
-        self.assertIn("note 必须以 existing_user_note 原文开头", prompt)
-        self.assertIn("禁止把 template_guidance 原句", prompt)
+        self.assertIn("当前节点模板说明", prompt)
+        self.assertIn("秃头，老人，老年斑", prompt)
+        self.assertIn("当前模式：补充细节", prompt)
+        self.assertIn("禁止复制为答案", prompt)
         self.assertIn("1", suggestions)
         self.assertIn("2", suggestions)
         self.assertTrue(suggestions["2"].note.startswith("秃头，老人，老年斑"))
@@ -680,18 +680,17 @@ class InspirationTest(unittest.TestCase):
 
         self.assertIn("补充信息", prompt)
         self.assertIn("空间站外有飞船和太空设备", prompt)
-        self.assertIn("现有节点说明（如果有，优先级最高）", prompt)
+        self.assertIn("现有节点说明（硬约束", prompt)
         self.assertIn("不得推翻、删除、替换或违背", prompt)
-        self.assertIn("note 必须以这段原文原样开头", prompt)
-        self.assertIn("合理联想并补充相关的环境、物件、光线", prompt)
+        self.assertIn("软件会原样保留已有说明", prompt)
+        self.assertIn("当前模式：补充细节", prompt)
         self.assertIn("当前项目节点树", prompt)
         self.assertIn("当前节点：时间", prompt)
         self.assertIn("搜索范围建议", prompt)
         self.assertIn("search_query 的用途是给当前节点找参考图", prompt)
-        self.assertIn("search_query 必须使用简体中文短语", prompt)
+        self.assertIn("search_query 均必须使用简体中文", prompt)
         self.assertNotIn("围绕原句扩写", prompt)
-        self.assertIn("不要输出“...”“待补充”“同上”", prompt)
-        self.assertIn("/no_think", prompt)
+        self.assertNotIn("/no_think", prompt)
 
     def test_creative_node_note_prompt_broadens_people_search_query_scope(self) -> None:
         prompt = _build_creative_node_note_prompt(

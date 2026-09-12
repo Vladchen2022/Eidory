@@ -148,7 +148,7 @@ from eidory.core.inspiration import (
     InspirationTerm,
     mix_inspiration_search_results,
 )
-from eidory.core.llm_provider import LMStudioProvider, LLMProviderError, SearchPlanFilter
+from eidory.core.llm_provider import LMStudioProvider, LLMProviderError, SearchPlanFilter, creative_node_supports_objects
 from eidory.core.media_types import (
     SUPPORTED_MEDIA_EXTENSIONS,
     SUPPORTED_IMAGE_EXTENSIONS,
@@ -609,7 +609,7 @@ def _creative_text_has_known_contradiction(original_note: str, candidate: str) -
 
 def _strip_creative_note_prefix_separator(text: str) -> str:
     clean = str(text or "").strip().lstrip("，,。.;；:：、\n\r\t ")
-    clean = re.sub(r"^[\w\u4e00-\u9fff（）() /｜|·-]{1,32}[：:]\s*", "", clean)
+    clean = re.sub(r"^(?:节点说明|当前节点说明|AI 建议|AI建议|补充说明|note|description)[：:]\s*", "", clean, flags=re.IGNORECASE)
     return clean.lstrip("，,。.;；:：、\n\r\t ")
 
 
@@ -677,38 +677,6 @@ def _creative_note_has_meaningful_expansion(original_note: str, merged_note: str
     return len(re.findall(r"[\w\u4e00-\u9fff]", suffix)) >= 8
 
 
-def _fallback_creative_node_note_expansion(
-    original_note: str,
-    generated_query: str,
-    node_title: str,
-) -> str:
-    original = str(original_note or "").strip()
-    if not original:
-        return ""
-    terms = [
-        term.strip()
-        for term in re.split(r"[\s，,。.;；:：、/|｜]+", str(generated_query or ""))
-        if term.strip()
-    ]
-    normalized_original = _compact_creative_constraint_text(original)
-    useful_terms: list[str] = []
-    for term in terms:
-        if _creative_text_has_known_contradiction(original, term):
-            continue
-        normalized_term = _compact_creative_constraint_text(term)
-        if not normalized_term or normalized_term in normalized_original or term in useful_terms:
-            continue
-        useful_terms.append(term)
-        if len(useful_terms) >= 5:
-            break
-    visible_terms = "、".join(useful_terms) if useful_terms else str(node_title or "该节点").strip()
-    return (
-        f"{original}\n"
-        f"{str(node_title or '该节点').strip()}进一步具体化为{visible_terms}等可见特征，"
-        "所有新增细节都围绕用户已写内容展开。"
-    ).strip()
-
-
 def _creative_user_note_search_query(original_note: str, node_title: str) -> str:
     seed = re.sub(r"[\s，,。.;；:：、/|]+", " ", str(original_note or "")).strip()
     title = str(node_title or "").strip()
@@ -747,7 +715,9 @@ def _merge_creative_user_note_with_search_query(
         if term.strip() and not _creative_text_has_known_contradiction(original, term)
     ]
     title = str(node_title or "").strip()
-    ordered_terms = original_terms + generated_terms
+    # The model's concise query includes the new reference targets. Putting a
+    # long original paragraph first used to truncate every new target at 240.
+    ordered_terms = generated_terms + original_terms
     if not ordered_terms and title:
         ordered_terms.append(title)
     merged_terms: list[str] = []
@@ -2942,7 +2912,9 @@ class MainWindow(QMainWindow):
         self.creative_node_query_input.setPlaceholderText("当前节点默认语义搜索语句")
         self.save_creative_node_button = QPushButton("保存节点")
         self.save_creative_node_button.hide()
-        self.generate_creative_children_button = QPushButton("当前节点信息补全")
+        self.generate_creative_children_button = QPushButton("联想新物件")
+        self.generate_creative_details_button = QPushButton("补充细节")
+        self.generate_creative_details_button.setToolTip("只深化已有内容的造型、材质、状态、光线与感受，不新增物件；先生成待采纳建议")
         self.generate_all_creative_nodes_button = QPushButton("补全所有节点信息")
         self.creative_node_progress_bar = QProgressBar()
         self.creative_node_progress_bar.setRange(0, 0)
@@ -2962,6 +2934,7 @@ class MainWindow(QMainWindow):
         for creative_button in [
             self.save_creative_node_button,
             self.generate_creative_children_button,
+            self.generate_creative_details_button,
             self.generate_all_creative_nodes_button,
             self.creative_ai_project_button,
             self.open_creative_copy_button,
@@ -2996,7 +2969,7 @@ class MainWindow(QMainWindow):
         self.creative_node_imagination_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.creative_node_imagination_slider.setValue(self.initial_creative_node_imagination)
         self.creative_node_imagination_slider.setToolTip(
-            "控制节点补全从严谨推断到发散联想；用户已有内容始终是不可违背的约束"
+            "联想新物件：越往右，新增实物的种类与联想跨度越大。补充细节：越往右，已有内容的视觉设计越大胆。两者都遵守主题、世界观及已确定内容"
         )
         self.inspiration_questions_label = QLabel("AI 追问：-")
         self.inspiration_questions_label.setWordWrap(True)
@@ -3217,6 +3190,7 @@ class MainWindow(QMainWindow):
         creative_node_button_row = QHBoxLayout()
         creative_node_button_row.setContentsMargins(0, 0, 0, 0)
         creative_node_button_row.addWidget(self.generate_creative_children_button)
+        creative_node_button_row.addWidget(self.generate_creative_details_button)
         creative_node_button_row.addWidget(self.generate_all_creative_nodes_button)
         node_tab_layout.addLayout(creative_node_button_row)
         node_tab_layout.addWidget(self.creative_node_progress_bar)
@@ -3664,6 +3638,7 @@ class MainWindow(QMainWindow):
         self.generate_inspiration_button.clicked.connect(self._generate_inspiration_terms_from_panel)
         self.save_creative_node_button.clicked.connect(self._save_current_creative_node_details)
         self.generate_creative_children_button.clicked.connect(self._generate_creative_children_for_selected_node)
+        self.generate_creative_details_button.clicked.connect(lambda: self._generate_creative_children_for_selected_node(completion_mode="details"))
         self.generate_all_creative_nodes_button.clicked.connect(self._generate_all_creative_node_notes)
         self.open_creative_copy_button.clicked.connect(lambda: self.creative_content_tabs.setCurrentIndex(1))
         self.back_creative_nodes_button.clicked.connect(lambda: self.creative_content_tabs.setCurrentIndex(0))
@@ -4359,7 +4334,7 @@ class MainWindow(QMainWindow):
             self.creative_node_imagination_strict_label.setText("Strict")
             self.creative_node_imagination_divergent_label.setText("Divergent")
             self.creative_node_imagination_slider.setToolTip(
-                "Controls grounded versus divergent node completion; existing user content always remains a hard constraint"
+                "Suggest Objects: move right for more varied tangible ideas. Add Details: move right for bolder visual refinements of existing content. Both preserve all confirmed constraints."
             )
             self.creative_node_imagination_value_label.setText(
                 self._format_creative_node_imagination(
@@ -4377,7 +4352,9 @@ class MainWindow(QMainWindow):
             self.creative_add_child_button.setText("New Child")
             self.creative_delete_node_button.setText("Delete Node")
             self.save_creative_node_button.setText("Save Node")
-            self.generate_creative_children_button.setText("Complete Current Node")
+            self.generate_creative_children_button.setText("Suggest Objects")
+            self.generate_creative_details_button.setText("Add Details")
+            self.generate_creative_details_button.setToolTip("Develop existing shape, material, state, lighting and feeling; no new objects. Suggestions require acceptance.")
             self.generate_all_creative_nodes_button.setText("Suggest for Unlocked Nodes")
             self.open_creative_copy_button.setText("Copy")
             self.back_creative_nodes_button.setText("Back to Nodes")
@@ -4522,7 +4499,7 @@ class MainWindow(QMainWindow):
             self.creative_node_imagination_strict_label.setText("严谨")
             self.creative_node_imagination_divergent_label.setText("发散")
             self.creative_node_imagination_slider.setToolTip(
-                "控制节点补全从严谨推断到发散联想；用户已有内容始终是不可违背的约束"
+                "联想新物件：越往右，新增实物的种类与联想跨度越大。补充细节：越往右，已有内容的视觉设计越大胆。两者都遵守主题、世界观及已确定内容"
             )
             self.creative_node_imagination_value_label.setText(
                 self._format_creative_node_imagination(
@@ -4540,7 +4517,9 @@ class MainWindow(QMainWindow):
             self.creative_add_child_button.setText("新建子节点")
             self.creative_delete_node_button.setText("删除节点")
             self.save_creative_node_button.setText("保存节点")
-            self.generate_creative_children_button.setText("当前节点信息补全")
+            self.generate_creative_children_button.setText("联想新物件")
+            self.generate_creative_details_button.setText("补充细节")
+            self.generate_creative_details_button.setToolTip("只深化已有内容的造型、材质、状态、光线与感受，不新增物件；先生成待采纳建议")
             self.generate_all_creative_nodes_button.setText("补全未锁定、无待采纳建议的节点")
             self.open_creative_copy_button.setText("文案")
             self.back_creative_nodes_button.setText("返回节点树")
@@ -14617,7 +14596,7 @@ class MainWindow(QMainWindow):
         self.creative_node_tree.setEnabled(has_node)
         if hasattr(self, "creative_content_tabs"):
             self.creative_content_tabs.setEnabled(has_node)
-        self.generate_creative_children_button.setEnabled(has_node and not creative_generation_busy)
+        self._sync_creative_completion_actions(node, busy=creative_generation_busy)
         self.generate_all_creative_nodes_button.setEnabled(has_node and not creative_generation_busy)
         self.creative_new_project_button.setEnabled(
             not creative_generation_busy
@@ -15363,7 +15342,7 @@ class MainWindow(QMainWindow):
         locked = bool(node and hasattr(self, "creative_workspace") and self.creative_workspace.store.node(node.id)["locked"])
         if hasattr(self, "creative_content_tabs"):
             self.creative_content_tabs.setEnabled(has_node)
-        self.generate_creative_children_button.setEnabled(has_node and not locked and not creative_generation_busy)
+        self._sync_creative_completion_actions(node, busy=creative_generation_busy)
         self.generate_all_creative_nodes_button.setEnabled(has_node and not creative_generation_busy)
         self.creative_new_project_button.setEnabled(not creative_generation_busy)
         self.creative_template_combo.setEnabled(not creative_generation_busy)
@@ -15373,7 +15352,26 @@ class MainWindow(QMainWindow):
             self.creative_node_status_label.setText(status)
             self.statusBar().showMessage(status)
 
-    def _generate_creative_children_for_selected_node(self) -> None:
+    def _sync_creative_completion_actions(self, node, *, busy: bool) -> None:
+        locked = bool(node and hasattr(self, "creative_workspace") and self.creative_workspace.store.node(node.id)["locked"])
+        eligible = bool(node and creative_node_supports_objects(node_title=node.title, node_path=self._creative_node_path_text(node.id)))
+        self.generate_creative_children_button.setEnabled(bool(node and eligible and not locked and not busy))
+        self.generate_creative_details_button.setEnabled(bool(node and not locked and not busy))
+        if node and not eligible:
+            tooltip = ("This node describes time, appearance, action or composition. Use Add Details."
+                       if self.current_language == "en" else "此节点负责时间、外观、动作或构图等内容，不适合新增实物；请使用“补充细节”")
+        else:
+            tooltip = ("Suggest new tangible objects within this node and world. Suggestions require acceptance."
+                       if self.current_language == "en" else "只联想当前节点与世界观中尚未出现的实物；先生成待采纳建议")
+        self.generate_creative_children_button.setToolTip(tooltip)
+        self.generate_all_creative_nodes_button.setToolTip(
+            "Automatically suggest objects for physical-content nodes and details for other nodes; skip locked nodes and pending suggestions."
+            if self.current_language == "en" else "按节点职责自动选择：物件、地点等联想实物，时间、构图等补充细节；跳过已锁定或已有待采纳建议的节点"
+        )
+
+    def _generate_creative_children_for_selected_node(self, *, completion_mode: str = "objects") -> None:
+        if self._creative_all_nodes_in_progress or self._creative_node_note_in_progress:
+            return
         self._set_ai_workflow_mode("project")
         node = self._current_creative_node()
         project = (
@@ -15383,6 +15381,9 @@ class MainWindow(QMainWindow):
         )
         if node is None or project is None:
             self.statusBar().showMessage("先选择创作项目节点")
+            return
+        if completion_mode == "objects" and not creative_node_supports_objects(node_title=node.title, node_path=self._creative_node_path_text(node.id)):
+            self.statusBar().showMessage("此节点不适合新增实物，请使用补充细节")
             return
         if self.creative_workspace.store.node(node.id)["locked"]:
             self.statusBar().showMessage("当前节点已锁定；解除锁定后可生成新建议")
@@ -15409,7 +15410,8 @@ class MainWindow(QMainWindow):
             query_text=raw_query,
         )
         ai_current_note = self._creative_node_live_constraint_text(node, project, initial_constraint)
-        self._set_creative_node_completion_busy(True, f"正在补全“{node.title}”...")
+        action = "联想新物件" if completion_mode == "objects" else "补充细节"
+        self._set_creative_node_completion_busy(True, f"正在为“{node.title}”{action}...")
         provider = self._make_llm_provider()
         self.creative_node_auto_save_timer.stop()
         if raw_note != node.note or raw_query != node.search_query:
@@ -15431,6 +15433,7 @@ class MainWindow(QMainWindow):
                     node_path=node_path,
                     node_template_hint=node_template_hint,
                     imagination_level=imagination_level,
+                    completion_mode=completion_mode,
                     language=self.current_language,
                 )
                 self.events.put(("creative_node_note_done", (node.id, ai_current_note, suggestion, model_name)))
@@ -15799,7 +15802,7 @@ class MainWindow(QMainWindow):
             note = _merge_creative_user_note_with_ai_note(original_note, note)
             query = _merge_creative_user_note_with_search_query(original_note, query, node.title)
             if not _creative_note_has_meaningful_expansion(original_note, note):
-                note = _fallback_creative_node_note_expansion(original_note, query, node.title)
+                return None
         if stage_only:
             if self.creative_workspace.store.node(node.id)["locked"]:
                 return None

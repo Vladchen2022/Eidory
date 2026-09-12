@@ -233,6 +233,7 @@ class CreativeWorkspace(QObject):
         w.creative_node_query_input.setReadOnly(locked)
         if locked:
             w.generate_creative_children_button.setEnabled(False)
+            w.generate_creative_details_button.setEnabled(False)
         label = f"加入『{node.title}』" if node else "先选择创作节点"
         self.collect_button.setText(label)
         w.save_selection_to_creative_node_button.setText(label)

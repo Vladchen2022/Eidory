@@ -6482,7 +6482,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 ) as question,
                 patch.object(window, "_start_background_task") as start_task,
             ):
-                window._generate_creative_children_for_selected_node()
+                window._generate_creative_children_for_selected_node(completion_mode="details")
 
             question.assert_not_called()
             start_task.assert_called_once()
@@ -6504,7 +6504,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
 
-            self.assertEqual(window.generate_creative_children_button.text(), "当前节点信息补全")
+            self.assertEqual(window.generate_creative_children_button.text(), "联想新物件")
             self.assertEqual(window.generate_all_creative_nodes_button.text(), "补全未锁定、无待采纳建议的节点")
             self.assertEqual(window.creative_template_label.text(), "新建项目模板")
             self.assertEqual(window.creative_new_project_button.text(), "按此主题新建项目")
@@ -7071,7 +7071,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 patch.object(window, "_start_background_task", side_effect=run_immediately),
                 patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
             ):
-                window._generate_creative_children_for_selected_node()
+                window._generate_creative_children_for_selected_node(completion_mode="details")
                 window._poll_events()
                 self._adopt_suggestions(window)
 
@@ -7142,7 +7142,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 patch.object(window, "_start_background_task", side_effect=run_immediately),
                 patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
             ):
-                window._generate_creative_children_for_selected_node()
+                window._generate_creative_children_for_selected_node(completion_mode="details")
                 window._poll_events()
                 self._adopt_suggestions(window)
 
@@ -8082,7 +8082,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 patch.object(window, "_start_background_task", side_effect=run_immediately),
                 patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
             ):
-                window._generate_creative_children_for_selected_node()
+                window._generate_creative_children_for_selected_node(completion_mode="details")
                 window._poll_events()
                 self._adopt_suggestions(window)
 
@@ -8132,14 +8132,14 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 patch.object(window, "_start_background_task", side_effect=hold_background_task),
                 patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
             ):
-                window._generate_creative_children_for_selected_node()
+                window._generate_creative_children_for_selected_node(completion_mode="details")
 
             self.assertTrue(window._creative_node_note_in_progress)
             window.creative_workspace.show_planning()
             self.assertTrue(window.creative_node_progress_bar.isVisible())
             self.assertFalse(window.generate_creative_children_button.isEnabled())
             self.assertFalse(window.creative_node_imagination_slider.isEnabled())
-            self.assertIn("正在补全", window.creative_node_status_label.text())
+            self.assertIn("补充细节", window.creative_node_status_label.text())
             window._set_creative_node_completion_busy(False)
             self.assertTrue(window.creative_node_imagination_slider.isEnabled())
             window.close()

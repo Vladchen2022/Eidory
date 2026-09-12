@@ -96,6 +96,11 @@ def _normalize_creative_node_imagination(value: int) -> int:
     return max(0, min(100, int(value)))
 
 
+def _creative_node_addition_limit(value: int) -> int:
+    level = _normalize_creative_node_imagination(value)
+    return 2 if level <= 20 else 3 if level <= 40 else 4 if level <= 60 else 6 if level <= 80 else 8
+
+
 def _creative_node_imagination_temperature(value: int) -> float:
     level = _normalize_creative_node_imagination(value)
     if level <= 50:
@@ -107,33 +112,101 @@ def _creative_node_imagination_guidance(value: int, *, language: str) -> str:
     level = _normalize_creative_node_imagination(value)
     if language == "en":
         if level <= 20:
-            mode = "Strict: add only directly supported, conventional, highly plausible visual details. Avoid speculative new facts."
+            mode = "Strict: suggest at most 2 missing elements directly supported by the setting and everyday needs; prefer familiar functions."
         elif level <= 40:
-            mode = "Conservative: allow small plausible inferences that stay close to the supplied context."
+            mode = "Conservative: suggest 2–3 new elements from the immediate use, supply, maintenance or spatial relationships of the existing content."
         elif level <= 60:
-            mode = "Balanced: combine grounded plausibility with a few distinctive, project-specific visual decisions."
+            mode = "Balanced: suggest 3–4 project-specific additions across at least two relevant functions or visual dimensions."
         elif level <= 80:
-            mode = "Exploratory: allow unusual but coherent visual combinations and stronger extrapolation from the context."
+            mode = "Exploratory: suggest 4–6 distinct additions across several relevant functions; explore reuse, indirect consequences and coherent cross-purpose combinations."
         else:
-            mode = "Divergent: make bold, surprising, visually exaggerated associations while keeping them usable as reference-planning details."
+            mode = "Divergent: suggest 5–8 distinct additions; explore less obvious functions, repurposed mechanisms and surprising spatial or social-use relationships supported by this world. Do not just exaggerate the existing subject."
         return (
             f"Imagination level: {level}/100. {mode} "
+            "Never exceed the upper count for this level. The lower count is not a quota: fewer strong, compatible ideas beat padding. "
+            "The slider changes semantic breadth and association distance, not adjective density or permission to break constraints. "
             "At every level, the project brief, extra context, and existing user note remain hard constraints; never contradict them."
         )
     if level <= 20:
-        mode = "严谨：只补充输入信息直接支持、常规且高度可信的视觉细节，避免推测新的事实。"
+        mode = "严谨：最多新增 2 项输入信息直接支持、常见且符合日常需要的内容，优先补眼前缺失的功能。"
     elif level <= 40:
-        mode = "偏严谨：允许少量合理推断，但整体紧贴用户提供的语境。"
+        mode = "偏严谨：建议新增 2–3 项，从已有内容直接涉及的使用、供给、维修或空间关系延伸。"
     elif level <= 60:
-        mode = "平衡：兼顾可信度与辨识度，加入少量当前项目专属的视觉决策。"
+        mode = "平衡：建议新增 3–4 项，覆盖至少两种相关功能或视觉维度，形成当前项目专属的想法。"
     elif level <= 80:
-        mode = "偏发散：允许不常见但自洽的视觉组合，并根据已有语境做更明显的延伸。"
+        mode = "偏发散：建议新增 4–6 项，跨越多种相关功能，探索废物再利用、间接需求、不同用途之间的合理组合。"
     else:
-        mode = "发散：允许大胆、意外和视觉夸张的联想，但结果仍须能用于寻找参考图。"
+        mode = "发散：建议新增 5–8 项，探索不显然的需求、改作他用的结构，以及这个世界能成立的空间或使用关系；不要只把原对象变得更夸张。"
     return (
         f"联想程度：{level}/100。{mode}"
+        "不得超过本档数量上限；下限不是必须凑满的配额，宁缺毋滥。"
+        "滑块控制新增语义的广度和联想距离，不控制形容词多少，也不放宽设定约束。"
         "无论处于哪一档，项目主题、补充信息和用户已有节点说明始终是硬约束，绝对不得违背。"
     )
+
+
+def creative_node_supports_objects(*, node_title: str, node_path: str = "") -> bool:
+    # Classify the selected node itself; ancestor names must not turn a
+    # composition/lighting child into a props node.
+    kind = _creative_node_scope_kind(node_title=node_title, node_path=f"project / {node_title}")
+    return kind not in {"time", "material", "identity", "body", "head", "event", "mood", "composition"}
+
+
+def _creative_node_completion_mode(mode: str, *, node_title: str, node_path: str) -> str:
+    if mode not in {"auto", "objects", "details"}:
+        raise ValueError(f"Unknown node completion mode: {mode}")
+    if mode == "auto":
+        return "objects" if creative_node_supports_objects(node_title=node_title, node_path=node_path) else "details"
+    return mode
+
+
+def _creative_node_details_contract(*, language: str) -> str:
+    if language == "en":
+        return """Mode: ADD DETAILS. Develop only the subjects or visual decisions already established in this node or project. Do not introduce new objects, people, devices, buildings, functions or plot events. If the node is empty, derive the relevant subject from the brief and template; do not invent a prop inventory.
+Preserve all confirmed facts, identities, counts, materials, time and world constraints. The application keeps the existing note verbatim; return only additional detail, never a rewrite or a repetition.
+Explore relevant shape, proportions, material, wear, surface, posture, existing light behavior, composition and sensory atmosphere. Each detail must name its existing subject/aspect and describe a visible decision. Feelings are welcome here when grounded in visible evidence; avoid generic emotional prose and synonymous adjective lists. Do not invent a new lamp to explain a lighting detail; work with the established light sources. Ordinary intrinsic parts of an existing object may be described (bed frame, mattress), but do not add blankets, boxes, electronics or other removable accessories to decorate it.
+The slider controls detail boldness: low = restrained, directly supported refinements; high = distinctive but compatible combinations of visual details and sensory effects. It never permits changing confirmed facts or adding new objects.
+Return additions as an array of {name: existing subject/aspect, visual: additional visible detail and its effect}. Keep entries concise and independently editable. If no compatible detail is possible, return an empty array. search_query combines the existing reference subject with a few concrete visual traits; omit emotional explanations and follow search scope."""
+    return """当前模式：补充细节。只深化当前节点或项目中已经存在的对象与视觉决策，不新增物件、人物、装置、建筑、用途或剧情事件。节点为空时从主题及模板推导本节点已有主体的视觉表达，不借机列出新物件清单。
+所有已确定的身份、数量、材质、时间、世界观等都不可改写。软件会原样保留已有说明；你只输出尚未描述的细节，不复制、替换或润色原文。
+按节点职责补造型、比例、材质、磨损、表面、姿态、已有光线的作用、构图及感受。每项明确指出已有对象或视觉方面，给出可见的具体选择。允许表达感受，但要由具体可见细节支撑，不堆情绪词或近义形容词；不要为了光线细节新增一盏灯，要使用已有光源。可以描述原对象通常自带的组成部分（如床架、床垫），但不能为了“细节”额外摆上毯子、箱子、电子设备等可独立移走的配件。
+滑块控制细节设计的大胆程度：左侧克制、直接依据设定；右侧探索更有特点且相容的视觉细节组合和感官效果。任何档位都不能改写确认事实或增加新物件。
+返回 additions 数组，每项 name 为“已有对象／细节方面”，visual 为“补充的可见细节及效果”。条目简短、独立可编辑；没有相容细节时返回空数组。search_query 保留已有参考主体与少量具体视觉特征，去掉抒情解释，并服从搜索范围。"""
+
+
+def _creative_node_expansion_contract(*, language: str, completion_mode: str = "objects") -> str:
+    """Shared by single-node, batch and retry prompts to prevent style drift."""
+    if completion_mode == "details":
+        return _creative_node_details_contract(language=language)
+    if language == "en":
+        return """
+Mode: SUGGEST NEW OBJECTS. Expand the illustrator’s tangible object inventory beyond every object already mentioned.
+Output a structured additions array. Each item has name (a new reference target) and visual (its visible realization and use). References to note below mean the text the application composes from these items; do not return a note field. If no valid additions exist, return additions: [].
+1. Respect the brief, extra context and all confirmed node content together. The application preserves the existing note verbatim; output only NEW ideas and never repeat the existing note. The project tree supplies constraints and node responsibilities; empty/template nodes are not confirmed facts. New ideas remain proposals until accepted.
+2. A useful addition is a previously absent, drawable and independently searchable physical object, tangible structure or natural entity. Every name must identify an actual drawable thing, never an emotion, an action, a camera position or an abstract mechanism. Rephrasing an existing noun with new colors, wear, textures, adjectives or emotional prose does not count as a new idea. Such details may identify a NEW element, but cannot substitute for one.
+3. Stay within this node’s job: props suggest new functional objects; places suggest physical structures or natural entities; world nodes suggest visible artifacts of that world; character/clothing nodes may suggest compatible wearable or carried items, never extra people or anatomy. A single-object structural node may suggest missing physical components. Do not put a props inventory into time, lighting, action or composition nodes.
+4. Explore missing needs and consequences of the world: living, working, resources, maintenance, movement, communication and social use. Select only dimensions relevant to this node. Combine existing-world objects with new functions before inventing unsupported technology. Do not assume a culture, region or identity implies poverty, a single building style or a technology level; use the user's actual setting.
+5. Write each addition on a separate line as “concrete name: what is visibly present and what it does or relates to here”. Choose a coherent set, not mutually incompatible alternatives. Avoid repetitive variants of the same object, generic mood language, whole-scene narration and abstract worldbuilding without visible evidence.
+6. Before answering, silently remove ideas already present in the existing note or assigned to another node, constraint conflicts, and descriptions that only embellish the old subject. A useful test: after removing decorative adjectives, is there still a NEW drawable reference target? If the constraints leave no room for an addition, return additions: [] and empty search_query rather than fabricate one.
+7. search_query is a compact reference-search phrase: retain essential existing targets and necessary world anchors, then name the most useful NEW targets explicitly. Aim for at most 40 words. Omit explanations and emotional prose. Do not paste the full note or demand every suggestion coexist in one image; suggestions are reference options. Obey the node's search-scope guidance.
+8. For a broad PROPS or ENVIRONMENT node that allows multiple subjects, EVERY addition must be a different tangible target from the original object. Never return the original object, its renamed version or intrinsic components as a new suggestion. Do not spend every idea on bed accessories, vehicle attachments or the same subject's surface. An already implied wall/window/floor with a new finish is also embellishment, not a new object. In a props node focus on movable functional objects; structural architecture belongs to place nodes. Only a node explicitly about one object's structure should concentrate on that object's components. Do not invent new residents or occupations to justify a prop.
+9. Distinguish proposals from real-world facts. Avoid invented engineering explanations, false historical certainty, and unsafe causal claims; describe observable functions conservatively. Practical plausibility and confirmed constraints outrank surprise.
+Negative example only: “old bed → more torn sheets, a lonely feeling” changes description but adds no new reference target. Do not use it as the expansion pattern.
+""".strip()
+    return """
+当前模式：联想新物件。扩展当前节点尚未出现的实物种类。已有物件及其造型细节不属于本次输出。
+输出结构化 additions 数组，每项包含 name（新的参考目标名称）与 visual（可见内容及用途）。下文 note 指软件由这些条目组合的说明，不要返回 note 字段。确实没有可新增内容时，返回 additions: []。
+1. 项目主题、补充信息、各节点已确定内容必须共同成立。软件会原样保留用户现有节点说明；你只输出新增想法，不重复原文；节点树提供约束及分工，空节点和模板说明不等于已确定事实。新内容只是待采纳建议，不擅自变成项目事实。
+2. 有效新增是原文没有的、可以画出来并独立找参考的实物、实体结构或自然实体。每项名称必须是一件可画出来的东西，不能是情绪、动作、机位、抽象机制或构图方案。给旧名词换颜色、加磨损、加纹理、堆形容词或情绪感受，不算新增想法；这些细节可以用于识别一个新元素，但不能替代新元素。
+3. 只在当前节点的职责内添加实物。物件补功能道具；地点补实体结构或自然实体；世界观补这个世界可见的实体载体；人物/穿戴补相容的穿戴或携带物，不新增人物或身体结构；单一物件结构拆解可补缺失的实体部件。不能把实物清单塞进时间、光线、事件或构图节点。
+4. 从这个世界尚未表达的需要与后果找灵感：生活、工作、资源、维修、通行、通信、社会使用。只选当前节点相关的维度。优先把世界中已有的技术和物件改作他用，不凭空升级科技。不能仅凭地域、文化或人物身份推定贫富、建筑风格或技术水平，必须依据用户实际设定。
+5. 每个新增想法独立一行，写成“具体名称：画面里能看见什么，在这里有什么用途或关系”。选择能共存的一组建议，不堆互相排斥的方案。不要重复同一物件的不同修饰版本，不抒情，不写整幅画的长篇场景描写，不写没有可见载体的抽象设定。
+6. 输出前自行检查并删掉：原文已经有的东西、属于其他节点的内容、违反约束的内容、只是修饰旧对象的句子。检验办法是去掉装饰性形容词后，是否仍然多了一个可画、可单独找图的新目标。若约束确实不允许增加内容，返回 additions: [] 和空 search_query，不硬凑。
+7. search_query 只保留原有核心目标、必需的世界观锚点，以及最有用的新目标名称，建议控制在 80 个汉字内。必须让新增内容进入检索词；不要粘贴完整说明、用途解释或情绪文案，也不要要求一张图片同时包含所有建议。建议是可收集的参考方向，并须服从当前节点的搜索范围。
+8. 对于允许多个对象的宽泛“物件”或“环境”节点，每一项都必须是原对象之外、能独立出现在这个环境里的另一种实物。原物件、它的改名版本、它通常自带的组成部分，一律不能作为新物件条目返回。不要把所有名额花在床上用品、汽车挂件或同一对象的表面；房间本来就有的墙、窗、地板换一层表面也不是新物件。物件节点优先可移动的功能实物，建筑结构属于地点节点；只有明确负责单一物件结构拆解的节点才集中补其部件。不要为道具擅自新增住户或改变职业。
+9. 创作设想不等于真实知识。不要编造工程原理、断言不确定的历史事实或虚构因果；描述可观察的用途即可。实际可行性与已确认约束优先于意外感。
+只给反例：“破旧的床 → 床单更破、孤寂感更强”改变了描述，没有增加新的参考目标，不能把它当补全模式。
+""".strip()
 
 
 class LMStudioProvider:
@@ -375,8 +448,12 @@ class LMStudioProvider:
         node_path: str = "",
         node_template_hint: str = "",
         imagination_level: int = 50,
+        completion_mode: str = "auto",
         language: str = "zh",
     ) -> tuple[CreativeNodeNoteSuggestion, str]:
+        completion_mode = _creative_node_completion_mode(completion_mode, node_title=node_title, node_path=node_path)
+        if completion_mode == "objects" and not creative_node_supports_objects(node_title=node_title, node_path=node_path):
+            raise LLMProviderError("此节点不适合新增实物，请使用补充细节")
         clean_title = node_title.strip()
         clean_brief = project_brief.strip()
         if not clean_title and not clean_brief:
@@ -386,11 +463,11 @@ class LMStudioProvider:
             {
                 "role": "system",
                 "content": (
-                    "You fill one fixed illustration planning node. Do not create child nodes. "
+                    "You follow the selected mode to suggest reference content within one fixed illustration planning node. Do not create child nodes. "
                     "Return one strict JSON object only. Do not output analysis, reasoning, "
                     "chain-of-thought, or a thinking process."
                     if language == "en"
-                    else "你只负责补全一个固定插画规划节点。不要生成子节点。只输出严格 JSON 对象，不要输出分析、推理、思考过程或步骤。"
+                    else "你按所选模式为固定插画规划节点提出参考建议。不要生成子节点。只输出严格 JSON 对象。"
                 ),
             },
             {
@@ -404,6 +481,7 @@ class LMStudioProvider:
                     node_path=node_path.strip(),
                     node_template_hint=node_template_hint.strip(),
                     imagination_level=imagination_level,
+                    completion_mode=completion_mode,
                     language=language,
                 ),
             },
@@ -412,13 +490,20 @@ class LMStudioProvider:
             model_name=model_name,
             messages=messages,
             prefer_json=True,
-            response_format=_creative_node_note_response_format(),
-            reasoning_effort="none",
+            response_format=_creative_node_note_response_format(imagination_level, completion_mode),
+            reasoning_effort="low",
             temperature=_creative_node_imagination_temperature(imagination_level),
-            max_tokens=900,
+            max_tokens=4000,
             allow_reasoning_content=True,
         )
-        suggestion = parse_creative_node_note_suggestion(content, language=language)
+        try:
+            suggestion = parse_creative_node_note_suggestion(content, language=language)
+        except LLMProviderError:
+            if not current_note.strip():
+                raise
+            # A short copy-only response can fail the parser before the usual
+            # expansion check. Give it the same bounded retry, never filler text.
+            suggestion = CreativeNodeNoteSuggestion(note=current_note.strip(), search_query="")
         refined = _refine_creative_node_note_suggestion(
             suggestion,
             project_brief=clean_brief,
@@ -429,7 +514,7 @@ class LMStudioProvider:
             language=language,
         )
         if current_note.strip() and not _creative_note_has_meaningful_expansion(current_note, refined.note):
-            refined = self._retry_or_fallback_creative_node_note_expansion(
+            refined = self._retry_creative_node_note_expansion(
                 model_name=model_name,
                 project_brief=clean_brief,
                 project_extra=project_extra.strip(),
@@ -440,6 +525,7 @@ class LMStudioProvider:
                 node_template_hint=node_template_hint.strip(),
                 first_suggestion=refined,
                 imagination_level=imagination_level,
+                completion_mode=completion_mode,
                 language=language,
             )
         return refined, model_name
@@ -452,6 +538,7 @@ class LMStudioProvider:
         project_outline: str = "",
         nodes: list[dict[str, str]],
         imagination_level: int = 50,
+        completion_mode: str = "auto",
         language: str = "zh",
     ) -> tuple[dict[str, CreativeNodeNoteSuggestion], str]:
         clean_brief = project_brief.strip()
@@ -479,11 +566,11 @@ class LMStudioProvider:
             {
                 "role": "system",
                 "content": (
-                    "You complete multiple fixed illustration planning nodes. "
+                    "You follow each node’s selected mode to complete multiple fixed illustration planning nodes. "
                     "Return one strict JSON object only. Do not create or rename nodes. "
                     "Do not output analysis, reasoning, chain-of-thought, or a thinking process."
                     if language == "en"
-                    else "你负责一次性补全多个固定插画规划节点。只输出严格 JSON 对象。不要创建或改名节点。不要输出分析、推理、思考过程或步骤。"
+                    else "你严格按每个节点所选模式补全固定插画规划节点。只输出严格 JSON 对象。不要创建或改名节点。不要输出分析、推理、思考过程或步骤。"
                 ),
             },
             {
@@ -494,6 +581,7 @@ class LMStudioProvider:
                     project_outline=project_outline.strip(),
                     nodes=clean_nodes,
                     imagination_level=imagination_level,
+                    completion_mode=completion_mode,
                     language=language,
                 ),
             },
@@ -502,10 +590,10 @@ class LMStudioProvider:
             model_name=model_name,
             messages=messages,
             prefer_json=True,
-            response_format=_creative_node_notes_response_format(),
-            reasoning_effort="none",
+            response_format=_creative_node_notes_response_format(imagination_level),
+            reasoning_effort="low",
             temperature=_creative_node_imagination_temperature(imagination_level),
-            max_tokens=min(5200, max(1400, 520 * len(clean_nodes) + 600)),
+            max_tokens=min(12000, max(4000, 1100 * len(clean_nodes) + 1600)),
             allow_reasoning_content=True,
         )
         parsed = parse_creative_node_note_batch_suggestions(content, language=language)
@@ -528,19 +616,13 @@ class LMStudioProvider:
                 context["current_note"],
                 refined_suggestion.note,
             ):
-                refined_suggestion = _fallback_creative_node_note_expansion(
-                    current_note=context["current_note"],
-                    generated_note=refined_suggestion.note,
-                    search_query=refined_suggestion.search_query,
-                    node_title=context["node_title"],
-                    project_brief=clean_brief,
-                    project_extra=project_extra.strip(),
-                    language=language,
-                )
+                # Missing results are reported by the caller. Never turn
+                # a copy-only answer into a plausible-looking stock sentence.
+                continue
             refined[node_id] = refined_suggestion
         return refined, model_name
 
-    def _retry_or_fallback_creative_node_note_expansion(
+    def _retry_creative_node_note_expansion(
         self,
         *,
         model_name: str,
@@ -553,6 +635,7 @@ class LMStudioProvider:
         node_template_hint: str,
         first_suggestion: CreativeNodeNoteSuggestion,
         imagination_level: int,
+        completion_mode: str,
         language: str,
     ) -> CreativeNodeNoteSuggestion:
         retry_messages = [
@@ -576,6 +659,7 @@ class LMStudioProvider:
                     node_template_hint=node_template_hint,
                     previous_note=first_suggestion.note,
                     imagination_level=imagination_level,
+                    completion_mode=completion_mode,
                     language=language,
                 ),
             },
@@ -585,13 +669,13 @@ class LMStudioProvider:
                 model_name=model_name,
                 messages=retry_messages,
                 prefer_json=True,
-                response_format=_creative_node_note_response_format(),
-                reasoning_effort="none",
+                response_format=_creative_node_note_response_format(imagination_level, completion_mode),
+                reasoning_effort="low",
                 temperature=min(
                     0.90,
                     _creative_node_imagination_temperature(imagination_level) + 0.10,
                 ),
-                max_tokens=900,
+                max_tokens=4000,
                 allow_reasoning_content=True,
             )
             retry_suggestion = parse_creative_node_note_suggestion(retry_content, language=language)
@@ -608,14 +692,10 @@ class LMStudioProvider:
                 return refined_retry
         except Exception:
             pass
-        return _fallback_creative_node_note_expansion(
-            current_note=current_note,
-            generated_note=first_suggestion.note,
-            search_query=first_suggestion.search_query,
-            node_title=node_title,
-            project_brief=project_brief,
-            project_extra=project_extra,
-            language=language,
+        raise LLMProviderError(
+            "The model did not add usable new content after retrying. Your existing note has been kept; try a different imagination level or clarify what this node still needs."
+            if language == "en"
+            else "模型重试后仍未补出可用的新内容。原有说明已保留；可调整联想程度，或说明这个节点还缺少什么。"
         )
 
     def generate_creative_project_seed(
@@ -993,6 +1073,25 @@ def parse_creative_node_suggestions(
     return suggestions
 
 
+def _creative_additions_note(payload: dict[str, object]) -> str:
+    additions = payload.get("additions")
+    if not isinstance(additions, list):
+        return ""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in additions[:8]:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_project_text(item.get("name"), max_length=64)
+        visual = _clean_project_text(item.get("visual"), max_length=160)
+        key = re.sub(r"[\W_]+", "", name).casefold()
+        if not key or not visual or key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"{name}: {visual}")
+    return "\n".join(lines)
+
+
 def parse_creative_node_note_suggestion(
     content: str,
     *,
@@ -1011,8 +1110,12 @@ def parse_creative_node_note_suggestion(
     note = _first_clean_project_text(
         payload,
         ("note", "description", "detail", "节点说明", "当前节点说明", "说明", "描述", "内容"),
-        max_length=900,
+        max_length=900, preserve_lines=True,
     )
+    if "additions" in payload:
+        note = _creative_additions_note(payload)
+        if not note:
+            raise LLMProviderError("AI 没有提出新的参考想法")
     search_query = _first_clean_project_text(
         payload,
         ("search_query", "searchQuery", "query", "搜索语句", "搜索短语", "搜图短语", "检索词", "搜索词"),
@@ -1052,8 +1155,12 @@ def parse_creative_node_note_batch_suggestions(
         note = _first_clean_project_text(
             raw,
             ("note", "description", "detail", "节点说明", "当前节点说明", "说明", "描述", "内容"),
-            max_length=900,
+            max_length=900, preserve_lines=True,
         )
+        if "additions" in raw:
+            note = _creative_additions_note(raw)
+            if not note:
+                continue
         search_query = _first_clean_project_text(
             raw,
             ("search_query", "searchQuery", "query", "搜索语句", "搜索短语", "搜图短语", "检索词", "搜索词"),
@@ -1137,50 +1244,6 @@ def _creative_note_has_meaningful_expansion(current_note: str, generated_note: s
         return bool(str(generated_note or "").strip())
     suffix = _creative_note_expansion_suffix(original, generated_note)
     return len(re.findall(r"[\w\u4e00-\u9fff]", suffix)) >= 8
-
-
-def _fallback_creative_node_note_expansion(
-    *,
-    current_note: str,
-    generated_note: str,
-    search_query: str,
-    node_title: str,
-    project_brief: str,
-    project_extra: str,
-    language: str,
-) -> CreativeNodeNoteSuggestion:
-    original = str(current_note or "").strip()
-    if not original:
-        return CreativeNodeNoteSuggestion(note=str(generated_note or "").strip(), search_query=search_query)
-    query_terms = [
-        term.strip()
-        for term in re.split(r"[\s，,。.;；:：、/|｜]+", str(search_query or ""))
-        if term.strip()
-    ]
-    normalized_original = re.sub(r"\s+", "", original)
-    useful_terms: list[str] = []
-    for term in query_terms:
-        if term in useful_terms:
-            continue
-        if term and term not in normalized_original and len(term) <= 18:
-            useful_terms.append(term)
-        if len(useful_terms) >= 5:
-            break
-    context_parts = [
-        part.strip()
-        for part in [project_brief, project_extra]
-        if part and part.strip() and part.strip() not in original
-    ]
-    if language == "en":
-        visible_terms = ", ".join(useful_terms) if useful_terms else node_title
-        context = f" within {context_parts[0]}" if context_parts else ""
-        suffix = f"{node_title} should further show visible cues such as {visible_terms}{context}, keeping the user's stated traits unchanged."
-    else:
-        visible_terms = "、".join(useful_terms) if useful_terms else node_title
-        context = f"，并贴合“{context_parts[0][:36]}”的设定" if context_parts else ""
-        suffix = f"{node_title}进一步具体化为{visible_terms}等可见特征{context}，所有新增细节都围绕用户已写内容展开。"
-    note = f"{original}\n{suffix}".strip()
-    return CreativeNodeNoteSuggestion(note=note, search_query=search_query)
 
 
 def _refine_creative_node_note_suggestion(
@@ -1652,7 +1715,7 @@ def _clean_creative_node_note_plain_text(content: str, *, max_length: int) -> st
     text = re.sub(r"```$", "", text).strip()
     text = re.sub(r"(?im)^\s*(节点说明|当前节点说明|note)\s*[:：]\s*", "", text).strip()
     text = re.sub(r"(?im)^\s*(搜索语句|搜索短语|search_query|search query)\s*[:：].*$", "", text).strip()
-    return " ".join(text.split())[:max_length]
+    return _clean_project_text(text, max_length=max_length, preserve_lines=True)
 
 
 def _creative_node_search_query_from_plain_note(note: str, *, max_length: int) -> str:
@@ -1974,17 +2037,20 @@ def _first_clean_project_text(
     keys: tuple[str, ...],
     *,
     max_length: int,
+    preserve_lines: bool = False,
 ) -> str:
     for key in keys:
-        text = _clean_project_text(payload.get(key), max_length=max_length)
+        text = _clean_project_text(payload.get(key), max_length=max_length, preserve_lines=preserve_lines)
         if text:
             return text
     return ""
 
 
-def _clean_project_text(value: object, *, max_length: int) -> str:
+def _clean_project_text(value: object, *, max_length: int, preserve_lines: bool = False) -> str:
     if not isinstance(value, str):
         return ""
+    if preserve_lines:
+        return "\n".join(" ".join(line.split()) for line in value.strip().splitlines() if line.strip())[:max_length]
     return " ".join(value.strip().split())[:max_length]
 
 
@@ -2100,7 +2166,22 @@ def _creative_nodes_response_format() -> dict[str, object]:
     }
 
 
-def _creative_node_note_response_format() -> dict[str, object]:
+def _creative_node_additions_schema(imagination_level: int, completion_mode: str = "auto") -> dict[str, object]:
+    return {
+        "type": "array", "maxItems": _creative_node_addition_limit(imagination_level),
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": ("Existing subject or visual aspect" if completion_mode == "details" else "A NEW tangible object, different from all existing objects and their intrinsic parts" if completion_mode == "objects" else "Target or visual aspect for the selected node mode")},
+                "visual": {"type": "string", "description": "One brief, visible realization and its use or relationship within this project"},
+            },
+            "required": ["name", "visual"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _creative_node_note_response_format(imagination_level: int = 50, completion_mode: str = "auto") -> dict[str, object]:
     return {
         "type": "json_schema",
         "json_schema": {
@@ -2108,37 +2189,29 @@ def _creative_node_note_response_format() -> dict[str, object]:
             "schema": {
                 "type": "object",
                 "properties": {
-                    "note": {"type": "string"},
+                    "additions": _creative_node_additions_schema(imagination_level, completion_mode),
                     "search_query": {"type": "string"},
                 },
-                "required": ["note", "search_query"],
+                "required": ["additions", "search_query"],
+                "additionalProperties": False,
             },
         },
     }
 
 
-def _creative_node_notes_response_format() -> dict[str, object]:
+def _creative_node_notes_response_format(imagination_level: int = 50) -> dict[str, object]:
+    node_schema = _creative_node_note_response_format(imagination_level)["json_schema"]["schema"]
+    node_schema["properties"]["node_id"] = {"type": "string"}
+    node_schema["required"].append("node_id")
     return {
         "type": "json_schema",
         "json_schema": {
             "name": "eidory_creative_node_notes",
             "schema": {
                 "type": "object",
-                "properties": {
-                    "nodes": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "node_id": {"type": "string"},
-                                "note": {"type": "string"},
-                                "search_query": {"type": "string"},
-                            },
-                            "required": ["node_id", "note", "search_query"],
-                        },
-                    },
-                },
+                "properties": {"nodes": {"type": "array", "items": node_schema}},
                 "required": ["nodes"],
+                "additionalProperties": False,
             },
         },
     }
@@ -2535,339 +2608,92 @@ Rules:
 
 
 def _build_creative_node_notes_prompt(
-    *,
-    project_brief: str,
-    project_extra: str,
-    project_outline: str,
-    nodes: list[dict[str, str]],
-    imagination_level: int = 50,
-    language: str,
+    *, project_brief: str, project_extra: str, project_outline: str,
+    nodes: list[dict[str, str]], imagination_level: int = 50,
+    completion_mode: str = "auto", language: str,
 ) -> str:
-    clean_nodes: list[dict[str, str]] = []
+    requests = []
     for node in nodes:
-        node_title = str(node.get("node_title", "")).strip()
-        current_note = str(node.get("current_note", "")).strip()
-        node_path = str(node.get("node_path", "")).strip()
-        clean_nodes.append(
-            {
-                "node_id": str(node.get("node_id", "")).strip(),
-                "node_title": node_title,
-                "node_path": node_path,
-                "existing_user_note": current_note,
-                "template_guidance": str(node.get("node_template_hint", "")).strip(),
-                "search_scope_guidance": _creative_node_search_scope_guidance(
-                    project_extra=project_extra,
-                    current_note=current_note,
-                    node_title=node_title,
-                    node_path=node_path,
-                    language=language,
-                ),
-            }
-        )
-    nodes_json = json.dumps(clean_nodes, ensure_ascii=False, indent=2)
-    extra_block = project_extra if project_extra else (
-        "No extra project context has been provided." if language == "en" else "用户未填写补充信息。"
-    )
-    outline_block = project_outline if project_outline else (
-        "No project node tree has been provided." if language == "en" else "未提供项目节点树。"
-    )
-    imagination_guidance = _creative_node_imagination_guidance(
-        imagination_level,
-        language=language,
-    )
-    if language == "en":
-        return f"""
-Project brief:
-{project_brief or "-"}
-
-Extra project context:
-{extra_block}
-
-Current project node tree. Treat empty/template nodes as not yet completed:
-{outline_block}
-
-Completion style:
-{imagination_guidance}
-
-Nodes to complete as JSON:
-{nodes_json}
-
-Return JSON:
-{{"nodes":[{{"node_id":"same node_id from input","note":"project-specific visual planning paragraph","search_query":"concrete English semantic image-search phrase"}}]}}
-
-Rules:
-1. Return exactly one result for every input node_id.
-2. Do not create, rename, remove, merge, or reorder nodes.
-3. The project brief and extra context are hard constraints for every node.
-4. If existing_user_note is empty, infer this node from the project brief, extra context, and the node's template guidance.
-5. If existing_user_note is non-empty, it is already confirmed by the user. The returned note for that node must begin with existing_user_note unchanged, then add concrete visual expansion after it. Returning only existing_user_note is invalid.
-6. Never contradict existing_user_note. For example, if the user wrote bald, elderly, or age spots, do not generate young, thick hair, smooth skin, or any opposite visual trait.
-7. template_guidance only explains the node's job. Never copy template_guidance as note or search_query.
-8. Every note must include project-specific visual decisions, not a generic category description.
-9. Each search_query must obey that node's search_scope_guidance and should retrieve useful reference images for that node, not recreate the whole final image.
-10. Do not output Markdown, analysis, reasoning, or text outside JSON.
-11. If your model supports thinking mode, disable it and output only the final JSON.
-
-/no_think
-""".strip()
-    return f"""
-项目主题：
-{project_brief or "-"}
-
-补充信息：
-{extra_block}
-
-当前项目节点树（空节点/模板占位节点视为尚未完成）：
-{outline_block}
-
-节点补全风格：
-{imagination_guidance}
-
-需要补全的节点 JSON：
-{nodes_json}
-
-输出 JSON：
-{{"nodes":[{{"node_id":"原样返回输入里的 node_id","note":"当前项目专属的视觉规划说明","search_query":"具体的中文语义搜图短语"}}]}}
-
-规则：
-1. 必须给每个输入 node_id 返回一条结果。
-2. 不要创建、删除、合并、改名或重排节点。
-3. “项目主题”和“补充信息”是所有节点的硬约束。
-4. 如果 existing_user_note 为空，必须根据“项目主题”“补充信息”和 template_guidance 联想出这个节点的具体视觉内容。
-5. 如果 existing_user_note 非空，它就是用户已确认内容。对应节点返回的 note 必须以 existing_user_note 原文开头，然后再追加具体化的视觉联想。只返回 existing_user_note 原文判定为失败。
-6. 禁止违背 existing_user_note。例如用户写了“秃头、老人、老年斑”，就不能生成青年、浓密头发、光滑皮肤或任何相反特征。
-7. template_guidance 只说明这个节点负责什么，禁止把 template_guidance 原句或同义改写作为 note/search_query。
-8. 每个 note 都必须写成当前项目专属内容，必须能看出它来自“项目主题”和“补充信息”，不能是泛泛的分类说明。
-9. 每个 search_query 必须服从该节点的 search_scope_guidance；它的用途是给当前节点找参考图，不是复原整张最终图。
-10. 不要输出 Markdown、分析、推理、思考过程或 JSON 之外的内容。
-11. 如果模型支持 Thinking/Reasoning 模式，请关闭它，只输出最终 JSON。
-
-/no_think
-""".strip()
+        requests.append({"node_id": node["node_id"], "instructions": _build_creative_node_note_prompt(
+            project_brief=project_brief, project_extra=project_extra, project_outline=project_outline,
+            node_title=node["node_title"], current_note=node.get("current_note", ""),
+            node_path=node.get("node_path", ""), node_template_hint=node.get("node_template_hint", ""),
+            imagination_level=imagination_level, completion_mode=completion_mode, language=language,
+        )})
+    return ("Complete each fixed node following its own mode and instructions. Do not create or rename nodes. "
+            'Return only {"nodes":[{"node_id":"input id","additions":[{"name":"target/aspect","visual":"detail"}],"search_query":"phrase"}]}.\n'
+            + json.dumps(requests, ensure_ascii=False, indent=2))
 
 
 def _build_creative_node_note_prompt(
-    *,
-    project_brief: str,
-    project_extra: str,
-    project_outline: str = "",
-    node_title: str,
-    current_note: str,
-    node_path: str,
-    node_template_hint: str = "",
-    imagination_level: int = 50,
-    language: str,
+    *, project_brief: str, project_extra: str, project_outline: str = "",
+    node_title: str, current_note: str, node_path: str, node_template_hint: str = "",
+    imagination_level: int = 50, completion_mode: str = "auto", language: str,
 ) -> str:
-    current_note_block = current_note if current_note else (
-        "No detail has been provided yet." if language == "en" else "用户尚未填写具体内容。"
-    )
-    template_hint_block = node_template_hint if node_template_hint else (
-        "No template guidance has been provided." if language == "en" else "无额外模板说明。"
-    )
-    node_path_block = node_path if node_path else node_title
-    extra_block = project_extra if project_extra else (
-        "No extra project context has been provided." if language == "en" else "用户未填写补充信息。"
-    )
-    outline_block = project_outline if project_outline else (
-        "No project node tree has been provided." if language == "en" else "未提供项目节点树。"
-    )
-    search_scope_block = _creative_node_search_scope_guidance(
-        project_extra=project_extra,
-        current_note=current_note,
-        node_title=node_title,
-        node_path=node_path,
-        language=language,
-    )
-    imagination_guidance = _creative_node_imagination_guidance(
-        imagination_level,
-        language=language,
-    )
+    mode = _creative_node_completion_mode(completion_mode, node_title=node_title, node_path=node_path)
+    contract = _creative_node_expansion_contract(language=language, completion_mode=mode)
+    if mode == "objects":
+        guidance = _creative_node_imagination_guidance(imagination_level, language=language)
+    else:
+        guidance = (f"Detail boldness: {imagination_level}/100. At most {_creative_node_addition_limit(imagination_level)} compatible details."
+                    if language == "en" else f"细节联想程度：{imagination_level}/100。最多 {_creative_node_addition_limit(imagination_level)} 项相容细节，不必凑满。")
+    scope = _creative_node_search_scope_guidance(project_extra=project_extra, current_note=current_note,
+        node_title=node_title, node_path=node_path, language=language)
     if language == "en":
-        return f"""
-Project brief:
-{project_brief or "-"}
-
-Extra project context:
-{extra_block}
-
+        context = f"""Project brief (hard constraint):
+{project_brief}
+Extra project context (hard constraint):
+{project_extra or "-"}
 Current fixed planning node:
-{node_path_block or "-"}
-
-Existing node detail, if any. Treat it as the strongest constraint:
-{current_note_block}
-
-Template guidance for this node. Use it only to understand the node's job; do not copy it as the answer:
-{template_hint_block}
-
-Current project node tree:
-{outline_block}
-
-Completion style:
-{imagination_guidance}
-
-Complete this node as an illustrator's reference-planning field. If existing node detail is provided, the returned note must begin with that exact existing detail unchanged, then add missing visual decisions after it. Do not merely rewrite the existing sentence. Returning only the existing detail is invalid.
-
+{node_path or node_title}
+Existing node detail (hard constraint; the application preserves it verbatim):
+{current_note or "No detail has been provided yet."}
+Template guidance (node responsibility only, never copy it as the answer):
+{node_template_hint or "-"}
+Current project node tree (confirmed contents constrain this node; empty/template nodes are not facts):
+{project_outline or "-"}
 Search-query scope guidance:
-{search_scope_block}
-
-Return JSON:
-{{"note":"one concise paragraph about what this node should define visually","search_query":"concrete English semantic image-search phrase"}}
-
-Rules:
-1. Do not create or rename nodes.
-2. The project brief and extra context are hard constraints. Do not add an era, weather, location, object, character, action, or mood that conflicts with them.
-3. If existing node detail is empty, infer this node from the project brief, extra context, and template guidance.
-4. If existing node detail is provided, preserve it as the highest-priority user constraint. The note must begin with the exact existing detail unchanged. You must add concrete visible expansion after it, such as related form, material, age cues, damage, expression, lighting, equipment, or surrounding context. Do not contradict, remove, or replace the user's content.
-5. Keep the note specific to this node only.
-6. The note may stay project-aware. The search_query must obey the search-query scope guidance even when the note mentions project-specific context.
-7. Do not copy all note details into search_query. Put only the reference target for this node in search_query.
-8. Avoid story-only abstractions; describe visible environment, objects, action, lighting, mood, material, or composition.
-9. The note must be a complete, useful sentence. Do not output placeholders such as "...", "TBD", or "same as above".
-10. If template guidance is provided, answer the actual project-specific version of that guidance. Never copy the template guidance sentence itself as note or search_query.
-11. Do not output Markdown, analysis, reasoning, or text outside JSON.
-12. If your model supports thinking mode, disable it and output only the final JSON.
-
-/no_think
-""".strip()
-    return f"""
-项目主题：
-{project_brief or "-"}
-
-补充信息：
-{extra_block}
-
+{scope}"""
+    else:
+        context = f"""项目主题（硬约束）：
+{project_brief}
+补充信息（硬约束）：
+{project_extra or "-"}
 当前固定规划节点：
-{node_path_block or "-"}
-
-现有节点说明（如果有，优先级最高）：
-{current_note_block}
-
-当前节点模板说明（只用于理解这个节点要补什么，禁止原样复制为答案）：
-{template_hint_block}
-
-当前项目节点树：
-{outline_block}
-
-节点补全风格：
-{imagination_guidance}
-
-请把这个节点补成插画师能直接拿来找参考图的规划内容。如果用户已经写了节点说明，返回的 note 必须以用户原文原样开头，再补充用户没有写出的相关视觉信息；不是替换原句，也不是只重复、改写或输出占位符。只返回用户原文视为失败。
-
+{node_path or node_title}
+现有节点说明（硬约束，软件会原样保留；不得推翻、删除、替换或违背）：
+{current_note or "用户尚未填写具体内容。"}
+当前节点模板说明（只说明职责，禁止复制为答案）：
+{node_template_hint or "-"}
+当前项目节点树（其他已确定内容是约束，空节点/模板占位不是事实）：
+{project_outline or "-"}
 搜索范围建议：
-{search_scope_block}
+{scope}"""
+    return f"""{context}
 
-输出 JSON：
-{{"note":"一段简洁说明，说明这个节点要明确哪些视觉参考","search_query":"具体的中文语义搜图短语"}}
+{contract}
 
-规则：
-1. 不要创建节点，不要改节点名。
-2. “项目主题”和“补充信息”是硬约束，不要加入与它们冲突的时代、天气、地点、物件、角色、动作或氛围。
-3. 如果“现有节点说明”为空，必须根据“项目主题”“补充信息”和当前节点模板说明联想出该节点的具体视觉内容。
-4. 如果“现有节点说明”里有用户已写内容，它是最高优先级约束。note 必须以这段原文原样开头，并且必须在后面追加具体可见的扩展；允许基于它合理联想并补充相关的环境、物件、光线、气氛、材质、动作或构图，例如形态、材质、年龄特征、伤痕、表情、光线、装备或环境关系。不得推翻、删除、替换或违背。
-5. 只补当前节点，不要把其他节点的内容混进来。
-6. note 可以保留项目语境；search_query 必须严格服从“搜索范围建议”，即使 note 里提到了项目主题、世界观、地点、角色或事件。
-7. 不要把 note 的所有细节复制进 search_query。search_query 只写当前节点要找的参考目标。
-8. search_query 必须使用简体中文短语，不要输出英文，除非是不可翻译的专有名词。
-9. 避免只有剧情或抽象词，要落到可见环境、物件、动作、光线、气氛、材质或构图。
-10. note 必须是一句完整、有信息量的说明。不要输出“...”“待补充”“同上”这类占位内容。
-11. 如果提供了“当前节点模板说明”，必须把它转化为当前项目的具体内容，禁止把模板说明原句或同义改写直接作为 note 或 search_query。
-12. 不要输出 Markdown、分析、推理、思考过程或 JSON 之外的内容。
-13. 如果模型支持 Thinking/Reasoning 模式，请关闭它，只输出最终 JSON。
+{guidance}
 
-/no_think
-""".strip()
+Return only a JSON object, no Markdown or commentary:
+{{"additions":[{{"name":"target or aspect for the selected mode","visual":"specific visible suggestion"}}],"search_query":"concise reference-search phrase"}}
+Use {"English" if language == "en" else "简体中文，除非不可翻译的专有名词"} for all field values. Do not create or rename nodes.
+{"Briefly check mode, novelty, world plausibility and conflicts before returning final JSON." if language == "en" else "简短检查模式边界、是否重复、世界观可行性及约束冲突，再返回最终 JSON。name、visual、search_query 均必须使用简体中文，不要把搜索词翻译成英文。"}""".strip()
 
 
 def _build_creative_node_note_retry_prompt(
-    *,
-    project_brief: str,
-    project_extra: str,
-    project_outline: str,
-    node_title: str,
-    current_note: str,
-    node_path: str,
-    node_template_hint: str,
-    previous_note: str,
-    imagination_level: int = 50,
-    language: str,
+    *, project_brief: str, project_extra: str, project_outline: str,
+    node_title: str, current_note: str, node_path: str, node_template_hint: str,
+    previous_note: str, imagination_level: int = 50, completion_mode: str = "auto", language: str,
 ) -> str:
-    imagination_guidance = _creative_node_imagination_guidance(
-        imagination_level,
-        language=language,
+    prompt = _build_creative_node_note_prompt(
+        project_brief=project_brief, project_extra=project_extra, project_outline=project_outline,
+        node_title=node_title, current_note=current_note, node_path=node_path, node_template_hint=node_template_hint,
+        imagination_level=imagination_level, completion_mode=completion_mode, language=language,
     )
-    if language == "en":
-        return f"""
-The previous answer was rejected because it did not add a meaningful expansion after the user's existing node detail.
-
-Project brief:
-{project_brief or "-"}
-
-Extra project context:
-{project_extra or "-"}
-
-Current node:
-{node_path or node_title}
-
-User's existing node detail, highest priority:
-{current_note}
-
-Template guidance:
-{node_template_hint or "-"}
-
-Rejected previous note:
-{previous_note or "-"}
-
-Completion style:
-{imagination_guidance}
-
-Return JSON:
-{{"note":"must start with the exact existing detail, then add concrete visible expansion","search_query":"concrete English reference-search phrase"}}
-
-Rules:
-1. note must start with the exact existing node detail unchanged.
-2. After that exact text, add at least one concrete visual sentence with visible traits, materials, age cues, damage, expression, equipment, lighting, or context.
-3. Do not contradict the existing detail.
-4. Returning only the existing detail is invalid.
-5. Output JSON only.
-
-/no_think
-""".strip()
-    return f"""
-上一次回答被拒绝，原因是没有在用户已有节点说明后追加有意义的扩展。
-
-项目主题：
-{project_brief or "-"}
-
-补充信息：
-{project_extra or "-"}
-
-当前节点：
-{node_path or node_title}
-
-用户已有节点说明（最高优先级）：
-{current_note}
-
-节点模板说明：
-{node_template_hint or "-"}
-
-被拒绝的上一次 note：
-{previous_note or "-"}
-
-节点补全风格：
-{imagination_guidance}
-
-输出 JSON：
-{{"note":"必须以用户已有节点说明原文开头，然后追加具体可见的扩展","search_query":"具体的中文参考图搜索短语"}}
-
-规则：
-1. note 必须以用户已有节点说明原文原样开头。
-2. 原文后面必须至少追加一句具体视觉描述，包含形态、材质、年龄特征、伤痕、表情、装备、光线或环境关系。
-3. 禁止违背用户已有节点说明。
-4. 只返回用户原文无效。
-5. 只输出 JSON。
-
-/no_think
-""".strip()
+    retry = ("Previous answer did not add usable content. Try again following the SAME selected mode; do not copy existing content."
+             if language == "en" else "上次回答没有补出可用内容。请按同一种所选模式重试，不要复述已有内容，也不要切换到另一种模式。")
+    return f"{prompt}\n{retry}\nRejected answer / 被拒绝的回答：\n{previous_note}"
 
 
 def _creative_node_search_scope_guidance(

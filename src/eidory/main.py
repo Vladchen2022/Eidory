@@ -17,6 +17,7 @@ def main() -> int:
     from PySide6.QtWidgets import QApplication
 
     from eidory.ui.main_window import MainWindow
+    from eidory.ui.branding import app_icon
     from eidory.ui.theme import apply_theme
     from eidory.ui.theme_colors import DEFAULT_THEME
 
@@ -28,6 +29,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     configure_qt_accessibility()
     app.setApplicationName("Eidory")
+    app.setWindowIcon(app_icon())
     apply_theme(app, store.get_setting("ui.theme") or DEFAULT_THEME, density=store.get_setting("ui.density") or "compact")
     window = MainWindow(paths=paths, store=store)
     window.resize(

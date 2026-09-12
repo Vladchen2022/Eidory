@@ -92,3 +92,32 @@ def test_theme_preference_survives_density_change_and_startup(window, app):
         assert app.palette().color(QPalette.ColorRole.Text) == QColor(get_theme("paper").colors["text"])
     finally:
         apply_theme(app, DEFAULT_THEME)
+
+
+def test_native_titlebar_refreshes_after_every_theme_change(window, app, monkeypatch):
+    """Exercise the macOS refresh guard without calling Cocoa on an offscreen view."""
+    from eidory.ui import main_window
+
+    w = window
+    calls = []
+    monkeypatch.setattr(main_window.sys, "platform", "darwin")
+    monkeypatch.setattr(app, "platformName", lambda: "cocoa")
+    def fake_native_update(target):
+        if target is w:
+            calls.append(get_theme().id)
+        return True
+    # allWidgets() can include closed windows awaiting Qt deletion; none of the
+    # offscreen handles may be sent to Cocoa while this platform guard is mocked.
+    monkeypatch.setattr(main_window.MainWindow, "_make_macos_titlebar_transparent", fake_native_update)
+    w._macos_titlebar_applied = False
+    try:
+        for theme in (*THEMES, THEMES[0], THEMES[2]):
+            apply_theme(app, theme.id)
+            assert calls[-1] == theme.id
+            assert w._macos_titlebar_theme == theme.id
+            count = len(calls)
+            w._apply_macos_titlebar()  # A repeated show/timer must not reconfigure layout.
+            assert len(calls) == count
+        assert calls == [t.id for t in (*THEMES, THEMES[0], THEMES[2])]
+    finally:
+        apply_theme(app, DEFAULT_THEME)

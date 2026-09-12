@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from eidory.ui.theme_colors import theme_color, set_theme_style, set_item_theme
+from eidory.ui.theme_colors import get_theme, theme_color, set_theme_style, set_item_theme
 
 import os
 import queue
@@ -1787,7 +1787,10 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(250, self._apply_macos_titlebar)
 
     def _apply_macos_titlebar(self) -> None:
-        if self._macos_titlebar_applied or sys.platform != "darwin":
+        if sys.platform != "darwin":
+            return
+        theme_id = get_theme().id
+        if self._macos_titlebar_applied and getattr(self, "_macos_titlebar_theme", None) == theme_id:
             return
         app = QApplication.instance()
         if app is None or app.platformName().lower() != "cocoa":
@@ -1799,6 +1802,7 @@ class MainWindow(QMainWindow):
             self._record_error(f"macOS 标题栏颜色设置失败：{exc}")
             return
         self._macos_titlebar_applied = True
+        self._macos_titlebar_theme = theme_id
         if hasattr(self, "central_layout"):
             self.central_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -1859,9 +1863,10 @@ class MainWindow(QMainWindow):
         if not window:
             return False
 
-        full_size_content_view_mask = 1 << 15
-        style_mask = send_ulong(window, "styleMask")
-        send_void_ulong(window, "setStyleMask:", style_mask | full_size_content_view_mask)
+        if not self._macos_titlebar_applied:
+            full_size_content_view_mask = 1 << 15
+            style_mask = send_ulong(window, "styleMask")
+            send_void_ulong(window, "setStyleMask:", style_mask | full_size_content_view_mask)
         send_void_bool(window, "setTitlebarAppearsTransparent:", True)
         send_void_long(window, "setTitleVisibility:", 0)
         # A fully draggable background steals drag gestures from controls that live
@@ -1874,7 +1879,7 @@ class MainWindow(QMainWindow):
             appearance_name = send_id(
                 ns_string,
                 "stringWithUTF8String:",
-                ctypes.c_char_p(b"NSAppearanceNameDarkAqua"),
+                ctypes.c_char_p(b"NSAppearanceNameDarkAqua" if get_theme().dark else b"NSAppearanceNameAqua"),
             )
             appearance = send_id(
                 ns_appearance,
@@ -1882,6 +1887,19 @@ class MainWindow(QMainWindow):
                 ctypes.c_void_p(appearance_name),
             )
             send_void_id(window, "setAppearance:", appearance)
+        # A transparent native titlebar uses NSWindow.backgroundColor, not Qt's
+        # widget stylesheet. Match the workspace header, including colored themes.
+        ns_color = cls("NSColor")
+        if ns_color:
+            color_send = ctypes.CFUNCTYPE(
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            )(("objc_msgSend", objc))
+            color = color_send(
+                ns_color, sel("colorWithSRGBRed:green:blue:alpha:"),
+                *theme_color("base").getRgbF(),
+            )
+            send_void_id(window, "setBackgroundColor:", color)
         return True
 
     def closeEvent(self, event) -> None:
@@ -2326,6 +2344,7 @@ class MainWindow(QMainWindow):
 
     def refresh_theme(self) -> None:
         # Update presentation in place, preserving selection, drafts and undo.
+        self._apply_macos_titlebar()
         for button in self.findChildren(QPushButton):
             kind = button.property("eidoryBoardIcon")
             if kind:

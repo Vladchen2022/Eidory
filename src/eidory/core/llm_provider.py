@@ -63,6 +63,9 @@ class CreativeNodeSuggestion:
 class CreativeNodeNoteSuggestion:
     note: str
     search_query: str
+    additions: tuple[dict[str, str], ...] = ()
+    entry_target: dict | None = None
+    entry_mode: str = "append"
 
 
 @dataclass(frozen=True)
@@ -436,6 +439,68 @@ class LMStudioProvider:
         )
         nodes = parse_creative_node_suggestions(content, language=language)
         return nodes, model_name
+
+    def generate_creative_reference_entries(
+        self, *, project_brief, node_title, project_extra="", project_outline="", current_note="",
+        node_path="", node_template_hint="", imagination_level=50, completion_mode="auto",
+        entry_target=None, language="zh",
+    ):
+        """A bounded structured request; never parse prose into checkable search rows."""
+        mode = "details" if completion_mode == "organize" else _creative_node_completion_mode(completion_mode, node_title=node_title, node_path=node_path)
+        if completion_mode == "organize":
+            prompt = (
+                "把原文中明确存在的可视内容整理为独立参考条目，禁止新增、推断或联想。"
+                "每行只对应一个明确目标，保留原文中的否定和限定，不得把禁止出现的东西作为搜索目标。"
+                "name 是含必要限定的简短搜索短语，visual 是原文对应细节；没有细节可填‘原文未补充细节’。"
+                "只提取可独立找参考的内容，最多8项；超出时先提取主要项，原文会完整保留。\n"
+                f"主题：{project_brief}\n世界观：{project_extra}\n节点：{node_path or node_title}\n原文：{current_note}"
+            )
+        else:
+            if mode == "objects" and not creative_node_supports_objects(node_title=node_title, node_path=node_path):
+                raise LLMProviderError("此节点不适合新增实物，请使用补充细节")
+            prompt = _build_creative_node_note_prompt(
+                project_brief=project_brief, project_extra=project_extra, project_outline=project_outline,
+                node_title=node_title, current_note=current_note, node_path=node_path,
+                node_template_hint=node_template_hint, imagination_level=imagination_level,
+                completion_mode=mode, language=language,
+            )
+        prompt += (
+            "\n输出严格JSON：{\"additions\":[{\"name\":\"独立搜索短语\",\"visual\":\"细节描述\"}],\"search_query\":\"\"}。"
+            "每个name会被单独用于图库语义搜索，不能依赖其他行才成立。"
+            "name保留识别该目标必需的世界观、材质或类别限定（如‘废土拼装越野车’），避免一长串无关词。"
+            "visual只解释本行目标的可视细节，可包含创作感受，不会自动参与搜索。"
+            "不输出复选框、ID或用户勾选状态；它们由软件管理。"
+        )
+        if entry_target:
+            prompt += (
+                "\n本次只补充以下这一行的细节，返回且只返回一项。不得新增其他对象，不得更改name。"
+                "visual需完整保留已确定细节并追加合理的新细节，避免重复修辞。"
+                + json.dumps({k: entry_target[k] for k in ("name", "visual")}, ensure_ascii=False)
+            )
+        model = self.model_name or self._first_available_model()
+        schema = _creative_node_note_response_format(100 if completion_mode == "organize" else imagination_level, mode)
+        messages = [{"role": "system", "content": "你是插画参考规划助手。遵守原有约束，只返回JSON，不输出思考过程。"},
+                    {"role": "user", "content": prompt}]
+        for attempt in range(2):
+            content = self._chat_completion(model_name=model, messages=messages, prefer_json=True,
+                response_format=schema, reasoning_effort="low",
+                temperature=0.15 if completion_mode == "organize" else _creative_node_imagination_temperature(imagination_level),
+                max_tokens=4000, allow_reasoning_content=True)
+            try:
+                payload = _load_json_object(content)
+                rows = _creative_additions(payload)
+                if not rows:
+                    raise LLMProviderError("AI 未返回有效条目")
+                if entry_target and (len(rows) != 1 or rows[0]["name"] != entry_target["name"]):
+                    raise LLMProviderError("细节建议偏离了选中的条目")
+                return CreativeNodeNoteSuggestion(
+                    note=_creative_additions_note(payload), search_query=" ".join(row["name"] for row in rows)[:240],
+                    additions=rows, entry_target=entry_target, entry_mode=completion_mode,
+                ), model
+            except LLMProviderError:
+                if attempt:
+                    raise LLMProviderError("AI 未返回有效的条目格式；原有内容未改动，请重试")
+                messages.append({"role": "user", "content": "上次格式无效。重新按约定输出additions数组，每项必须有非空name和visual；不得返回散文。"})
 
     def generate_creative_node_note(
         self,
@@ -1073,23 +1138,26 @@ def parse_creative_node_suggestions(
     return suggestions
 
 
-def _creative_additions_note(payload: dict[str, object]) -> str:
+def _creative_additions(payload):
     additions = payload.get("additions")
     if not isinstance(additions, list):
-        return ""
-    lines: list[str] = []
-    seen: set[str] = set()
+        return ()
+    rows = []
+    seen = set()
     for item in additions[:8]:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not all(isinstance(item.get(k), str) for k in ("name", "visual")):
             continue
-        name = _clean_project_text(item.get("name"), max_length=64)
-        visual = _clean_project_text(item.get("visual"), max_length=160)
+        name = _clean_project_text(item["name"], max_length=64)
+        visual = _clean_project_text(item["visual"], max_length=300)
         key = re.sub(r"[\W_]+", "", name).casefold()
-        if not key or not visual or key in seen:
-            continue
-        seen.add(key)
-        lines.append(f"{name}: {visual}")
-    return "\n".join(lines)
+        if key and visual and key not in seen:
+            seen.add(key)
+            rows.append({"name": name, "visual": visual})
+    return tuple(rows)
+
+
+def _creative_additions_note(payload):
+    return "\n".join(f'{row["name"]}: {row["visual"]}' for row in _creative_additions(payload))
 
 
 def parse_creative_node_note_suggestion(
@@ -1127,7 +1195,7 @@ def parse_creative_node_note_suggestion(
         search_query = note[:240]
     if not note:
         note = search_query
-    return CreativeNodeNoteSuggestion(note=note, search_query=search_query)
+    return CreativeNodeNoteSuggestion(note=note, search_query=search_query, additions=_creative_additions(payload))
 
 
 def parse_creative_node_note_batch_suggestions(
@@ -1172,7 +1240,7 @@ def parse_creative_node_note_batch_suggestions(
             search_query = note[:240]
         if not note:
             note = search_query
-        suggestions[node_id] = CreativeNodeNoteSuggestion(note=note, search_query=search_query)
+        suggestions[node_id] = CreativeNodeNoteSuggestion(note=note, search_query=search_query, additions=_creative_additions(raw))
     if not suggestions:
         raise LLMProviderError("AI 没有返回可用的节点说明")
     return suggestions
@@ -1258,7 +1326,7 @@ def _refine_creative_node_note_suggestion(
 ) -> CreativeNodeNoteSuggestion:
     note = _ensure_creative_note_preserves_current_note(current_note, suggestion.note)
     if language == "en":
-        return CreativeNodeNoteSuggestion(note=note, search_query=suggestion.search_query)
+        return CreativeNodeNoteSuggestion(note=note, search_query=suggestion.search_query, additions=suggestion.additions)
     refined_query = _refine_creative_node_search_query(
         suggestion.search_query,
         project_brief=project_brief,
@@ -1269,7 +1337,7 @@ def _refine_creative_node_note_suggestion(
     )
     if not refined_query:
         refined_query = suggestion.search_query
-    return CreativeNodeNoteSuggestion(note=note, search_query=refined_query[:240])
+    return CreativeNodeNoteSuggestion(note=note, search_query=refined_query[:240], additions=suggestion.additions)
 
 
 def _refine_creative_node_search_query(

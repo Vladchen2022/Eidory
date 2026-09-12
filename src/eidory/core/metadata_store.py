@@ -197,6 +197,12 @@ class MetadataStore:
 
     @staticmethod
     def _ensure_remaining_schema_migrations(conn: sqlite3.Connection) -> None:
+        for table, columns in (("creative_node_workflow", ("entries_json", "proposal_entries_json")),
+                               ("creative_node_versions", ("entries_json",))):
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for column in columns:
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         for statement in (
             """
             CREATE INDEX IF NOT EXISTS idx_images_missing_name

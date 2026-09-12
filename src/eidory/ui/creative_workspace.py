@@ -9,6 +9,8 @@ from PySide6.QtWidgets import (
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
+from eidory.ui.reference_entries import ReferenceEntriesTable
+from eidory.core.creative_entries import decode_entries, encode_entries, new_entry, search_names, composed_note
 from eidory.core.creative_workspace import CreativeWorkspaceStore, decode_state
 from eidory.core.search_filters import FilterGroup, FilterPlan, SearchFilter
 
@@ -126,16 +128,48 @@ class CreativeWorkspace(QObject):
         self._button("围绕当前主题完善项目", self.complete_theme, w.ai_workflow_stack.widget(0).layout())
 
         node_layout = w.creative_node_note_input.parentWidget().layout()
+        node_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        node_layout.setSpacing(6)
         actions = QHBoxLayout()
         self.lock_button = QCheckBox("已确定，锁定此节点")
         self.lock_button.toggled.connect(self.toggle_lock)
         actions.addWidget(self.lock_button)
         self.restore_button = self._button("恢复上次采纳前的内容", self.restore_note, actions)
         node_layout.insertLayout(1, actions)
+        self.entries_panel = QWidget()
+        self.entries_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        entries_layout = QVBoxLayout(self.entries_panel)
+        entries_layout.setContentsMargins(0, 4, 0, 4)
+        entries_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.entries_hint = QLabel("仅勾选行用于找图，分别搜索并合并去重。原有说明作为 AI 约束，可整理为条目。点选一行后补充细节。")
+        self.entries_hint.setWordWrap(True)
+        self.entries_hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        entries_layout.addWidget(self.entries_hint)
+        self.entries_table = ReferenceEntriesTable()
+        entries_layout.addWidget(self.entries_table)
+        entry_actions = QHBoxLayout()
+        self.add_entry_button = self._button("＋ 手动添加条目", self.add_entry, entry_actions)
+        self.delete_entry_button = self._button("删除选中行", self.delete_entry, entry_actions)
+        self.organize_button = self._button("将原文整理为条目…", lambda: w._generate_creative_children_for_selected_node(completion_mode="organize"), entry_actions)
+        self.edit_base_button = self._button("编辑原有说明", self.edit_base_note, entry_actions)
+        self.original_button = self._button("查看完整说明", self.toggle_original, entry_actions)
+        entry_actions.addStretch()
+        entries_layout.addLayout(entry_actions)
+        node_layout.insertWidget(node_layout.indexOf(w.creative_node_note_input) + 1, self.entries_panel)
+        self.entries_table.entriesChanged.connect(self.save_entry_edits)
         self.proposal_panel = QWidget()
+        self.proposal_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         proposals = QVBoxLayout(self.proposal_panel)
         proposals.setContentsMargins(0, 4, 0, 4)
-        proposals.addWidget(QLabel("AI 建议 · 可先修改文字，再采纳；也可选中其中一段追加到当前说明"))
+        proposals.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.proposal_label = QLabel("AI 建议 · 可先修改文字，再采纳；也可选中其中一段追加到当前说明")
+        self.proposal_label.setWordWrap(True)
+        self.proposal_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        proposals.addWidget(self.proposal_label)
+        self.proposal_entries_table = ReferenceEntriesTable()
+        self.proposal_entries_table.setAccessibleName("AI 建议条目表")
+        proposals.addWidget(self.proposal_entries_table)
+        self.proposal_entries_table.entriesChanged.connect(self.save_pending_entries)
         self.proposal_input = QTextEdit()
         self.proposal_input.setAcceptRichText(False)
         self.proposal_input.setMaximumHeight(180)
@@ -144,8 +178,8 @@ class CreativeWorkspace(QObject):
         proposals.addWidget(self.proposal_input)
         proposals.addWidget(self.proposal_query)
         accept_row = QHBoxLayout()
-        self._button("采纳编辑后的建议", self.accept_note, accept_row)
-        self._button("追加选中段落", lambda: self.accept_note(partial=True), accept_row)
+        self.accept_button = self._button("采纳编辑后的建议", self.accept_note, accept_row)
+        self.partial_button = self._button("追加选中段落", lambda: self.accept_note(partial=True), accept_row)
         self._button("放弃建议", self.discard_note, accept_row)
         proposals.addLayout(accept_row)
         node_layout.addWidget(self.proposal_panel)
@@ -229,8 +263,10 @@ class CreativeWorkspace(QObject):
         self.proposal_panel.setEnabled(not locked)
         self.restore_button.setEnabled(bool(node and not locked and self.store.version_count(node.id)))
         self.loading = False
-        w.creative_node_note_input.setReadOnly(locked)
-        w.creative_node_query_input.setReadOnly(locked)
+        self.refresh_entries(node, state, locked)
+        structured = bool(state.get("entries_json"))
+        w.creative_node_note_input.setReadOnly(locked or structured)
+        w.creative_node_query_input.setReadOnly(locked or structured)
         if locked:
             w.generate_creative_children_button.setEnabled(False)
             w.generate_creative_details_button.setEnabled(False)
@@ -311,7 +347,7 @@ class CreativeWorkspace(QObject):
     def find(self):
         self.w._search_selected_creative_node()
 
-    def start_node_search(self, node, query):
+    def start_node_search(self, node, query, *, queries=None):
         w = self.w
         self.save_search()
         scope = w._current_view_payload()
@@ -322,10 +358,17 @@ class CreativeWorkspace(QObject):
                 scope["filter_scope"] = {"kind": "sidebar"}
                 scope["base_image_ids"] = None
                 scope["base_label"] = None
-        plan = FilterPlan((FilterGroup((SearchFilter("semantic", query, 50),)),))
+        names = queries if queries is not None else [query]
+        if not names:
+            w.statusBar().showMessage("请至少勾选一个有名称的参考条目")
+            return
+        previous = FilterPlan.from_payload(scope.get("filter_plan", {}))
+        strengths = {f.value: f.score_threshold for f in previous.positive_filters if f.kind == "semantic"}
+        plan = FilterPlan((FilterGroup(tuple(SearchFilter("semantic", name, strengths.get(name, 50)) for name in names), match_mode="any"),)) if queries is not None else FilterPlan((FilterGroup((SearchFilter("semantic", query, 50),)),))
         scope.update(filter_plan=plan.to_payload(), search_filters=[], excluded_image_ids=[], excluded_collection_ids=[])
         self.store.save_project(node.project_id, scope=scope)
         self.search_node_id = node.id
+        self.active_search_names = names if queries is not None else None
         w.current_result_mode = "search_chain"
         w._show_gallery_view()
         w._apply_view_payload(scope)
@@ -338,7 +381,7 @@ class CreativeWorkspace(QObject):
             return
         if not w.search_button.isEnabled() or w.filter_panel.error:
             return
-        state = {"view": w._current_view_payload(), "scroll": w.grid_view.verticalScrollBar().value(),
+        state = {"entry_names": getattr(self, "active_search_names", None), "view": w._current_view_payload(), "scroll": w.grid_view.verticalScrollBar().value(),
                  "selected": w.grid_view.selected_image_ids()}
         self.search_states[self.search_node_id] = state
         self.store.save_node(self.search_node_id, search_json=json.dumps(state, ensure_ascii=False))
@@ -353,7 +396,11 @@ class CreativeWorkspace(QObject):
             w._show_gallery_view()
             return
         state = self.search_states.get(node.id) or decode_state(self.store.node(node.id)["search_json"])
+        payload = self.store.entries(node.id)
+        if payload is not None and state.get("entry_names") != search_names(payload):
+            state = {}
         if state:
+            self.active_search_names = state.get("entry_names")
             self.search_node_id = node.id
             self.restore_position = (state.get("scroll", 0), state.get("selected", []))
             w.current_result_mode = "search_chain"
@@ -397,6 +444,158 @@ class CreativeWorkspace(QObject):
             self.w._sync_creative_node_panel()
             self.w.statusBar().showMessage("节点已锁定" if checked else "节点已解锁")
 
+    def refresh_entries(self, node, state, locked):
+        payload = decode_entries(state.get("entries_json", ""))
+        pending = decode_entries(state.get("proposal_entries_json", ""))
+        self.entries_panel.setVisible(node is not None)
+        self.entries_table.setVisible(payload is not None)
+        self.entries_hint.setVisible(payload is not None)
+        self.entries_table.set_entries((payload or {}).get("rows", []), locked=locked)
+        self.delete_entry_button.setVisible(payload is not None)
+        for button in (self.add_entry_button, self.delete_entry_button, self.organize_button):
+            button.setEnabled(bool(node and not locked))
+        busy = self.w._creative_node_note_in_progress or self.w._creative_all_nodes_in_progress
+        original = payload.get("base_note", "") if payload is not None else (node.note if node else "")
+        self.organize_button.setEnabled(bool(node and original.strip() and not locked and not pending and not busy and not state.get("proposal_note")))
+        self.organize_button.setVisible(True)
+        self.original_button.setVisible(payload is not None)
+        self.edit_base_button.setVisible(payload is not None)
+        self.edit_base_button.setEnabled(bool(node and not locked))
+        if getattr(self, "_entries_node", None) != (node.id if node else None):
+            self._entries_node = node.id if node else None
+            self._original_visible = False
+        self.w.creative_node_note_input.setVisible(payload is None or getattr(self, "_original_visible", False))
+        self.w.creative_node_note_input.setMinimumHeight(100)
+        self.w.creative_node_note_input.setMaximumHeight(170)
+        self.w.creative_node_query_input.setVisible(payload is None)
+        self.w.search_creative_node_button.setText("按勾选条目找参考" if payload is not None else "用此语句找参考")
+        self.proposal_entries_table.setVisible(pending is not None)
+        self.proposal_entries_table.set_entries((pending or {}).get("rows", []), locked=locked, detail_target=bool(pending and pending.get("target")))
+        self.proposal_input.setVisible(pending is None)
+        self.proposal_query.setVisible(pending is None)
+        self.partial_button.setVisible(pending is None)
+        self.accept_button.setText("采纳这些条目" if pending else "采纳编辑后的建议")
+        self.proposal_label.setText("AI 建议 · 名称和描述可修改；采纳后保存所有行，只有勾选行参与找图。" if pending else "AI 建议 · 可先修改文字，再采纳")
+        if pending and pending.get("target"):
+            self.proposal_label.setText("所选条目的细节建议 · 采纳后仅更新这一行的描述，搜索内容与勾选状态保持不变。")
+            self.accept_button.setText("采纳细节")
+        if pending:
+            self.proposal_panel.show()
+        if state.get("proposal_note") or pending:
+            self.w.generate_creative_children_button.setEnabled(False)
+            self.w.generate_creative_details_button.setEnabled(False)
+
+    def edit_base_note(self):
+        node = self.w._current_creative_node()
+        if not node or self.store.node(node.id)["locked"]:
+            return
+        payload = self.store.entries(node.id)
+        if payload is None:
+            return
+        dialog = QDialog(self.w)
+        dialog.setWindowTitle("编辑原有说明")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("原有说明是 AI 必须遵守的内容。找图目标由表格中的勾选行决定。"))
+        editor = QTextEdit(payload.get("base_note", ""))
+        editor.setAcceptRichText(False)
+        layout.addWidget(editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(640, 300)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            payload["base_note"] = editor.toPlainText()
+            if self.store.save_entries(node.id, payload, snapshot=True):
+                self.reload_node(node.id)
+
+    def toggle_original(self):
+        self._original_visible = not getattr(self, "_original_visible", False)
+        self.w.creative_node_note_input.setVisible(self._original_visible)
+        self.original_button.setText("收起完整说明" if self._original_visible else "查看完整说明")
+
+    def selected_entry_target(self):
+        return self.entries_table.selected_entry()
+
+    def invalidate_entry_search(self, node_id):
+        self.search_states.pop(node_id, None)
+        self.store.save_node(node_id, search_json="")
+        if self.search_node_id == node_id:
+            self.search_node_id = None
+
+    def save_entry_edits(self, rows):
+        node = self.w._current_creative_node()
+        if self.loading or node is None:
+            return
+        payload = self.store.entries(node.id)
+        if payload is None:
+            return
+        old_names = search_names(payload)
+        payload["rows"] = rows
+        if self.store.save_entries(node.id, payload):
+            if old_names != search_names(payload):
+                self.invalidate_entry_search(node.id)
+            # Synchronize compatibility fields without rebuilding the active table/editor.
+            updated = self.w.store.get_creative_node(node.id)
+            self.w._set_creative_node_editor_draft(node.id, note=updated.note, search_query=updated.search_query)
+            for widget, value, setter in ((self.w.creative_node_note_input, updated.note, "setPlainText"),
+                                          (self.w.creative_node_query_input, updated.search_query, "setText")):
+                widget.blockSignals(True)
+                getattr(widget, setter)(value)
+                widget.blockSignals(False)
+            self.w.statusBar().showMessage(f"已保存 · 勾选 {len(search_names(payload))} 项；点“找参考”按当前勾选搜索")
+
+    def save_pending_entries(self, rows):
+        node = self.w._current_creative_node()
+        if node is None or self.loading or self.store.node(node.id)["locked"]:
+            return
+        payload = decode_entries(self.store.node(node.id)["proposal_entries_json"])
+        if payload:
+            payload["rows"] = rows
+            self.store.save_node(node.id, proposal_entries_json=encode_entries(payload))
+
+    def add_entry(self):
+        node = self.w._current_creative_node()
+        if not node or self.store.node(node.id)["locked"]:
+            return
+        dialog = QDialog(self.w)
+        dialog.setWindowTitle("添加参考条目")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("搜索内容（含必要限定，例如：废土拼装汽车）"))
+        name = QLineEdit()
+        name.setAccessibleName("参考条目搜索内容")
+        layout.addWidget(name)
+        layout.addWidget(QLabel("细节描述（可选，不自动参与搜索）"))
+        visual = QTextEdit()
+        visual.setAccessibleName("参考条目细节描述")
+        layout.addWidget(visual)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+        name.textChanged.connect(lambda value: buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(bool(value.strip())))
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.w._save_current_creative_node_editor_snapshot()
+        node = self.w.store.get_creative_node(node.id)
+        payload = self.store.entries(node.id) or {"base_note": node.note, "base_query": node.search_query, "rows": []}
+        payload["rows"].append(new_entry(name.text(), visual.toPlainText()))
+        if self.store.save_entries(node.id, payload, snapshot=True):
+            self.invalidate_entry_search(node.id)
+            self.reload_node(node.id)
+
+    def delete_entry(self):
+        node = self.w._current_creative_node()
+        row = self.selected_entry_target()
+        if node and row and not self.store.node(node.id)["locked"]:
+            payload = self.store.entries(node.id)
+            payload["rows"] = [r for r in payload["rows"] if r["id"] != row["id"]]
+            if self.store.save_entries(node.id, payload, snapshot=True):
+                self.invalidate_entry_search(node.id)
+                self.reload_node(node.id)
+                self.w.statusBar().showMessage("条目已删除，可用“恢复”撤销")
+
     def save_proposal_edits(self):
         node = self.w._current_creative_node()
         if not self.loading and node:
@@ -406,6 +605,15 @@ class CreativeWorkspace(QObject):
         w = self.w
         node = w._current_creative_node()
         if node is None:
+            return
+        if self.store.node(node.id)["proposal_entries_json"]:
+            w._save_current_creative_node_editor_snapshot()
+            if self.store.accept_entries(node.id):
+                self.invalidate_entry_search(node.id)
+                self.reload_node(node.id)
+                w.statusBar().showMessage("条目已采纳；仅勾选内容参与找图，可恢复采纳前的内容")
+            else:
+                w.statusBar().showMessage("无法采纳：目标条目已更改、节点已锁定或存在空名称，请检查建议")
             return
         if partial:
             text = self.proposal_input.textCursor().selectedText().replace("\u2029", "\n").strip()
@@ -417,7 +625,13 @@ class CreativeWorkspace(QObject):
         else:
             note, query = self.proposal_input.toPlainText(), self.proposal_query.text()
         w._save_current_creative_node_editor_snapshot()
-        if self.store.accept(node.id, note=note.strip(), query=query.strip(), keep_proposal=partial):
+        entries = self.store.entries(node.id)
+        if entries is not None:
+            # Older copy-writing providers may still return prose; preserve row identity and choices.
+            entries["base_note"] = note.strip()
+            note, query = composed_note(entries), " ".join(search_names(entries))[:240]
+        if self.store.accept(node.id, note=note.strip(), query=query.strip(), keep_proposal=partial,
+                             entries_json=encode_entries(entries) if entries is not None else None):
             if partial:
                 remaining = self.proposal_input.toPlainText().replace(text, "", 1).strip()
                 self.store.save_node(node.id, proposal_note=remaining)
@@ -434,12 +648,13 @@ class CreativeWorkspace(QObject):
     def discard_note(self):
         node = self.w._current_creative_node()
         if node:
-            self.store.save_node(node.id, proposal_note="", proposal_query="")
-            self.refresh()
+            self.store.save_node(node.id, proposal_note="", proposal_query="", proposal_entries_json="")
+            self.w._sync_creative_node_panel()
 
     def restore_note(self):
         node = self.w._current_creative_node()
         if node and self.store.restore(node.id):
+            self.invalidate_entry_search(node.id)
             self.reload_node(node.id)
             self.w.statusBar().showMessage("已恢复上次采纳前的内容")
 

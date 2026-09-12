@@ -386,7 +386,9 @@ CREATE TABLE IF NOT EXISTS creative_node_workflow (
     locked INTEGER NOT NULL DEFAULT 0,
     proposal_note TEXT NOT NULL DEFAULT '',
     proposal_query TEXT NOT NULL DEFAULT '',
-    search_json TEXT NOT NULL DEFAULT ''
+    search_json TEXT NOT NULL DEFAULT '',
+    entries_json TEXT NOT NULL DEFAULT '',
+    proposal_entries_json TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS creative_node_versions (
@@ -394,6 +396,7 @@ CREATE TABLE IF NOT EXISTS creative_node_versions (
     node_id INTEGER NOT NULL REFERENCES creative_nodes(id) ON DELETE CASCADE,
     note TEXT NOT NULL,
     search_query TEXT NOT NULL,
+    entries_json TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_creative_node_versions_node ON creative_node_versions(node_id, id);

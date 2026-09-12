@@ -14836,6 +14836,7 @@ class MainWindow(QMainWindow):
                     "search_query": node.search_query,
                     "image_ids": self.store.creative_node_image_ids(node.id),
                     "layout": self.store.get_creative_node_board_layout(node.id) or "",
+                    "workflow": self.creative_workspace.store.node(node.id),
                 }
                 for node in ordered
             ],
@@ -14889,6 +14890,10 @@ class MainWindow(QMainWindow):
                 note=str(raw_node.get("note", "")),
                 search_query=str(raw_node.get("search_query", "")),
             )
+            workflow = dict(raw_node.get("workflow", {}))
+            workflow.pop("node_id", None)
+            if workflow:
+                self.creative_workspace.store.save_node(new_id, **workflow)
             id_map[old_id] = new_id
             first_new_id = first_new_id or new_id
             image_ids: list[int] = []
@@ -15354,6 +15359,8 @@ class MainWindow(QMainWindow):
 
     def _sync_creative_completion_actions(self, node, *, busy: bool) -> None:
         locked = bool(node and hasattr(self, "creative_workspace") and self.creative_workspace.store.node(node.id)["locked"])
+        pending = bool(node and hasattr(self, "creative_workspace") and self.creative_workspace.store.node(node.id)["proposal_note"])
+        busy = busy or pending
         eligible = bool(node and creative_node_supports_objects(node_title=node.title, node_path=self._creative_node_path_text(node.id)))
         self.generate_creative_children_button.setEnabled(bool(node and eligible and not locked and not busy))
         self.generate_creative_details_button.setEnabled(bool(node and not locked and not busy))
@@ -15388,6 +15395,16 @@ class MainWindow(QMainWindow):
         if self.creative_workspace.store.node(node.id)["locked"]:
             self.statusBar().showMessage("当前节点已锁定；解除锁定后可生成新建议")
             return
+        state = self.creative_workspace.store.node(node.id)
+        if state["proposal_note"] or state["proposal_entries_json"]:
+            self.statusBar().showMessage("先采纳或放弃当前建议，再生成下一批")
+            return
+        entry_target = None
+        if completion_mode == "details" and state["entries_json"]:
+            entry_target = self.creative_workspace.selected_entry_target()
+            if entry_target is None:
+                self.statusBar().showMessage("先点选要补充细节的条目行；左侧复选框仅用于选择搜索目标")
+                return
         if self._creative_node_editor_node_id == node.id:
             raw_note = self.creative_node_note_input.toPlainText().strip()
             raw_query = self.creative_node_query_input.text().strip()
@@ -15409,8 +15426,10 @@ class MainWindow(QMainWindow):
             note_text=raw_note,
             query_text=raw_query,
         )
-        ai_current_note = self._creative_node_live_constraint_text(node, project, initial_constraint)
-        action = "联想新物件" if completion_mode == "objects" else "补充细节"
+        original_entries = self.creative_workspace.store.entries(node.id)
+        original_prose = original_entries.get("base_note", "") if original_entries is not None else raw_note
+        ai_current_note = original_prose if completion_mode == "organize" else self._creative_node_live_constraint_text(node, project, initial_constraint)
+        action = "整理原文" if completion_mode == "organize" else ("联想新物件" if completion_mode == "objects" else "补充细节")
         self._set_creative_node_completion_busy(True, f"正在为“{node.title}”{action}...")
         provider = self._make_llm_provider()
         self.creative_node_auto_save_timer.stop()
@@ -15424,7 +15443,10 @@ class MainWindow(QMainWindow):
 
         def run() -> None:
             try:
-                suggestion, model_name = provider.generate_creative_node_note(
+                generator = getattr(provider, "generate_creative_reference_entries", None)
+                extra_args = {"entry_target": entry_target} if callable(generator) else {}
+                generator = generator if callable(generator) else provider.generate_creative_node_note
+                suggestion, model_name = generator(
                     project_brief=project_brief,
                     project_extra=project_extra,
                     project_outline=project_outline,
@@ -15435,6 +15457,7 @@ class MainWindow(QMainWindow):
                     imagination_level=imagination_level,
                     completion_mode=completion_mode,
                     language=self.current_language,
+                    **extra_args,
                 )
                 self.events.put(("creative_node_note_done", (node.id, ai_current_note, suggestion, model_name)))
             except Exception as exc:
@@ -15643,7 +15666,7 @@ class MainWindow(QMainWindow):
             errors: list[str] = []
             model_name = ""
             batch_generator = getattr(provider, "generate_creative_node_notes", None)
-            single_generator = getattr(provider, "generate_creative_node_note", None)
+            single_generator = getattr(provider, "generate_creative_reference_entries", None) or getattr(provider, "generate_creative_node_note", None)
             total_requests = len(requests)
 
             def append_single_result(index: int, request: dict[str, object]) -> None:
@@ -15773,6 +15796,17 @@ class MainWindow(QMainWindow):
         node = self.store.get_creative_node(node_id)
         if node is None:
             return None
+        additions = getattr(suggestion, "additions", ())
+        if additions:
+            staged = self.creative_workspace.store.stage_entries(
+                node_id, additions, mode=getattr(suggestion, "entry_mode", "append"),
+                target=getattr(suggestion, "entry_target", None),
+            )
+            if not staged:
+                return None
+            if not stage_only:
+                self.creative_workspace.store.accept_entries(node_id)
+            return self.store.get_creative_node(node_id)
         note = str(getattr(suggestion, "note", "")).strip()
         query = str(getattr(suggestion, "search_query", "")).strip()
         if note and (
@@ -15937,9 +15971,9 @@ class MainWindow(QMainWindow):
         return len(re.findall(r"[\w\u4e00-\u9fff]", clean)) >= 6
 
     def _handle_creative_node_note_error(self, node_id: int, exc: Exception) -> None:
-        if self.current_creative_node_id == node_id:
-            self._set_creative_node_completion_busy(False)
-            self._sync_creative_node_panel()
+        self._set_creative_node_completion_busy(False)
+        self._sync_creative_node_panel()
+        self.statusBar().showMessage("AI 生成失败，原有内容已保留")
         QMessageBox.warning(self, "Eidory", f"AI补全当前节点失败：{exc}")
 
     def _creative_project_node_payload(self, project_id: int) -> list[dict[str, str]]:
@@ -16061,6 +16095,15 @@ class MainWindow(QMainWindow):
         node = self._current_creative_node()
         if node is None:
             self.statusBar().showMessage("先选择创作项目节点")
+            return
+        entries = self.creative_workspace.store.entries(node.id)
+        if entries is not None:
+            from eidory.core.creative_entries import search_names
+            names = search_names(entries)
+            if not names:
+                self.statusBar().showMessage("请至少勾选一个参考条目；未勾选时不会自动搜索全部图库")
+                return
+            self.creative_workspace.start_node_search(node, "", queries=names)
             return
         if self._creative_node_editor_node_id == node.id:
             note_text = self.creative_node_note_input.toPlainText()

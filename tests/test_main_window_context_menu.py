@@ -6505,7 +6505,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.app.processEvents()
 
             self.assertEqual(window.generate_creative_children_button.text(), "联想新物件")
-            self.assertEqual(window.generate_all_creative_nodes_button.text(), "补全未锁定、无待采纳建议的节点")
+            self.assertEqual(window.generate_all_creative_nodes_button.text(), "批量补全项目节点")
             self.assertEqual(window.creative_template_label.text(), "新建项目模板")
             self.assertEqual(window.creative_new_project_button.text(), "按此主题新建项目")
             self.assertEqual(window.creative_ai_project_button.text(), "给我一个新创作题目")

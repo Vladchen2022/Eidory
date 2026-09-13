@@ -5,7 +5,7 @@ from weakref import ref
 
 from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -124,13 +124,20 @@ class CreativeWorkspace(QObject):
         w.creative_node_note_input.setPlaceholderText("已经确定的创作细节；AI 的新建议会单独显示，采纳后才更新这里。")
         w.creative_ai_project_button.setText("给我一个新创作题目")
         w.creative_new_project_button.setText("按此主题新建项目")
-        w.generate_all_creative_nodes_button.setText("补全未锁定、无待采纳建议的节点")
-        self._button("围绕当前主题完善项目", self.complete_theme, w.ai_workflow_stack.widget(0).layout())
+        w.generate_all_creative_nodes_button.setText("批量补全项目节点")
 
         node_layout = w.creative_node_note_input.parentWidget().layout()
         node_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         node_layout.setSpacing(6)
         actions = QHBoxLayout()
+        actions.addWidget(QLabel("内容形式"))
+        self.format_combo = QComboBox()
+        self.format_combo.setAccessibleName("节点内容形式")
+        self.format_combo.addItem("整体说明", "text")
+        self.format_combo.addItem("参考条目", "entries")
+        self.format_combo.setToolTip("整体说明适合设定、氛围和构图；参考条目适合独立找图的目标。切换会保留原文，可恢复。")
+        self.format_combo.currentIndexChanged.connect(self.change_content_format)
+        actions.addWidget(self.format_combo)
         self.lock_button = QCheckBox("已确定，锁定此节点")
         self.lock_button.toggled.connect(self.toggle_lock)
         actions.addWidget(self.lock_button)
@@ -318,13 +325,6 @@ class CreativeWorkspace(QObject):
         self.show_planning()
         self.w.inspiration_brief_input.setFocus()
 
-    def complete_theme(self):
-        self.w._set_ai_workflow_mode("project")
-        if not self.w.inspiration_brief_input.toPlainText().strip():
-            self.w.statusBar().showMessage("先填写主题；想探索全新题目可使用“给我一个新创作题目”")
-            return
-        self.w._generate_all_creative_node_notes()
-
     def show_planning(self):
         w = self.w
         w._save_current_board_layout_if_needed()
@@ -444,10 +444,41 @@ class CreativeWorkspace(QObject):
             self.w._sync_creative_node_panel()
             self.w.statusBar().showMessage("节点已锁定" if checked else "节点已解锁")
 
+    def content_format(self, node):
+        if not node:
+            return "text"
+        return self.store.content_format(node.id, node.title, self.w._creative_node_path_text(node.id))
+
+    def change_content_format(self):
+        node = self.w._current_creative_node()
+        if self.loading or not node:
+            return
+        state = self.store.node(node.id)
+        if state["locked"] or state["proposal_note"] or state["proposal_entries_json"] or self.w._creative_node_note_in_progress or self.w._creative_all_nodes_in_progress:
+            return
+        target = self.format_combo.currentData()
+        if target == self.content_format(node):
+            return
+        self.w._save_current_creative_node_editor_snapshot()
+        node = self.w.store.get_creative_node(node.id)
+        # Explicit conversion preserves the full text, snapshots row IDs/choices,
+        # and can be undone through the existing restore action.
+        if self.store.accept(node.id, note=node.note, query=node.search_query,
+                             entries_json="" if target == "text" else None, content_format=target):
+            self.invalidate_entry_search(node.id)
+            self.reload_node(node.id)
+            self.w.statusBar().showMessage("内容形式已切换，原文已保留；可恢复切换前的内容")
+
     def refresh_entries(self, node, state, locked):
         payload = decode_entries(state.get("entries_json", ""))
         pending = decode_entries(state.get("proposal_entries_json", ""))
-        self.entries_panel.setVisible(node is not None)
+        content_format = self.content_format(node)
+        self.format_combo.blockSignals(True)
+        self.format_combo.setCurrentIndex(self.format_combo.findData(content_format))
+        self.format_combo.blockSignals(False)
+        self.format_combo.setEnabled(bool(node and not locked and not pending and not state.get("proposal_note")
+            and not self.w._creative_node_note_in_progress and not self.w._creative_all_nodes_in_progress))
+        self.entries_panel.setVisible(node is not None and content_format == "entries")
         self.entries_table.setVisible(payload is not None)
         self.entries_hint.setVisible(payload is not None)
         self.entries_table.set_entries((payload or {}).get("rows", []), locked=locked)

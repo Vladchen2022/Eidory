@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from eidory.core.creative_entries import decode_entries, encode_entries, composed_note, search_names, name_key, new_entry
+from eidory.core.creative_templates import creative_node_default_format
 from eidory.core.time_utils import utc_now_iso
 
 
@@ -31,10 +32,10 @@ class CreativeWorkspaceStore:
     def node(self, node_id):
         with self.store.connect() as conn:
             row = conn.execute("SELECT * FROM creative_node_workflow WHERE node_id = ?", (node_id,)).fetchone()
-        return dict(row) if row else {"locked": 0, "proposal_note": "", "proposal_query": "", "search_json": "", "entries_json": "", "proposal_entries_json": ""}
+        return dict(row) if row else {"locked": 0, "proposal_note": "", "proposal_query": "", "search_json": "", "entries_json": "", "proposal_entries_json": "", "content_format": ""}
 
     def save_node(self, node_id, **changes):
-        allowed = {"locked", "proposal_note", "proposal_query", "search_json", "entries_json", "proposal_entries_json"}
+        allowed = {"locked", "proposal_note", "proposal_query", "search_json", "entries_json", "proposal_entries_json", "content_format"}
         if not changes or set(changes) - allowed or self.store.get_creative_node(node_id) is None:
             return
         with self.store.connect() as conn:
@@ -42,19 +43,30 @@ class CreativeWorkspaceStore:
             conn.execute("UPDATE creative_node_workflow SET " + ", ".join(f"{key} = ?" for key in changes) + " WHERE node_id = ?",
                          (*changes.values(), node_id))
 
-    def accept(self, node_id, *, note, query, keep_proposal=False, entries_json=None):
+    def content_format(self, node_id, node_title, node_path=""):
+        state = self.node(node_id)
+        if state["content_format"] in {"text", "entries"}:
+            return state["content_format"]
+        # Existing rows remain usable until the user explicitly changes format.
+        if state["entries_json"]:
+            return "entries"
+        return creative_node_default_format(node_title, node_path)
+
+    def accept(self, node_id, *, note, query, keep_proposal=False, entries_json=None, content_format=None):
         """Save previous accepted content and the replacement in one transaction."""
         with self.store.connect() as conn:
             row = conn.execute("SELECT * FROM creative_nodes WHERE id = ?", (node_id,)).fetchone()
             state = conn.execute("SELECT * FROM creative_node_workflow WHERE node_id = ?", (node_id,)).fetchone()
             if row is None or (state and state["locked"]):
                 return False
-            conn.execute("INSERT INTO creative_node_versions(node_id, note, search_query, entries_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                         (node_id, row["note"], row["search_query"], state["entries_json"] if state else "", utc_now_iso()))
+            conn.execute("INSERT INTO creative_node_versions(node_id, note, search_query, entries_json, content_format, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                         (node_id, row["note"], row["search_query"], state["entries_json"] if state else "", state["content_format"] if state else "", utc_now_iso()))
             conn.execute("UPDATE creative_nodes SET note = ?, search_query = ?, updated_at = ? WHERE id = ?",
                          (note, query, utc_now_iso(), node_id))
             conn.execute("UPDATE creative_projects SET updated_at = ? WHERE id = ?", (utc_now_iso(), row["project_id"]))
             conn.execute("INSERT OR IGNORE INTO creative_node_workflow(node_id) VALUES (?)", (node_id,))
+            if content_format is not None:
+                conn.execute("UPDATE creative_node_workflow SET content_format = ?, search_json = '' WHERE node_id = ?", (content_format, node_id))
             if entries_json is not None:
                 conn.execute("UPDATE creative_node_workflow SET entries_json = ?, search_json = '' WHERE node_id = ?", (entries_json, node_id))
             if not keep_proposal:
@@ -72,7 +84,7 @@ class CreativeWorkspaceStore:
             conn.execute("UPDATE creative_nodes SET note = ?, search_query = ?, updated_at = ? WHERE id = ?",
                          (row["note"], row["search_query"], utc_now_iso(), node_id))
             conn.execute("INSERT OR IGNORE INTO creative_node_workflow(node_id) VALUES (?)", (node_id,))
-            conn.execute("UPDATE creative_node_workflow SET entries_json = ?, search_json = '' WHERE node_id = ?", (row["entries_json"], node_id))
+            conn.execute("UPDATE creative_node_workflow SET entries_json = ?, content_format = ?, search_json = '' WHERE node_id = ?", (row["entries_json"], row["content_format"], node_id))
             conn.execute("DELETE FROM creative_node_versions WHERE id = ?", (row["id"],))
         return True
 
@@ -127,7 +139,7 @@ class CreativeWorkspaceStore:
                     payload["rows"].append(row)
                     known.add(name_key(row["name"]))
         return self.accept(node_id, note=composed_note(payload), query=" ".join(search_names(payload))[:240],
-                           entries_json=encode_entries(payload))
+                           entries_json=encode_entries(payload), content_format="entries")
 
     def save_entries(self, node_id, payload, *, snapshot=False):
         old = self.entries(node_id)

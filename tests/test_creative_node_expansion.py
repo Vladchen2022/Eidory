@@ -166,9 +166,10 @@ def test_two_buttons_select_modes_and_respect_node_lock_and_busy(window):
     assert not w.generate_creative_children_button.isEnabled()
     assert not w.generate_creative_details_button.isEnabled()
     w._load_creative_project(pid, select_node_id=lighting, show_board=False)
-    assert not w.generate_creative_children_button.isEnabled()
+    assert w.generate_creative_children_button.isEnabled()
+    assert w.generate_creative_children_button.text() == '完善说明'
     assert w.generate_creative_details_button.isEnabled()
-    assert '补充细节' in w.generate_creative_children_button.toolTip()
+    assert '整体说明' in w.generate_creative_children_button.toolTip()
 
 
 def test_staged_named_suggestion_keeps_first_object_name(window):

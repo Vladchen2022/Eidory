@@ -197,8 +197,8 @@ class MetadataStore:
 
     @staticmethod
     def _ensure_remaining_schema_migrations(conn: sqlite3.Connection) -> None:
-        for table, columns in (("creative_node_workflow", ("entries_json", "proposal_entries_json")),
-                               ("creative_node_versions", ("entries_json",))):
+        for table, columns in (("creative_node_workflow", ("entries_json", "proposal_entries_json", "content_format")),
+                               ("creative_node_versions", ("entries_json", "content_format"))):
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             for column in columns:
                 if column not in existing:

@@ -387,6 +387,7 @@ CREATE TABLE IF NOT EXISTS creative_node_workflow (
     proposal_note TEXT NOT NULL DEFAULT '',
     proposal_query TEXT NOT NULL DEFAULT '',
     search_json TEXT NOT NULL DEFAULT '',
+    content_format TEXT NOT NULL DEFAULT '',
     entries_json TEXT NOT NULL DEFAULT '',
     proposal_entries_json TEXT NOT NULL DEFAULT ''
 );
@@ -396,6 +397,7 @@ CREATE TABLE IF NOT EXISTS creative_node_versions (
     node_id INTEGER NOT NULL REFERENCES creative_nodes(id) ON DELETE CASCADE,
     note TEXT NOT NULL,
     search_query TEXT NOT NULL,
+    content_format TEXT NOT NULL DEFAULT '',
     entries_json TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );

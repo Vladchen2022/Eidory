@@ -3192,6 +3192,7 @@ class MainWindow(QMainWindow):
         creative_node_button_row.addWidget(self.generate_creative_children_button)
         creative_node_button_row.addWidget(self.generate_creative_details_button)
         creative_node_button_row.addWidget(self.generate_all_creative_nodes_button)
+        creative_node_button_row.addWidget(QLabel("跳过已锁定和待采纳节点"))
         node_tab_layout.addLayout(creative_node_button_row)
         node_tab_layout.addWidget(self.creative_node_progress_bar)
         creative_node_action_row = QHBoxLayout()
@@ -3637,7 +3638,7 @@ class MainWindow(QMainWindow):
         )
         self.generate_inspiration_button.clicked.connect(self._generate_inspiration_terms_from_panel)
         self.save_creative_node_button.clicked.connect(self._save_current_creative_node_details)
-        self.generate_creative_children_button.clicked.connect(self._generate_creative_children_for_selected_node)
+        self.generate_creative_children_button.clicked.connect(lambda: self._generate_creative_children_for_selected_node(completion_mode="auto"))
         self.generate_creative_details_button.clicked.connect(lambda: self._generate_creative_children_for_selected_node(completion_mode="details"))
         self.generate_all_creative_nodes_button.clicked.connect(self._generate_all_creative_node_notes)
         self.open_creative_copy_button.clicked.connect(lambda: self.creative_content_tabs.setCurrentIndex(1))
@@ -4355,7 +4356,7 @@ class MainWindow(QMainWindow):
             self.generate_creative_children_button.setText("Suggest Objects")
             self.generate_creative_details_button.setText("Add Details")
             self.generate_creative_details_button.setToolTip("Develop existing shape, material, state, lighting and feeling; no new objects. Suggestions require acceptance.")
-            self.generate_all_creative_nodes_button.setText("Suggest for Unlocked Nodes")
+            self.generate_all_creative_nodes_button.setText("Complete Project Nodes")
             self.open_creative_copy_button.setText("Copy")
             self.back_creative_nodes_button.setText("Back to Nodes")
             self.generate_creative_copy_button.setText("Generate Copy")
@@ -4520,7 +4521,7 @@ class MainWindow(QMainWindow):
             self.generate_creative_children_button.setText("联想新物件")
             self.generate_creative_details_button.setText("补充细节")
             self.generate_creative_details_button.setToolTip("只深化已有内容的造型、材质、状态、光线与感受，不新增物件；先生成待采纳建议")
-            self.generate_all_creative_nodes_button.setText("补全未锁定、无待采纳建议的节点")
+            self.generate_all_creative_nodes_button.setText("批量补全项目节点")
             self.open_creative_copy_button.setText("文案")
             self.back_creative_nodes_button.setText("返回节点树")
             self.generate_creative_copy_button.setText("生成文案")
@@ -14738,6 +14739,7 @@ class MainWindow(QMainWindow):
                     project_brief,
                 ),
             )
+            self.creative_workspace.store.save_node(node_id, content_format=template_node.content_format)
             for child_template in template_node.children:
                 add_template_node(node_id, child_template)
             return node_id
@@ -14969,6 +14971,8 @@ class MainWindow(QMainWindow):
             normalized_placeholder = self._normalized_creative_constraint_text(placeholder)
             if not normalized_placeholder:
                 continue
+            if normalized_query == normalized_placeholder:
+                return True
             for context in project_contexts:
                 default_query = template_search_query(node.title, placeholder, context)
                 if normalized_query == self._normalized_creative_constraint_text(default_query):
@@ -15361,10 +15365,20 @@ class MainWindow(QMainWindow):
         locked = bool(node and hasattr(self, "creative_workspace") and self.creative_workspace.store.node(node.id)["locked"])
         pending = bool(node and hasattr(self, "creative_workspace") and self.creative_workspace.store.node(node.id)["proposal_note"])
         busy = busy or pending
+        text_mode = bool(node and self.creative_workspace.content_format(node) == "text")
         eligible = bool(node and creative_node_supports_objects(node_title=node.title, node_path=self._creative_node_path_text(node.id)))
-        self.generate_creative_children_button.setEnabled(bool(node and eligible and not locked and not busy))
+        self.generate_creative_children_button.setText(("完善说明" if self.current_language != "en" else "Develop Description") if text_mode else ("联想新物件" if self.current_language != "en" else "Suggest Objects"))
+        self.generate_creative_children_button.setEnabled(bool(node and (text_mode or eligible) and not locked and not busy))
         self.generate_creative_details_button.setEnabled(bool(node and not locked and not busy))
-        if node and not eligible:
+        if hasattr(self, "creative_workspace"):
+            self.creative_workspace.format_combo.setEnabled(bool(node and not locked and not busy))
+        self.creative_node_imagination_slider.setToolTip(
+            "完善说明：控制设定联系与视觉表达的联想跨度。联想新物件：控制新增实物的种类。"
+            "补充细节：控制已有内容的视觉细化程度。三者都遵守主题与已确定内容。"
+        )
+        if text_mode:
+            tooltip = "按本节点职责补充一小段整体说明；已有内容保留，先生成待采纳建议"
+        elif node and not eligible:
             tooltip = ("This node describes time, appearance, action or composition. Use Add Details."
                        if self.current_language == "en" else "此节点负责时间、外观、动作或构图等内容，不适合新增实物；请使用“补充细节”")
         else:
@@ -15372,11 +15386,11 @@ class MainWindow(QMainWindow):
                        if self.current_language == "en" else "只联想当前节点与世界观中尚未出现的实物；先生成待采纳建议")
         self.generate_creative_children_button.setToolTip(tooltip)
         self.generate_all_creative_nodes_button.setToolTip(
-            "Automatically suggest objects for physical-content nodes and details for other nodes; skip locked nodes and pending suggestions."
-            if self.current_language == "en" else "按节点职责自动选择：物件、地点等联想实物，时间、构图等补充细节；跳过已锁定或已有待采纳建议的节点"
+            "Use each node’s content format; skip locked nodes and pending suggestions."
+            if self.current_language == "en" else "按各节点的内容形式生成短文或参考条目；跳过已锁定和待采纳节点"
         )
 
-    def _generate_creative_children_for_selected_node(self, *, completion_mode: str = "objects") -> None:
+    def _generate_creative_children_for_selected_node(self, *, completion_mode: str = "auto") -> None:
         if self._creative_all_nodes_in_progress or self._creative_node_note_in_progress:
             return
         self._set_ai_workflow_mode("project")
@@ -15389,6 +15403,9 @@ class MainWindow(QMainWindow):
         if node is None or project is None:
             self.statusBar().showMessage("先选择创作项目节点")
             return
+        text_mode = self.creative_workspace.content_format(node) == "text" and completion_mode != "organize"
+        if completion_mode == "auto" and not text_mode:
+            completion_mode = "objects" if creative_node_supports_objects(node_title=node.title, node_path=self._creative_node_path_text(node.id)) else "details"
         if completion_mode == "objects" and not creative_node_supports_objects(node_title=node.title, node_path=self._creative_node_path_text(node.id)):
             self.statusBar().showMessage("此节点不适合新增实物，请使用补充细节")
             return
@@ -15429,7 +15446,7 @@ class MainWindow(QMainWindow):
         original_entries = self.creative_workspace.store.entries(node.id)
         original_prose = original_entries.get("base_note", "") if original_entries is not None else raw_note
         ai_current_note = original_prose if completion_mode == "organize" else self._creative_node_live_constraint_text(node, project, initial_constraint)
-        action = "整理原文" if completion_mode == "organize" else ("联想新物件" if completion_mode == "objects" else "补充细节")
+        action = "完善说明" if text_mode and completion_mode == "auto" else "整理原文" if completion_mode == "organize" else ("联想新物件" if completion_mode == "objects" else "补充细节")
         self._set_creative_node_completion_busy(True, f"正在为“{node.title}”{action}...")
         provider = self._make_llm_provider()
         self.creative_node_auto_save_timer.stop()
@@ -15443,8 +15460,8 @@ class MainWindow(QMainWindow):
 
         def run() -> None:
             try:
-                generator = getattr(provider, "generate_creative_reference_entries", None)
-                extra_args = {"entry_target": entry_target} if callable(generator) else {}
+                generator = getattr(provider, "generate_creative_node_prose" if text_mode else "generate_creative_reference_entries", None)
+                extra_args = {"entry_target": entry_target} if callable(generator) and not text_mode else {}
                 generator = generator if callable(generator) else provider.generate_creative_node_note
                 suggestion, model_name = generator(
                     project_brief=project_brief,
@@ -15625,7 +15642,7 @@ class MainWindow(QMainWindow):
             requests = []
             for node in nodes:
                 state = self.creative_workspace.store.node(node.id)
-                if state["locked"] or state["proposal_note"] or state["proposal_query"]:
+                if state["locked"] or state["proposal_note"] or state["proposal_query"] or state["proposal_entries_json"]:
                     continue
                 raw_note, _raw_query = self._creative_node_editor_text_pair(node)
                 raw_note = raw_note.strip()
@@ -15636,6 +15653,7 @@ class MainWindow(QMainWindow):
                     {
                         "node_id": node.id,
                         "title": node.title,
+                        "content_format": self.creative_workspace.content_format(node),
                         "current_note": current_note,
                         "node_template_hint": node_template_hint,
                         "node_path": self._creative_node_path_text(node.id),
@@ -15667,13 +15685,15 @@ class MainWindow(QMainWindow):
             model_name = ""
             batch_generator = getattr(provider, "generate_creative_node_notes", None)
             single_generator = getattr(provider, "generate_creative_reference_entries", None) or getattr(provider, "generate_creative_node_note", None)
+            prose_generator = getattr(provider, "generate_creative_node_prose", None) or getattr(provider, "generate_creative_node_note", None)
             total_requests = len(requests)
 
             def append_single_result(index: int, request: dict[str, object]) -> None:
                 nonlocal model_name
                 try:
-                    if callable(single_generator):
-                        suggestion, model_name_result = single_generator(
+                    node_generator = prose_generator if request["content_format"] == "text" else single_generator
+                    if callable(node_generator):
+                        suggestion, model_name_result = node_generator(
                             project_brief=project_brief,
                             project_extra=project_extra,
                             project_outline=str(request["project_outline"]),
@@ -15711,7 +15731,7 @@ class MainWindow(QMainWindow):
                 except Exception as exc:
                     errors.append(f"{index}. {request['title']}：{exc}")
 
-            if callable(single_generator):
+            if callable(single_generator) or callable(prose_generator):
                 for index, request in enumerate(requests, 1):
                     self.events.put(
                         (
@@ -15834,7 +15854,13 @@ class MainWindow(QMainWindow):
             original_note = stored_note
         if original_note:
             note = _merge_creative_user_note_with_ai_note(original_note, note)
-            query = _merge_creative_user_note_with_search_query(original_note, query, node.title)
+            if getattr(suggestion, "entry_mode", "") == "prose":
+                # The contradiction filter splits sentences into lines. Keep
+                # the user's original formatting but present new prose together.
+                suffix = note[len(original_note):].strip()
+                note = original_note + ("\n" + " ".join(suffix.splitlines()) if suffix else "")
+            else:
+                query = _merge_creative_user_note_with_search_query(original_note, query, node.title)
             if not _creative_note_has_meaningful_expansion(original_note, note):
                 return None
         if stage_only:

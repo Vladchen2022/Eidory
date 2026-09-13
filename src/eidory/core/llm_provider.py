@@ -149,10 +149,14 @@ def _creative_node_imagination_guidance(value: int, *, language: str) -> str:
 
 
 def creative_node_supports_objects(*, node_title: str, node_path: str = "") -> bool:
+    from eidory.core.creative_templates import creative_node_template
+    template_node = creative_node_template(node_title, node_path)
+    if template_node is not None:
+        return template_node.content_format == "entries"
     # Classify the selected node itself; ancestor names must not turn a
     # composition/lighting child into a props node.
     kind = _creative_node_scope_kind(node_title=node_title, node_path=f"project / {node_title}")
-    return kind not in {"time", "material", "identity", "body", "head", "event", "mood", "composition"}
+    return kind not in {"root", "world", "time", "material", "identity", "body", "head", "event", "mood", "composition"}
 
 
 def _creative_node_completion_mode(mode: str, *, node_title: str, node_path: str) -> str:
@@ -439,6 +443,73 @@ class LMStudioProvider:
         )
         nodes = parse_creative_node_suggestions(content, language=language)
         return nodes, model_name
+
+    def generate_creative_node_prose(
+        self, *, project_brief, node_title, project_extra="", project_outline="", current_note="",
+        node_path="", node_template_hint="", imagination_level=50, completion_mode="auto", language="zh",
+    ):
+        """Paragraph suggestions are a separate contract, not flattened object rows."""
+        from eidory.core.creative_templates import creative_node_template
+        template_node = creative_node_template(node_title, node_path)
+        responsibility = node_template_hint or (template_node.note if template_node else "围绕节点名称表达一个连贯的创作决定")
+        scope = _creative_node_search_scope_guidance(project_extra=project_extra, current_note=current_note,
+            node_title=node_title, node_path=node_path, language=language)
+        prompt = f"""为创作规划节点补充一小段连贯说明。此模式不是实物清单，也不是逐项参考条目。
+项目主题（约束）：{project_brief}
+补充设定（约束）：{project_extra}
+当前节点：{node_path or node_title}
+节点职责：{responsibility}
+用户已有说明（完整保留的硬约束）：{current_note or '未填写'}
+项目节点上下文（已确定内容是约束，模板占位不是事实）：{project_outline}
+只完成当前节点职责，不扩展到其他节点。世界观补时代、技术边界、社会或生态规则之间的合理联系；
+氛围用光、色、空间与观看感受形成统一表达；构图说明视点、层次、主体与焦点关系；
+时间明确时段及可见光照；事件说明相容的动作互动；角色身份、身体、物件用途及工作状态各自只补对应方面。
+没有单独的实物主体时不要硬造实物，也不要把角色或物件设计改成一个新的故事场景。
+用户原文由软件保留，只返回尚未说明的补充，不复述、润色、推翻原文，不增加互斥选项。
+联想程度 {imagination_level}/100：左侧只做直接支持的补充；右侧允许更有想象力且自洽的设定联系、动作关系或视觉表达。
+任何档位都不可违背用户主题、世界观、数量、身份和禁用内容；不以增加形容词、篇幅或无根据的技术设定充数。
+{'本次仅补充细节：深化已有视觉决策，不新增对象、用途或事件。' if completion_mode == 'details' else '本次完善当前节点的整体说明，提出一个连贯、可落实的方向。'}
+搜索语句要短，提炼此节点可找图的视觉特征；不要粘贴整段说明或抽象规则，也不要强制共现无关目标。
+搜索职责：{scope}
+只输出严格 JSON：{{"note":"一小段新增说明", "search_query":"简短找图语句"}}。
+note 不带标题、序号、列表、键值分项或 Markdown，建议 2–4 句、80–160 个汉字，不超过 500 字；
+search_query 不超过 120 字。{'所有字段使用英文。' if language == 'en' else '所有字段使用简体中文。'}"""
+        response_format = {"type": "json_schema", "json_schema": {
+            "name": "eidory_creative_node_prose", "schema": {
+                "type": "object", "properties": {
+                    "note": {"type": "string", "maxLength": 700},
+                    "search_query": {"type": "string", "maxLength": 240}},
+                "required": ["note", "search_query"], "additionalProperties": False}}}
+        model = self.model_name or self._first_available_model()
+        messages = [{"role": "system", "content": "你是创作规划助手。尊重已有约束，按节点职责写连贯短文，只输出JSON。"},
+                    {"role": "user", "content": prompt}]
+        for attempt in range(2):
+            content = self._chat_completion(model_name=model, messages=messages, prefer_json=True,
+                response_format=response_format, reasoning_effort="low",
+                temperature=_creative_node_imagination_temperature(imagination_level),
+                max_tokens=4000, allow_reasoning_content=True)
+            try:
+                payload = _load_json_object(content)
+                note, query = payload.get("note"), payload.get("search_query")
+                if not isinstance(note, str) or not isinstance(query, str) or not note.strip() or not query.strip():
+                    raise LLMProviderError("AI 未返回说明与搜索语句")
+                if language == "zh" and not re.search(r"[\u4e00-\u9fff]", query):
+                    raise LLMProviderError("搜索语句需使用中文，保留必要专有名词即可")
+                if len(note) > 700 or len(query) > 240 or re.search(r"(?m)^\s*(?:[-*•]|\d+[.、)])\s*", note):
+                    raise LLMProviderError("AI 未返回简短段落")
+                note = " ".join(note.splitlines()).strip()
+                if current_note.strip() and not _creative_note_has_meaningful_expansion(current_note, note):
+                    raise LLMProviderError("AI 只重复了已有内容")
+                query = _refine_creative_node_search_query(query.strip(), project_brief=project_brief,
+                    project_extra=project_extra, node_title=node_title, current_note=current_note, node_path=node_path)
+                if not query.strip():
+                    raise LLMProviderError("AI 未返回符合节点职责的搜索语句")
+                return CreativeNodeNoteSuggestion(note=note, search_query=query, entry_mode="prose"), model
+            except LLMProviderError as exc:
+                if attempt:
+                    raise LLMProviderError(f"AI 未返回有效的短文建议（{exc}）；原有内容未改动，请重试") from exc
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": f"上次未通过校验：{exc}。请修正这个问题，严格返回非空note短段落与search_query短语，不要列表或重复原文。"})
 
     def generate_creative_reference_entries(
         self, *, project_brief, node_title, project_extra="", project_outline="", current_note="",
@@ -2698,6 +2769,10 @@ def _build_creative_node_note_prompt(
     node_title: str, current_note: str, node_path: str, node_template_hint: str = "",
     imagination_level: int = 50, completion_mode: str = "auto", language: str,
 ) -> str:
+    from eidory.core.creative_templates import creative_node_template
+    template_node = creative_node_template(node_title, node_path)
+    if not node_template_hint and template_node is not None:
+        node_template_hint = template_node.note
     mode = _creative_node_completion_mode(completion_mode, node_title=node_title, node_path=node_path)
     contract = _creative_node_expansion_contract(language=language, completion_mode=mode)
     if mode == "objects":

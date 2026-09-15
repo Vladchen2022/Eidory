@@ -457,6 +457,13 @@ class LMStudioProvider:
         from eidory.core.creative_templates import creative_node_template
         template_node = creative_node_template(node_title, node_path)
         responsibility = node_template_hint or (template_node.note if template_node else "围绕节点名称表达一个连贯的创作决定")
+        role_name = template_node.title if template_node else node_title
+        boundary = {
+            '世界观': '只补时代、文明、技术边界、社会或生态规则的联系。可解释这些规则如何限制当前创作；不要安排镜头、前中后景、灯光、构图或逐件设计设备。用户已经提供的这些信息只作为约束。',
+            '氛围': '只补整体光色、空间感、观看感受及可见依据；不改写世界规则，不安排新人物、设备或新剧情。',
+            '构图': '只补视点、主体位置、前中后景和视觉焦点；只使用已确定的场景与对象，不另造世界规则或新对象。',
+            '构图焦点': '只补视线引导、前中后景、主体位置和焦点；用已有场景与对象，不另造剧情。',
+        }.get(role_name, '只补上述节点职责直接涉及的方面。其他节点内容只作为约束，不替其他节点作决定。')
         scope = _creative_node_search_scope_guidance(project_extra=project_extra, current_note=current_note,
             node_title=node_title, node_path=node_path, language=language)
         prompt = f"""为创作规划节点补充一小段连贯说明。此模式不是实物清单，也不是逐项参考条目。
@@ -466,9 +473,7 @@ class LMStudioProvider:
 节点职责：{responsibility}
 用户已有说明（完整保留的硬约束）：{current_note or '未填写'}
 项目节点上下文（已确定内容是约束，模板占位不是事实）：{project_outline}
-只完成当前节点职责，不扩展到其他节点。世界观补时代、技术边界、社会或生态规则之间的合理联系；
-氛围用光、色、空间与观看感受形成统一表达；构图说明视点、层次、主体与焦点关系；
-时间明确时段及可见光照；事件说明相容的动作互动；角色身份、身体、物件用途及工作状态各自只补对应方面。
+当前节点的输出边界（严格遵守）：{boundary}
 没有单独的实物主体时不要硬造实物，也不要把角色或物件设计改成一个新的故事场景。
 用户原文由软件保留，只返回尚未说明的补充，不复述、润色、推翻原文，不增加互斥选项。
 联想程度 {imagination_level}/100：左侧只做直接支持的补充；右侧允许更有想象力且自洽的设定联系、动作关系或视觉表达。
@@ -486,7 +491,7 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
                     "search_query": {"type": "string", "maxLength": 240}},
                 "required": ["note", "search_query"], "additionalProperties": False}}}
         model = self.model_name or self._first_available_model()
-        messages = [{"role": "system", "content": "你是创作规划助手。尊重已有约束，按节点职责写连贯短文，只输出JSON。"},
+        messages = [{"role": "system", "content": f"你是创作规划助手。当前只负责{role_name}。{boundary} 尊重已有约束，写连贯短文，只输出JSON。"},
                     {"role": "user", "content": prompt}]
         for attempt in range(2):
             content = self._chat_completion(model_name=model, messages=messages, prefer_json=True,

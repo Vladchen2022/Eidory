@@ -253,7 +253,8 @@ class WorkflowUpgrade(QObject):
             ranks = {im.id: i for i, im in enumerate(self.w.current_chain_result.ranked_scope_images or images)}
             images = sorted(images, key=lambda im: ranks.get(im.id, len(ranks)))
         badges = self.w.store.creative_node_image_badges(self.w.current_creative_project_id) if self.w.current_creative_project_id else {}
-        self.decorate_references(self.w.current_creative_project_id, badges)
+        node = self.w._current_creative_node()
+        self.decorate_references(self.w.current_creative_project_id, badges, node.id if node else None)
         for image_id, reasons in getattr(self, 'match_badges', {}).items():
             badges.setdefault(image_id, []).extend(reasons)
         self.w.grid_view.set_images(images, badges_by_image_id=badges)
@@ -278,9 +279,9 @@ class WorkflowUpgrade(QObject):
         data = self.w.store.creative_node_branch_board_data(node.id)
         selected = self.w.grid_view.selected_image_ids()
         badges = data['badges']
-        self.decorate_references(node.project_id, badges)
+        self.decorate_references(node.project_id, badges, node.id)
         mode = self.collection_mode.currentData()
-        images = data['images']
+        images = self.w._sort_images(data['images'])
         if mode:
             def status(image):
                 labels = badges.get(image.id, [])
@@ -291,17 +292,47 @@ class WorkflowUpgrade(QObject):
         self.w.grid_view.select_image_ids(selected)
         self.refresh()
 
-    def decorate_references(self, project_id, badges):
+    def decorate_references(self, project_id, badges, node_id=None):
+        # A reference decision belongs to a node-image link, not the whole project.
+        # Parent views aggregate only their branch; any active reference keeps a
+        # shared image active even when another node has rejected it.
         with self.w.store.connect() as conn:
-            rows = conn.execute("SELECT d.* FROM creative_reference_decisions d JOIN creative_nodes n ON n.id=d.node_id WHERE n.project_id=?", (project_id,)).fetchall()
+            rows = conn.execute("""
+                WITH RECURSIVE scope(id) AS (
+                    SELECT id FROM creative_nodes
+                    WHERE project_id=? AND (? IS NULL OR id=?)
+                    UNION
+                    SELECT n.id FROM creative_nodes n JOIN scope s ON n.parent_id=s.id
+                    WHERE n.project_id=?
+                )
+                SELECT l.image_id, COALESCE(d.status, 'candidate') AS status,
+                       COALESCE(d.purpose, '') AS purpose,
+                       COALESCE(NULLIF(TRIM(l.intent_label), ''), n.title) AS node_label
+                FROM scope s JOIN creative_node_images l ON l.node_id=s.id
+                JOIN creative_nodes n ON n.id=s.id
+                LEFT JOIN creative_reference_decisions d
+                  ON d.node_id=l.node_id AND d.image_id=l.image_id
+            """, (project_id, node_id, node_id, project_id)).fetchall()
+        decisions = {}
+        priority = {'unused': 0, 'candidate': 1, 'primary': 2}
         for row in rows:
             image_id = row['image_id']
             if image_id in badges:
-                label = REFERENCE_STATUSES.get(row['status'], '备选')
-                if label not in badges[image_id]:
-                    badges[image_id].append(label)
-                if row['purpose'] and row['purpose'] not in badges[image_id]:
-                    badges[image_id].append(row['purpose'])
+                decision = decisions.setdefault(image_id, {'status': 'unused', 'purposes': [], 'node_label': row['node_label']})
+                if priority.get(row['status'], 1) > priority[decision['status']]:
+                    decision['status'] = row['status']
+                    decision['node_label'] = row['node_label']
+                if row['purpose'] and row['purpose'] not in decision['purposes']:
+                    decision['purposes'].append(row['purpose'])
+        for image_id, decision in decisions.items():
+            # A shared image goes in the section that actually uses it, rather
+            # than an earlier node that marked it unused.
+            label = decision['node_label']
+            if label in badges[image_id]:
+                badges[image_id].remove(label)
+                badges[image_id].insert(0, label)
+            badges[image_id].append(REFERENCE_STATUSES.get(decision['status'], '备选'))
+            badges[image_id].extend(decision['purposes'])
 
     def show_overview(self):
         pid = self.w.current_creative_project_id

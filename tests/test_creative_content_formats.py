@@ -145,6 +145,7 @@ def test_only_one_batch_entry_and_skips_locked_and_pending(window):
     with patch.object(w, '_make_llm_provider') as provider:
         w._generate_all_creative_node_notes()
     provider.assert_not_called()
+    assert 'AI 正在' not in w.creative_node_status_label.text()
 
 
 def test_prose_schema_retries_rejects_lists_and_never_turns_them_into_rows():
@@ -155,6 +156,10 @@ def test_prose_schema_retries_rejects_lists_and_never_turns_them_into_rows():
     assert chat.call_count == 2 and not result.additions and result.entry_mode == 'prose'
     schema = chat.call_args.kwargs['response_format']['json_schema']['schema']
     assert set(schema['properties']) == {'note', 'search_query'}
+    instructions = '\n'.join(m['content'] for m in chat.call_args.kwargs['messages'])
+    assert '当前只负责世界观' in instructions
+    assert '不要安排镜头、前中后景、灯光、构图' in instructions
+    assert '物件所属时代、技术体系、制造文化' not in instructions
     with patch.object(p, '_chat_completion', return_value='{"note":"1. 风格\\n2. 情绪", "search_query":"光线"}') as chat:
         with pytest.raises(LLMProviderError, match='原有内容未改动'):
             p.generate_creative_node_prose(project_brief='村庄', node_title='氛围')

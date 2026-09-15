@@ -4615,6 +4615,11 @@ class MainWindow(QMainWindow):
         self._refresh_ai_character_vision_value_filter_combo()
         if hasattr(self, "workspace_chrome"):
             self.workspace_chrome.retranslate()
+        if hasattr(self, "creative_workspace"):
+            self._sync_creative_completion_actions(
+                self._current_creative_node(),
+                busy=self._creative_all_nodes_in_progress or self._creative_node_note_in_progress,
+            )
 
     def _choose_folder(self) -> None:
         collection_id = self._selected_collection_id()
@@ -15668,8 +15673,7 @@ class MainWindow(QMainWindow):
         finally:
             self.current_creative_project_id = previous_project_id
         if not requests:
-            self._set_creative_all_nodes_busy(False)
-            self.statusBar().showMessage("所有节点已锁定或已有待采纳建议")
+            self._set_creative_all_nodes_busy(False, "所有节点已锁定或已有待采纳建议")
             return
         selected_node_id = self.current_creative_node_id
         selected_node = self.store.get_creative_node(selected_node_id) if selected_node_id is not None else None
@@ -16441,11 +16445,15 @@ class MainWindow(QMainWindow):
         title = self._creative_node_path_text_from_nodes(node.id, nodes) or node.title
         raw_badges = board_data.get("badges", {})
         badges = {key: list(value) for key, value in raw_badges.items()} if isinstance(raw_badges, dict) else {}
+        scoped_links = {
+            (link["node_id"], link["image_id"])
+            for link in self.store.creative_node_image_links_for_branch(node.id, image_ids)
+        }
         for reference in self.creative_workspace.store.reference_notes(node.project_id):
-            if reference["note"].strip() and reference["image_id"] in image_ids:
+            if reference["note"].strip() and (reference["node_id"], reference["image_id"]) in scoped_links:
                 badges.setdefault(reference["image_id"], []).append(reference["note"][:90])
         if hasattr(self, "workflow_upgrade"):
-            self.workflow_upgrade.decorate_references(node.project_id, badges)
+            self.workflow_upgrade.decorate_references(node.project_id, badges, node.id)
         self._board_image_by_id = {image.id: image for image in images}
         self.project_board_view.set_images(
             images,
@@ -16458,6 +16466,12 @@ class MainWindow(QMainWindow):
         self._current_board_image_ids = image_id_tuple
         self._mark_current_board_layout_clean()
         self.center_result_stack.setCurrentWidget(self.project_board_view)
+        # set_images may place newly collected images without a user drag.
+        # Persist that layout too, so versions and exports match the screen.
+        current_layout = self.project_board_view.layout_payload()
+        previous_items = (layout_payload or {}).get("items", {})
+        if set(current_layout.get("items", {})) - set(previous_items):
+            self._save_current_board_layout_if_needed(force=True)
         self.project_board_view.setFocus(Qt.FocusReason.OtherFocusReason)
         self.load_more_button.hide()
         self.save_project_board_layout_button.setEnabled(True)
@@ -18936,9 +18950,15 @@ class MainWindow(QMainWindow):
         if self.search_filters or self.current_result_mode == "search_chain":
             self._apply_search_chain_filters()
             images = self.current_chain_filtered_images
-            self.grid_view.set_images(images)
+            if hasattr(self, "workflow_upgrade") and self.current_chain_result:
+                self.workflow_upgrade.search_finished()
+            else:
+                self.grid_view.set_images(images)
             self._set_search_chain_result_status(tuple(self.search_filters), images)
             self._update_search_chain_diagnostics(tuple(self.search_filters), images)
+            return
+        if self.current_result_mode == "creative_node" and hasattr(self, "workflow_upgrade"):
+            self.workflow_upgrade.display_collected()
             return
         if self.current_result_mode == "temp_project":
             images = self._apply_result_management_filters(

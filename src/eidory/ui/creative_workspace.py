@@ -414,6 +414,8 @@ class CreativeWorkspace(QObject):
             w.current_result_mode = "search_chain"
             w._show_gallery_view()
             w._apply_view_payload(state["view"])
+            if hasattr(w, 'workspace_chrome'):
+                w.workspace_chrome.refresh()
         else:
             self.find()
 
@@ -432,6 +434,8 @@ class CreativeWorkspace(QObject):
                 w.grid_view.select_image_ids(selected)
             w.grid_view.verticalScrollBar().setValue(scroll)
         self.refresh_reference()
+        if hasattr(w, 'workspace_chrome'):
+            w.workspace_chrome.refresh()
 
     def show_collected(self):
         node = self.w._current_creative_node()
@@ -770,7 +774,7 @@ class CreativeWorkspace(QObject):
         data = self.w.store.creative_node_branch_board_data(node_id)
         board = ProjectBoardView()
         if hasattr(self.w, 'workflow_upgrade'):
-            self.w.workflow_upgrade.decorate_references(data['node'].project_id, data['badges'])
+            self.w.workflow_upgrade.decorate_references(data['node'].project_id, data['badges'], node_id)
         board.set_images(data['images'], title=data['node'].title,
                          layout_payload=decode_state(self.w.store.get_creative_node_board_layout(node_id)),
                          badges_by_image_id=data['badges'])

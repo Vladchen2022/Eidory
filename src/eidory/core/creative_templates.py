@@ -136,14 +136,16 @@ def template_search_query(title: str, note: str, project_brief: str = "") -> str
 def creative_node_template(node_title: str, node_path: str = "") -> CreativeTemplateNode | None:
     """Use explicit template responsibilities before consulting the nearest ancestor.
 
-    Older projects persist titles rather than template IDs. All built-in titles
-    are unambiguous across the six templates; custom children inherit their
-    nearest known parent, while custom/root nodes default to a paragraph.
+    Older projects persist titles rather than template IDs. Shared titles use
+    a common responsibility; custom children inherit their nearest known parent.
     """
     parts = [p.strip() for p in node_path.split(" / ") if p.strip()]
     if parts and len(parts) == 1 and parts[0] == node_title.strip():
         return None
     known = {n.title: n for template in CREATIVE_TEMPLATES for n in template.root.children}
+    # Every template has a worldview. Do not silently use the final (object
+    # design) template's manufacturing brief for characters and environments.
+    known['世界观'] = CreativeTemplateNode('世界观', '整体时代、文明、技术边界、社会秩序或自然与幻想规则，以及它们如何约束当前创作。')
     aliases = {"光照": "时间与光照", "光线": "灯光与色彩", "灯光": "灯光与色彩",
                "气氛": "氛围", "镜头": "构图", "视角": "构图", "服装": "穿戴",
                "主角": "人物", "次要角色": "人物", "道具": "物件",

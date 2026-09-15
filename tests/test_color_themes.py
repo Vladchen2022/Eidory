@@ -18,6 +18,22 @@ def contrast(a, b):
     return (light + .05) / (dark + .05)
 
 
+def test_theme_refresh_ignores_destroyed_or_non_widget_wrappers(app):
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QLabel, QWidget, QWidgetItem
+    from shiboken6 import delete
+    from eidory.ui.theme_colors import refresh_themed_widgets
+
+    live = QLabel('test')
+    live.setProperty('eidoryThemeStyle', 'color: @text@;')
+    dead = QWidget()
+    delete(dead)
+    item = QWidgetItem(live)
+    refresh_themed_widgets(SimpleNamespace(allWidgets=lambda: [item, dead, live]))
+    assert '@text@' not in live.styleSheet()
+    live.deleteLater()
+
+
 @pytest.mark.parametrize("theme", THEMES, ids=lambda t: t.id)
 def test_theme_text_and_controls_have_readable_contrast(theme):
     c = theme.colors

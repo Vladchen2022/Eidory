@@ -119,7 +119,13 @@ def _apply_item_theme(item, tokens, column):
 
 
 def refresh_themed_widgets(app):
+    from shiboken6 import isValid
+
     for widget in app.allWidgets():
+        # Qt can destroy/recycle widgets while style changes rebuild controls.
+        # Ignore stale wrappers and layout items in the captured widget list.
+        if not isinstance(widget, QWidget) or not isValid(widget):
+            continue
         template = widget.property("eidoryThemeStyle")
         if template:
             widget.setStyleSheet(resolve_theme_style(template))

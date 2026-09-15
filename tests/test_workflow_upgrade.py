@@ -109,3 +109,37 @@ def test_readiness_rejects_http_errors(code):
     with patch('urllib.request.urlopen', side_effect=HTTPError('http://local',code,'error',{},None)):
         ok, message = check_model_service('http://local/v1')
     assert not ok and str(code) in message
+
+
+def test_user_core_survives_unchanged_template_query():
+    from types import SimpleNamespace
+    from eidory.core.creative_templates import creative_node_template, template_search_query
+    from eidory.core.search_targets import initial_targets
+    hint = creative_node_template('人物').note
+    node = SimpleNamespace(title='人物')
+    entries = {'base_query':template_search_query('人物',hint,'研发室'), 'base_note':'三位工程师，只有一台机器人', 'rows':[{'id':'a','name':'扳手','enabled':True}]}
+    rows = initial_targets(node, entries)
+    assert rows[0]['id'] == 'core'
+    assert rows[0]['query'] == '三位工程师，只有一台机器人'
+    entries['base_note'] = hint
+    assert all(r['id'] != 'core' for r in initial_targets(node, entries))
+
+
+def test_unrelated_source_edit_preserves_independent_search_checkbox():
+    from types import SimpleNamespace
+    node = SimpleNamespace(title='物件')
+    entries = {'base_query':'机器人','base_note':'机器人', 'rows':[{'id':'a','name':'工具','enabled':True},{'id':'b','name':'工作台','enabled':True}]}
+    rows = resolved_targets(node, entries, {})
+    rows[1]['enabled'] = False
+    saved = {'signature':target_signature(node,entries), 'rows':rows}
+    entries['rows'][1]['enabled'] = False
+    resolved = resolved_targets(node,entries,{'search_targets_json':json.dumps(saved)})
+    assert not next(r for r in resolved if r['id']=='a')['enabled']
+    assert not next(r for r in resolved if r['id']=='b')['enabled']
+
+
+@pytest.mark.parametrize('raw', ['[]','null','{"rows":null}','{"rows":[{}]}'])
+def test_invalid_saved_search_targets_have_safe_fallback(raw):
+    from types import SimpleNamespace
+    node = SimpleNamespace(title='物件',search_query='机器人',note='机器人')
+    assert resolved_targets(node,None,{'search_targets_json':raw})[0]['query'] == '机器人'

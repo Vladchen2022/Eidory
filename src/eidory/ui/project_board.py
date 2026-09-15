@@ -297,11 +297,8 @@ class BoardImageItem(QGraphicsPixmapItem):
 
     @property
     def badge_text(self) -> str:
-        if not self._badges:
-            return ""
-        if len(self._badges) == 1:
-            return self._badges[0]
-        return f"{self._badges[0]} +{len(self._badges) - 1}"
+        from eidory.core.project_state import reference_badge_text
+        return reference_badge_text(self._badges)
 
     @staticmethod
     def _normalize_badges(badges: list[str] | None) -> list[str]:
@@ -1223,6 +1220,65 @@ class BoardTextItem(QGraphicsTextItem):
         event.accept()
 
 
+class BoardSectionItem(QGraphicsRectItem):
+    """A persisted section; moving its frame translates its member images once."""
+    def __init__(self, view, payload):
+        super().__init__(0, 0, payload.get("width", 1120), payload.get("height", 420))
+        self.view = view
+        self.label = str(payload.get("label", "参考图"))
+        self.image_ids = [int(i) for i in payload.get("image_ids", []) if int(i) in view._image_items]
+        self.locked = bool(payload.get("locked", False))
+        self._ready = False
+        self._position = QPointF(payload.get("x", 80), payload.get("y", 110))
+        self.setPos(self._position)
+        self.setZValue(-1)
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not self.locked)
+        self.heading = QGraphicsTextItem(self)
+        self.heading.setPos(20, 12)
+        self.heading.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        font = self.heading.font(); font.setPointSize(22); font.setBold(True); self.heading.setFont(font)
+        self.refresh_theme()
+        self._ready = True
+
+    def refresh_theme(self):
+        self.setPen(QPen(theme_color("border"), 2))
+        color = theme_color("raised"); color.setAlpha(100); self.setBrush(color)
+        self.heading.setDefaultTextColor(theme_color("text"))
+        self.heading.setPlainText(self.label + (" · 已锁定" if self.locked else ""))
+        self.setToolTip("双击标题锁定／解锁分区布局；锁定后自动整理会保留本区位置与大小")
+
+    def itemChange(self, change, value):
+        result = super().itemChange(change, value)
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged and self._ready:
+            delta = self.pos() - self._position
+            self._position = QPointF(self.pos())
+            for image_id in self.image_ids:
+                item = self.view._image_items.get(image_id)
+                if item:
+                    item.setPos(item.pos() + delta)
+            self.view._schedule_layout_changed()
+        return result
+
+    def mousePressEvent(self, event):
+        # Images are scene siblings, so Qt must not move selected members again.
+        for item in self.view.scene().selectedItems():
+            if item is not self:
+                item.setSelected(False)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.locked = not self.locked
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not self.locked)
+        self.refresh_theme()
+        self.view._schedule_layout_changed()
+        event.accept()
+
+    def payload(self):
+        return dict(label=self.label, image_ids=self.image_ids, locked=self.locked,
+                    x=self.x(), y=self.y(), width=self.rect().width(), height=self.rect().height())
+
+
 class ProjectBoardView(QGraphicsView):
     imageDoubleClicked = Signal(int)
     imagePreviewRequested = Signal(int)
@@ -1255,6 +1311,7 @@ class ProjectBoardView(QGraphicsView):
         self.setBackgroundBrush(theme_color("canvas"))
         self._image_items: dict[int, QGraphicsItem] = {}
         self._note_items: list[BoardTextItem] = []
+        self._section_items: list[BoardSectionItem] = []
         self._undo_layouts = []
         self._redo_layouts = []
         self._last_layout = None
@@ -1293,7 +1350,9 @@ class ProjectBoardView(QGraphicsView):
     def refresh_theme(self) -> None:
         self.setBackgroundBrush(theme_color("canvas"))
         for item in self._scene.items():
-            if isinstance(item, QGraphicsTextItem):
+            if isinstance(item, BoardSectionItem):
+                item.refresh_theme()
+            elif isinstance(item, QGraphicsTextItem):
                 heading = isinstance(item, BoardTextItem) and item.heading
                 item.setDefaultTextColor(theme_color("warning" if heading else "text"))
             elif isinstance(item, BoardPlaceholderItem):
@@ -1324,6 +1383,7 @@ class ProjectBoardView(QGraphicsView):
             self._scene.clear()
             self._image_items.clear()
             self._note_items.clear()
+            self._section_items.clear()
             self._images_by_id = {int(image.id): image for image in images}
             self._focus_quality_image_ids.clear()
             self._selected_image_ids_cache = []
@@ -1425,6 +1485,17 @@ class ProjectBoardView(QGraphicsView):
                 for raw_note in layout_payload.get("notes", []):
                     if isinstance(raw_note, dict):
                         self._add_text(str(raw_note.get("text", "")), _safe_float(raw_note.get("x"), 80), _safe_float(raw_note.get("y"), 80), heading=raw_note.get("heading", False))
+            if isinstance(layout_payload, dict):
+                for section in layout_payload.get("sections", []):
+                    if isinstance(section, dict):
+                        self._add_section(section)
+                # Existing groups never jump when new references are collected.
+                if self._section_items:
+                    assigned = {i for section in self._section_items for i in section.image_ids}
+                    fresh = [i for i in self._image_items if i not in assigned]
+                    if fresh:
+                        bottom = max(s.sceneBoundingRect().bottom() for s in self._section_items) + 60
+                        self._layout_sections(fresh, bottom)
             if not images and not self._note_items:
                 text = self._scene.addText("当前节点没有保存图片")
                 text.setDefaultTextColor(theme_color("text"))
@@ -1446,7 +1517,7 @@ class ProjectBoardView(QGraphicsView):
     def fit_all_images(self) -> None:
         self._view_mode = "fit_all"
         self._last_fit_selection_ids = ()
-        self._fit_items_to_view(self._visible_image_items() + list(self._note_items), margin=80.0)
+        self._fit_items_to_view(self._visible_image_items() + list(self._note_items) + list(self._section_items), margin=80.0)
 
     def hide_selected_items(self) -> int:
         items = self._selected_image_items()
@@ -1553,7 +1624,7 @@ class ProjectBoardView(QGraphicsView):
                 if local_display is not None:
                     items[str(image_id)]["local_display"] = local_display
         notes = [{"text": item.toPlainText(), "x": item.x(), "y": item.y(), "heading": item.heading} for item in self._note_items]
-        return {"version": 1, "items": items, "notes": notes}
+        return {"version": 1, "items": items, "notes": notes, "sections": [s.payload() for s in self._section_items]}
 
     def _add_text(self, text, x, y, *, heading=False):
         item = BoardTextItem(text, self._schedule_layout_changed, heading=heading)
@@ -1573,34 +1644,74 @@ class ProjectBoardView(QGraphicsView):
         self.flush_pending_layout_change()
         self.fit_all_images()
 
+    def _add_section(self, payload):
+        item = BoardSectionItem(self, payload)
+        self._scene.addItem(item)
+        self._section_items.append(item)
+        return item
+
+    def toggle_section_lock(self):
+        selected = [s for s in self._section_items if s.isSelected()]
+        if not selected:
+            ids = set(self.selected_image_ids())
+            selected = [s for s in self._section_items if ids.intersection(s.image_ids)]
+        for section in selected:
+            section.locked = not section.locked
+            section.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not section.locked)
+            section.refresh_theme()
+        self._schedule_layout_changed()
+
+    def _layout_sections(self, image_ids, top):
+        groups = {}
+        for image_id in image_ids:
+            labels = self._board_badges.get(image_id, [])
+            groups.setdefault(labels[0] if labels else "参考图", []).append(image_id)
+        # Two columns for ordinary windows; three for wide canvases. Each column
+        # fills independently so uneven groups do not leave a whole empty row.
+        columns = min(len(groups), 3 if self.viewport().width() > 1700 else 2)
+        if not columns:
+            return
+        bottoms = [top] * columns
+        width, gap = 1120, 60
+        for label, ids in groups.items():
+            col = min(range(columns), key=lambda c: bottoms[c])
+            left, y = DEFAULT_LAYOUT_LEFT + col * (width + gap), bottoms[col]
+            x, row_y, row_height = left + 24, y + 72, 0
+            ids.sort(key=lambda i: 0 if "主参考" in self._board_badges.get(i, []) else 1)
+            for image_id in ids:
+                item = self._image_items[image_id]
+                ratio = max(.35, min(3, item.display_width / max(item.display_height, 1)))
+                height = 320 if "主参考" in self._board_badges.get(image_id, []) else 210
+                item_width = min(width - 48, height * ratio)
+                if x > left + 24 and x + item_width > left + width - 24:
+                    x = left + 24; row_y += row_height + 35; row_height = 0
+                if isinstance(item, BoardImageItem):
+                    item.set_display_size(item_width, height)
+                item.setPos(x, row_y)
+                x += item_width + 24; row_height = max(row_height, height)
+            section_height = row_y + row_height + 24 - y
+            self._add_section(dict(label=label, image_ids=ids, x=left, y=y, width=width, height=section_height))
+            bottoms[col] = y + section_height + gap
+
     def arrange_by_labels(self):
         self.flush_pending_layout_change()
         self._suppress_layout_changed = True
-        y = DEFAULT_LAYOUT_TOP
-        groups = {}
-        for image_id in self._image_items:
-            labels = self._board_badges.get(image_id, [])
-            groups.setdefault(labels[0] if labels else "参考图", []).append(image_id)
-        # Replace generated headings while keeping the user's free notes.
-        for item in list(self._note_items):
-            if item.heading:
-                self._scene.removeItem(item)
-                self._note_items.remove(item)
-        for label, image_ids in groups.items():
-            self._add_text(label, DEFAULT_LAYOUT_LEFT, y, heading=True)
-            y += 70
-            x, row_height = DEFAULT_LAYOUT_LEFT, 0
-            for image_id in image_ids:
-                item = self._image_items[image_id]
-                if x > DEFAULT_LAYOUT_LEFT and x + item.display_width > DEFAULT_LAYOUT_ROW_WIDTH:
-                    x = DEFAULT_LAYOUT_LEFT
-                    y += row_height + DEFAULT_LAYOUT_GAP_Y
-                    row_height = 0
-                item.setPos(x, y)
-                x += item.display_width + DEFAULT_LAYOUT_GAP_X
-                row_height = max(row_height, item.display_height)
-            y += row_height + 100
-        self._suppress_layout_changed = False
+        try:
+            labels = {badges[0] for badges in self._board_badges.values() if badges}
+            for note in list(self._note_items):
+                if note.heading and note.toPlainText() in labels:
+                    self._scene.removeItem(note)
+                    self._note_items.remove(note)
+            locked = [s for s in self._section_items if s.locked]
+            retained = {i for s in locked for i in s.image_ids}
+            for section in list(self._section_items):
+                if not section.locked:
+                    self._scene.removeItem(section)
+                    self._section_items.remove(section)
+            top = max((s.sceneBoundingRect().bottom() + 60 for s in locked), default=DEFAULT_LAYOUT_TOP)
+            self._layout_sections([i for i in self._image_items if i not in retained], top)
+        finally:
+            self._suppress_layout_changed = False
         self._schedule_layout_changed()
         self.flush_pending_layout_change()
         self.fit_all_images()
@@ -2076,7 +2187,13 @@ class ProjectBoardView(QGraphicsView):
         if factor > 1:
             self._ensure_focus_quality_for_items(self._selected_image_items(), target_zoom=next_zoom)
         scale_factor = next_zoom / max(0.001, self._zoom)
+        center = self.mapToScene(self.viewport().rect().center())
+        anchor = self.transformationAnchor()
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.scale(scale_factor, scale_factor)
+        self.centerOn(center)
+        self.setTransformationAnchor(anchor)
+        self._view_mode = "manual"
         self._zoom = next_zoom
 
     def _fit_selected_items(self, items: list[QGraphicsItem]) -> None:
@@ -2098,7 +2215,7 @@ class ProjectBoardView(QGraphicsView):
                 self._fit_items_to_view(selected_items, margin=10.0)
                 return
         if self._view_mode == "fit_all":
-            self._fit_items_to_view(self._visible_image_items() + list(self._note_items), margin=80.0)
+            self._fit_items_to_view(self._visible_image_items() + list(self._note_items) + list(self._section_items), margin=80.0)
 
     def _schedule_refit_current_view_mode(self) -> None:
         if self._refit_timer_pending:

@@ -253,3 +253,23 @@ def test_index_filter_returns_to_visible_results(window, app):
     assert not w.workspace_chrome._dialogs[3].isVisible()
     assert w.center_result_stack.currentWidget() is w.grid_view
     assert w.current_virtual_filter == 'un_ai_scene_tagged'
+
+
+def test_accessibility_toggle_changes_stage_content(window, app):
+    w = window
+    _, node = project(w)
+    image = w.store.list_images(limit=None)[0]
+    w.store.add_images_to_creative_node(node.id, [image.id])
+    for stage in (3, 0, 2, 1):
+        # macOS accessibility sends a check-state change without clicked().
+        w.workspace_chrome.stage_buttons[stage].setChecked(True)
+        w._poll_events()
+        app.processEvents()
+        assert sum(b.isChecked() for b in w.workspace_chrome.stage_buttons) == 1
+        if stage == 3:
+            assert w.center_result_stack.currentWidget() is w.project_board_view
+        elif stage in (1, 2):
+            assert w.center_result_stack.currentWidget() is w.grid_view
+        else:
+            assert w.center_result_stack.currentWidget() is not w.grid_view
+            assert w.center_result_stack.currentWidget() is not w.project_board_view

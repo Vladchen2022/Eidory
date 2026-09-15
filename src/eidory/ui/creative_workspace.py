@@ -206,6 +206,11 @@ class CreativeWorkspace(QObject):
         if self.loading or not self.project_id or w.ai_workflow_stack.currentIndex() != 0:
             return
         if w.store.get_creative_project(self.project_id):
+            if hasattr(w, 'workflow_upgrade'):
+                old_key = w.workflow_upgrade.state.context_key(self.project_id)
+                for node in w.store.list_creative_nodes(self.project_id):
+                    if not w.workflow_upgrade.state.options(node.id)['reviewed_context']:
+                        w.workflow_upgrade.state.set_options(node.id, reviewed_context=old_key)
             w.store.update_creative_project_details(self.project_id, brief=w.inspiration_brief_input.toPlainText().strip())
             self.store.save_project(self.project_id, extra=w.inspiration_answers_input.toPlainText().strip())
 
@@ -298,6 +303,8 @@ class CreativeWorkspace(QObject):
         self.refresh_reference()
         if hasattr(w, "workspace_chrome"):
             w.workspace_chrome.refresh()
+        if hasattr(w, 'workflow_upgrade'):
+            w.workflow_upgrade.refresh()
 
     def refresh_project_references(self):
         """Membership survives result rebuilds, independently of search badges."""
@@ -397,7 +404,8 @@ class CreativeWorkspace(QObject):
             return
         state = self.search_states.get(node.id) or decode_state(self.store.node(node.id)["search_json"])
         payload = self.store.entries(node.id)
-        if payload is not None and state.get("entry_names") != search_names(payload):
+        names = w.workflow_upgrade.queries(node) if hasattr(w, 'workflow_upgrade') else search_names(payload) if payload else None
+        if payload is not None and state.get("entry_names") != names:
             state = {}
         if state:
             self.active_search_names = state.get("entry_names")
@@ -415,6 +423,8 @@ class CreativeWorkspace(QObject):
         if self.search_node_id and self.search_node_id == w.current_creative_node_id:
             badges = w.store.creative_node_image_badges(w.current_creative_project_id)
             w.grid_view.set_images(w.current_chain_filtered_images, badges_by_image_id=badges)
+        if hasattr(w, 'workflow_upgrade'):
+            w.workflow_upgrade.search_finished()
         if self.restore_position is not None:
             scroll, selected = self.restore_position
             self.restore_position = None
@@ -429,6 +439,8 @@ class CreativeWorkspace(QObject):
             self.save_search()
             self.w._clear_result_management_state()
             self.w._show_creative_node_saved_images(node.id)
+            if hasattr(self.w, "workflow_upgrade"):
+                self.w.workflow_upgrade.display_collected()
             self.w.right_tab_widget.setCurrentIndex(1)
             self.refresh()
 
@@ -441,6 +453,8 @@ class CreativeWorkspace(QObject):
         if not self.loading and node:
             self.w._save_current_creative_node_editor_snapshot()
             self.store.save_node(node.id, locked=int(checked))
+            if checked and hasattr(self.w, 'workflow_upgrade'):
+                self.w.workflow_upgrade.state.set_options(node.id, reviewed_context=self.w.workflow_upgrade.state.context_key(node.project_id))
             self.w._sync_creative_node_panel()
             self.w.statusBar().showMessage("节点已锁定" if checked else "节点已解锁")
 
@@ -705,6 +719,8 @@ class CreativeWorkspace(QObject):
             self.reference_input.setPlainText(self.store.reference_note(*key) if key else "")
             self.reference_input.blockSignals(False)
         self.reference_input.setEnabled(key is not None)
+        if hasattr(w, 'workflow_upgrade'):
+            w.workflow_upgrade.refresh()
 
     def save_reference(self):
         if self._reference_key:
@@ -753,6 +769,8 @@ class CreativeWorkspace(QObject):
         from eidory.ui.project_board import ProjectBoardView
         data = self.w.store.creative_node_branch_board_data(node_id)
         board = ProjectBoardView()
+        if hasattr(self.w, 'workflow_upgrade'):
+            self.w.workflow_upgrade.decorate_references(data['node'].project_id, data['badges'])
         board.set_images(data['images'], title=data['node'].title,
                          layout_payload=decode_state(self.w.store.get_creative_node_board_layout(node_id)),
                          badges_by_image_id=data['badges'])

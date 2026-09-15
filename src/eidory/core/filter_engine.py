@@ -10,6 +10,27 @@ from eidory.core.search_service import SearchService
 from eidory.models import ImageItem
 
 
+def balanced_rank(base, conditions, raw_matches):
+    """Deterministic round-robin rank: every target gets a chance on the first screen."""
+    conditions = sorted(set(conditions), key=lambda f: (f.kind, str(f.value)))
+    if len(conditions) < 2:
+        return list(base)
+    queues = [iter(sorted(raw_matches[f], key=lambda im: (-(im.score or 0), im.id))) for f in conditions]
+    seen, result = set(), []
+    while queues:
+        active = []
+        for queue in queues:
+            for im in queue:
+                if im.id not in seen:
+                    seen.add(im.id)
+                    result.append(im)
+                    active.append(queue)
+                    break
+        queues = active
+    result.extend(im for im in base if im.id not in seen)
+    return result
+
+
 def matching_group_ids(group: FilterGroup, matches: dict[SearchFilter, set[int]]) -> set[int]:
     """Empty groups never match; an empty include section is handled as all."""
     if not group.filters:
@@ -131,6 +152,9 @@ class FilterEngine:
                 scored_ids = {im.id for im in ranked_matches}
                 ranked = [*ranked_matches, *(replace(im, score=None) for im in base if im.id not in scored_ids)]
                 break
+        scored = [f for f in plan.positive_filters if f.kind in {'semantic', 'similar', 'color'}]
+        if len(set(scored)) > 1:
+            ranked = balanced_rank(base, scored, raw_matches)
         return SearchChainResult(
             images=[im for im in ranked if im.id in positive_ids],
             excluded_image_ids=frozenset(excluded_ids),

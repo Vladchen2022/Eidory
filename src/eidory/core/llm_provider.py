@@ -148,6 +148,11 @@ def _creative_node_imagination_guidance(value: int, *, language: str) -> str:
     )
 
 
+def node_task_is_character(title, path=''):
+    from eidory.core.creative_tasks import node_task
+    return node_task(title, path)[0] == '完善人物方案'
+
+
 def creative_node_supports_objects(*, node_title: str, node_path: str = "") -> bool:
     from eidory.core.creative_templates import creative_node_template
     template_node = creative_node_template(node_title, node_path)
@@ -550,6 +555,15 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
             )
         model = self.model_name or self._first_available_model()
         schema = _creative_node_note_response_format(100 if completion_mode == "organize" else imagination_level, mode)
+        cast_limit = None
+        if mode == 'objects' and node_task_is_character(node_title, node_path):
+            counts = re.findall(r'([一二两三四五六七八九十1-9])(?:位|名|个)(?:工程师|人物|角色|技师|研究员)', project_brief+' '+project_extra+' '+current_note)
+            values = {'一':1,'二':2,'两':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10}
+            if counts:
+                cast_limit = max(values[c] if c in values else int(c) for c in counts)
+                schema['json_schema']['schema']['properties']['additions']['maxItems'] = cast_limit
+                prompt += f'\n人物行数上限 {cast_limit}。每行名称必须是人物身份或整体造型，不能是服饰配件或局部细节。'
+
         messages = [{"role": "system", "content": "你是插画参考规划助手。遵守原有约束，只返回JSON，不输出思考过程。"},
                     {"role": "user", "content": prompt}]
         for attempt in range(2):
@@ -562,6 +576,8 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
                 rows = _creative_additions(payload)
                 if not rows:
                     raise LLMProviderError("AI 未返回有效条目")
+                if cast_limit is not None and len(rows) > cast_limit:
+                    raise LLMProviderError("人物方案超过已确定人数")
                 if entry_target and (len(rows) != 1 or rows[0]["name"] != entry_target["name"]):
                     raise LLMProviderError("细节建议偏离了选中的条目")
                 return CreativeNodeNoteSuggestion(
@@ -2311,7 +2327,7 @@ def _creative_node_additions_schema(imagination_level: int, completion_mode: str
         "items": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": ("Existing subject or visual aspect" if completion_mode == "details" else "A NEW tangible object, different from all existing objects and their intrinsic parts" if completion_mode == "objects" else "Target or visual aspect for the selected node mode")},
+                "name": {"type": "string", "description": ("Existing subject or visual aspect" if completion_mode == "details" else "Concrete target appropriate to the node role; follow the task contract for characters, spaces or objects" if completion_mode == "objects" else "Target or visual aspect for the selected node mode")},
                 "visual": {"type": "string", "description": "One brief, visible realization and its use or relationship within this project"},
             },
             "required": ["name", "visual"],
@@ -2775,7 +2791,18 @@ def _build_creative_node_note_prompt(
         node_template_hint = template_node.note
     mode = _creative_node_completion_mode(completion_mode, node_title=node_title, node_path=node_path)
     contract = _creative_node_expansion_contract(language=language, completion_mode=mode)
+    role = ''
     if mode == "objects":
+        from eidory.core.creative_tasks import role_contract
+        role = role_contract(node_title, node_path, language)
+        contract = role or contract
+    if role:
+        guidance = (f"本节点联想跨度 {imagination_level}/100。越高，角色或空间方案的差异越明显，但始终服从本节点职责。"
+                    "人物方案只列人物，穿戴与道具细节放在该人物的 visual 内，禁止另起一行作为角色。"
+                    "已确定三位工程师时，最多三行，分别是一位工程师的独立造型方向；不能把同一人的挂扣、证件、手套拆成多行。"
+                    if node_task_is_character(node_title, node_path) else
+                    f"本节点联想跨度 {imagination_level}/100。围绕当前节点的空间或设计要素，提出功能不同的方案；不需要凑满条数。")
+    elif mode == "objects":
         guidance = _creative_node_imagination_guidance(imagination_level, language=language)
     else:
         guidance = (f"Detail boldness: {imagination_level}/100. At most {_creative_node_addition_limit(imagination_level)} compatible details."

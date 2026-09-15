@@ -30,7 +30,7 @@ def main() -> int:
     configure_qt_accessibility()
     app.setApplicationName("Eidory")
     app.setWindowIcon(app_icon())
-    apply_theme(app, store.get_setting("ui.theme") or DEFAULT_THEME, density=store.get_setting("ui.density") or "compact")
+    apply_theme(app, store.get_setting("ui.theme") or DEFAULT_THEME, density=store.get_setting("ui.density") or "compact", font_size=_setting_int(store, "ui.font_size", 13, 11, 20))
     window = MainWindow(paths=paths, store=store)
     window.resize(
         _setting_int(store, "ui.window_width", 1320, 900, 2400),

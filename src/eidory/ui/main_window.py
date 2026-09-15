@@ -1713,6 +1713,8 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self.creative_workspace = CreativeWorkspace(self)
         self.workspace_chrome = WorkspaceChrome(self)
+        from eidory.ui.workflow_upgrade import WorkflowUpgrade
+        self.workflow_upgrade = WorkflowUpgrade(self)
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
         self._ensure_temporary_import_collection()
         self._refresh_folders()
@@ -3950,10 +3952,16 @@ class MainWindow(QMainWindow):
                 return
         except OSError:
             pass
+        from eidory.core.automatic_backup import database_summary
+        try:
+            summary = database_summary(source_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法预览备份", str(exc))
+            return
         confirm = QMessageBox.question(
             self,
             "恢复数据库",
-            "恢复会先备份当前数据库，然后用所选数据库替换当前数据库。继续？",
+            f"所选备份：{source_path.name}\n图片 {summary['images']} 张；项目 {summary['creative_projects']} 个；节点 {summary['creative_nodes']} 个。\n恢复会先备份当前数据库，然后替换当前数据库。源图片文件不随数据库恢复。继续？",
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
@@ -4157,6 +4165,8 @@ class MainWindow(QMainWindow):
         report.append(self._check_database())
         ffmpeg_path = find_media_tool("ffmpeg")
         report.append(("ffmpeg", ffmpeg_path is not None, ffmpeg_path or "未找到，视频缩略图会失败"))
+        from eidory.core.readiness import library_readiness
+        report.extend(library_readiness(self.store))
         report.append(self._check_llm_endpoint())
         return report
 
@@ -4181,22 +4191,10 @@ class MainWindow(QMainWindow):
             return "数据库", False, str(exc)
 
     def _check_llm_endpoint(self) -> tuple[str, bool, str]:
+        from eidory.core.readiness import check_model_service
         service = self._llm_service_key()
-        endpoint = self._llm_endpoint(service).rstrip("/")
-        if not endpoint:
-            return "模型服务", False, "Endpoint 为空"
-        request = urllib.request.Request(f"{endpoint}/models")
-        api_key = self._llm_api_key(service)
-        if api_key:
-            request.add_header("Authorization", f"Bearer {api_key}")
-        try:
-            with urllib.request.urlopen(request, timeout=2.0) as response:
-                status = int(getattr(response, "status", 0))
-            return "模型服务", 200 <= status < 500, f"{self._llm_service_label(service)} / HTTP {status}"
-        except urllib.error.HTTPError as exc:
-            return "模型服务", exc.code < 500, f"{self._llm_service_label(service)} / HTTP {exc.code}"
-        except Exception as exc:
-            return "模型服务", False, f"{self._llm_service_label(service)} / {exc}"
+        ok, message = check_model_service(self._llm_endpoint(service), self._llm_model(service), self._llm_api_key(service))
+        return "AI 模型", ok, message
 
     def _handle_self_check_done(self, payload: object) -> None:
         report, show_success = payload
@@ -15367,7 +15365,9 @@ class MainWindow(QMainWindow):
         busy = busy or pending
         text_mode = bool(node and self.creative_workspace.content_format(node) == "text")
         eligible = bool(node and creative_node_supports_objects(node_title=node.title, node_path=self._creative_node_path_text(node.id)))
-        self.generate_creative_children_button.setText(("完善说明" if self.current_language != "en" else "Develop Description") if text_mode else ("联想新物件" if self.current_language != "en" else "Suggest Objects"))
+        from eidory.core.creative_tasks import node_task
+        task = node_task(node.title, self._creative_node_path_text(node.id)) if node else ("联想新物件", "Suggest Objects", "")
+        self.generate_creative_children_button.setText(("完善说明" if self.current_language != "en" else "Develop Description") if text_mode else task[1 if self.current_language == "en" else 0])
         self.generate_creative_children_button.setEnabled(bool(node and (text_mode or eligible) and not locked and not busy))
         self.generate_creative_details_button.setEnabled(bool(node and not locked and not busy))
         if hasattr(self, "creative_workspace"):
@@ -15383,7 +15383,7 @@ class MainWindow(QMainWindow):
                        if self.current_language == "en" else "此节点负责时间、外观、动作或构图等内容，不适合新增实物；请使用“补充细节”")
         else:
             tooltip = ("Suggest new tangible objects within this node and world. Suggestions require acceptance."
-                       if self.current_language == "en" else "只联想当前节点与世界观中尚未出现的实物；先生成待采纳建议")
+                       if self.current_language == "en" else task[2] or "只联想当前节点与世界观中尚未出现的实物；先生成待采纳建议")
         self.generate_creative_children_button.setToolTip(tooltip)
         self.generate_all_creative_nodes_button.setToolTip(
             "Use each node’s content format; skip locked nodes and pending suggestions."
@@ -15446,7 +15446,8 @@ class MainWindow(QMainWindow):
         original_entries = self.creative_workspace.store.entries(node.id)
         original_prose = original_entries.get("base_note", "") if original_entries is not None else raw_note
         ai_current_note = original_prose if completion_mode == "organize" else self._creative_node_live_constraint_text(node, project, initial_constraint)
-        action = "完善说明" if text_mode and completion_mode == "auto" else "整理原文" if completion_mode == "organize" else ("联想新物件" if completion_mode == "objects" else "补充细节")
+        from eidory.core.creative_tasks import node_task
+        action = "完善说明" if text_mode and completion_mode == "auto" else "整理原文" if completion_mode == "organize" else (node_task(node.title, self._creative_node_path_text(node.id))[0] if completion_mode == "objects" else "补充细节")
         self._set_creative_node_completion_busy(True, f"正在为“{node.title}”{action}...")
         provider = self._make_llm_provider()
         self.creative_node_auto_save_timer.stop()
@@ -16125,7 +16126,7 @@ class MainWindow(QMainWindow):
         entries = self.creative_workspace.store.entries(node.id)
         if entries is not None:
             from eidory.core.creative_entries import search_names
-            names = search_names(entries)
+            names = self.workflow_upgrade.queries(node) if hasattr(self, 'workflow_upgrade') else search_names(entries)
             if not names:
                 self.statusBar().showMessage("请至少勾选一个参考条目；未勾选时不会自动搜索全部图库")
                 return
@@ -16152,7 +16153,11 @@ class MainWindow(QMainWindow):
         if not query.strip():
             self.statusBar().showMessage("当前节点没有可搜索内容")
             return
-        self.creative_workspace.start_node_search(node, query)
+        options = self.workflow_upgrade.state.options(node.id) if hasattr(self, 'workflow_upgrade') else {}
+        if options.get('search_targets_json'):
+            self.creative_workspace.start_node_search(node, '', queries=self.workflow_upgrade.queries(node))
+        else:
+            self.creative_workspace.start_node_search(node, query)
 
     def _handle_creative_node_search_done(self, revision: int, node_id: int, query: str, result) -> None:
         self.search_creative_node_button.setEnabled(self.current_creative_node_id is not None)
@@ -16439,6 +16444,8 @@ class MainWindow(QMainWindow):
         for reference in self.creative_workspace.store.reference_notes(node.project_id):
             if reference["note"].strip() and reference["image_id"] in image_ids:
                 badges.setdefault(reference["image_id"], []).append(reference["note"][:90])
+        if hasattr(self, "workflow_upgrade"):
+            self.workflow_upgrade.decorate_references(node.project_id, badges)
         self._board_image_by_id = {image.id: image for image in images}
         self.project_board_view.set_images(
             images,

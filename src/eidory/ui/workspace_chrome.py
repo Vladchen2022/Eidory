@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QMenu, QPushButton,
-    QScrollArea, QSizePolicy, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from eidory.ui.theme import apply_theme
@@ -204,8 +204,10 @@ class WorkspaceChrome(QObject):
         w.show_project_board_button.hide()
         # One navigation strip owns the four stages.
         self.stage_buttons = [cw.navigation.layout().itemAt(i).widget() for i in range(4)]
-        for button in self.stage_buttons:
+        for button, callback in zip(self.stage_buttons, (cw.show_project_planning, cw.show_candidates, cw.show_collected, cw.show_board)):
+            button.clicked.disconnect()
             button.setCheckable(True)
+            button.toggled.connect(lambda checked, action=callback: action() if checked else self.refresh())
             button.setProperty("variant", "navigation")
         cw.context_label.setProperty("role", "muted")
 
@@ -232,6 +234,7 @@ class WorkspaceChrome(QObject):
         ):
             button.setParent(self.adapters)
             menu.addAction(label, button.click)
+        menu.addAction("锁定／解锁所选分区", w.project_board_view.toggle_section_lock)
         more.setMenu(menu)
         row.addWidget(more)
         w.center_result_stack.parentWidget().layout().insertWidget(1, self.board_tools)
@@ -272,6 +275,14 @@ class WorkspaceChrome(QObject):
                 self.density_combo.setCurrentIndex(1 if w.store.get_setting("ui.density") == "comfortable" else 0)
                 self.density_combo.currentIndexChanged.connect(self.change_density)
                 display.addWidget(self.density_combo)
+                display.addWidget(QLabel("文字大小"))
+                self.font_size = QSpinBox()
+                self.font_size.setAccessibleName("界面文字大小")
+                self.font_size.setRange(11, 20)
+                self.font_size.setSuffix(" pt")
+                self.font_size.setValue(w._setting_int("ui.font_size", 13, minimum=11, maximum=20))
+                self.font_size.valueChanged.connect(self.change_font_size)
+                display.addWidget(self.font_size)
                 display.addStretch(1)
                 self.restore_layout_button = self._button("恢复默认布局", w._restore_workspace_layout, display)
                 self.restore_layout_button.setToolTip("展开左右侧栏；保留当前项目、筛选、选中图片与看板内容")
@@ -315,6 +326,10 @@ class WorkspaceChrome(QObject):
             dialog.show()
             dialog.raise_()
             dialog.activateWindow()
+
+    def change_font_size(self, value):
+        self.w.store.set_setting("ui.font_size", str(value))
+        apply_theme(QApplication.instance(), self.theme_combo.currentData(), density=self.density_combo.currentData(), font_size=value)
 
     def change_density(self):
         density = self.density_combo.currentData()
@@ -451,7 +466,9 @@ class WorkspaceChrome(QObject):
         is_board = w.center_result_stack.currentWidget() is w.project_board_view
         phase = 3 if is_board else 0 if not is_gallery else 2 if w.current_result_mode == "creative_node" else 1
         for index, button in enumerate(self.stage_buttons):
+            previous = button.blockSignals(True)
             button.setChecked(index == phase)
+            button.blockSignals(previous)
         self.stage_buttons[2].setEnabled(bool(project_id))
         self.selection_bar.setVisible(is_gallery)
         self.board_tools.setVisible(is_board and not w._board_focus_mode)

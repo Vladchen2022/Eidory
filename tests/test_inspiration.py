@@ -400,11 +400,11 @@ class InspirationTest(unittest.TestCase):
         self.assertEqual(divergent_kwargs["temperature"], 0.80)
         strict_prompt = strict_kwargs["messages"][1]["content"]
         divergent_prompt = divergent_kwargs["messages"][1]["content"]
-        self.assertIn("联想程度：0/100", strict_prompt)
-        self.assertIn("最多新增 2 项", strict_prompt)
-        self.assertIn("联想程度：100/100", divergent_prompt)
-        self.assertIn("建议新增 5–8 项", divergent_prompt)
-        self.assertIn("绝对不得违背", divergent_prompt)
+        self.assertIn("联想跨度 0/100", strict_prompt)
+        self.assertIn("补充空间组成", strict_prompt)
+        self.assertIn("联想跨度 100/100", divergent_prompt)
+        self.assertIn("不需要凑满条数", divergent_prompt)
+        self.assertIn("保留用户已确定的场所", divergent_prompt)
 
     def test_batch_creative_node_prompt_uses_same_imagination_guidance(self) -> None:
         prompt = _build_creative_node_notes_prompt(
@@ -424,9 +424,9 @@ class InspirationTest(unittest.TestCase):
             language="zh",
         )
 
-        self.assertIn("联想程度：85/100", prompt)
-        self.assertIn("建议新增 5–8 项", prompt)
-        self.assertIn("绝对不得违背", prompt)
+        self.assertIn("联想跨度 85/100", prompt)
+        self.assertIn("补充空间组成", prompt)
+        self.assertIn("保留用户已确定的场所", prompt)
 
     def test_generate_creative_node_note_accepts_json_from_reasoning_content(self) -> None:
         provider = LMStudioProvider(model_name="fake")

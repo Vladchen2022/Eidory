@@ -430,3 +430,25 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS creative_node_options (
+    node_id INTEGER PRIMARY KEY REFERENCES creative_nodes(id) ON DELETE CASCADE,
+    search_targets_json TEXT NOT NULL DEFAULT '',
+    reference_requirement TEXT NOT NULL DEFAULT 'needed',
+    reviewed_context TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS creative_reference_decisions (
+    node_id INTEGER NOT NULL,
+    image_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate',
+    purpose TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(node_id, image_id),
+    FOREIGN KEY(node_id, image_id) REFERENCES creative_node_images(node_id, image_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS creative_project_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES creative_projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);

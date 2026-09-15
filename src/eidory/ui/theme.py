@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication
 from eidory.ui.theme_colors import DEFAULT_THEME, get_theme, refresh_themed_widgets, resolve_theme_style
 
 
-def apply_theme(app: QApplication, theme_id: str = DEFAULT_THEME, *, density: str = "compact") -> None:
+def apply_theme(app: QApplication, theme_id: str = DEFAULT_THEME, *, density: str = "compact", font_size: int | None = None) -> None:
     """Switch presentation only; never rebuild library, filter or board content."""
     theme = get_theme(theme_id)
     app.setProperty("eidoryTheme", theme.id)
@@ -18,6 +18,11 @@ def apply_theme(app: QApplication, theme_id: str = DEFAULT_THEME, *, density: st
         if family in families:
             font.setFamily(family)
             break
+    if font_size is not None:
+        app.setProperty("eidoryFontSize", max(11, min(20, int(font_size))))
+    preferred = app.property("eidoryFontSize")
+    if preferred:
+        font.setPointSize(int(preferred))
     app.setFont(font)
     palette = QPalette()
     roles = {
@@ -53,6 +58,8 @@ def apply_dark_theme(app: QApplication, *, density: str = "compact") -> None:
 _STYLESHEET = """
         QWidget { background: @window@; color: @text@; selection-background-color: @selection@; selection-color: @selection_text@; }
         QLabel, QCheckBox { background: transparent; }
+        QWidget#confirmedEntriesPanel { border: 1px solid @border@; border-radius: 6px; background: @base@; }
+        QWidget#pendingSuggestionPanel { border: 2px solid @warning@; border-radius: 6px; background: @raised@; }
         QLabel[role="muted"] { color: @muted@; }
         QLabel[role="sectionTitle"] { color: @muted@; font-weight: 600; padding: 5px 0; }
         QMainWindow, QDialog { background: @window@; }

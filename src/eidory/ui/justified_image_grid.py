@@ -953,9 +953,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         badges = self._badges_by_image_id.get(image.id, [])
         if not badges:
             return
-        text = badges[0]
-        if len(badges) > 1:
-            text = f"{text} +{len(badges) - 1}"
+        from eidory.core.project_state import reference_badge_text
+        text = reference_badge_text(badges)
         metrics = painter.fontMetrics()
         text = metrics.elidedText(text, Qt.TextElideMode.ElideRight, max(24, rect.width() - 14))
         padding_x = 5

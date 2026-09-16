@@ -1715,6 +1715,8 @@ class MainWindow(QMainWindow):
         self.workspace_chrome = WorkspaceChrome(self)
         from eidory.ui.workflow_upgrade import WorkflowUpgrade
         self.workflow_upgrade = WorkflowUpgrade(self)
+        from eidory.ui.creative_flow import CreativeFlow
+        self.creative_flow = CreativeFlow(self)
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
         self._ensure_temporary_import_collection()
         self._refresh_folders()
@@ -14286,7 +14288,9 @@ class MainWindow(QMainWindow):
         self._sync_creative_node_panel()
         self._refresh_project_sidebar(select_kind="creative", select_id=project_id)
         if show_board and self.current_creative_node_id is not None:
-            QTimer.singleShot(0, self._show_current_creative_board)
+            # The requested stage must take effect before the next user action.
+            # A queued board switch can otherwise land after a newer navigation.
+            self._show_current_creative_board()
 
     def _on_creative_template_changed(self, _index: int) -> None:
         if self.current_creative_project_id is not None:
@@ -14438,6 +14442,8 @@ class MainWindow(QMainWindow):
         )
         self._sync_creative_node_panel()
         if self.current_creative_node_id is not None:
+            if hasattr(self, 'creative_flow'):
+                return  # The creative workspace keeps the current task when changing content.
             if self.center_result_stack.currentWidget() is not self.creative_workspace.planning_scroll:
                 self._show_current_creative_board()
 
@@ -16261,6 +16267,9 @@ class MainWindow(QMainWindow):
         if node is None:
             self.statusBar().showMessage("先选择创作项目节点")
             return
+        if hasattr(self, 'creative_flow') and (self.creative_flow._search_dirty_node == node.id or not self.search_button.isEnabled()):
+            self.statusBar().showMessage("找图目标已修改，请更新结果后再收集")
+            return
         selected_images = self._selected_grid_images()
         if not selected_images:
             self.statusBar().showMessage("先在图片墙选择要存入节点的图片")
@@ -16298,6 +16307,12 @@ class MainWindow(QMainWindow):
 
     def _refresh_after_creative_node_images_changed(self, node: CreativeNodeItem) -> None:
         self._invalidate_creative_node_direct_image_cache(node.id)
+        project = self.store.get_creative_project(node.project_id)
+        if project:
+            index = self.creative_project_combo.findData(project.id)
+            if index >= 0:
+                self.creative_project_combo.setItemText(index, f"{'⬆ ' if project.is_pinned else ''}{project.title} ({project.node_count}/{project.image_count})")
+            self._refresh_project_sidebar(select_kind="creative", select_id=self.current_creative_project_id)
         if self.current_creative_project_id == node.project_id:
             self._refresh_creative_node_tree(select_node_id=self.current_creative_node_id or node.id)
             self._sync_creative_node_panel()

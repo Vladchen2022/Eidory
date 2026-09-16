@@ -213,6 +213,8 @@ def test_collection_undo_does_not_act_on_a_different_project(window):
 def test_stage_navigation_reflects_current_work_and_recovers_from_board(window, app):
     w = window
     pid, node = project(w)
+    w.creative_node_note_input.setPlainText('沙漠古城')
+    w.workflow_upgrade.flush()
     image = w.store.list_images(limit=None)[0]
     w.store.add_images_to_creative_node(node.id, [image.id])
     chrome = w.workspace_chrome
@@ -220,7 +222,7 @@ def test_stage_navigation_reflects_current_work_and_recovers_from_board(window, 
         chrome.stage_buttons[index].click()
         w._poll_events()
         app.processEvents()
-        assert chrome.stage_buttons[index].isChecked()
+        assert chrome.stage_buttons[1 if index == 2 else index].isChecked()
         assert sum(button.isChecked() for button in chrome.stage_buttons) == 1
     assert chrome.board_tools.isVisible()
     w._set_board_focus_mode(True)
@@ -258,6 +260,8 @@ def test_index_filter_returns_to_visible_results(window, app):
 def test_accessibility_toggle_changes_stage_content(window, app):
     w = window
     _, node = project(w)
+    w.creative_node_note_input.setPlainText('沙漠古城')
+    w.workflow_upgrade.flush()
     image = w.store.list_images(limit=None)[0]
     w.store.add_images_to_creative_node(node.id, [image.id])
     for stage in (3, 0, 2, 1):

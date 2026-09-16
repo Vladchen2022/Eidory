@@ -139,6 +139,8 @@ class WorkflowUpgrade(QObject):
             self.results_bar.setVisible(self.w.current_result_mode == 'search_chain' and self.w.center_result_stack.currentWidget() is self.w.grid_view)
         finally:
             self.refreshing = False
+        if hasattr(self.w, 'creative_flow'):
+            self.w.creative_flow.refresh()
 
     def queries(self, node):
         entries = self.w.creative_workspace.store.entries(node.id)

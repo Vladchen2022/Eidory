@@ -59,6 +59,12 @@ _STYLESHEET = """
         QWidget { background: @window@; color: @text@; selection-background-color: @selection@; selection-color: @selection_text@; }
         QLabel, QCheckBox { background: transparent; }
         QWidget#confirmedEntriesPanel { border: 1px solid @border@; border-radius: 6px; background: @base@; }
+        QWidget#creativeOverviewCard, QWidget#creativeIdeaCard { background: @base@; border: 1px solid @border@; border-radius: 8px; }
+        QWidget#creativeSuggestionCard { background: @raised@; border: 1px solid @warning@; border-radius: 8px; }
+        QWidget#creativeOverviewCard QLabel, QWidget#creativeIdeaCard QLabel, QWidget#creativeSuggestionCard QLabel { border: none; background: transparent; }
+        QLabel[role="flowTitle"] { font-size: 19px; font-weight: 600; padding: 3px 0; }
+        QLabel[role="flowSubtitle"] { font-weight: 600; padding: 3px 0; }
+        QLabel#creativeBaseSummary { background: @base@; border: 1px solid @border@; border-radius: 6px; padding: 10px; }
         QWidget#pendingSuggestionPanel { border: 2px solid @warning@; border-radius: 6px; background: @raised@; }
         QLabel[role="muted"] { color: @muted@; }
         QLabel[role="sectionTitle"] { color: @muted@; font-weight: 600; padding: 5px 0; }

@@ -220,7 +220,8 @@ def test_table_panel_does_not_expand_into_empty_space(window, app):
     w.creative_workspace.show_planning()
     app.processEvents()
     ws = w.creative_workspace
-    assert ws.entries_panel.height() < ws.entries_table.height() + 120
+    assert not ws.entries_table.isVisible()
+    assert ws.entries_panel.height() < w.creative_flow.idea_cards.sizeHint().height() + 120
 
 
 def test_discarding_proposal_reenables_generation(window):

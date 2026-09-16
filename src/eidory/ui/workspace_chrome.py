@@ -314,7 +314,7 @@ class WorkspaceChrome(QObject):
         self.w.search_creative_node_button.setText("Find References" if english else "用此语句找参考")
 
     def _inspector_changed(self, index):
-        if index >= 3:
+        if index in (3, 4):
             self.open_global_panel(index)
             self.w.right_tab_widget.setCurrentIndex(self._last_inspector_tab)
         else:
@@ -479,3 +479,5 @@ class WorkspaceChrome(QObject):
         self.export_button.setEnabled(bool(project_id))
         self.refresh_selection()
         self.sync_sidebars()
+        if hasattr(w, 'creative_flow'):
+            w.creative_flow.refresh()

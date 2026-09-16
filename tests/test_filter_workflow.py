@@ -407,12 +407,18 @@ def test_live_strength_broadens_from_full_scope_without_search_and_undoes_one_dr
     with patch.object(window.search_service, "semantic_search", side_effect=AssertionError("live adjustment must reuse scores")):
         slider.setSliderDown(True)
         slider.setValue(50)
-        QTest.qWait(80)
+        for _ in range(20):
+            if len(window.grid_view.images()) == 3:
+                break
+            QTest.qWait(50)
         assert len(window.grid_view.images()) == 3
         assert slider.isSliderDown()
         assert panel.strength_sliders["include", 0, 0] is slider
         slider.setValue(0)
-        QTest.qWait(80)
+        for _ in range(20):
+            if len(window.grid_view.images()) == 4:
+                break
+            QTest.qWait(50)
         assert len(window.grid_view.images()) == 4
         assert len(window.filter_workflow.history) == history_length + 1
         slider.setValue(85)
@@ -512,6 +518,7 @@ def test_two_filter_boxes_keep_each_condition_on_its_own_row(window):
 def test_five_condition_rows_grow_and_shrink_without_padding_empty_exclusion_box(window):
     panel = window.filter_panel
     window.resize(1400, 900)
+    panel.expand_button.click()
     QTest.qWait(50)
     empty_right_height = panel.section_boxes["exclude"].height()
     conditions = tuple(SearchFilter("semantic", f"condition {index}", 50) for index in range(5))

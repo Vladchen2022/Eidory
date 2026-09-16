@@ -252,6 +252,10 @@ class FilterPanel(QWidget):
         self.scope_button.setMaximumWidth(280)
         self.scope_button.clicked.connect(self.scopeRequested)
         self.scope_row.addWidget(self.scope_button)
+        self._show_empty_conditions = False
+        self.expand_button = QPushButton('＋ 筛选条件')
+        self.expand_button.clicked.connect(self._toggle_empty_conditions)
+        self.scope_row.addWidget(self.expand_button)
         self.scope_row.addStretch(1)
         outer.addLayout(self.scope_row)
 
@@ -423,6 +427,18 @@ class FilterPanel(QWidget):
         self._reflow_conditions()
         self._layout_timer.start(0)
         self._update_status()
+        self._sync_empty_conditions()
+
+    def _toggle_empty_conditions(self):
+        self._show_empty_conditions = not self._show_empty_conditions
+        self._sync_empty_conditions()
+
+    def _sync_empty_conditions(self):
+        active = any(group.filters for plan in (self.draft, self.applied) for section in ('include', 'exclude') for group in getattr(plan, section))
+        for box in self.section_boxes.values():
+            box.setVisible(active or self._show_empty_conditions)
+        self.expand_button.setVisible(not active)
+        self.expand_button.setText('收起空筛选' if self._show_empty_conditions else '＋ 筛选条件')
 
     def _render_group(self, section, index, group):
         rows = self.section_layouts[section]

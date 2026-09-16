@@ -305,6 +305,8 @@ class CreativeWorkspace(QObject):
             w.workspace_chrome.refresh()
         if hasattr(w, 'workflow_upgrade'):
             w.workflow_upgrade.refresh()
+        if hasattr(w, 'creative_flow'):
+            w.creative_flow.refresh()
 
     def refresh_project_references(self):
         """Membership survives result rebuilds, independently of search badges."""
@@ -327,13 +329,23 @@ class CreativeWorkspace(QObject):
 
     def new_project(self):
         self.w._load_creative_project(None)
+        self.w._refresh_creative_projects(select_project_id=None)
+        if hasattr(self.w, 'creative_flow'):
+            self.w.creative_flow.start_brief.clear()
+            self.w.creative_flow.start_extra.clear()
         self.w._set_ai_workflow_mode("project")
         self.load_context()
         self.show_planning()
-        self.w.inspiration_brief_input.setFocus()
+        if hasattr(self.w, 'creative_flow'):
+            self.w.creative_flow.start_brief.setFocus()
+        else:
+            self.w.inspiration_brief_input.setFocus()
 
     def show_planning(self):
         w = self.w
+        if hasattr(w, 'creative_flow') and w.ai_workflow_stack.currentIndex() == 0:
+            w.creative_flow.show_planning()
+            return
         w._save_current_board_layout_if_needed()
         w._set_board_focus_mode(False)
         w._set_board_window_pinned(False)
@@ -354,7 +366,7 @@ class CreativeWorkspace(QObject):
     def find(self):
         self.w._search_selected_creative_node()
 
-    def start_node_search(self, node, query, *, queries=None):
+    def start_node_search(self, node, query, *, queries=None, preserve_filters=False):
         w = self.w
         self.save_search()
         scope = w._current_view_payload()
@@ -372,7 +384,23 @@ class CreativeWorkspace(QObject):
         previous = FilterPlan.from_payload(scope.get("filter_plan", {}))
         strengths = {f.value: f.score_threshold for f in previous.positive_filters if f.kind == "semantic"}
         plan = FilterPlan((FilterGroup(tuple(SearchFilter("semantic", name, strengths.get(name, 50)) for name in names), match_mode="any"),)) if queries is not None else FilterPlan((FilterGroup((SearchFilter("semantic", query, 50),)),))
-        scope.update(filter_plan=plan.to_payload(), search_filters=[], excluded_image_ids=[], excluded_collection_ids=[])
+        if preserve_filters:
+            old_names = set(getattr(self, 'active_search_names', None) or [])
+            groups = []
+            replaced = False
+            for group in previous.include:
+                if any(f.kind == 'semantic' and f.value in old_names for f in group.filters):
+                    remaining = tuple(f for f in group.filters if not (f.kind == 'semantic' and f.value in old_names))
+                    groups.append(FilterGroup(plan.include[0].filters + remaining, group.match_mode))
+                    replaced = True
+                else:
+                    groups.append(group)
+            if not replaced:
+                groups.insert(0, plan.include[0])
+            plan = FilterPlan(tuple(groups), previous.exclude)
+            scope.update(filter_plan=plan.to_payload(), search_filters=[])
+        else:
+            scope.update(filter_plan=plan.to_payload(), search_filters=[], excluded_image_ids=[], excluded_collection_ids=[])
         self.store.save_project(node.project_id, scope=scope)
         self.search_node_id = node.id
         self.active_search_names = names if queries is not None else None
@@ -404,8 +432,13 @@ class CreativeWorkspace(QObject):
             return
         state = self.search_states.get(node.id) or decode_state(self.store.node(node.id)["search_json"])
         payload = self.store.entries(node.id)
-        names = w.workflow_upgrade.queries(node) if hasattr(w, 'workflow_upgrade') else search_names(payload) if payload else None
-        if payload is not None and state.get("entry_names") != names:
+        if hasattr(w, 'creative_flow'):
+            names = [r['query'] for r in w.creative_flow.targets() if r['enabled']]
+        else:
+            names = w.workflow_upgrade.queries(node) if hasattr(w, 'workflow_upgrade') else search_names(payload) if payload else None
+        # Legacy text searches have no entry_names. Keep their cached filters;
+        # explicit target edits already invalidate the cache.
+        if (payload is not None or state.get('entry_names') is not None) and state.get("entry_names") != names:
             state = {}
         if state:
             self.active_search_names = state.get("entry_names")
@@ -416,8 +449,13 @@ class CreativeWorkspace(QObject):
             w._apply_view_payload(state["view"])
             if hasattr(w, 'workspace_chrome'):
                 w.workspace_chrome.refresh()
+        elif hasattr(w, 'creative_flow'):
+            w.creative_flow.open_search()
         else:
             self.find()
+        if hasattr(w, 'creative_flow'):
+            w.right_tab_widget.setCurrentIndex(w.creative_flow.reference_index)
+            w.creative_flow.refresh()
 
     def search_finished(self):
         w = self.w
@@ -544,7 +582,7 @@ class CreativeWorkspace(QObject):
         dialog = QDialog(self.w)
         dialog.setWindowTitle("编辑原有说明")
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("原有说明是 AI 必须遵守的内容。找图目标由表格中的勾选行决定。"))
+        layout.addWidget(QLabel("原有说明是 AI 必须遵守的内容。找图时可在右侧选择搜索目标。"))
         editor = QTextEdit(payload.get("base_note", ""))
         editor.setAcceptRichText(False)
         layout.addWidget(editor)

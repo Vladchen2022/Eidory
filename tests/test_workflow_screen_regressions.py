@@ -77,7 +77,8 @@ def test_returning_from_collected_to_cached_search_selects_only_find_stage(windo
     w._search_selected_creative_node()
     w._poll_events()
     w.creative_workspace.show_collected()
-    assert w.workspace_chrome.stage_buttons[2].isChecked()
+    assert w.workspace_chrome.stage_buttons[1].isChecked()
+    assert not w.workspace_chrome.stage_buttons[2].isVisible()
     w.creative_workspace.show_candidates()
     w._poll_events()
     assert [b.isChecked() for b in w.workspace_chrome.stage_buttons] == [False, True, False, False]

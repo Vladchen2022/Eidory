@@ -11,13 +11,16 @@ def target_signature(node, entries):
 
 
 def initial_targets(node, entries, path=''):
-    if entries is None:
-        return [{'id': 'core', 'name': node.title, 'query': node.search_query or node.note, 'enabled': True, '_source_enabled': True, 'kind': '核心目标'}]
-    rows = [{'id': r['id'], 'name': r['name'], 'query': r['name'], 'enabled': r['enabled'], '_source_enabled': r['enabled'], 'kind': '参考条目'} for r in entries['rows']]
     template = creative_node_template(node.title, path)
     hints = [n.note for t in CREATIVE_TEMPLATES for n in t.root.children]
     def placeholder(value):
         return any(hint and hint in value for hint in hints) or (template and value == template_search_query(template.title, template.note))
+    if entries is None:
+        query = node.search_query or node.note
+        if placeholder(query) and node.note and not placeholder(node.note):
+            query = node.note[:180]
+        return [{'id': 'core', 'name': node.title, 'query': query, 'enabled': True, '_source_enabled': True, 'kind': '核心目标'}]
+    rows = [{'id': r['id'], 'name': r['name'], 'query': r['name'], 'enabled': r['enabled'], '_source_enabled': r['enabled'], 'kind': '参考条目'} for r in entries['rows']]
     base = entries.get('base_query', '').strip()
     if not base or placeholder(base):
         # Editing the note does not overwrite the default template query. Fall

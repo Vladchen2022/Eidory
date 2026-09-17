@@ -15170,6 +15170,10 @@ class MainWindow(QMainWindow):
         visit(None, 0)
         return "\n".join(lines)[:4000]
 
+    def _creative_node_sibling_titles(self, node) -> tuple[str, ...]:
+        return tuple(other.title for other in self.store.list_creative_nodes(node.project_id)
+                     if other.parent_id == node.parent_id and other.id != node.id)
+
     def _queue_creative_node_auto_save(self) -> None:
         if self._suppress_creative_node_auto_save:
             return
@@ -15379,6 +15383,12 @@ class MainWindow(QMainWindow):
         from eidory.core.creative_tasks import node_task
         task = node_task(node.title, self._creative_node_path_text(node.id)) if node else ("联想新物件", "Suggest Objects", "")
         self.generate_creative_children_button.setText(("完善说明" if self.current_language != "en" else "Develop Description") if text_mode else task[1 if self.current_language == "en" else 0])
+        if node:
+            from eidory.core.creative_tasks import is_character_subject
+            if is_character_subject(node.title, self._creative_node_path_text(node.id)):
+                self.generate_creative_children_button.setText(
+                    f'Develop {node.title}' if self.current_language == 'en' else f'完善“{node.title}”方案')
+        self.generate_creative_children_button.setAccessibleName(self.generate_creative_children_button.text())
         self.generate_creative_children_button.setEnabled(bool(node and (text_mode or eligible) and not locked and not busy))
         self.generate_creative_details_button.setEnabled(bool(node and not locked and not busy))
         if hasattr(self, "creative_workspace"):
@@ -15395,6 +15405,9 @@ class MainWindow(QMainWindow):
         else:
             tooltip = ("Suggest new tangible objects within this node and world. Suggestions require acceptance."
                        if self.current_language == "en" else task[2] or "只联想当前节点与世界观中尚未出现的实物；先生成待采纳建议")
+        if node and is_character_subject(node.title, self._creative_node_path_text(node.id)):
+            tooltip = (f'Only develop {node.title}; other character nodes are excluded. Review before accepting.'
+                       if self.current_language == 'en' else f'只完善“{node.title}”，不生成其他角色的方案；建议采纳后才保存。')
         self.generate_creative_children_button.setToolTip(tooltip)
         self.generate_all_creative_nodes_button.setToolTip(
             "Use each node’s content format; skip locked nodes and pending suggestions."
@@ -15467,6 +15480,7 @@ class MainWindow(QMainWindow):
         self._clear_pending_creative_node_details(node.id)
         project_brief, project_extra = self._creative_node_ai_context(project)
         node_path = self._creative_node_path_text(node.id)
+        sibling_titles = self._creative_node_sibling_titles(node)
         project_outline = self._creative_project_outline_text(project.id, selected_node_id=node.id)
         imagination_level = self.creative_node_imagination_slider.value()
 
@@ -15482,6 +15496,7 @@ class MainWindow(QMainWindow):
                     node_title=node.title,
                     current_note=ai_current_note,
                     node_path=node_path,
+                    sibling_titles=sibling_titles,
                     node_template_hint=node_template_hint,
                     imagination_level=imagination_level,
                     completion_mode=completion_mode,
@@ -15669,6 +15684,7 @@ class MainWindow(QMainWindow):
                         "current_note": current_note,
                         "node_template_hint": node_template_hint,
                         "node_path": self._creative_node_path_text(node.id),
+                        "sibling_titles": self._creative_node_sibling_titles(node),
                         "project_outline": self._creative_project_outline_text(
                             project_id,
                             selected_node_id=node.id,
@@ -15711,6 +15727,7 @@ class MainWindow(QMainWindow):
                             node_title=str(request["title"]),
                             current_note=str(request["current_note"]),
                             node_path=str(request["node_path"]),
+                            sibling_titles=request["sibling_titles"],
                             node_template_hint=str(request["node_template_hint"]),
                             imagination_level=imagination_level,
                             language=self.current_language,
@@ -15727,6 +15744,7 @@ class MainWindow(QMainWindow):
                                     "current_note": str(request["current_note"]),
                                     "node_template_hint": str(request["node_template_hint"]),
                                     "node_path": str(request["node_path"]),
+                                    "sibling_titles": request["sibling_titles"],
                                 }
                             ],
                             imagination_level=imagination_level,
@@ -15766,6 +15784,7 @@ class MainWindow(QMainWindow):
                             "current_note": str(request["current_note"]),
                             "node_template_hint": str(request["node_template_hint"]),
                             "node_path": str(request["node_path"]),
+                            "sibling_titles": request["sibling_titles"],
                         }
                         for request in requests
                     ]

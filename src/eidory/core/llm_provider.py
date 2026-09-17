@@ -149,8 +149,46 @@ def _creative_node_imagination_guidance(value: int, *, language: str) -> str:
 
 
 def node_task_is_character(title, path=''):
-    from eidory.core.creative_tasks import node_task
-    return node_task(title, path)[0] == '完善人物方案'
+    from eidory.core.creative_templates import creative_node_template
+    template = creative_node_template(title, path)
+    return bool(template and template.title == '人物')
+
+
+def _bind_character_subject(schema, title, path, *, entries):
+    from eidory.core.creative_tasks import is_character_subject
+    if not is_character_subject(title, path):
+        return ''
+    body = schema['json_schema']['schema']
+    body['properties']['subject_node'] = {'type': 'string', 'enum': [title]}
+    body['required'].append('subject_node')
+    if entries:
+        body['properties']['additions']['minItems'] = 1
+        body['properties']['additions']['maxItems'] = 1
+    return f'\nJSON 还必须包含 subject_node 字段，值严格为 {json.dumps(title, ensure_ascii=False)}，用于校验本次方案归属。'
+
+
+def _validate_character_subject(payload, title, path, sibling_titles=(), *, entries, require_subject_name=False):
+    from eidory.core.creative_tasks import is_character_subject
+    if not is_character_subject(title, path):
+        return
+    if payload.get('subject_node') != title:
+        raise LLMProviderError(f'方案归属错误：本次只完善“{title}”')
+    if entries:
+        raw = payload.get('additions')
+        # Validate before normalization can truncate or deduplicate wrong rows.
+        if not isinstance(raw, list) or len(raw) != 1:
+            raise LLMProviderError(f'“{title}”子节点只能返回一条当前角色方案，不能混入其他角色')
+        names = [str(row.get('name', '')) for row in raw if isinstance(row, dict)]
+        if require_subject_name and any(title.casefold() not in name.casefold() for name in names):
+            raise LLMProviderError(f'人物方案名称必须以“{title}”为主体并包含此角色名，不能只返回服装或配饰')
+    else:
+        names = [str(payload.get('search_query', ''))]
+    for peer in sibling_titles:
+        peer = str(peer).strip()
+        if not peer or peer.casefold() in title.casefold():
+            continue
+        if any(peer.casefold() in name.casefold() for name in names):
+            raise LLMProviderError(f'当前是“{title}”，返回的主体却包含同级节点“{peer}”')
 
 
 def creative_node_supports_objects(*, node_title: str, node_path: str = "") -> bool:
@@ -452,6 +490,7 @@ class LMStudioProvider:
     def generate_creative_node_prose(
         self, *, project_brief, node_title, project_extra="", project_outline="", current_note="",
         node_path="", node_template_hint="", imagination_level=50, completion_mode="auto", language="zh",
+        sibling_titles=(),
     ):
         """Paragraph suggestions are a separate contract, not flattened object rows."""
         from eidory.core.creative_templates import creative_node_template
@@ -490,6 +529,9 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
                     "note": {"type": "string", "maxLength": 700},
                     "search_query": {"type": "string", "maxLength": 240}},
                 "required": ["note", "search_query"], "additionalProperties": False}}}
+        from eidory.core.creative_tasks import node_scope_contract
+        prompt += '\n' + node_scope_contract(node_title, node_path, sibling_titles)
+        prompt += _bind_character_subject(response_format, node_title, node_path, entries=False)
         model = self.model_name or self._first_available_model()
         messages = [{"role": "system", "content": f"你是创作规划助手。当前只负责{role_name}。{boundary} 尊重已有约束，写连贯短文，只输出JSON。"},
                     {"role": "user", "content": prompt}]
@@ -500,6 +542,7 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
                 max_tokens=4000, allow_reasoning_content=True)
             try:
                 payload = _load_json_object(content)
+                _validate_character_subject(payload, node_title, node_path, sibling_titles, entries=False)
                 note, query = payload.get("note"), payload.get("search_query")
                 if not isinstance(note, str) or not isinstance(query, str) or not note.strip() or not query.strip():
                     raise LLMProviderError("AI 未返回说明与搜索语句")
@@ -524,7 +567,7 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
     def generate_creative_reference_entries(
         self, *, project_brief, node_title, project_extra="", project_outline="", current_note="",
         node_path="", node_template_hint="", imagination_level=50, completion_mode="auto",
-        entry_target=None, language="zh",
+        entry_target=None, language="zh", sibling_titles=(),
     ):
         """A bounded structured request; never parse prose into checkable search rows."""
         mode = "details" if completion_mode == "organize" else _creative_node_completion_mode(completion_mode, node_title=node_title, node_path=node_path)
@@ -558,16 +601,19 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
                 "visual需完整保留已确定细节并追加合理的新细节，避免重复修辞。"
                 + json.dumps({k: entry_target[k] for k in ("name", "visual")}, ensure_ascii=False)
             )
+        from eidory.core.creative_tasks import is_character_subject, node_scope_contract
+        prompt += '\n' + node_scope_contract(node_title, node_path, sibling_titles)
         model = self.model_name or self._first_available_model()
         schema = _creative_node_note_response_format(100 if completion_mode == "organize" else imagination_level, mode)
         cast_limit = None
-        if mode == 'objects' and node_task_is_character(node_title, node_path):
+        if mode == 'objects' and node_task_is_character(node_title, node_path) and not is_character_subject(node_title, node_path):
             counts = re.findall(r'([一二两三四五六七八九十1-9])(?:位|名|个)(?:工程师|人物|角色|技师|研究员)', project_brief+' '+project_extra+' '+current_note)
             values = {'一':1,'二':2,'两':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10}
             if counts:
                 cast_limit = max(values[c] if c in values else int(c) for c in counts)
                 schema['json_schema']['schema']['properties']['additions']['maxItems'] = cast_limit
                 prompt += f'\n人物行数上限 {cast_limit}。每行名称必须是人物身份或整体造型，不能是服饰配件或局部细节。'
+        prompt += _bind_character_subject(schema, node_title, node_path, entries=True)
 
         messages = [{"role": "system", "content": "你是插画参考规划助手。遵守原有约束，只返回JSON，不输出思考过程。"},
                     {"role": "user", "content": prompt}]
@@ -578,6 +624,8 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
                 max_tokens=4000, allow_reasoning_content=True)
             try:
                 payload = _load_json_object(content)
+                _validate_character_subject(payload, node_title, node_path, sibling_titles, entries=True,
+                                            require_subject_name=mode == 'objects' and not entry_target)
                 rows = _creative_additions(payload)
                 if not rows:
                     raise LLMProviderError("AI 未返回有效条目")
@@ -589,10 +637,11 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
                     note=_creative_additions_note(payload), search_query=" ".join(row["name"] for row in rows)[:240],
                     additions=rows, entry_target=entry_target, entry_mode=completion_mode,
                 ), model
-            except LLMProviderError:
+            except LLMProviderError as exc:
                 if attempt:
-                    raise LLMProviderError("AI 未返回有效的条目格式；原有内容未改动，请重试")
-                messages.append({"role": "user", "content": "上次格式无效。重新按约定输出additions数组，每项必须有非空name和visual；不得返回散文。"})
+                    raise LLMProviderError(f"AI 未返回符合当前节点范围的有效条目（{exc}）；原有内容未改动，请重试") from exc
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": f"上次未通过校验：{exc}。请针对原因修正，严格遵守本次唯一输出范围与JSON约定；不得把其他节点方案放入当前节点。"})
 
     def generate_creative_node_note(
         self,
@@ -607,7 +656,16 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
         imagination_level: int = 50,
         completion_mode: str = "auto",
         language: str = "zh",
+        sibling_titles=(),
     ) -> tuple[CreativeNodeNoteSuggestion, str]:
+        from eidory.core.creative_tasks import is_character_subject
+        if is_character_subject(node_title, node_path):
+            return self.generate_creative_reference_entries(
+                project_brief=project_brief, project_extra=project_extra, project_outline=project_outline,
+                node_title=node_title, current_note=current_note, node_path=node_path,
+                node_template_hint=node_template_hint, imagination_level=imagination_level,
+                completion_mode=completion_mode, language=language, sibling_titles=sibling_titles,
+            )
         completion_mode = _creative_node_completion_mode(completion_mode, node_title=node_title, node_path=node_path)
         if completion_mode == "objects" and not creative_node_supports_objects(node_title=node_title, node_path=node_path):
             raise LLMProviderError("此节点不适合新增实物，请使用补充细节")
@@ -698,12 +756,30 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
         completion_mode: str = "auto",
         language: str = "zh",
     ) -> tuple[dict[str, CreativeNodeNoteSuggestion], str]:
+        from eidory.core.creative_tasks import is_character_subject
         clean_brief = project_brief.strip()
+        scoped_results = {}
         clean_nodes: list[dict[str, str]] = []
         for raw in nodes:
             node_id = str(raw.get("node_id", "")).strip()
             title = str(raw.get("node_title", "")).strip()
             if not node_id or not title:
+                continue
+            path = str(raw.get('node_path', '')).strip()
+            if is_character_subject(title, path):
+                # Legacy batch callers get the same per-subject validation as
+                # single-node generation; results remain keyed to the input ID.
+                try:
+                    scoped_results[node_id], _ = self.generate_creative_reference_entries(
+                        project_brief=clean_brief, project_extra=project_extra, project_outline=project_outline,
+                        node_title=title, node_path=path, current_note=str(raw.get('current_note', '')),
+                        node_template_hint=str(raw.get('node_template_hint', '')),
+                        imagination_level=imagination_level, completion_mode=completion_mode,
+                        sibling_titles=raw.get('sibling_titles', ()), language=language,
+                    )
+                except LLMProviderError:
+                    # Missing nodes are reported as failures by the caller.
+                    continue
                 continue
             clean_nodes.append(
                 {
@@ -715,7 +791,7 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
                 }
             )
         if not clean_nodes:
-            return {}, self.model_name or self._first_available_model()
+            return scoped_results, self.model_name or self._first_available_model()
         if not clean_brief:
             raise LLMProviderError("创作主题不能为空")
         model_name = self.model_name or self._first_available_model()
@@ -754,7 +830,7 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
             allow_reasoning_content=True,
         )
         parsed = parse_creative_node_note_batch_suggestions(content, language=language)
-        refined: dict[str, CreativeNodeNoteSuggestion] = {}
+        refined: dict[str, CreativeNodeNoteSuggestion] = dict(scoped_results)
         context_by_id = {node["node_id"]: node for node in clean_nodes}
         for node_id, suggestion in parsed.items():
             context = context_by_id.get(node_id)
@@ -2802,7 +2878,10 @@ def _build_creative_node_note_prompt(
         role = role_contract(node_title, node_path, language)
         contract = role or contract
     if role:
-        guidance = (f"本节点联想跨度 {imagination_level}/100。越高，角色或空间方案的差异越明显，但始终服从本节点职责。"
+        from eidory.core.creative_tasks import is_character_subject
+        guidance = (f"本节点联想跨度 {imagination_level}/100。只探索当前角色本身的造型可能性，任何档位都不扩展到其他角色；只返回一条完整方案。"
+                    if is_character_subject(node_title, node_path) else
+                    f"本节点联想跨度 {imagination_level}/100。越高，角色或空间方案的差异越明显，但始终服从本节点职责。"
                     "人物方案只列人物，穿戴与道具细节放在该人物的 visual 内，禁止另起一行作为角色。"
                     "已确定三位工程师时，最多三行，分别是一位工程师的独立造型方向；不能把同一人的挂扣、证件、手套拆成多行。"
                     if node_task_is_character(node_title, node_path) else
@@ -2844,7 +2923,10 @@ Search-query scope guidance:
 {project_outline or "-"}
 搜索范围建议：
 {scope}"""
+    from eidory.core.creative_tasks import node_scope_contract
     return f"""{context}
+
+{node_scope_contract(node_title, node_path)}
 
 {contract}
 

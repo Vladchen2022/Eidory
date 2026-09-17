@@ -108,6 +108,7 @@ _STYLESHEET = """
         QPushButton:hover { background: @hover@; border-color: @border@; }
         QPushButton:pressed, QPushButton:checked { background: @selection@; border-color: @link@; color: @selection_text@; }
         QPushButton:focus { border-color: @link@; }
+        QWidget#recentCreativeProjects QPushButton { text-align: left; }
         QPushButton[variant="primary"] { background: @accent@; color: @accent_text@; border-color: @accent@; }
         QPushButton[variant="primary"]:hover { background: @accent_hover@; border-color: @accent_hover@; }
         QPushButton[variant="primary"]:pressed { background: @accent_pressed@; }

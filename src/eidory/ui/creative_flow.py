@@ -136,9 +136,15 @@ class CreativeFlow(QObject):
         actions.addStretch()
         layout.addLayout(actions)
         self.recent_projects = QWidget()
+        self.recent_projects.setObjectName('recentCreativeProjects')
+        self.recent_projects.setMaximumWidth(760)
+        self.recent_projects.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.recent_layout = QVBoxLayout(self.recent_projects)
         self.recent_layout.setContentsMargins(0, 12, 0, 0)
+        self.recent_layout.setSpacing(6)
+        self.recent_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         layout.addWidget(self.recent_projects)
+        layout.addStretch(1)
         self.home_stack.addWidget(self.start)
         self.overview = QWidget()
         outer = QVBoxLayout(self.overview)
@@ -195,8 +201,11 @@ class CreativeFlow(QObject):
         if projects:
             self.recent_layout.addWidget(label('继续已有项目', role='flowSubtitle'))
         for project in projects:
-            button(f'{project.title}  ·  {project.image_count} 张参考',
-                   lambda _=False, pid=project.id: self.resume_project(pid), self.recent_layout)
+            entry = button(f'{project.title}  ·  {project.image_count} 张参考',
+                           lambda _=False, pid=project.id: self.resume_project(pid), self.recent_layout)
+            # macOS button layout insets must not eat the visible row spacing.
+            entry.setAttribute(Qt.WidgetAttribute.WA_LayoutUsesWidgetRect)
+            entry.setToolTip(entry.text())
 
     def suggest_project(self):
         w = self.w

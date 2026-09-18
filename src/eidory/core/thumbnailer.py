@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import subprocess
+import os
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -18,6 +21,20 @@ class Thumbnailer:
     def thumbnail_path_for(self, image_id: int) -> Path:
         return self.thumbnail_dir / f"thumb_{image_id:09d}.webp"
 
+    @staticmethod
+    @contextmanager
+    def _atomic_output(output_path: Path):
+        fd, name = tempfile.mkstemp(prefix='.thumb-', suffix='.webp', dir=output_path.parent)
+        os.close(fd)
+        temporary = Path(name)
+        try:
+            yield temporary
+            if not temporary.stat().st_size:
+                raise RuntimeError('Thumbnail encoder produced an empty file')
+            os.replace(temporary, output_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def generate(self, image_id: int, image_path: str) -> Path:
         output_path = self.thumbnail_path_for(image_id)
         with open_local_image(image_path) as image:
@@ -27,7 +44,8 @@ class Thumbnailer:
             image.thumbnail((self.max_edge, self.max_edge), Image.Resampling.LANCZOS)
             if image.mode not in {"RGB", "RGBA"}:
                 image = image.convert("RGB")
-            image.save(output_path, "WEBP", quality=82, method=4)
+            with self._atomic_output(output_path) as temporary:
+                image.save(temporary, "WEBP", quality=82, method=4)
         return output_path
 
     def generate_video(
@@ -60,9 +78,9 @@ class Thumbnailer:
             "-y",
             str(output_path),
         ]
-        subprocess.run(command, check=True, timeout=30)
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            raise RuntimeError("ffmpeg did not create a video thumbnail")
+        with self._atomic_output(output_path) as temporary:
+            command[-1] = str(temporary)
+            subprocess.run(command, check=True, timeout=30)
         return output_path
 
     @staticmethod

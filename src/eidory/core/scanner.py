@@ -357,7 +357,12 @@ class ImageScanner:
     def _read_dimensions(file_path: str) -> tuple[int | None, int | None]:
         try:
             with open_local_image(file_path) as image:
-                return int(image.width), int(image.height)
+                width, height = int(image.width), int(image.height)
+                # Thumbnail and preview decoders apply EXIF orientation; their
+                # layout metadata must describe the same displayed axes.
+                if image.getexif().get(274) in (5, 6, 7, 8):
+                    width, height = height, width
+                return width, height
         except Exception:
             return None, None
 

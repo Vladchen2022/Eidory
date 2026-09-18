@@ -1,7 +1,8 @@
 """Edit selected board references in place, without a second image collection."""
 from weakref import ref
+from collections import Counter
 
-from PySide6.QtCore import QObject, QSignalBlocker, Qt
+from PySide6.QtCore import QObject, QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
 
@@ -15,6 +16,11 @@ class BoardInspector(QObject):
         self.refreshing = False
         self._selection_key = None
         self._links = []
+        self._pending_note = None
+        self._note_timer = QTimer(self)
+        self._note_timer.setSingleShot(True)
+        self._note_timer.setInterval(300)
+        self._note_timer.timeout.connect(self.flush_note)
         self.page = QWidget()
         self.page.setObjectName('boardSelectionInspector')
         layout = QVBoxLayout(self.page)
@@ -79,7 +85,7 @@ class BoardInspector(QObject):
             self.quick_grades[status] = b
         self.remove_button = QPushButton('移出看板')
         self.remove_button.setToolTip('移除所选图片在当前看板分支中的关联；保留图库源文件，可撤销。')
-        self.remove_button.clicked.connect(lambda: self.w._remove_images_from_current_board(self.selected_ids()))
+        self.remove_button.clicked.connect(self.remove_selected)
         row.addWidget(self.remove_button)
         row.addStretch(1)
         center_layout = window.center_result_stack.parentWidget().layout()
@@ -94,8 +100,9 @@ class BoardInspector(QObject):
         self.purpose.currentIndexChanged.connect(lambda: self.save(purpose=self.purpose.currentData()))
         self.note.textChanged.connect(self.save_note)
         window.project_board_view.selectionChanged.connect(self.refresh)
+        window.project_board_view.imageLoaded.connect(self.refresh_preview)
         window.project_board_view.sectionsChanged.connect(self.sections_changed)
-        window.project_board_view.layoutChanged.connect(self.refresh)
+        # Moving/resizing a picture changes no inspector metadata.
         section_button = window.creative_workspace.board_buttons[1]
         section_button.clicked.disconnect()
         section_button.toggled.connect(lambda _: window.project_board_view.toggle_node_sections())
@@ -117,6 +124,12 @@ class BoardInspector(QObject):
     def selected_ids(self):
         return self.w.project_board_view.selected_image_ids()
 
+    def refresh_preview(self, image_id):
+        if self.selected_ids() == [image_id]:
+            item = self.w.project_board_view._image_items.get(image_id)
+            if hasattr(item, 'source_pixmap'):
+                self.preview.setPixmap(item.source_pixmap().scaled(240, 140, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
     def sections_changed(self, grouped):
         button = self.w.creative_workspace.board_buttons[1]
         button.setCheckable(True)
@@ -136,10 +149,14 @@ class BoardInspector(QObject):
             return
         w = self.w
         if w.center_result_stack.currentWidget() is not w.project_board_view:
+            self.flush_note()
             return
         self.refreshing = True
         try:
             ids = self.selected_ids()
+            pending = self._pending_note
+            if pending and (ids != [pending[1]] or self._selection_key[0] != w._current_board_node_id):
+                self.flush_note()
             self.selection_label.setText(f'已选 {len(ids)} 张' if ids else '先在看板选图')
             node = w.store.get_creative_node(w._current_board_node_id) if w._current_board_node_id else None
             self._links = w.store.creative_node_image_links_for_branch(node.id, ids) if node and ids else []
@@ -149,7 +166,7 @@ class BoardInspector(QObject):
                 self._selection_key = selection_key
                 self.scope.clear()
                 owners = sorted({r['node_id'] for r in self._links})
-                ambiguous = any(sum(r['image_id'] == i for r in self._links) > 1 for i in ids)
+                ambiguous = any(count > 1 for count in Counter(r['image_id'] for r in self._links).values())
                 if ambiguous:
                     self.scope.addItem('请选择要调整的节点', None)
                 if len(owners) > 1:
@@ -167,15 +184,15 @@ class BoardInspector(QObject):
                 image = w._board_image_by_id.get(ids[0]) if len(ids) == 1 else None
                 if image:
                     self.info.setText(f'{image.file_name}\n{image.width} × {image.height} · {image.file_size / 1024:.0f} KB\n{image.file_path}')
-                    pixmap = QPixmap(image.thumbnail_path or '')
+                    item = w.project_board_view._image_items.get(image.id)
+                    pixmap = item.source_pixmap() if hasattr(item, 'source_pixmap') else QPixmap()
                     self.preview.setPixmap(pixmap.scaled(240, 140, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
                 else:
                     self.info.setText(f'已选 {len(ids)} 张，可批量设置参考等级和用途。' if ids else '在看板中选择图片，直接调整参考等级和用途。')
                 self.preview.setVisible(image is not None)
             active = self.active_links()
-            decisions = [w.workflow_upgrade.state.decision(r['node_id'], r['image_id']) for r in active]
-            statuses = {d['status'] for d in decisions}
-            purposes = {d['purpose'] for d in decisions}
+            statuses = {r['reference_status'] or 'candidate' for r in active}
+            purposes = {r['reference_purpose'] or '' for r in active}
             status = next(iter(statuses)) if len(statuses) == 1 else None
             purpose = next(iter(purposes)) if len(purposes) == 1 else None
             self.grade.setItemText(0, '等级不同' if active else '先选择图片与所属节点')
@@ -192,7 +209,9 @@ class BoardInspector(QObject):
             self.remove_button.setEnabled(bool(ids))
             self.open_button.setEnabled(len(ids) == 1)
             note_key = (active[0]['node_id'], active[0]['image_id']) if len(active) == 1 else None
-            text = w.creative_workspace.store.reference_note(*note_key) if note_key else ''
+            text = (active[0]['reference_note'] or '') if note_key else ''
+            if self._pending_note and self._pending_note[:2] == note_key:
+                text = self._pending_note[2]
             if self.note.toPlainText() != text:
                 self.note.setPlainText(text)
             self.note.setEnabled(note_key is not None)
@@ -210,6 +229,7 @@ class BoardInspector(QObject):
 
     def scope_changed(self, *_):
         if not self.refreshing:
+            self.flush_note()
             self.refresh()
 
     def save(self, *, status=None, purpose=None):
@@ -218,15 +238,15 @@ class BoardInspector(QObject):
         active = self.active_links()
         if not active:
             return
+        self.flush_note()
         # One transaction preserves per-node purposes when only grade changes.
         with self.w.store.connect() as conn:
             for link in active:
                 nid, iid = link['node_id'], link['image_id']
-                old = self.w.workflow_upgrade.state.decision(nid, iid)
                 conn.execute('''INSERT INTO creative_reference_decisions(node_id,image_id,status,purpose)
                     SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM creative_node_images WHERE node_id=? AND image_id=?)
-                    ON CONFLICT(node_id,image_id) DO UPDATE SET status=excluded.status,purpose=excluded.purpose''',
-                    (nid, iid, status or old['status'], old['purpose'] if purpose is None else purpose, nid, iid))
+                    ON CONFLICT(node_id,image_id) DO UPDATE SET status=COALESCE(?,status),purpose=COALESCE(?,purpose)''',
+                    (nid, iid, status or 'candidate', purpose or '', nid, iid, status, purpose))
         self.refresh_badges()
         self.refresh()
         self.w.statusBar().showMessage('已保存所选图片的参考等级与用途')
@@ -251,7 +271,19 @@ class BoardInspector(QObject):
             return
         links = self.active_links()
         if len(links) == 1:
-            self.w.creative_workspace.store.save_reference_note(links[0]['node_id'], links[0]['image_id'], self.note.toPlainText())
+            self._pending_note = (links[0]['node_id'], links[0]['image_id'], self.note.toPlainText())
+            self._note_timer.start()
+
+    def flush_note(self):
+        self._note_timer.stop()
+        pending = self._pending_note
+        if pending is not None:
+            self.w.creative_workspace.store.save_reference_note(*pending)
+            self._pending_note = None
+
+    def remove_selected(self):
+        self.flush_note()
+        self.w._remove_images_from_current_board(self.selected_ids())
 
     def open_image(self):
         ids = self.selected_ids()

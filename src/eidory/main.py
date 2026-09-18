@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
+import time
 
 from eidory.config import AppPaths
 from eidory.core.metadata_store import MetadataStore
@@ -9,6 +10,11 @@ from eidory.core.metadata_store import MetadataStore
 
 def main() -> int:
     multiprocessing.freeze_support()
+    started = time.perf_counter()
+    paths = AppPaths.default()
+    paths.ensure()
+    from eidory.core.diagnostics import setup_diagnostics, watch_event_loop
+    logger = setup_diagnostics(paths.log_dir)
 
     from eidory.ui.accessibility import configure_qt_accessibility
 
@@ -21,8 +27,6 @@ def main() -> int:
     from eidory.ui.theme import apply_theme
     from eidory.ui.theme_colors import DEFAULT_THEME
 
-    paths = AppPaths.default()
-    paths.ensure()
     store = MetadataStore(paths.database_path)
     store.initialize()
 
@@ -37,6 +41,8 @@ def main() -> int:
         _setting_int(store, "ui.window_height", 860, 600, 1800),
     )
     window.show()
+    watch_event_loop(window, logger)
+    logger.info('Window shown in %.0f ms', (time.perf_counter()-started)*1000)
     return app.exec()
 
 

@@ -118,6 +118,8 @@ class WorkflowUpgrade(QObject):
         w.center_result_stack.currentChanged.connect(self.refresh)
 
     def flush(self):
+        if hasattr(self.w, 'creative_flow'):
+            self.w.creative_flow.board_inspector.flush_note()
         self.w.creative_workspace.save_context()
         self.w._save_current_creative_node_editor_snapshot()
         self.w._save_current_board_layout_if_needed()

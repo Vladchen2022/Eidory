@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 
 from eidory.models import ImageItem
 from eidory.ui.drop_import_box import payload_from_mime_data, payload_supports_mime_data
+from eidory.ui.board_image_loader import BoardImageLoader
 
 
 BOARD_WIDTH = 5200
@@ -104,6 +105,12 @@ def _cached_pixmap(
     pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
     if pixmap.isNull():
         return pixmap
+    _store_cached_pixmap(key, pixmap)
+    return pixmap
+
+
+def _store_cached_pixmap(key, pixmap):
+    global _BOARD_PIXMAP_CACHE_TOTAL_BYTES
     existing_bytes = _BOARD_PIXMAP_CACHE_BYTES.pop(key, 0)
     _BOARD_PIXMAP_CACHE_TOTAL_BYTES = max(0, _BOARD_PIXMAP_CACHE_TOTAL_BYTES - existing_bytes)
     _BOARD_PIXMAP_CACHE[key] = QPixmap(pixmap)
@@ -118,13 +125,27 @@ def _cached_pixmap(
         old_key, _old_pixmap = _BOARD_PIXMAP_CACHE.popitem(last=False)
         old_bytes = _BOARD_PIXMAP_CACHE_BYTES.pop(old_key, 0)
         _BOARD_PIXMAP_CACHE_TOTAL_BYTES = max(0, _BOARD_PIXMAP_CACHE_TOTAL_BYTES - old_bytes)
-    return pixmap
 
 
 def _estimated_pixmap_bytes(pixmap: QPixmap) -> int:
     if pixmap.isNull():
         return 0
     return max(0, pixmap.width()) * max(0, pixmap.height()) * 4
+
+
+def _image_aspect_ratio(image: ImageItem, pixmap: QPixmap) -> float:
+    decoded = pixmap.width() / max(1, pixmap.height())
+    if not image.width or not image.height:
+        return decoded
+    metadata = image.width / image.height
+    # The scanner stores raw dimensions; EXIF-oriented thumbnails may have
+    # their axes swapped. Keep exact metadata proportions despite pixel rounding.
+    tolerance = 2 / max(1, min(pixmap.width(), pixmap.height()))
+    if abs(decoded / metadata - 1) <= tolerance:
+        return metadata
+    if abs(decoded * metadata - 1) <= tolerance:
+        return 1 / metadata
+    return decoded
 
 
 def _clamp_float(value: object, fallback: float = 0.0) -> float:
@@ -262,6 +283,7 @@ class BoardImageItem(QGraphicsPixmapItem):
         file_path: str,
         badges: list[str] | None = None,
         on_layout_changed: Callable[[], None] | None = None,
+        source_aspect_ratio: float | None = None,
     ) -> None:
         super().__init__(pixmap)
         self.image_id = image_id
@@ -274,7 +296,8 @@ class BoardImageItem(QGraphicsPixmapItem):
         self._resizing = False
         self._resize_start_scene = QPointF()
         self._resize_start_width = self._display_width
-        self._aspect_ratio = pixmap.width() / max(1, pixmap.height())
+        self._source_aspect_ratio = source_aspect_ratio or pixmap.width() / max(1, pixmap.height())
+        self._aspect_ratio = self._source_aspect_ratio
         self._pinned = False
         self._flipped = False
         self._grayscale = False
@@ -330,6 +353,10 @@ class BoardImageItem(QGraphicsPixmapItem):
         self._display_width = width
         self._display_height = width / max(0.001, self._aspect_ratio)
         self.setScale(self._display_width / max(1, pixmap.width()))
+        # Rounded thumbnail dimensions must not change the logical canvas
+        # geometry when higher-resolution pixels arrive.
+        pixel_ratio = pixmap.width() / max(1, pixmap.height())
+        self.setTransform(QTransform().scale(1, pixel_ratio / self._aspect_ratio))
         if sync_local_full_width:
             self._sync_local_full_width_from_display_width()
         if (
@@ -451,10 +478,10 @@ class BoardImageItem(QGraphicsPixmapItem):
     def source_pixmap(self) -> QPixmap:
         return QPixmap(self._source_pixmap)
 
-    def replace_source_pixmap(self, pixmap: QPixmap) -> bool:
+    def replace_source_pixmap(self, pixmap: QPixmap, *, allow_smaller: bool = False) -> bool:
         if pixmap.isNull():
             return False
-        if (
+        if not allow_smaller and (
             pixmap.width() * pixmap.height()
             < self._source_pixmap.width() * self._source_pixmap.height()
         ):
@@ -494,7 +521,10 @@ class BoardImageItem(QGraphicsPixmapItem):
             while len(self._display_variant_cache) > 4:
                 self._display_variant_cache.popitem(last=False)
         current_width = self._display_width
-        self._aspect_ratio = pixmap.width() / max(1, pixmap.height())
+        self._aspect_ratio = self._source_aspect_ratio
+        if self.is_local_display_enabled():
+            bounds = self._local_display['bounds']
+            self._aspect_ratio *= bounds['w'] / max(0.001, bounds['h'])
         self.setPixmap(pixmap)
         self.set_display_size(current_width, sync_local_full_width=False)
 
@@ -1294,6 +1324,7 @@ class BoardSectionItem(QGraphicsRectItem):
 
 
 class ProjectBoardView(QGraphicsView):
+    imageLoaded = Signal(int)
     imageDoubleClicked = Signal(int)
     imagePreviewRequested = Signal(int)
     selectionChanged = Signal(list)
@@ -1334,6 +1365,20 @@ class ProjectBoardView(QGraphicsView):
         self._board_badges = {}
         self._images_by_id: dict[int, ImageItem] = {}
         self._focus_quality_image_ids: set[int] = set()
+        self._image_generation = 0
+        self._pending_image_loads: set[tuple[int, int, int]] = set()
+        self._thumbnail_pixmaps: dict[int, QPixmap] = {}
+        self._loaded_image_sides: dict[int, int] = {}
+        self._failed_image_ids: set[int] = set()
+        self._pending_local_edit = None
+        self._image_loader = BoardImageLoader(self)
+        self._image_loader.loaded.connect(self._image_loaded)
+        self._quality_timer = QTimer(self)
+        self._quality_timer.setSingleShot(True)
+        self._quality_timer.setInterval(120)
+        self._quality_timer.timeout.connect(self._refresh_visible_quality)
+        self.horizontalScrollBar().valueChanged.connect(self._schedule_visible_quality)
+        self.verticalScrollBar().valueChanged.connect(self._schedule_visible_quality)
         self._title_item: QGraphicsTextItem | None = None
         self._zoom = 1.0
         self._space_pan_active = False
@@ -1390,6 +1435,13 @@ class ProjectBoardView(QGraphicsView):
         }
         self._board_title = title
         self._board_badges = normalized_badges
+        self._image_generation += 1
+        self._image_loader.reset()
+        self._pending_local_edit = None
+        self._pending_image_loads.clear()
+        self._thumbnail_pixmaps.clear()
+        self._loaded_image_sides.clear()
+        self._failed_image_ids.clear()
         self.setUpdatesEnabled(False)
         previous_scene_signal_state = self._scene.blockSignals(True)
         previous_selected_ids = list(self._selected_image_ids_cache)
@@ -1459,11 +1511,15 @@ class ProjectBoardView(QGraphicsView):
             placed_positions: set[tuple[int, int]] = set()
             for index, image in enumerate(images):
                 item_payload = stored_items.get(str(image.id), {})
-                pixmap = self._pixmap_for(
-                    image,
-                    prefer_source=False,
-                    max_side=MAX_BOARD_THUMBNAIL_SIDE,
-                )
+                pixmap = self._cached_thumbnail(image)
+                loaded = not pixmap.isNull()
+                if not loaded:
+                    # Metadata gives the final geometry immediately; decoding
+                    # must never block set_images or alter saved positions.
+                    size = QSize(max(1, image.width or 220), max(1, image.height or 160))
+                    size.scale(128, 128, Qt.AspectRatioMode.KeepAspectRatio)
+                    pixmap = QPixmap(size)
+                    pixmap.fill(theme_color('canvas'))
                 item_width, item_height = self._default_item_size(pixmap)
                 if default_x > DEFAULT_LAYOUT_LEFT and default_x + item_width > row_right:
                     default_x = DEFAULT_LAYOUT_LEFT
@@ -1492,6 +1548,11 @@ class ProjectBoardView(QGraphicsView):
                     normalized_badges.get(image.id, []),
                 )
                 self._apply_item_payload_state(image.id, item_payload)
+                if loaded:
+                    self._thumbnail_pixmaps[image.id] = pixmap
+                    self._loaded_image_sides[image.id] = MAX_BOARD_THUMBNAIL_SIDE
+                else:
+                    self._request_image(image.id, MAX_BOARD_THUMBNAIL_SIDE)
                 placed_positions.add((int(round(x)), int(round(y))))
                 row_height = max(row_height, item_height)
                 default_x += item_width + DEFAULT_LAYOUT_GAP_X
@@ -1529,6 +1590,123 @@ class ProjectBoardView(QGraphicsView):
             self.selectionChanged.emit([])
         if images:
             self._schedule_refit_current_view_mode()
+            self._schedule_visible_quality()
+
+    @staticmethod
+    def _cached_thumbnail(image):
+        for path in (image.thumbnail_path, image.file_path):
+            key = (path, image.modified_time_ns, image.file_size, MAX_BOARD_THUMBNAIL_SIDE)
+            cached = _BOARD_PIXMAP_CACHE.get(key)
+            if cached is not None:
+                _BOARD_PIXMAP_CACHE.move_to_end(key)
+                return QPixmap(cached)
+        return QPixmap()
+
+    def _request_image(self, image_id, side):
+        image = self._images_by_id.get(image_id)
+        if image is None:
+            return
+        token = (self._image_generation, image_id, side)
+        if token in self._pending_image_loads:
+            return
+        paths = (image.file_path, image.thumbnail_path) if side > MAX_BOARD_THUMBNAIL_SIDE else (image.thumbnail_path, image.file_path)
+        self._pending_image_loads.add(token)
+        self._image_loader.request(token, [str(p) for p in paths if p], side, urgent=side > MAX_BOARD_THUMBNAIL_SIDE)
+
+    def _image_loaded(self, token, image, path):
+        self._pending_image_loads.discard(token)
+        generation, iid, side = token
+        if generation != self._image_generation:
+            return
+        item = self._image_items.get(iid)
+        if not isinstance(item, BoardImageItem):
+            return
+        if image.isNull():
+            self._focus_quality_image_ids.discard(iid)
+            item.setToolTip(self._images_by_id[iid].file_path + '\n无法读取图片')
+            if iid not in self._failed_image_ids and iid not in self._thumbnail_pixmaps:
+                label = QGraphicsTextItem(self._images_by_id[iid].file_name, item)
+                item._unreadable_label = label
+                label.setDefaultTextColor(theme_color('text'))
+                label.setTextWidth(max(40, item.display_width - 18))
+                label.setScale(1 / max(.001, item.scale()))
+                label.setPos(9 / item.scale(), max(0, item.display_height / 2 - 20) / item.scale())
+            self._failed_image_ids.add(iid)
+            if self._pending_local_edit == (generation, iid):
+                self._pending_local_edit = None
+            return
+        pixmap = QPixmap.fromImage(image)
+        if side == MAX_BOARD_THUMBNAIL_SIDE:
+            self._thumbnail_pixmaps[iid] = pixmap
+            metadata = self._images_by_id[iid]
+            _store_cached_pixmap((path, metadata.modified_time_ns, metadata.file_size, side), pixmap)
+        elif self._pending_local_edit != (generation, iid) and (not self.isVisible() or not self._needs_focus_quality_upgrade_from_thumbnail(item)):
+            self._focus_quality_image_ids.discard(iid)
+            return
+        self._failed_image_ids.discard(iid)
+        label = getattr(item, '_unreadable_label', None)
+        if label is not None:
+            self._scene.removeItem(label)
+            item._unreadable_label = None
+        item.setToolTip(self._images_by_id[iid].file_path)
+        # Loading pixels is not a layout edit (nor an undo step).
+        previous = self._suppress_layout_changed
+        self._suppress_layout_changed = True
+        aspect_changed = False
+        try:
+            if side >= self._loaded_image_sides.get(iid, 0):
+                ratio = _image_aspect_ratio(self._images_by_id[iid], pixmap)
+                aspect_changed = abs(item._source_aspect_ratio - ratio) > 1e-9
+                item._source_aspect_ratio = ratio
+                item.replace_source_pixmap(pixmap, allow_smaller=True)
+                self._loaded_image_sides[iid] = side
+        finally:
+            self._suppress_layout_changed = previous
+        self._schedule_visible_quality()
+        if aspect_changed:
+            self._schedule_refit_current_view_mode()
+        self.imageLoaded.emit(iid)
+        if side > MAX_BOARD_THUMBNAIL_SIDE and self._pending_local_edit == (generation, iid):
+            self._pending_local_edit = None
+            if iid in self.selected_image_ids():
+                self._edit_local_display_item(item)
+
+    def _schedule_visible_quality(self, *_):
+        if hasattr(self, '_quality_timer'):
+            self._quality_timer.start()
+
+    def _needs_focus_quality_upgrade_from_thumbnail(self, item):
+        thumbnail = self._thumbnail_pixmaps.get(item.image_id)
+        if thumbnail is None:
+            return True
+        rendered = max(item.sceneBoundingRect().width(), item.sceneBoundingRect().height()) * self._zoom * self.devicePixelRatioF()
+        return rendered > max(thumbnail.width(), thumbnail.height()) * .92
+
+    def _refresh_visible_quality(self):
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        for iid, item in self._image_items.items():
+            if not isinstance(item, BoardImageItem):
+                continue
+            needs_high = iid not in self._failed_image_ids and self.isVisible() and item.isVisible() and visible.intersects(item.sceneBoundingRect()) and self._needs_focus_quality_upgrade_from_thumbnail(item)
+            if needs_high:
+                self._ensure_focus_quality_for_items([item], force=True)
+            elif iid in self._focus_quality_image_ids and iid in self._thumbnail_pixmaps:
+                self._focus_quality_image_ids.discard(iid)
+                previous = self._suppress_layout_changed
+                self._suppress_layout_changed = True
+                try:
+                    item.replace_source_pixmap(self._thumbnail_pixmaps[iid], allow_smaller=True)
+                    self._loaded_image_sides[iid] = MAX_BOARD_THUMBNAIL_SIDE
+                finally:
+                    self._suppress_layout_changed = previous
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._refresh_visible_quality()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._schedule_visible_quality()
 
     def fit_all_images(self) -> None:
         self._view_mode = "fit_all"
@@ -1580,8 +1758,7 @@ class ProjectBoardView(QGraphicsView):
         selected = [item for item in self._selected_image_items() if isinstance(item, BoardImageItem)]
         if not selected:
             return False
-        self._ensure_focus_quality_for_items([selected[0]], force=True)
-        return self._edit_local_display_item(selected[0])
+        return self._edit_local_display_for_image(selected[0].image_id)
 
     def toggle_selected_local_display(self) -> int:
         changed = 0
@@ -1825,6 +2002,7 @@ class ProjectBoardView(QGraphicsView):
         self._view_mode = "manual"
         self._last_fit_selection_ids = ()
         self.centerOn(BOARD_WIDTH / 2, BOARD_HEIGHT / 2)
+        self._schedule_visible_quality()
 
     def wheelEvent(self, event) -> None:
         modifiers = event.modifiers()
@@ -2235,6 +2413,7 @@ class ProjectBoardView(QGraphicsView):
         self.setTransformationAnchor(anchor)
         self._view_mode = "manual"
         self._zoom = next_zoom
+        self._schedule_visible_quality()
 
     def _fit_selected_items(self, items: list[QGraphicsItem]) -> None:
         if not items:
@@ -2347,6 +2526,7 @@ class ProjectBoardView(QGraphicsView):
                 file_path=image.file_path,
                 badges=badges,
                 on_layout_changed=self._schedule_layout_changed,
+                source_aspect_ratio=_image_aspect_ratio(image, pixmap),
             )
             item.set_display_size(width, height)
         item.setPos(x, y)
@@ -2409,8 +2589,12 @@ class ProjectBoardView(QGraphicsView):
         item = self._image_items.get(image_id)
         if not isinstance(item, BoardImageItem):
             return False
+        token = (self._image_generation, image_id, MAX_BOARD_FOCUS_PIXMAP_SIDE)
+        if image_id in self._focus_quality_image_ids and token not in self._pending_image_loads:
+            return self._edit_local_display_item(item)
+        self._pending_local_edit = (self._image_generation, image_id)
         self._ensure_focus_quality_for_items([item], force=True)
-        return self._edit_local_display_item(item)
+        return True
 
     def _edit_local_display_item(self, item: BoardImageItem) -> bool:
         source_pixmap = item.source_pixmap()
@@ -2446,14 +2630,7 @@ class ProjectBoardView(QGraphicsView):
             image = self._images_by_id.get(image_id)
             if image is None:
                 continue
-            pixmap = self._pixmap_for(
-                image,
-                prefer_source=True,
-                max_side=MAX_BOARD_FOCUS_PIXMAP_SIDE,
-            )
-            if pixmap.isNull():
-                continue
-            item.replace_source_pixmap(pixmap)
+            self._request_image(image_id, MAX_BOARD_FOCUS_PIXMAP_SIDE)
 
     @staticmethod
     def _needs_focus_quality_upgrade(item: BoardImageItem, target_zoom: float) -> bool:
@@ -2486,6 +2663,7 @@ class ProjectBoardView(QGraphicsView):
         self.scale(next_zoom, next_zoom)
         self._zoom = next_zoom
         self.centerOn(rect.center())
+        self._schedule_visible_quality()
 
     def _fit_target_for_items(self, items: list[QGraphicsItem], *, margin: float) -> tuple[float, QRectF] | None:
         if not items:

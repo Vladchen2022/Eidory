@@ -77,6 +77,32 @@ class MainWindowContextMenuTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        self._test_windows = []
+        initialize = MainWindow.__init__
+        def tracked_initialize(window, *args, **kwargs):
+            initialize(window, *args, **kwargs)
+            self._test_windows.append(window)
+        tracker = patch.object(MainWindow, '__init__', tracked_initialize)
+        tracker.start()
+        self.addCleanup(tracker.stop)
+        self.addCleanup(self._close_test_windows)
+
+    def _close_test_windows(self):
+        # Close even after a failed assertion. A live watcher must not be
+        # garbage-collected while a subsequent test constructs its window.
+        for window in self._test_windows:
+            window.close()
+        deadline = time.monotonic() + 5
+        while any(not w._shutdown_ready for w in self._test_windows) and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(.005)
+        self.assertTrue(all(w._shutdown_ready for w in self._test_windows))
+        # Match the shared pytest window fixture's PySide item-wrapper lifetime.
+        if not hasattr(self.app, '_context_test_windows'):
+            self.app._context_test_windows = []
+        self.app._context_test_windows.extend(self._test_windows)
+
     def _adopt_suggestions(self, window):
         # These legacy cases verify the contents after the user adopts a suggestion.
         # Staging and non-mutation are independently covered in test_creative_workspace.

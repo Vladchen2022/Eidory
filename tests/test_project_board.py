@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QUrl
+from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QUrl, QTimer
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QGraphicsScene
@@ -23,8 +23,37 @@ class ProjectBoardViewTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_space_toggle_restores_fit_all_not_previous_manual_view(self) -> None:
+    def setUp(self) -> None:
+        self._boards = []
+
+    def _board(self):
         board = ProjectBoardView()
+        self._boards.append(board)
+        return board
+
+    def tearDown(self) -> None:
+        # Standalone test views need the same decoder drain as MainWindow.close.
+        # Retain Qt item wrappers until QApplication exits, as the shared window
+        # fixture does; deleting them mid-suite is unsafe with PySide 6.11.
+        for board in self._boards:
+            board._image_loader.stop()
+            for timer in board.findChildren(QTimer):
+                timer.stop()
+            self.assertTrue(board._image_loader.pool.waitForDone(3000))
+            board.close()
+        if not hasattr(self.app, '_board_test_views'):
+            self.app._board_test_views = []
+        self.app._board_test_views.extend(self._boards)
+        self.app.processEvents()
+
+    def wait_for_images(self, board):
+        deadline = time.monotonic() + 5
+        while board._pending_image_loads and time.monotonic() < deadline:
+            QTest.qWait(2)
+        self.assertFalse(board._pending_image_loads)
+
+    def test_space_toggle_restores_fit_all_not_previous_manual_view(self) -> None:
+        board = self._board()
         board.resize(900, 700)
         board.set_images([self._image(1), self._image(2)])
 
@@ -53,7 +82,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             pixmap.fill(QColor("#667788"))
             self.assertTrue(pixmap.save(str(image_path)))
 
-            board = ProjectBoardView()
+            board = self._board()
             board.resize(2400, 900)
             board.show()
             self.app.processEvents()
@@ -80,7 +109,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             self.assertTrue(source.save(str(source_path)))
             self.assertTrue(thumbnail.save(str(thumbnail_path)))
 
-            board = ProjectBoardView()
+            board = self._board()
             board.resize(1200, 800)
             board.show()
             self.app.processEvents()
@@ -97,11 +126,13 @@ class ProjectBoardViewTest(unittest.TestCase):
             )
             item = board._image_items[1]
             self.assertIsInstance(item, BoardImageItem)
+            self.wait_for_images(board)
             self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 180)
 
             board._select_image_id(1)
             board.toggle_fit_selection_or_restore()
 
+            self.wait_for_images(board)
             self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 1800)
             self.assertEqual(board._view_mode, "fit_selection")
 
@@ -116,7 +147,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             self.assertTrue(source.save(str(source_path)))
             self.assertTrue(thumbnail.save(str(thumbnail_path)))
 
-            board = ProjectBoardView()
+            board = self._board()
             board.resize(1200, 800)
             board.show()
             self.app.processEvents()
@@ -133,6 +164,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             )
             item = board._image_items[1]
             self.assertIsInstance(item, BoardImageItem)
+            self.wait_for_images(board)
             self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 560)
 
             board._select_image_id(1)
@@ -142,6 +174,7 @@ class ProjectBoardViewTest(unittest.TestCase):
 
             board.toggle_fit_selection_or_restore()
 
+            self.wait_for_images(board)
             self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 1800)
 
     def test_default_board_layout_uses_item_edges_to_avoid_overlap(self) -> None:
@@ -154,7 +187,7 @@ class ProjectBoardViewTest(unittest.TestCase):
                 self.assertTrue(pixmap.save(str(image_path)))
                 images.append(self._image(image_id, file_path=str(image_path), width=1200, height=300))
 
-            board = ProjectBoardView()
+            board = self._board()
             board.resize(1400, 900)
             board.show()
             self.app.processEvents()
@@ -175,7 +208,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             pixmap.fill(QColor("#334455"))
             self.assertTrue(pixmap.save(str(image_path)))
 
-            board = ProjectBoardView()
+            board = self._board()
             board.set_images(
                 [self._image(1, file_path=str(image_path), width=320, height=180)],
                 badges_by_image_id={1: ["世界观", "地点"]},
@@ -192,7 +225,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             self.assertTrue(pixmap.save(str(image_path)))
 
             image = self._image(1, file_path=str(image_path), width=320, height=180)
-            board = ProjectBoardView()
+            board = self._board()
             board.set_images([image])
             item = board._image_items[1]
             item.setPos(210, 320)
@@ -204,7 +237,7 @@ class ProjectBoardViewTest(unittest.TestCase):
 
             payload = board.layout_payload()
 
-            restored = ProjectBoardView()
+            restored = self._board()
             restored.set_images([image], layout_payload=payload)
             restored_item = restored._image_items[1]
             self.assertEqual(restored_item.pos().x(), 210)
@@ -223,7 +256,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             self.assertTrue(pixmap.save(str(image_path)))
 
             image = self._image(1, file_path=str(image_path), width=400, height=300)
-            board = ProjectBoardView()
+            board = self._board()
             board.set_images([image])
             item = board._image_items[1]
             self.assertIsInstance(item, BoardImageItem)
@@ -237,7 +270,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             )
 
             payload = board.layout_payload()
-            restored = ProjectBoardView()
+            restored = self._board()
             restored.set_images([image], layout_payload=payload)
             restored_item = restored._image_items[1]
             local_payload = getattr(restored_item, "local_display_payload")()
@@ -255,7 +288,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             self.assertTrue(pixmap.save(str(image_path)))
 
             image = self._image(1, file_path=str(image_path), width=400, height=300)
-            board = ProjectBoardView()
+            board = self._board()
             board.set_images([image])
             item = board._image_items[1]
             self.assertIsInstance(item, BoardImageItem)
@@ -284,7 +317,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             self.assertTrue(pixmap.save(str(image_path)))
 
             image = self._image(1, file_path=str(image_path), width=400, height=300)
-            board = ProjectBoardView()
+            board = self._board()
             board.set_images([image])
             board._select_image_id(1)
             self.assertFalse(board.selected_has_local_display())
@@ -342,7 +375,7 @@ class ProjectBoardViewTest(unittest.TestCase):
         self.assertGreater(blue_pixels, 120)
 
     def test_delete_key_requests_selected_image_removal(self) -> None:
-        board = ProjectBoardView()
+        board = self._board()
         board.set_images([self._image(1), self._image(2)])
         emitted: list[list[int]] = []
         board.removeImagesRequested.connect(lambda image_ids: emitted.append(list(image_ids)))
@@ -359,7 +392,7 @@ class ProjectBoardViewTest(unittest.TestCase):
         self.assertTrue(event.isAccepted())
 
     def test_context_menu_can_request_preview_for_board_image(self) -> None:
-        board = ProjectBoardView()
+        board = self._board()
         board.resize(900, 700)
         board.set_images([self._image(1)])
         board.show()
@@ -424,7 +457,7 @@ class ProjectBoardViewTest(unittest.TestCase):
         self.assertNotIn("清除局部展示", menu_texts)
 
     def test_select_image_emits_selection_changed(self) -> None:
-        board = ProjectBoardView()
+        board = self._board()
         board.set_images([self._image(1), self._image(2)])
         emitted: list[list[int]] = []
         board.selectionChanged.connect(lambda image_ids: emitted.append(list(image_ids)))
@@ -434,7 +467,7 @@ class ProjectBoardViewTest(unittest.TestCase):
         self.assertEqual(emitted, [[2]])
 
     def test_select_image_uses_cached_selection_without_scene_scan(self) -> None:
-        board = ProjectBoardView()
+        board = self._board()
         board.set_images([self._image(1), self._image(2)])
         emitted: list[list[int]] = []
         board.selectionChanged.connect(lambda image_ids: emitted.append(list(image_ids)))
@@ -446,7 +479,7 @@ class ProjectBoardViewTest(unittest.TestCase):
         self.assertEqual(emitted, [[2]])
 
     def test_select_image_does_not_emit_layout_changed(self) -> None:
-        board = ProjectBoardView()
+        board = self._board()
         board.set_images([self._image(1), self._image(2)])
         self.app.processEvents()
         emitted: list[bool] = []
@@ -463,7 +496,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             pixmap = QPixmap(320, 180)
             pixmap.fill(QColor("#334455"))
             self.assertTrue(pixmap.save(str(image_path)))
-            board = ProjectBoardView()
+            board = self._board()
             board.set_images([self._image(1, file_path=str(image_path), width=320, height=180)])
             self.app.processEvents()
             emitted: list[bool] = []
@@ -482,7 +515,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             pixmap = QPixmap(320, 180)
             pixmap.fill(QColor("#334455"))
             self.assertTrue(pixmap.save(str(image_path)))
-            board = ProjectBoardView()
+            board = self._board()
             board.set_images([self._image(1, file_path=str(image_path), width=320, height=180)])
             self.app.processEvents()
             emitted: list[bool] = []
@@ -502,7 +535,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             pixmap = QPixmap(320, 180)
             pixmap.fill(QColor("#334455"))
             self.assertTrue(pixmap.save(str(image_path)))
-            board = ProjectBoardView()
+            board = self._board()
             board.set_images([self._image(1, file_path=str(image_path), width=320, height=180)])
             self.app.processEvents()
             emitted: list[bool] = []
@@ -516,7 +549,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             self.assertFalse(board.flush_pending_layout_change())
 
     def test_undo_shortcut_requests_board_removal_undo(self) -> None:
-        board = ProjectBoardView()
+        board = self._board()
         emitted: list[bool] = []
         board.undoRemovalRequested.connect(lambda: emitted.append(True))
 
@@ -598,7 +631,7 @@ class ProjectBoardViewTest(unittest.TestCase):
         self.assertEqual(notifications, ["changed"])
 
     def test_board_view_batches_layout_notifications_for_multi_item_drag(self) -> None:
-        board = ProjectBoardView()
+        board = self._board()
         board.set_images([self._image(1), self._image(2)])
         notifications: list[str] = []
         board.layoutChanged.connect(lambda: notifications.append("changed"))
@@ -621,7 +654,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             pixmap = QPixmap(640, 360)
             pixmap.fill(QColor("#445566"))
             self.assertTrue(pixmap.save(str(image_path)))
-            board = ProjectBoardView()
+            board = self._board()
             board.resize(1000, 760)
             board.show()
             self.app.processEvents()

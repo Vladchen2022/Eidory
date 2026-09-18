@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import html as html_lib
 import json
@@ -1629,6 +1630,13 @@ class MainWindow(QMainWindow):
         self._creative_node_note_in_progress = False
         self._background_threads: set[threading.Thread] = set()
         self._background_threads_lock = threading.Lock()
+        self._background_futures = set()
+        self._latest_search_future = None
+        self._event_poll_pending = False
+        self._background_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix='Eidory-background')
+        self._interactive_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='Eidory-search')
+        self._closing = False
+        self._shutdown_ready = False
         self._near_duplicate_hash_records_cache: list[ImageDHashRecord] | None = None
         self._near_duplicate_hash_records_cache_count: int | None = None
         self._near_duplicate_job_counter = 0
@@ -1646,6 +1654,7 @@ class MainWindow(QMainWindow):
         self._file_watch_thread = QThread(self)
         self._file_watch_worker = _FileWatchWorker()
         self._file_watch_worker.moveToThread(self._file_watch_thread)
+        self._file_watch_thread.finished.connect(self._file_watch_worker.deleteLater)
         self._file_watch_configure_requested.connect(
             self._file_watch_worker.configure,
             Qt.ConnectionType.QueuedConnection,
@@ -1742,7 +1751,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1200, self._run_startup_self_check)
 
         self.poll_timer = QTimer(self)
-        self.poll_timer.timeout.connect(self._poll_events)
+        self.poll_timer.timeout.connect(lambda: self._poll_events(time_budget_ms=12))
         self.poll_timer.start(250)
 
     def showEvent(self, event) -> None:
@@ -1877,6 +1886,13 @@ class MainWindow(QMainWindow):
         return True
 
     def closeEvent(self, event) -> None:
+        if self._shutdown_ready:
+            super().closeEvent(event)
+            return
+        if self._closing:
+            event.ignore()
+            return
+        self._closing = True
         if hasattr(self, "filter_workflow"):
             self.filter_workflow.cancel_strength()
         if hasattr(self, "poll_timer"):
@@ -1909,11 +1925,20 @@ class MainWindow(QMainWindow):
         self._clear_last_removal_undo(cleanup_backups=True)
         self._database_maintenance_active = True
         self._stop_file_watcher_for_maintenance()
-        self._stop_index_workers_for_maintenance(timeout_seconds=2.0)
-        self._wait_for_background_tasks(timeout_seconds=2.0)
+        for worker in (self.embedding_worker, self.ai_vision_worker, self.ai_character_vision_worker):
+            if worker is not None:
+                worker.stop()
+        if hasattr(self.search_service, 'stop'):
+            self.search_service.stop()
+        self.project_board_view._image_loader.stop()
+        self.project_board_view._pending_image_loads.clear()
+        # Already accepted writes finish; neither threads nor DB transactions are
+        # terminated. Wait through the event loop instead of freezing the window.
+        self._background_executor.shutdown(wait=False)
+        self._interactive_executor.shutdown(wait=False)
         if hasattr(self, "_file_watch_thread"):
             self._file_watch_thread.quit()
-            self._file_watch_thread.wait(1500)
+            self._file_watch_thread.wait(30)
         if getattr(self, "video_player", None) is not None:
             self.video_player.stop()
         if hasattr(self, "root_splitter"):
@@ -1924,7 +1949,49 @@ class MainWindow(QMainWindow):
         size = self.size()
         self.store.set_setting("ui.window_width", str(size.width()))
         self.store.set_setting("ui.window_height", str(size.height()))
-        super().closeEvent(event)
+        for timer in self.findChildren(QTimer):
+            timer.stop()
+        for pool in self.findChildren(QThreadPool):
+            pool.clear()
+        if self._shutdown_idle():
+            self._shutdown_ready = True
+            super().closeEvent(event)
+            return
+        event.ignore()
+        self.setEnabled(False)
+        self.statusBar().showMessage('正在保存并等待后台任务安全结束…')
+        # Retain the window even if a caller drops its Python reference after
+        # close(). QThread must never die with the QObject parent still running.
+        app = QApplication.instance()
+        if not hasattr(app, '_eidory_closing_windows'):
+            app._eidory_closing_windows = []
+        app._eidory_closing_windows.append(self)
+        self._shutdown_timer = QTimer(self)
+        self._shutdown_timer.setInterval(50)
+        self._shutdown_timer.timeout.connect(self._finish_shutdown)
+        self._shutdown_timer.start()
+
+    def _shutdown_idle(self) -> bool:
+        with self._background_threads_lock:
+            if self._background_threads or any(not f.done() for f in self._background_futures):
+                return False
+        if self._file_watch_thread.isRunning():
+            return False
+        if any(w is not None and w.is_alive() for w in (self.embedding_worker, self.ai_vision_worker, self.ai_character_vision_worker)):
+            return False
+        if hasattr(self.search_service, 'background_running') and self.search_service.background_running():
+            return False
+        return not any(pool.activeThreadCount() for pool in self.findChildren(QThreadPool))
+
+    def _finish_shutdown(self):
+        if not self._shutdown_idle():
+            return
+        self._shutdown_timer.stop()
+        self._shutdown_ready = True
+        self.close()
+        windows = getattr(QApplication.instance(), '_eidory_closing_windows', [])
+        if self in windows:
+            windows.remove(self)
 
     def _start_background_task(
         self,
@@ -1943,16 +2010,28 @@ class MainWindow(QMainWindow):
 
         def run_and_unregister() -> None:
             thread = threading.current_thread()
+            with self._background_threads_lock:
+                self._background_threads.add(thread)
             try:
                 target()
+            except Exception as exc:
+                self.events.put(('error', f'后台任务 {name} 失败：{exc}'))
             finally:
                 with self._background_threads_lock:
                     self._background_threads.discard(thread)
 
-        thread = threading.Thread(target=run_and_unregister, daemon=True, name=f"Eidory-{name}")
+        executor = self._interactive_executor if name.startswith('search') else self._background_executor
+        if name == 'search' and self._latest_search_future is not None:
+            self._latest_search_future.cancel()  # Only queued, superseded reads.
+        future = executor.submit(run_and_unregister)
+        if name == 'search':
+            self._latest_search_future = future
         with self._background_threads_lock:
-            self._background_threads.add(thread)
-        thread.start()
+            self._background_futures.add(future)
+        def completed(done):
+            with self._background_threads_lock:
+                self._background_futures.discard(done)
+        future.add_done_callback(completed)
         return True
 
     def _wait_for_background_tasks(self, *, timeout_seconds: float) -> bool:
@@ -1960,7 +2039,8 @@ class MainWindow(QMainWindow):
         while True:
             with self._background_threads_lock:
                 threads = [thread for thread in self._background_threads if thread.is_alive()]
-            if not threads:
+                pending = any(not f.done() for f in self._background_futures)
+            if not threads and not pending:
                 return True
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1968,6 +2048,8 @@ class MainWindow(QMainWindow):
                 return False
             for thread in threads:
                 thread.join(timeout=min(0.25, remaining))
+            if not threads:
+                time.sleep(min(0.01, remaining))
 
     def _stop_index_workers_for_maintenance(self, *, timeout_seconds: float) -> bool:
         workers = [
@@ -4237,7 +4319,10 @@ class MainWindow(QMainWindow):
         self.error_log_messages = self.error_log_messages[-200:]
         try:
             self.paths.log_dir.mkdir(parents=True, exist_ok=True)
-            with (self.paths.log_dir / "eidory-ui.log").open("a", encoding="utf-8") as handle:
+            path = self.paths.log_dir / 'eidory-ui.log'
+            if path.exists() and path.stat().st_size > 2*1024*1024:
+                path.replace(path.with_suffix('.previous.log'))
+            with path.open("a", encoding="utf-8") as handle:
                 handle.write(entry + "\n")
         except Exception:
             pass
@@ -6108,6 +6193,7 @@ class MainWindow(QMainWindow):
 
         self._start_background_task(
             run,
+            name="search",
             on_rejected=self._restore_search_task_controls,
         )
 
@@ -6731,6 +6817,8 @@ class MainWindow(QMainWindow):
         self._refresh_filter_chain_ui()
 
         def run() -> None:
+            if self._closing or revision != self.semantic_search_revision:
+                return
             try:
                 result = self._compute_search_chain(
                     filters=filters,
@@ -6752,6 +6840,7 @@ class MainWindow(QMainWindow):
 
         self._start_background_task(
             run,
+            name="search",
             on_rejected=self._restore_search_task_controls,
         )
 
@@ -10943,6 +11032,8 @@ class MainWindow(QMainWindow):
         self.note_auto_save_timer.start()
 
     def _save_pending_note(self) -> None:
+        if hasattr(self, 'creative_flow'):
+            self.creative_flow.board_inspector.flush_note()
         image_id = self._pending_note_image_id
         note_text = self._pending_note_text
         if image_id is None or note_text is None:
@@ -13275,10 +13366,13 @@ class MainWindow(QMainWindow):
         if not self.ai_vision_stats_refresh_timer.isActive():
             self.ai_vision_stats_refresh_timer.start()
 
-    def _poll_events(self) -> None:
+    def _poll_events(self, *, time_budget_ms: float | None = None) -> None:
+        if self._closing:
+            return
         processed = 0
         max_events_per_tick = 80
-        while processed < max_events_per_tick:
+        deadline = time.monotonic() + time_budget_ms / 1000 if time_budget_ms is not None else float('inf')
+        while processed < max_events_per_tick and time.monotonic() < deadline:
             try:
                 kind, payload = self.events.get_nowait()
             except queue.Empty:
@@ -13563,8 +13657,13 @@ class MainWindow(QMainWindow):
                     self._pending_board_import_node_id = None
                 QMessageBox.critical(self, "Eidory", str(payload))
                 self._run_pending_score_threshold_recompute()
-        if processed >= max_events_per_tick and not self.events.empty():
-            QTimer.singleShot(0, self._poll_events)
+        if not self.events.empty() and not self._event_poll_pending:
+            self._event_poll_pending = True
+            QTimer.singleShot(8, self._continue_poll_events)
+
+    def _continue_poll_events(self):
+        self._event_poll_pending = False
+        self._poll_events(time_budget_ms=12)
 
     def _handle_scan_done(self, result: ScanResult) -> None:
         self._set_import_controls_enabled(True)
@@ -17043,6 +17142,8 @@ class MainWindow(QMainWindow):
             self._open_image_preview(image)
 
     def _remove_images_from_current_board(self, image_ids: list[int]) -> None:
+        if hasattr(self, 'creative_flow'):
+            self.creative_flow.board_inspector.flush_note()
         if self.center_result_stack.currentWidget() is not self.project_board_view:
             return
         clean_ids = [int(image_id) for image_id in image_ids if int(image_id) > 0]

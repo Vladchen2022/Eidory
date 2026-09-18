@@ -40,6 +40,7 @@ def test_board_has_inline_inspector_and_grade_changes_preserve_selection_geometr
     assert w.creative_flow.tray.isVisible() is False
     inspector.purpose.setCurrentIndex(inspector.purpose.findData('造型'))
     inspector.note.setPlainText('只参考轮廓')
+    QTest.qWait(350)
     assert w.workflow_upgrade.state.decision(a.id, iid)['purpose'] == '造型'
     assert w.creative_workspace.store.reference_note(a.id, iid) == '只参考轮廓'
     w._save_current_board_layout_if_needed(force=True)

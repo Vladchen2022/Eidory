@@ -6,6 +6,7 @@ stores and commands as the library, structured editor and board.
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import wraps
 import json
 from weakref import ref
 
@@ -50,6 +51,20 @@ def clear_layout(layout):
             item.widget().deleteLater()
         elif item.layout():
             clear_layout(item.layout())
+
+
+def batch_navigation_refresh(method):
+    """Refresh the final page once after synchronous navigation signals settle."""
+    @wraps(method)
+    def navigate(self, *args, **kwargs):
+        self._refresh_batch_depth = getattr(self, '_refresh_batch_depth', 0) + 1
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._refresh_batch_depth -= 1
+            if not self._refresh_batch_depth:
+                self.refresh()
+    return navigate
 
 
 class CreativeFlow(QObject):
@@ -392,6 +407,7 @@ class CreativeFlow(QObject):
         side.insertWidget(side.indexOf(ui.reference_bar), self.grade_bar)
         ui.status.hide()
 
+    @batch_navigation_refresh
     def show_planning(self):
         w = self.w
         w._save_current_board_layout_if_needed()
@@ -408,6 +424,7 @@ class CreativeFlow(QObject):
         self.cw.refresh()
         w.statusBar().showMessage('构思 · ' + self.cw.context_label.text())
 
+    @batch_navigation_refresh
     def show_overview(self):
         self.w.workflow_upgrade.flush()
         self.w._set_ai_workflow_mode('project')
@@ -744,6 +761,7 @@ class CreativeFlow(QObject):
             self.w._refresh_after_creative_node_images_changed(node)
             self.refresh()
 
+    @batch_navigation_refresh
     def show_project_board(self):
         root = self.w.store.creative_root_node_id(self.w.current_creative_project_id) if self.w.current_creative_project_id else None
         if root:
@@ -895,7 +913,7 @@ class CreativeFlow(QObject):
             self.cw.collect_button.setEnabled(False)
 
     def refresh(self, *_args):
-        if self.refreshing:
+        if self.refreshing or getattr(self, '_refresh_batch_depth', 0):
             return
         self.refreshing = True
         try:
@@ -925,6 +943,8 @@ class CreativeFlow(QObject):
                 if not self._on_board and w.current_creative_project_id:
                     w.right_tab_widget.setCurrentIndex(self.reference_index)
             self._on_board = is_board
+            if not is_board:
+                self.board_inspector.flush_note()
             is_search = (is_gallery and w.current_result_mode != 'creative_node') or w.center_result_stack.currentWidget() is self.search_empty
             self.overview_button.setEnabled(bool(w.current_creative_project_id))
             cw.collected_button.hide()
@@ -940,6 +960,12 @@ class CreativeFlow(QObject):
                     self.refresh_cards()
                 else:
                     self.refresh_recent()
+            if is_board:
+                self.target_area.hide()
+                self.search_notice.hide()
+                for widget in (w.shuffle_results_button, w.save_result_set_button, w.thumbnail_size_label, w.thumbnail_size_slider):
+                    widget.hide()
+                return
             self.refresh_editor(node, state)
             self.target_area.setVisible(bool(node and is_search))
             self.search_notice.setVisible(bool(node and is_search))

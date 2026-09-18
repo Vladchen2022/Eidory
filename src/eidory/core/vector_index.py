@@ -25,25 +25,32 @@ class VectorIndex:
         self._id_to_index: dict[int, int] = {}
         self._dirty = True
         self._lock = threading.RLock()
+        self._updates: dict[int, np.ndarray] = {}
+        self._removed: set[int] = set()
 
     def invalidate(self) -> None:
         with self._lock:
             self._dirty = True
 
     def reload(self) -> None:
-        image_ids, matrix = self.store.embeddings_for_model(
-            model_name=self.model_name,
-            model_revision=self.model_revision,
-            embedding_dim=self.embedding_dim,
-        )
-        matrix = _normalize_matrix(matrix)
+        # Serialize publication with upsert/invalidate. An indexer may commit
+        # during the DB read; its following upsert must not be lost on publish.
         with self._lock:
+            image_ids, matrix = self.store.embeddings_for_model(
+                model_name=self.model_name,
+                model_revision=self.model_revision,
+                embedding_dim=self.embedding_dim,
+            )
+            matrix = _normalize_matrix(matrix)
+            matrix.flags.writeable = False
             self._image_ids = image_ids
             self._matrix = matrix
             self._id_to_index = {
                 int(image_id): index
                 for index, image_id in enumerate(image_ids)
             }
+            self._updates.clear()
+            self._removed.clear()
             self._dirty = False
 
     def upsert(self, image_id: int, vector: np.ndarray) -> None:
@@ -51,18 +58,31 @@ class VectorIndex:
         with self._lock:
             if self._dirty:
                 return
-            existing_index = self._id_to_index.get(int(image_id))
-            if existing_index is None:
-                self._dirty = True
-            else:
-                self._matrix[existing_index] = vector
+            self._updates[int(image_id)] = vector
+            self._removed.discard(int(image_id))
+            if len(self._updates) + len(self._removed) >= 256:
+                self._compact_updates()
 
     def remove(self, image_id: int) -> None:
         with self._lock:
-            index = self._id_to_index.get(int(image_id))
-            if index is None:
-                return
-            self._dirty = True
+            self._updates.pop(int(image_id), None)
+            self._removed.add(int(image_id))
+            if len(self._updates) + len(self._removed) >= 256:
+                self._compact_updates()
+
+    def _compact_updates(self) -> None:
+        """Publish a new immutable snapshot without rereading the database."""
+        ids = sorted((set(self._id_to_index) | set(self._updates)) - self._removed)
+        matrix = np.empty((len(ids), self.embedding_dim), dtype=np.float32)
+        for row, image_id in enumerate(ids):
+            vector = self._updates.get(image_id)
+            matrix[row] = vector if vector is not None else self._matrix[self._id_to_index[image_id]]
+        matrix.flags.writeable = False
+        self._image_ids = np.asarray(ids, dtype=np.int64)
+        self._matrix = matrix
+        self._id_to_index = {image_id: row for row, image_id in enumerate(ids)}
+        self._updates.clear()
+        self._removed.clear()
 
     def search(
         self,
@@ -72,11 +92,6 @@ class VectorIndex:
     ) -> list[tuple[int, float]]:
         if top_k <= 0:
             return []
-        with self._lock:
-            dirty = self._dirty
-        if dirty:
-            self.reload()
-
         query = np.asarray(query_vector, dtype=np.float32)
         if query.ndim != 1:
             raise ValueError("query vector must be one-dimensional")
@@ -90,39 +105,46 @@ class VectorIndex:
         query = query / query_norm
 
         with self._lock:
+            if self._dirty:
+                self.reload()
             image_ids = self._image_ids
             matrix = self._matrix
-            id_to_index = dict(self._id_to_index)
-        if matrix.shape[0] == 0:
-            return []
-        scores = matrix @ query
+            id_to_index = self._id_to_index
+            updates = dict(self._updates)
+            removed = set(self._removed)
 
         if allowed_image_ids is None:
-            candidate_indexes = np.arange(matrix.shape[0])
+            candidate_ids = [int(i) for i in image_ids if i not in removed]
+            candidate_ids.extend(i for i in updates if i not in id_to_index)
+            if updates:
+                candidate_ids.sort()
         else:
-            if not allowed_image_ids:
-                return []
-            candidate_indexes = np.fromiter(
-                (
-                    index
-                    for image_id in allowed_image_ids
-                    if (index := id_to_index.get(int(image_id))) is not None
-                ),
-                dtype=np.int64,
-            )
-            if candidate_indexes.shape[0] == 0:
-                return []
+            candidate_ids = [int(i) for i in allowed_image_ids
+                             if i not in removed and (i in id_to_index or i in updates)]
+        if not candidate_ids:
+            return []
+        indexes = np.asarray([id_to_index.get(i, -1) for i in candidate_ids], dtype=np.int64)
+        in_base = indexes >= 0
+        candidate_scores = np.empty(len(candidate_ids), dtype=np.float32)
+        # Small node/folder scopes need not multiply the entire library matrix.
+        if len(candidate_ids) < matrix.shape[0] // 4:
+            candidate_scores[in_base] = matrix[indexes[in_base]] @ query
+        else:
+            scores = matrix @ query
+            candidate_scores[in_base] = scores[indexes[in_base]]
+        if updates:
+            positions = [j for j, i in enumerate(candidate_ids) if i in updates]
+            if positions:
+                candidate_scores[positions] = np.vstack([updates[candidate_ids[j]] for j in positions]) @ query
 
-        k = min(top_k, candidate_indexes.shape[0])
-        candidate_scores = scores[candidate_indexes]
+        k = min(top_k, len(candidate_ids))
         if k == candidate_scores.shape[0]:
-            order = candidate_indexes[np.argsort(-candidate_scores)]
+            order = np.argsort(-candidate_scores)
         else:
             local_candidates = np.argpartition(-candidate_scores, k - 1)[:k]
-            ordered_local = local_candidates[np.argsort(-candidate_scores[local_candidates])]
-            order = candidate_indexes[ordered_local]
+            order = local_candidates[np.argsort(-candidate_scores[local_candidates])]
         return [
-            (int(image_ids[index]), float(scores[index]))
+            (candidate_ids[index], float(candidate_scores[index]))
             for index in order
         ]
 

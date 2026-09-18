@@ -50,6 +50,35 @@ class SearchService:
         self._color_generation_lock = threading.Lock()
         self._color_generation_queue: OrderedDict[int, ImageItem] = OrderedDict()
         self._color_generation_running = False
+        self._color_generation_worker: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._query_lock = threading.Lock()
+        self._query_vectors: OrderedDict[tuple, np.ndarray] = OrderedDict()
+
+    def _encode_query(self, query: str) -> np.ndarray:
+        provider = self.embedding_provider
+        key = (id(provider), provider.model_name, provider.model_revision, provider.dim, query)
+        # Providers already serialize model inference. Coalesce duplicate requests
+        # and retain only a small, model-specific text cache (never image results).
+        with self._query_lock:
+            vector = self._query_vectors.get(key)
+            if vector is None:
+                vector = np.asarray(provider.encode_text(query), dtype=np.float32).copy()
+                self._query_vectors[key] = vector
+                while len(self._query_vectors) > 128:
+                    self._query_vectors.popitem(last=False)
+            else:
+                self._query_vectors.move_to_end(key)
+            return vector.copy()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        with self._color_generation_lock:
+            self._color_generation_queue.clear()
+
+    def background_running(self) -> bool:
+        worker = self._color_generation_worker
+        return worker is not None and worker.is_alive()
 
     def keyword_search(
         self,
@@ -129,7 +158,7 @@ class SearchService:
                 candidate_limit=0,
             )
 
-        query_vector = self.embedding_provider.encode_text(query)
+        query_vector = self._encode_query(query)
         matches = self.vector_index.search(
             query_vector,
             candidate_limit,
@@ -293,6 +322,8 @@ class SearchService:
     def _queue_color_feature_generation(self, images: list[ImageItem]) -> None:
         queued = False
         with self._color_generation_lock:
+            if self._stop_event.is_set():
+                return
             for image in images:
                 if image.id in self._color_generation_queue:
                     continue
@@ -306,6 +337,7 @@ class SearchService:
             name="EidoryColorFeatureWorker",
             daemon=True,
         )
+        self._color_generation_worker = worker
         worker.start()
 
     def _run_color_feature_generation(self) -> None:
@@ -340,6 +372,8 @@ class SearchService:
                 failure_records = []
 
         for image in images:
+            if self._stop_event.is_set():
+                break
             if image.id in ready_ids or image.id in failed_ids:
                 continue
             path = Path(image.file_path)

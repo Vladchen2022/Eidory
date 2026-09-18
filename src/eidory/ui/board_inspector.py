@@ -1,3 +1,5 @@
+
+from eidory.ui.edit_history import undoable
 """Edit selected board references in place, without a second image collection."""
 from weakref import ref
 from collections import Counter
@@ -232,6 +234,7 @@ class BoardInspector(QObject):
             self.flush_note()
             self.refresh()
 
+    @undoable("调整参考等级与用途")
     def save(self, *, status=None, purpose=None):
         if self.refreshing or (status is None and purpose is None):
             return
@@ -264,6 +267,8 @@ class BoardInspector(QObject):
                 badges.setdefault(r['image_id'], []).append(r['note'][:90])
         w.workflow_upgrade.decorate_references(node.project_id, badges, node.id)
         w.project_board_view.set_reference_badges(badges)
+        if hasattr(w, "board_navigation"):
+            w.board_navigation.refresh()
         w.creative_flow._tray_key = None
 
     def save_note(self):
@@ -274,6 +279,7 @@ class BoardInspector(QObject):
             self._pending_note = (links[0]['node_id'], links[0]['image_id'], self.note.toPlainText())
             self._note_timer.start()
 
+    @undoable("编辑用途说明")
     def flush_note(self):
         self._note_timer.stop()
         pending = self._pending_note

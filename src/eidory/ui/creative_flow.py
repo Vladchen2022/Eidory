@@ -5,6 +5,8 @@ stores and commands as the library, structured editor and board.
 """
 from __future__ import annotations
 
+from eidory.ui.edit_history import undoable
+
 from copy import deepcopy
 from functools import wraps
 import json
@@ -503,6 +505,7 @@ class CreativeFlow(QObject):
             return []  # Template instructions are prompts for the author, not search terms.
         return resolved_targets(node, entries, options, self.w._creative_node_path_text(node.id))
 
+    @undoable("修改找图目标")
     def save_targets(self, rows):
         node = self.w._current_creative_node()
         if not node:
@@ -511,6 +514,8 @@ class CreativeFlow(QObject):
             'signature': target_signature(node, self.cw.store.entries(node.id)), 'rows': rows}, ensure_ascii=False))
         self.cw.invalidate_entry_search(node.id)
         self._search_dirty_node = node.id
+        if hasattr(self.w, "simple_search"):
+            self.w.simple_search.schedule("targets")
 
     def change_target(self, target_id, *, enabled=None, query=None):
         rows = self.targets()
@@ -547,6 +552,9 @@ class CreativeFlow(QObject):
             self.target_hint.setText('请至少勾选一项，并填写它的找图用语。')
             return
         self._search_dirty_node = None
+        if hasattr(self.w, "simple_search"):
+            self.w.simple_search.pending = None
+            self.w.simple_search.timer.stop()
         preserve = self._result_node_id == node.id and self.w.current_result_mode == 'search_chain'
         self.cw.start_node_search(node, '', queries=list(dict.fromkeys(r['query'] for r in rows if r['enabled'])), preserve_filters=preserve)
         self._result_node_id = node.id
@@ -637,6 +645,7 @@ class CreativeFlow(QObject):
                 self.w.generate_creative_details_button.click()
                 break
 
+    @undoable("编辑想法")
     def edit_entry(self, row_id, *, pending=False):
         state = self.cw.store.node(self.w.current_creative_node_id)
         if state['locked']:
@@ -672,6 +681,7 @@ class CreativeFlow(QObject):
                 self.cw.invalidate_entry_search(self.w.current_creative_node_id)
                 self.cw.reload_node(self.w.current_creative_node_id)
 
+    @undoable("采纳想法")
     def accept_one(self, row_id):
         node = self.w._current_creative_node()
         state = self.cw.store.node(node.id)
@@ -734,6 +744,7 @@ class CreativeFlow(QObject):
         self.w.grid_view.select_image_ids([image_id])
         self.w.right_tab_widget.setCurrentIndex(1)
 
+    @undoable("移出参考")
     def remove_reference(self):
         item, node = self.tray.currentItem(), self.w._current_creative_node()
         if item is None or node is None:
@@ -911,6 +922,8 @@ class CreativeFlow(QObject):
             self.search_context.setText(f'正在为「{node.title}」更新结果…')
         if dirty or busy:
             self.cw.collect_button.setEnabled(False)
+        if hasattr(self.w, "simple_search"):
+            self.w.simple_search.refresh()
 
     def refresh(self, *_args):
         if self.refreshing or getattr(self, '_refresh_batch_depth', 0):

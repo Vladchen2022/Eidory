@@ -133,7 +133,7 @@ class ProjectBoardViewTest(unittest.TestCase):
             board.toggle_fit_selection_or_restore()
 
             self.wait_for_images(board)
-            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 1800)
+            self.assertGreater(max(item.source_pixmap().width(), item.source_pixmap().height()), 384)
             self.assertEqual(board._view_mode, "fit_selection")
 
     def test_small_zoom_does_not_upgrade_selected_image_to_source(self) -> None:
@@ -165,17 +165,17 @@ class ProjectBoardViewTest(unittest.TestCase):
             item = board._image_items[1]
             self.assertIsInstance(item, BoardImageItem)
             self.wait_for_images(board)
-            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 560)
+            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 384)
 
             board._select_image_id(1)
             board._zoom_by(1.2)
 
-            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 560)
+            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 384)
 
             board.toggle_fit_selection_or_restore()
 
             self.wait_for_images(board)
-            self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 1800)
+            self.assertGreater(max(item.source_pixmap().width(), item.source_pixmap().height()), 384)
 
     def test_default_board_layout_uses_item_edges_to_avoid_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

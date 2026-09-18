@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from eidory.ui.theme_colors import theme_color
 
 import json
@@ -54,7 +56,8 @@ MAX_ZOOM = 16.0
 GRID_SIZE = 36
 PIXMAP_CACHE_LIMIT = 512
 MAX_SOURCE_PIXMAP_SIDE = 2200
-MAX_BOARD_THUMBNAIL_SIDE = 560
+MAX_BOARD_THUMBNAIL_SIDE = 384
+_BOARD_IMAGE_SIZES = OrderedDict()
 MAX_BOARD_FOCUS_PIXMAP_SIDE = 4096
 LAYOUT_CHANGED_IDLE_MS = 450
 DEFAULT_LAYOUT_LEFT = 80.0
@@ -125,6 +128,14 @@ def _store_cached_pixmap(key, pixmap):
         old_key, _old_pixmap = _BOARD_PIXMAP_CACHE.popitem(last=False)
         old_bytes = _BOARD_PIXMAP_CACHE_BYTES.pop(old_key, 0)
         _BOARD_PIXMAP_CACHE_TOTAL_BYTES = max(0, _BOARD_PIXMAP_CACHE_TOTAL_BYTES - old_bytes)
+
+
+def trim_pixmap_cache(budget):
+    global _BOARD_PIXMAP_CACHE_TOTAL_BYTES, _BOARD_PIXMAP_CACHE_BYTE_LIMIT
+    _BOARD_PIXMAP_CACHE_BYTE_LIMIT = max(0, budget)
+    while _BOARD_PIXMAP_CACHE and _BOARD_PIXMAP_CACHE_TOTAL_BYTES > budget:
+        key, _ = _BOARD_PIXMAP_CACHE.popitem(last=False)
+        _BOARD_PIXMAP_CACHE_TOTAL_BYTES -= _BOARD_PIXMAP_CACHE_BYTES.pop(key, 0)
 
 
 def _estimated_pixmap_bytes(pixmap: QPixmap) -> int:
@@ -1516,7 +1527,8 @@ class ProjectBoardView(QGraphicsView):
                 if not loaded:
                     # Metadata gives the final geometry immediately; decoding
                     # must never block set_images or alter saved positions.
-                    size = QSize(max(1, image.width or 220), max(1, image.height or 160))
+                    size = QSize(*_BOARD_IMAGE_SIZES.get((image.file_path, image.modified_time_ns, image.file_size),
+                                 (max(1, image.width or 220), max(1, image.height or 160))))
                     size.scale(128, 128, Qt.AspectRatioMode.KeepAspectRatio)
                     pixmap = QPixmap(size)
                     pixmap.fill(theme_color('canvas'))
@@ -1635,6 +1647,12 @@ class ProjectBoardView(QGraphicsView):
             if self._pending_local_edit == (generation, iid):
                 self._pending_local_edit = None
             return
+        metadata = self._images_by_id[iid]
+        size_key = (metadata.file_path, metadata.modified_time_ns, metadata.file_size)
+        _BOARD_IMAGE_SIZES[size_key] = (image.width(), image.height())
+        _BOARD_IMAGE_SIZES.move_to_end(size_key)
+        while len(_BOARD_IMAGE_SIZES) > 4096:
+            _BOARD_IMAGE_SIZES.popitem(last=False)
         pixmap = QPixmap.fromImage(image)
         if side == MAX_BOARD_THUMBNAIL_SIDE:
             self._thumbnail_pixmaps[iid] = pixmap
@@ -1681,6 +1699,35 @@ class ProjectBoardView(QGraphicsView):
             return True
         rendered = max(item.sceneBoundingRect().width(), item.sceneBoundingRect().height()) * self._zoom * self.devicePixelRatioF()
         return rendered > max(thumbnail.width(), thumbnail.height()) * .92
+
+    def trim_image_memory(self, budget):
+        # Downgrade offscreen pixel buffers, retaining positions, edits and a
+        # small preview. Visible images regain resolution through the loader.
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        def cost(item):
+            pix = item.source_pixmap()
+            return pix.width() * pix.height() * 4
+        items = [item for item in self._image_items.values() if isinstance(item, BoardImageItem)]
+        total = sum(cost(item) for item in items)
+        candidates = sorted(items, key=lambda item: (self.isVisible() and visible.intersects(item.sceneBoundingRect()), -cost(item)))
+        previous = self._suppress_layout_changed
+        self._suppress_layout_changed = True
+        try:
+            for item in candidates:
+                if total <= budget:
+                    break
+                if self.isVisible() and visible.intersects(item.sceneBoundingRect()):
+                    continue
+                old = cost(item)
+                pix = item.source_pixmap().scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                item.replace_source_pixmap(pix, allow_smaller=True)
+                self._thumbnail_pixmaps[item.image_id] = pix
+                self._loaded_image_sides[item.image_id] = 128
+                self._focus_quality_image_ids.discard(item.image_id)
+                total -= old - cost(item)
+        finally:
+            self._suppress_layout_changed = previous
+        return total
 
     def _refresh_visible_quality(self):
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
@@ -2026,13 +2073,20 @@ class ProjectBoardView(QGraphicsView):
     def keyPressEvent(self, event) -> None:
         undo_modifier = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
         if event.matches(QKeySequence.StandardKey.Redo):
-            self.redo_layout()
+            history = getattr(self.window(), "edit_history", None)
+            if history is not None and history.future:
+                history.redo()
+            else:
+                self.redo_layout()
             event.accept()
             return
         if event.matches(QKeySequence.StandardKey.Undo) or (
             event.key() == Qt.Key.Key_Z and bool(event.modifiers() & undo_modifier)
         ):
-            if not self.undo_layout():
+            history = getattr(self.window(), "edit_history", None)
+            if history is not None and history.past:
+                history.undo()
+            elif not self.undo_layout():
                 self.undoRemovalRequested.emit()
             event.accept()
             return
@@ -2361,10 +2415,16 @@ class ProjectBoardView(QGraphicsView):
             self._select_image_id(image_id)
         menu = QMenu(self)
         preview_action = menu.addAction("通过预览显示图片")
+        compare_action = menu.addAction("对比选中图片…")
+        compare_action.setEnabled(len(self.selected_image_ids()) >= 2)
         menu.addSeparator()
         remove_action = menu.addAction("从当前项目移除")
         remove_action.setEnabled(bool(self.selected_image_ids()))
         chosen = menu.exec(event.globalPos())
+        if chosen == compare_action:
+            self.window()._compare_selected_images()
+            event.accept()
+            return
         if chosen == preview_action:
             self.imagePreviewRequested.emit(image_id)
             event.accept()
@@ -2478,6 +2538,9 @@ class ProjectBoardView(QGraphicsView):
             return
         payload = self._capture_layout_payload()
         if self._last_layout is not None and payload != self._last_layout:
+            history = getattr(self.window(), "edit_history", None)
+            if history is not None:
+                history.board_edit(self._last_layout, payload)
             self._undo_layouts.append(deepcopy(self._last_layout))
             self._undo_layouts = self._undo_layouts[-40:]
             self._redo_layouts.clear()
@@ -2622,7 +2685,9 @@ class ProjectBoardView(QGraphicsView):
             if not isinstance(item, BoardImageItem):
                 continue
             image_id = int(item.image_id)
-            if image_id in self._focus_quality_image_ids:
+            rendered = max(item.sceneBoundingRect().width(), item.sceneBoundingRect().height()) * (target_zoom or self._zoom) * self.devicePixelRatioF()
+            wanted = min(MAX_BOARD_FOCUS_PIXMAP_SIDE, max(768, 2 ** int(math.ceil(math.log2(max(1, rendered))))))
+            if image_id in self._focus_quality_image_ids and self._loaded_image_sides.get(image_id, 0) >= wanted:
                 continue
             if not force and target_zoom is not None and not self._needs_focus_quality_upgrade(item, target_zoom):
                 continue
@@ -2630,7 +2695,7 @@ class ProjectBoardView(QGraphicsView):
             image = self._images_by_id.get(image_id)
             if image is None:
                 continue
-            self._request_image(image_id, MAX_BOARD_FOCUS_PIXMAP_SIDE)
+            self._request_image(image_id, wanted)
 
     @staticmethod
     def _needs_focus_quality_upgrade(item: BoardImageItem, target_zoom: float) -> bool:

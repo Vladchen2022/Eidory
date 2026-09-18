@@ -153,11 +153,11 @@ def apply(window, plan):
     QApplication.processEvents()
 
 
-def test_staged_edits_do_not_change_wall_until_apply(window):
+def test_edits_wait_for_debounce_and_manual_update_can_flush(window):
     panel = window.filter_panel
     panel.put_condition("include", 0, PLANE)
     assert len(window.grid_view.images()) == 4
-    assert "未应用" in panel.status_label.text()
+    assert "正在准备更新" in panel.status_label.text()
     QTest.mouseClick(panel.apply_button, Qt.MouseButton.LeftButton)
     window._poll_events()
     assert {im.file_name for im in window.grid_view.images()} == {"red-plane.png", "blue-plane.png"}
@@ -462,7 +462,7 @@ def test_live_strength_keeps_other_cutoffs_and_new_draft_staged(window):
     slider.setValue(100)
     QTest.qWait(80)
     assert len(window.grid_view.images()) == 2
-    assert "未应用" in window.filter_panel.status_label.text()
+    assert "正在准备更新" in window.filter_panel.status_label.text()
     QTest.mouseClick(window.filter_panel.apply_button, Qt.MouseButton.LeftButton)
     window._poll_events()
     assert len(window.grid_view.images()) == 1

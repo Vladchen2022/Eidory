@@ -195,6 +195,7 @@ from eidory.ui.project_board import ProjectBoardView
 from eidory.ui.filter_workflow import FilterWorkflow
 from eidory.ui.creative_workspace import CreativeWorkspace
 from eidory.ui.workspace_chrome import WorkspaceChrome
+from eidory.ui.edit_history import undoable
 
 
 LLM_SERVICE_OPTIONS = [
@@ -1361,55 +1362,7 @@ class _FileWatchWorker(QObject):
         return self._watcher
 
 
-class ImageCompareDialog(QDialog):
-    def __init__(self, images: list[ImageItem], *, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setWindowTitle("对比查看")
-        self.resize(1280, 760)
-        layout = QVBoxLayout(self)
-        hint = QLabel("多图对比用于最终判断。需要精细缩放时，双击单张图进入快速预览。")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        content = QWidget()
-        grid = QHBoxLayout(content)
-        grid.setContentsMargins(8, 8, 8, 8)
-        grid.setSpacing(10)
-        for image in images[:6]:
-            column = QVBoxLayout()
-            preview = QLabel()
-            preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            preview.setMinimumSize(260, 380)
-            preview.setProperty("role", "preview")
-            pixmap = QPixmap()
-            if not image.is_missing and Path(image.file_path).exists() and not is_supported_video(image.file_path):
-                pixmap = _load_scaled_qt_pixmap(image.file_path, 1040, 1040)
-            if not pixmap.isNull():
-                preview.setPixmap(
-                    pixmap.scaled(
-                        520,
-                        520,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                )
-            else:
-                preview.setText("无法预览")
-            info = QLabel(
-                f"{image.file_name}\n"
-                f"{MissingFilesDialog._dimension_text(image)} / {MissingFilesDialog._size_text(image.file_size)}\n"
-                f"{image.file_path}"
-            )
-            info.setWordWrap(True)
-            column.addWidget(preview, 1)
-            column.addWidget(info)
-            grid.addLayout(column, 1)
-        scroll.setWidget(content)
-        layout.addWidget(scroll, 1)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+from eidory.ui.compare_dialog import ImageCompareDialog
 
 
 class MainWindow(QMainWindow):
@@ -1726,6 +1679,20 @@ class MainWindow(QMainWindow):
         self.workflow_upgrade = WorkflowUpgrade(self)
         from eidory.ui.creative_flow import CreativeFlow
         self.creative_flow = CreativeFlow(self)
+        from eidory.ui.simple_search import SimpleSearch
+        from eidory.ui.edit_history import EditHistory
+        self.edit_history = EditHistory(self)
+        self.simple_search = SimpleSearch(self)
+        from eidory.ui.task_control import TaskControl
+        self.task_control = TaskControl(self)
+        from eidory.ui.thumbnail_job import ThumbnailJob
+        from eidory.ui.board_navigation import BoardNavigation
+        from eidory.ui.memory_budget import ImageMemoryBudget
+        self.thumbnail_job = ThumbnailJob(self)
+        self.board_navigation = BoardNavigation(self)
+        self.image_memory_budget = ImageMemoryBudget(self)
+        from eidory.ui.responsive_chrome import ResponsiveChrome
+        self.responsive_chrome = ResponsiveChrome(self)
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
         self._ensure_temporary_import_collection()
         self._refresh_folders()
@@ -1893,6 +1860,15 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._closing = True
+        if hasattr(self, "task_control"):
+            self.task_control.cancel()
+        if hasattr(self, "simple_search"):
+            self.simple_search.timer.stop()
+        if hasattr(self, "thumbnail_job"):
+            self.thumbnail_job.cancelled.set()
+        if hasattr(self, "image_memory_budget"):
+            self.image_memory_budget.timer.stop()
+            self.image_memory_budget.idle.stop()
         if hasattr(self, "filter_workflow"):
             self.filter_workflow.cancel_strength()
         if hasattr(self, "poll_timer"):
@@ -2211,8 +2187,8 @@ class MainWindow(QMainWindow):
             for index, visible in self._sidebar_visible.items():
                 self.root_splitter.widget(index).setVisible(visible)
             total = max(1, sum(self.root_splitter.sizes()))
-            left = LEFT_SIDEBAR_WIDTH if self._sidebar_visible[0] else 0
-            right = RIGHT_SIDEBAR_WIDTH if self._sidebar_visible[2] else 0
+            left = (220 if self.width() < 1250 else LEFT_SIDEBAR_WIDTH) if self._sidebar_visible[0] else 0
+            right = (260 if self.width() < 1250 else RIGHT_SIDEBAR_WIDTH) if self._sidebar_visible[2] else 0
             center = max(1, total - left - right)
             self.root_splitter.setSizes([left, center, right])
         finally:
@@ -9303,6 +9279,8 @@ class MainWindow(QMainWindow):
         command = action.data()
         if command == "preview":
             self._open_image_preview(context_image)
+        elif command in {"prefer_more", "prefer_less"}:
+            self.simple_search.prefer(context_image.id, 1 if command == "prefer_more" else -1)
         elif command == "compare_selection":
             self._compare_selected_images()
         elif command == "find_similar":
@@ -9374,6 +9352,9 @@ class MainWindow(QMainWindow):
         add_action(menu, "preview", "快速预览")
         add_action(menu, "compare_selection", "对比查看")
         add_action(menu, "find_similar", "查找相似图片")
+        if self.current_result_mode == "search_chain" and context_image is not None:
+            add_action(menu, "prefer_more", "更像这张（调整排序）")
+            add_action(menu, "prefer_less", "减少这类（调整排序）")
         has_single_context = context_image is not None and len(selected_images) <= 1
         actions["preview"].setEnabled(has_single_context)
         actions["compare_selection"].setEnabled(len(selected_images) >= 2)
@@ -12599,31 +12580,7 @@ class MainWindow(QMainWindow):
             images,
         ):
             return
-        rebuilt = 0
-        failed = 0
-        for image in images:
-            path = Path(image.file_path)
-            if image.is_missing or not path.exists():
-                failed += 1
-                self.store.update_thumbnail(image.id, None, "failed")
-                continue
-            try:
-                thumbnail_path = (
-                    self.thumbnailer.generate_video(image.id, image.file_path)
-                    if is_supported_video(image.file_path)
-                    else self.thumbnailer.generate(image.id, image.file_path)
-                )
-                self.store.update_thumbnail(image.id, str(thumbnail_path), "ready")
-                rebuilt += 1
-            except Exception:
-                failed += 1
-                self.store.update_thumbnail(image.id, None, "failed")
-        self._invalidate_near_duplicate_hash_cache()
-        self._refresh_current_results_for_filters()
-        self._record_operation_history(f"重建缩略图：成功 {rebuilt}，失败 {failed}")
-        self.statusBar().showMessage(
-            f"缩略图重建完成：成功 {rebuilt}，失败 {failed}"
-        )
+        self.thumbnail_job.start(images)
 
     def _set_file_watch_enabled(self, enabled: bool) -> None:
         self.file_watch_enabled = bool(enabled)
@@ -13158,7 +13115,9 @@ class MainWindow(QMainWindow):
         self._show_duplicate_images(images, badges_by_image_id=badges)
 
     def _compare_selected_images(self) -> None:
-        images = self._selected_grid_images()
+        images = (self.store.images_by_ids(self.project_board_view.selected_image_ids())
+                  if self.center_result_stack.currentWidget() is self.project_board_view
+                  else self._selected_grid_images())
         if len(images) < 2:
             self.statusBar().showMessage("至少选择 2 张图片才能对比")
             return
@@ -13395,6 +13354,10 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 break
             processed += 1
+            if kind == "controlled_ai":
+                job, kind, payload = payload
+                if not self.task_control.consume(job, kind, payload):
+                    continue
             if kind == "scan_done":
                 self._handle_scan_done(payload)
             elif kind == "scan_all_done":
@@ -15615,7 +15578,10 @@ class MainWindow(QMainWindow):
         from eidory.core.creative_tasks import node_task
         action = "完善说明" if text_mode and completion_mode == "auto" else "整理原文" if completion_mode == "organize" else (node_task(node.title, self._creative_node_path_text(node.id))[0] if completion_mode == "objects" else "补充细节")
         self._set_creative_node_completion_busy(True, f"正在为“{node.title}”{action}...")
+        entry_id = entry_target.get("id") if entry_target else None
+        task = self.task_control.begin(f"AI · {node.title}", lambda: self._retry_node_completion(node.id, completion_mode, entry_id))
         provider = self._make_llm_provider()
+        self.task_control.bind(task, provider)
         self.creative_node_auto_save_timer.stop()
         if raw_note != node.note or raw_query != node.search_query:
             self._flush_creative_node_editor_draft(node.id, status_message="")
@@ -15645,14 +15611,23 @@ class MainWindow(QMainWindow):
                     language=self.current_language,
                     **extra_args,
                 )
-                self.events.put(("creative_node_note_done", (node.id, ai_current_note, suggestion, model_name)))
+                task.emit("creative_node_note_done", (node.id, ai_current_note, suggestion, model_name))
             except Exception as exc:
-                self.events.put(("creative_node_note_error", (node.id, exc)))
+                task.emit("creative_node_note_error", (node.id, exc))
 
         self._start_background_task(
             run,
-            on_rejected=lambda: self._set_creative_node_completion_busy(False),
+            on_rejected=self.task_control.cancel,
         )
+
+    def _retry_node_completion(self, node_id, mode, entry_id=None):
+        node = self.store.get_creative_node(node_id)
+        if node is not None:
+            self._load_creative_project(node.project_id, select_node_id=node_id)
+            if entry_id is not None:
+                self.creative_flow.entry_details(entry_id)
+            else:
+                self._generate_creative_children_for_selected_node(completion_mode=mode)
 
     def _generate_all_creative_node_notes(self) -> None:
         self._set_ai_workflow_mode("project")
@@ -15692,7 +15667,7 @@ class MainWindow(QMainWindow):
 
     def _set_creative_all_nodes_busy(self, busy: bool, status: str = "") -> None:
         self._creative_all_nodes_in_progress = busy
-        self._set_creative_node_completion_busy(busy, status or "AI 正在补全节点...")
+        self._set_creative_node_completion_busy(busy, status or ("AI 正在补全节点..." if busy else ""))
 
     def _generate_creative_project_seed_then_all_nodes(self, target_project_id: int | None = None) -> None:
         template_id = str(self.creative_template_combo.currentData() or "story")
@@ -15844,9 +15819,16 @@ class MainWindow(QMainWindow):
         if selected_node is None or selected_node.project_id != project_id:
             selected_node_id = self.store.creative_root_node_id(project_id)
         project_brief, project_extra = self._creative_node_ai_context(project)
+        task = self.task_control.begin("AI · 批量补全", lambda: self._generate_all_creative_node_notes_for_project(project_id), batch=(project_id, selected_node_id))
         provider = self._make_llm_provider()
+        self.task_control.bind(task, provider)
         imagination_level = self.creative_node_imagination_slider.value()
         self._set_creative_all_nodes_busy(True, f"正在补全全部节点：{project.title}")
+
+        class Events:
+            def put(_self, event):
+                task.emit(*event)
+        events = Events()
 
         def run() -> None:
             results: list[tuple[int, str, object]] = []
@@ -15898,20 +15880,24 @@ class MainWindow(QMainWindow):
                     else:
                         raise RuntimeError("当前 AI provider 不支持节点补全")
                     model_name = model_name_result
-                    results.append((int(request["node_id"]), str(request["current_note"]), suggestion))
+                    result = (int(request["node_id"]), str(request["current_note"]), suggestion)
+                    results.append(result)
+                    task.checkpoint(result)
                 except Exception as exc:
                     errors.append(f"{index}. {request['title']}：{exc}")
 
             if callable(single_generator) or callable(prose_generator):
                 for index, request in enumerate(requests, 1):
-                    self.events.put(
+                    if task.cancelled.is_set():
+                        return
+                    events.put(
                         (
                             "creative_all_node_notes_progress",
                             (project_id, index - 1, total_requests, str(request["title"])),
                         )
                     )
                     append_single_result(index, request)
-                    self.events.put(
+                    events.put(
                         (
                             "creative_all_node_notes_progress",
                             (project_id, index, total_requests, str(request["title"])),
@@ -15943,12 +15929,16 @@ class MainWindow(QMainWindow):
                     batch_suggestions = {}
                 suggestions_by_id = {str(key): value for key, value in dict(batch_suggestions).items()}
                 for index, request in enumerate(requests, 1):
+                    if task.cancelled.is_set():
+                        return
                     suggestion = suggestions_by_id.get(str(request["node_id"]))
                     if suggestion is None:
                         errors.append(f"{index}. {request['title']}：AI没有返回这个节点")
                         continue
-                    results.append((int(request["node_id"]), str(request["current_note"]), suggestion))
-                    self.events.put(
+                    result = (int(request["node_id"]), str(request["current_note"]), suggestion)
+                    results.append(result)
+                    task.checkpoint(result)
+                    events.put(
                         (
                             "creative_all_node_notes_progress",
                             (project_id, index, total_requests, str(request["title"])),
@@ -15962,9 +15952,9 @@ class MainWindow(QMainWindow):
                 message = "AI没有补全任何节点"
                 if detail:
                     message = f"{message}。失败明细：\n{detail}{suffix}"
-                self.events.put(("creative_all_node_notes_error", (project_id, RuntimeError(message))))
+                events.put(("creative_all_node_notes_error", (project_id, RuntimeError(message))))
                 return
-            self.events.put(
+            events.put(
                 (
                     "creative_all_node_notes_done",
                     (project_id, selected_node_id, results, errors, model_name),
@@ -15974,7 +15964,7 @@ class MainWindow(QMainWindow):
         self._start_background_task(
             run,
             name="creative-all-nodes",
-            on_rejected=lambda: self._set_creative_all_nodes_busy(False),
+            on_rejected=self.task_control.cancel,
         )
 
     def _apply_creative_node_note_suggestion(
@@ -16423,6 +16413,7 @@ class MainWindow(QMainWindow):
             ])
         self.search_diagnostics_label.setText("搜索诊断：" + "，".join(parts))
 
+    @undoable("收集参考")
     def _save_selection_to_current_creative_node(self) -> None:
         node = self._current_creative_node()
         if node is None:
@@ -16499,6 +16490,7 @@ class MainWindow(QMainWindow):
             current = by_id.get(current.parent_id) if current.parent_id is not None else None
         return ids
 
+    @undoable("移出参考")
     def _remove_selection_from_current_creative_node(self) -> None:
         node = self._current_creative_node()
         if node is None:
@@ -17238,6 +17230,7 @@ class MainWindow(QMainWindow):
         self._record_operation_history(f"从{label}“{project.name}”看板移除 {removed} 个图片链接")
         self.statusBar().showMessage(f"已从“{project.name}”移除 {removed} 个图片链接，源文件未删除。按 Cmd+Z 可恢复")
 
+    @undoable("移出看板参考")
     def _remove_images_from_current_creative_board(self, image_ids: list[int]) -> None:
         node_id = self._current_board_node_id or self.current_creative_node_id
         node = self.store.get_creative_node(int(node_id)) if node_id is not None else None

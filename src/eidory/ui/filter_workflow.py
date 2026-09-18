@@ -290,6 +290,9 @@ class FilterWorkflow(QObject):
             self.panel.result_label.setText(f"图片墙 · 已加载 {count} 张")
             self.panel.result_label.setToolTip(self.panel.result_label.text())
 
+        if hasattr(w, "simple_search"):
+            w.simple_search.refresh()
+
     def choose_scope(self):
         self.finish_strength()
         menu = QMenu(self.panel)

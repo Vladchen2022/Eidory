@@ -1032,6 +1032,9 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
             payload["response_format"] = response_format or _inspiration_response_format()
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
+        cancel = getattr(self, "cancel_event", None)
+        if cancel is not None and cancel.is_set():
+            raise LLMProviderError("已取消")
         headers = self._headers()
         response = None
         for attempt in range(2):
@@ -1074,6 +1077,9 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
         if response is None:
             raise LLMProviderError(f"{self.service_name} 请求失败：没有收到响应")
 
+        if cancel is not None and cancel.is_set():
+            response.close()
+            raise LLMProviderError("已取消")
         try:
             message = response.json()["choices"][0]["message"]
         except (KeyError, IndexError, TypeError, ValueError) as exc:

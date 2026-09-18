@@ -35,10 +35,15 @@ class WorkspaceChrome(QObject):
         self.retranslate()
         # Reparented controls may already have a cached stylesheet before roles
         # are assigned. Polish them once so first launch matches density changes.
+        from PySide6.QtWidgets import QStyle
+        self._polished_styles = []
         for widget in window.findChildren(QWidget):
             if widget.property("variant") or widget.property("role") or widget is window.creative_workspace.proposal_panel:
-                widget.style().unpolish(widget)
-                widget.style().polish(widget)
+                style = widget.style()
+                if isinstance(style, QStyle):
+                    self._polished_styles.append(style)
+                    style.unpolish(widget)
+                    style.polish(widget)
         self.refresh()
         QTimer.singleShot(0, self.sync_sidebars)
 

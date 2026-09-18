@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from eidory.ui.edit_history import undoable
+
 from weakref import ref
 
 from PySide6.QtCore import QObject, Qt, QTimer
@@ -490,6 +492,7 @@ class CreativeWorkspace(QObject):
         self.save_search()
         self.w._show_current_project_board()
 
+    @undoable("锁定构思")
     def toggle_lock(self, checked):
         node = self.w._current_creative_node()
         if not self.loading and node:
@@ -572,6 +575,7 @@ class CreativeWorkspace(QObject):
             self.w.generate_creative_children_button.setEnabled(False)
             self.w.generate_creative_details_button.setEnabled(False)
 
+    @undoable("编辑原文")
     def edit_base_note(self):
         node = self.w._current_creative_node()
         if not node or self.store.node(node.id)["locked"]:
@@ -610,6 +614,7 @@ class CreativeWorkspace(QObject):
         if self.search_node_id == node_id:
             self.search_node_id = None
 
+    @undoable("编辑想法")
     def save_entry_edits(self, rows):
         node = self.w._current_creative_node()
         if self.loading or node is None:
@@ -641,6 +646,7 @@ class CreativeWorkspace(QObject):
             payload["rows"] = rows
             self.store.save_node(node.id, proposal_entries_json=encode_entries(payload))
 
+    @undoable("添加想法")
     def add_entry(self):
         node = self.w._current_creative_node()
         if not node or self.store.node(node.id)["locked"]:
@@ -672,6 +678,7 @@ class CreativeWorkspace(QObject):
             self.invalidate_entry_search(node.id)
             self.reload_node(node.id)
 
+    @undoable("删除想法")
     def delete_entry(self):
         node = self.w._current_creative_node()
         row = self.selected_entry_target()
@@ -688,6 +695,7 @@ class CreativeWorkspace(QObject):
         if not self.loading and node:
             self.store.save_node(node.id, proposal_note=self.proposal_input.toPlainText(), proposal_query=self.proposal_query.text())
 
+    @undoable("采纳 AI 建议")
     def accept_note(self, _checked=False, *, partial=False):
         w = self.w
         node = w._current_creative_node()
@@ -738,6 +746,7 @@ class CreativeWorkspace(QObject):
             self.store.save_node(node.id, proposal_note="", proposal_query="", proposal_entries_json="")
             self.w._sync_creative_node_panel()
 
+    @undoable("恢复构思")
     def restore_note(self):
         node = self.w._current_creative_node()
         if node and self.store.restore(node.id):
@@ -764,6 +773,7 @@ class CreativeWorkspace(QObject):
         if hasattr(w, 'workflow_upgrade'):
             w.workflow_upgrade.refresh()
 
+    @undoable("编辑参考用途")
     def save_reference(self):
         if self._reference_key:
             self.store.save_reference_note(*self._reference_key, self.reference_input.toPlainText())

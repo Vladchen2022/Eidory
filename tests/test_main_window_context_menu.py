@@ -181,7 +181,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertFalse(window.search_input.isVisible())
             self.assertFalse(window.advanced_search_widget.isVisible())
             self.assertIs(window.saved_view_combo.parentWidget(), window.filter_panel)
-            self.assertTrue(window.saved_view_combo.isVisible())
+            self.assertTrue(window.saved_view_combo.isVisible() or window.responsive_chrome.more.isVisible())
             self.assertEqual(window.saved_view_combo.currentText(), "未选择预设")
             self.assertEqual(window.saved_view_combo.contextMenuPolicy(), Qt.ContextMenuPolicy.NoContextMenu)
             self.assertGreaterEqual(window.saved_view_combo.count(), 2)

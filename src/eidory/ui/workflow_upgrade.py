@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from eidory.ui.edit_history import undoable
+
 from weakref import ref
 
 from PySide6.QtCore import QObject, Qt, Signal, QTimer
@@ -261,6 +263,8 @@ class WorkflowUpgrade(QObject):
         else:
             ranks = {im.id: i for i, im in enumerate(self.w.current_chain_result.ranked_scope_images or images)}
             images = sorted(images, key=lambda im: ranks.get(im.id, len(ranks)))
+        if hasattr(self.w, "simple_search"):
+            images = self.w.simple_search.sort(images)
         badges = self.w.store.creative_node_image_badges(self.w.current_creative_project_id) if self.w.current_creative_project_id else {}
         node = self.w._current_creative_node()
         self.decorate_references(self.w.current_creative_project_id, badges, node.id if node else None)
@@ -270,6 +274,7 @@ class WorkflowUpgrade(QObject):
         self.w.grid_view.select_image_ids(selected)
         self.result_hint.setText(f'当前视图 {len(images)} 张 · 分别检索，合并去重；命中标记不代表识别概率')
 
+    @undoable("调整参考等级与用途")
     def save_decision(self, *_args):
         key = self.w.creative_workspace._reference_key
         if self.refreshing or not key:

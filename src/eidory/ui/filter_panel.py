@@ -159,7 +159,7 @@ class FilterEditorDialog(QDialog):
             "keyword": "查找文件名、路径、备注和用户标签中的文字。", "semantic": "按画面内容匹配；需要本地语义索引。",
             "color": "匹配整张图片的颜色倾向，不指定某个物体的颜色。", "similar": "先在图片墙中选中一张已索引图片。",
             "ai_scene": "匹配已生成的 AI 场景标签；没有该标签的图片不命中。", "ai_character": "匹配已生成的 AI 角色标签；没有该标签的图片不命中。",
-        }.get(kind, "确定后加入待应用条件，点击“应用筛选”才会更新图片墙。"))
+        }.get(kind, "确定后自动更新图片墙。"))
         if kind == "color":
             self._update_color()
 
@@ -205,6 +205,7 @@ class FilterEditorDialog(QDialog):
 
 
 class FilterPanel(QWidget):
+    draftChanged = Signal()
     applyRequested = Signal(object)
     scopeRequested = Signal()
     undoRequested = Signal()
@@ -395,7 +396,7 @@ class FilterPanel(QWidget):
         self.status_label.setToolTip(text)
         for (section, _, _), slider in self.strength_sliders.items():
             effect = "宽松：排除更多图片；严格：排除更少图片。" if section == "exclude" else "宽松：保留更多图片；严格：保留更少图片。"
-            slider.setToolTip(effect + ("拖动立即更新图片墙，无需应用。" if live else "先应用当前条件，再拖动即可实时调整。") + "\n数值是相对匹配强度，不是识别概率。")
+            slider.setToolTip(effect + ("拖动立即更新图片墙，无需应用。" if live else "条件会自动更新；完成后可拖动实时调整。") + "\n数值是相对匹配强度，不是识别概率。")
 
     def clear_draft(self):
         self.strengthFinished.emit()
@@ -403,6 +404,7 @@ class FilterPanel(QWidget):
         self.clear_context_on_apply = True
         self.error = ""
         self._render()
+        self.draftChanged.emit()
 
     def set_context_actions(self, actions):
         self._context_actions = actions
@@ -556,6 +558,7 @@ class FilterPanel(QWidget):
         self.draft = replace(self.draft, **{section: tuple(groups)})
         self.error = ""
         self._render()
+        self.draftChanged.emit()
 
     def add_group(self, section):
         groups = self._groups(section)

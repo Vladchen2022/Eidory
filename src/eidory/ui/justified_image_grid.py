@@ -829,6 +829,12 @@ class JustifiedImageGridView(QAbstractScrollArea):
             reader.setScaledSize(scaled_size)
         return reader.read()
 
+    def clear_pixmap_cache(self):
+        self._pixmap_cache.clear()
+        self._pixmap_cache_bytes.clear()
+        self._pixmap_cache_total_bytes = 0
+        self.viewport().update()
+
     def _pixmap_cache_key(self, image: ImageItem, source: str | None) -> PixmapCacheKey | None:
         if not source:
             return None

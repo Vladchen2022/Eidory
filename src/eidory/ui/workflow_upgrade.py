@@ -40,9 +40,12 @@ class WorkflowUpgrade(QObject):
         tools = QPushButton('项目工具 ▾')
         tools.setAccessibleName('项目总览、方案与导入导出')
         menu = QMenu(tools)
+        self.project_actions = []
         for label, callback in [('项目总览', self.show_overview), ('方案版本…', self.show_versions),
                                 ('功能准备检查…', self.show_readiness), ('导出可编辑项目包…', self.export_package), ('导入可编辑项目包…', self.import_package)]:
-            menu.addAction(label, callback)
+            action = menu.addAction(label, callback)
+            if callback in (self.show_overview, self.show_versions, self.export_package):
+                self.project_actions.append(action)
         tools.setMenu(menu)
         cw.navigation.layout().addWidget(tools)
         self.tools = tools
@@ -131,6 +134,8 @@ class WorkflowUpgrade(QObject):
         try:
             cw = self.w.creative_workspace
             node = self.w._current_creative_node()
+            for action in self.project_actions:
+                action.setEnabled(self.w.current_creative_project_id is not None)
             self.target_button.setEnabled(node is not None)
             key = cw._reference_key
             self.reference_bar.setEnabled(key is not None)

@@ -462,6 +462,7 @@ class WorkspaceChrome(QObject):
         self.project_node_panel.setVisible(bool(project_id))
         if w.creative_project_combo.count() and w.creative_project_combo.itemData(0) is None:
             w.creative_project_combo.setItemText(0, "独立图库")
+        self._sync_temporary_context()
         is_gallery = w.center_result_stack.currentWidget() is w.grid_view
         is_board = w.center_result_stack.currentWidget() is w.project_board_view
         phase = 3 if is_board else 0 if not is_gallery else 2 if w.current_result_mode == "creative_node" else 1
@@ -470,6 +471,16 @@ class WorkspaceChrome(QObject):
             button.setChecked(index == phase)
             button.blockSignals(previous)
         self.stage_buttons[2].setEnabled(bool(project_id))
+        can_show_board = (
+            w.current_search_result_set_project_id is None
+            and (bool(project_id) or (
+                w.current_temp_project_id is not None
+                and w.current_result_mode == "temp_project"
+                and w._current_temporary_project_kind() != "search"
+            ))
+        )
+        self.stage_buttons[3].setEnabled(can_show_board)
+        self.stage_buttons[3].setToolTip("" if can_show_board else "先选择创作项目或参考集，再使用看板")
         self.selection_bar.setVisible(is_gallery)
         self.board_tools.setVisible(is_board and not w._board_focus_mode)
         w.show_gallery_button.hide()
@@ -481,3 +492,29 @@ class WorkspaceChrome(QObject):
         self.sync_sidebars()
         if hasattr(w, 'creative_flow'):
             w.creative_flow.refresh()
+
+    def _sync_temporary_context(self):
+        # A reference set has its own board. Never label that context as the
+        # independent library, whose explicit selection exits all boards.
+        w = self.w
+        combo = w.creative_project_combo
+        project = None
+        if w.current_creative_project_id is None and w.current_temp_project_id is not None:
+            project = w.store.get_temporary_project(w.current_temp_project_id)
+        key = f"temporary:{project.id}" if project else None
+        previous = combo.blockSignals(True)
+        try:
+            for index in range(combo.count() - 1, 0, -1):
+                data = combo.itemData(index)
+                if isinstance(data, str) and data.startswith("temporary:") and data != key:
+                    combo.removeItem(index)
+            if project:
+                index = combo.findData(key)
+                if index < 0:
+                    combo.addItem(f"{w._temporary_project_label(project)}：{project.name}", key)
+                    index = combo.count() - 1
+                combo.setCurrentIndex(index)
+            elif w.current_creative_project_id is None:
+                combo.setCurrentIndex(0)
+        finally:
+            combo.blockSignals(previous)

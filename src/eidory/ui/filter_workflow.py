@@ -318,6 +318,22 @@ class FilterWorkflow(QObject):
         self.follow_sidebar()
         self.apply(draft, remember=False)
 
+    def reset_library_scope(self):
+        """Leave frozen/project scopes without issuing an intermediate query."""
+        w = self.window
+        for tree in (w.collection_tree, w.folder_tree):
+            previous = tree.blockSignals(True)
+            tree.setCurrentItem(tree.topLevelItem(0))
+            tree.blockSignals(previous)
+        w.current_virtual_filter = None
+        w._clear_tag_virtual_filter_selection()
+        w._clear_ai_vision_virtual_filter_selection()
+        previous = w.status_filter_combo.blockSignals(True)
+        w._set_combo_to_data(w.status_filter_combo, "all")
+        w.status_filter_combo.blockSignals(previous)
+        w._save_status_filter()
+        self.follow_sidebar()
+
     def select_collection_scope(self):
         w = self.window
         ids = w._select_collections_for_search_dialog(reverse_mode=False, context_image=w._selected_grid_image())

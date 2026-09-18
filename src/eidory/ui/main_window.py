@@ -9767,12 +9767,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已移动 {moved} 个标签到：{group_name}")
 
     def _search_tag_from_management(self, tag_id: int, tag_name: str) -> None:
+        # Tag selection belongs to management; searches must use the visible
+        # filter plan. In particular, do not inherit a collected/frozen scope.
+        self.creative_workspace.save_search()
+        self.creative_workspace.search_node_id = None
+        self.creative_workspace.restore_position = None
+        self.filter_workflow.remember()
         self._select_only_tag_id(tag_id)
-        self.current_virtual_filter = None
-        self._clear_collection_selection()
-        self._clear_ai_vision_virtual_filter_selection()
-        self._refresh_current_results_for_filters()
-        self.statusBar().showMessage(f"正在显示标签：{tag_name}")
+        self.filter_workflow.reset_library_scope()
+        self._clear_result_management_state()
+        self.current_temp_project_id = None
+        self.current_search_result_set_project_id = None
+        self.current_result_mode = "library"
+        self._clear_temporary_project_selection()
+        condition = SearchFilter("tag", self._tag_filter_value([tag_id], "any"))
+        self.filter_workflow.apply(FilterPlan((FilterGroup((condition,)),)), remember=False)
 
     def _selected_tag_context(self) -> tuple[int | None, str | None]:
         item = self.tag_list.currentItem()
@@ -10020,6 +10029,7 @@ class MainWindow(QMainWindow):
         self.collection_tree.blockSignals(previous)
         self.current_virtual_filter = None
         self.filter_workflow.follow_sidebar()
+        self._show_gallery_view()
         self._refresh_current_results_for_filters()
 
     def _on_collection_selection_changed(self) -> None:
@@ -10028,6 +10038,7 @@ class MainWindow(QMainWindow):
             self.folder_tree.setCurrentItem(self.folder_tree.topLevelItem(0))
             self.folder_tree.blockSignals(previous)
             self.filter_workflow.follow_sidebar()
+            self._show_gallery_view()
         item = self.collection_tree.currentItem()
         virtual_filter = item.data(0, COLLECTION_VIRTUAL_FILTER_ROLE) if item is not None else None
         if virtual_filter:
@@ -10058,6 +10069,8 @@ class MainWindow(QMainWindow):
             self.current_virtual_filter = selected_virtual_filter
             self._clear_collection_selection()
             self._clear_ai_vision_virtual_filter_selection()
+            self.filter_workflow.follow_sidebar()
+            self._show_gallery_view()
             self.selected_image = None
             self._refresh_current_results_for_filters()
             if self._detail_tab_is_visible():
@@ -10073,6 +10086,7 @@ class MainWindow(QMainWindow):
             self._refresh_temp_project_save_button()
         elif previous_virtual_filter == "untagged":
             self.current_virtual_filter = None
+            self.filter_workflow.follow_sidebar()
             self._refresh_virtual_collection_filters()
             self._refresh_current_results_for_filters()
         self._refresh_tag_action_buttons()
@@ -10097,6 +10111,8 @@ class MainWindow(QMainWindow):
             self.current_virtual_filter = selected_virtual_filter
             self._clear_collection_selection()
             self._clear_tag_virtual_filter_selection()
+            self.filter_workflow.follow_sidebar()
+            self._show_gallery_view()
             self.selected_image = None
             self._refresh_current_results_for_filters()
             if self._detail_tab_is_visible():
@@ -10116,6 +10132,7 @@ class MainWindow(QMainWindow):
             "un_ai_character_tagged",
         }:
             self.current_virtual_filter = None
+            self.filter_workflow.follow_sidebar()
             self._refresh_virtual_collection_filters()
             self._refresh_current_results_for_filters()
 
@@ -14322,6 +14339,9 @@ class MainWindow(QMainWindow):
         if self._refreshing_creative_projects:
             return
         project_id = self.creative_project_combo.currentData()
+        if isinstance(project_id, str) and project_id.startswith("temporary:"):
+            self._show_temporary_project_board(int(project_id.split(":", 1)[1]))
+            return
         self._load_creative_project(int(project_id) if project_id is not None else None, show_board=project_id is not None)
 
     def _on_creative_project_list_changed(self) -> None:
@@ -14342,9 +14362,19 @@ class MainWindow(QMainWindow):
         show_board: bool = False,
         save_current_editor: bool = True,
     ) -> None:
+        # Save while the old board still owns its node and pending edits.
+        self._save_current_board_layout_if_needed()
+        if hasattr(self, "creative_flow"):
+            self.creative_flow.board_inspector.flush_note()
         if hasattr(self, "creative_workspace"):
             self.creative_workspace.before_project_load(project_id)
         previous_project_id = self.current_creative_project_id
+        leaving_context = bool(
+            previous_project_id is not None
+            or self.current_temp_project_id is not None
+            or getattr(getattr(self, "creative_workspace", None), "project_id", None) is not None
+            or self.center_result_stack.currentWidget() is self.project_board_view
+        )
         if save_current_editor:
             if self._pending_creative_node_detail_id is not None:
                 self._save_pending_creative_node_details()
@@ -14353,9 +14383,13 @@ class MainWindow(QMainWindow):
         if project_id != previous_project_id:
             self._clear_creative_node_editor_state()
         self.current_creative_project_id = project_id
+        if project_id is not None and (project_id != previous_project_id or show_board):
+            self.current_temp_project_id = None
+            self.current_search_result_set_project_id = None
         if hasattr(self, "creative_workspace"):
             self.creative_workspace.load_project(project_id)
         if project_id is None:
+            self._show_gallery_view()
             self.current_creative_node_id = None
             self._current_board_node_id = None
             self._current_board_image_ids = ()
@@ -14370,6 +14404,15 @@ class MainWindow(QMainWindow):
             self.creative_project_copy_input.clear()
             self.creative_project_copy_input.blockSignals(False)
             self._clear_temporary_project_selection()
+            if hasattr(self, "creative_workspace"):
+                self.creative_workspace.search_node_id = None
+                self.creative_workspace.restore_position = None
+                self.creative_workspace.active_search_names = None
+            if leaving_context:
+                self.filter_workflow.reset_library_scope()
+                self.filter_workflow.history.clear()
+                self.filter_panel.undo_button.setEnabled(False)
+                self._clear_search()
             self._refresh_creative_template_preview_tree()
             self._sync_creative_node_panel()
             return
@@ -16533,6 +16576,8 @@ class MainWindow(QMainWindow):
     def _show_current_creative_board(self) -> None:
         node = self._current_creative_node()
         if node is None:
+            if hasattr(self, "workspace_chrome"):
+                self.workspace_chrome.refresh()
             self.statusBar().showMessage("先选择创作项目节点")
             return
         self._show_creative_board_for_node(node.id)

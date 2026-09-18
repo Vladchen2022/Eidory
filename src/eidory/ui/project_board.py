@@ -252,6 +252,7 @@ class BoardImageItem(QGraphicsPixmapItem):
     RESIZE_MARGIN = 12.0
     SELECTION_OUTLINE_COLOR = QColor("#2f80ff")
     SELECTION_OUTLINE_WIDTH = 3
+    PRIMARY_OUTLINE_COLOR = QColor('#d64b40')
 
     def __init__(
         self,
@@ -283,7 +284,10 @@ class BoardImageItem(QGraphicsPixmapItem):
         self._display_variant_cache: OrderedDict[tuple[object, ...], QPixmap] = OrderedDict()
         self.setToolTip(file_path)
         self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-        self.setCacheMode(QGraphicsItem.CacheMode.ItemCoordinateCache)
+        # Cosmetic outlines and badges must stay readable at the current zoom.
+        # ItemCoordinateCache rasterizes these at item scale, shrinking them
+        # together with the image on a zoomed-out board.
+        self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
         self.setAcceptHoverEvents(True)
         self._apply_flags()
 
@@ -619,15 +623,25 @@ class BoardImageItem(QGraphicsPixmapItem):
         if selected:
             clean_option.state &= ~QStyle.StateFlag.State_Selected
         super().paint(painter, clean_option, widget)
+        primary = '主参考' in self._badges
+        if primary:
+            painter.save()
+            pen = QPen(self.PRIMARY_OUTLINE_COLOR, 4)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self.boundingRect().adjusted(0.5, 0.5, -0.5, -0.5))
+            painter.restore()
         if selected:
             painter.save()
             pen = QPen(self.SELECTION_OUTLINE_COLOR, self.SELECTION_OUTLINE_WIDTH)
             pen.setCosmetic(True)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(self.boundingRect().adjusted(0.5, 0.5, -0.5, -0.5))
+            inset = 5.0 / max(abs(painter.worldTransform().m11()), 0.01) if primary else 0.5
+            painter.drawRect(self.boundingRect().adjusted(inset, inset, -inset, -inset))
             painter.restore()
-        text = self.badge_text
+        text = ('★ ' if primary else '') + self.badge_text
         if not text:
             return
         rect = self.boundingRect()
@@ -661,7 +675,7 @@ class BoardImageItem(QGraphicsPixmapItem):
             badge_height,
         )
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(20, 24, 30, 220))
+        painter.setBrush(self.PRIMARY_OUTLINE_COLOR if primary else QColor(20, 24, 30, 220))
         painter.drawRect(badge_rect)
         painter.setPen(QColor("#eef2f8"))
         painter.drawText(
@@ -1284,6 +1298,7 @@ class ProjectBoardView(QGraphicsView):
     imagePreviewRequested = Signal(int)
     selectionChanged = Signal(list)
     layoutChanged = Signal()
+    sectionsChanged = Signal(bool)
     removeImagesRequested = Signal(list)
     undoRemovalRequested = Signal()
     filesDropped = Signal(object)
@@ -1508,6 +1523,7 @@ class ProjectBoardView(QGraphicsView):
         self._undo_layouts.clear()
         self._redo_layouts.clear()
         self._last_layout = self._capture_layout_payload()
+        self.sectionsChanged.emit(bool(self._section_items))
 
         if previous_selected_ids:
             self.selectionChanged.emit([])
@@ -1650,6 +1666,29 @@ class ProjectBoardView(QGraphicsView):
         self._section_items.append(item)
         return item
 
+    def set_reference_badges(self, badges):
+        """Refresh reference decisions without rebuilding items or resetting the view."""
+        self._board_badges = {int(k): list(v) for k, v in badges.items()}
+        for image_id, item in self._image_items.items():
+            if isinstance(item, BoardImageItem):
+                item._badges = item._normalize_badges(self._board_badges.get(image_id, []))
+                item.update()
+        self.viewport().update()
+
+    def toggle_node_sections(self):
+        if not self._section_items:
+            self.arrange_by_labels()
+            return
+        self.flush_pending_layout_change()
+        # Remove only generated frames. Images, custom notes, local display and
+        # their geometry remain untouched; undo can restore even locked frames.
+        for section in self._section_items:
+            self._scene.removeItem(section)
+        self._section_items.clear()
+        self._schedule_layout_changed()
+        self.flush_pending_layout_change()
+        self.sectionsChanged.emit(False)
+
     def toggle_section_lock(self):
         selected = [s for s in self._section_items if s.isSelected()]
         if not selected:
@@ -1715,6 +1754,7 @@ class ProjectBoardView(QGraphicsView):
         self._schedule_layout_changed()
         self.flush_pending_layout_change()
         self.fit_all_images()
+        self.sectionsChanged.emit(bool(self._section_items))
 
     def undo_layout(self):
         self.flush_pending_layout_change()

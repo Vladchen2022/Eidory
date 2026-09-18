@@ -5115,11 +5115,14 @@ class MetadataStore:
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT node_id, image_id, sort_order, created_at, intent_label, intent_query
-                FROM creative_node_images
-                WHERE node_id IN ({node_placeholders})
-                  AND image_id IN ({image_placeholders})
-                ORDER BY node_id, sort_order, image_id
+                SELECT l.node_id, l.image_id, l.sort_order, l.created_at, l.intent_label, l.intent_query,
+                       d.status AS reference_status, d.purpose AS reference_purpose, r.note AS reference_note
+                FROM creative_node_images l
+                LEFT JOIN creative_reference_decisions d ON d.node_id=l.node_id AND d.image_id=l.image_id
+                LEFT JOIN creative_reference_notes r ON r.node_id=l.node_id AND r.image_id=l.image_id
+                WHERE l.node_id IN ({node_placeholders})
+                  AND l.image_id IN ({image_placeholders})
+                ORDER BY l.node_id, l.sort_order, l.image_id
                 """,
                 [*node_ids, *clean_ids],
             ).fetchall()
@@ -5131,6 +5134,9 @@ class MetadataStore:
                 "created_at": str(row["created_at"]),
                 "intent_label": row["intent_label"],
                 "intent_query": row["intent_query"],
+                "reference_status": row["reference_status"],
+                "reference_purpose": row["reference_purpose"],
+                "reference_note": row["reference_note"],
             }
             for row in rows
         ]
@@ -5181,6 +5187,14 @@ class MetadataStore:
                     (node_id, image_id, sort_order, created_at, label, query),
                 )
                 restored += int(cur.rowcount)
+                if link.get('reference_status') in {'primary', 'candidate', 'unused'}:
+                    conn.execute('''INSERT INTO creative_reference_decisions(node_id,image_id,status,purpose) VALUES (?,?,?,?)
+                        ON CONFLICT(node_id,image_id) DO UPDATE SET status=excluded.status,purpose=excluded.purpose''',
+                        (node_id,image_id,link['reference_status'],link.get('reference_purpose') or ''))
+                if link.get('reference_note') is not None:
+                    conn.execute('''INSERT INTO creative_reference_notes(node_id,image_id,note) VALUES (?,?,?)
+                        ON CONFLICT(node_id,image_id) DO UPDATE SET note=excluded.note''',
+                        (node_id,image_id,str(link['reference_note'])))
             if restored:
                 for project_id in project_ids:
                     conn.execute(

@@ -99,7 +99,7 @@ class CreativeWorkspace(QObject):
         self.group_button.setToolTip("选中至少 4 张已索引图片，预览并修改分组后保存")
         self.board_buttons = [
             self._button("便签", w.project_board_view.add_note, row),
-            self._button("按节点分区", w.project_board_view.arrange_by_labels, row),
+            self._button("按节点分区", w.project_board_view.toggle_node_sections, row),
             self._button("撤销编辑", w.project_board_view.undo_layout, row),
             self._button("重做", w.project_board_view.redo_layout, row),
         ]

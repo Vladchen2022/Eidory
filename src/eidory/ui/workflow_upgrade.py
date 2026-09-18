@@ -269,7 +269,8 @@ class WorkflowUpgrade(QObject):
             return
         self.state.set_decision(*key, self.status.currentData(), self.purpose.currentData())
         if self.w.center_result_stack.currentWidget() is self.w.project_board_view:
-            self.w._show_creative_board_for_node(self.w._current_board_node_id, force=True)
+            self.w.creative_flow.board_inspector.refresh_badges()
+            self.w.creative_flow.board_inspector.refresh()
         elif self.w.current_result_mode == 'creative_node':
             self.display_collected()
         self.w.statusBar().showMessage('已保存参考等级与用途')

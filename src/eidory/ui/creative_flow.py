@@ -295,8 +295,10 @@ class CreativeFlow(QObject):
         w.creative_node_tree.setHeaderLabels(['创作内容', '参考'])
 
     def _build_reference_panel(self):
-        self.reference_page = QWidget()
-        layout = QVBoxLayout(self.reference_page)
+        self.reference_page = QStackedWidget()
+        self.reference_collection = QWidget()
+        self.reference_page.addWidget(self.reference_collection)
+        layout = QVBoxLayout(self.reference_collection)
         layout.setContentsMargins(8, 10, 8, 8)
         self.reference_title = label('创作参考', role='flowTitle')
         layout.addWidget(self.reference_title)
@@ -355,6 +357,9 @@ class CreativeFlow(QObject):
         button('项目看板 →', self.show_project_board, row)
         layout.addLayout(row)
         self.reference_index = self.w.right_tab_widget.addTab(self.reference_page, '参考')
+        from eidory.ui.board_inspector import BoardInspector
+        self.board_inspector = BoardInspector(self.w, self.reference_page)
+        self._on_board = False
         self.search_notice = QWidget()
         notice = QHBoxLayout(self.search_notice)
         notice.setContentsMargins(2, 4, 2, 4)
@@ -743,7 +748,10 @@ class CreativeFlow(QObject):
         root = self.w.store.creative_root_node_id(self.w.current_creative_project_id) if self.w.current_creative_project_id else None
         if root:
             self.select_node(root)
-            self.cw.show_board()
+            # Explicit project navigation must not inherit a temporary search
+            # result set's rule that routes the generic board command to gallery.
+            self.w._show_creative_board_for_node(root)
+            self.w.right_tab_widget.setCurrentIndex(self.reference_index)
 
     def eventFilter(self, obj, event):
         if obj is self.overview and event.type() == QEvent.Type.Resize:
@@ -908,6 +916,15 @@ class CreativeFlow(QObject):
                 b.blockSignals(False)
                 b.setEnabled(cw._reference_key is not None)
             is_gallery = w.center_result_stack.currentWidget() is w.grid_view
+            is_board = w.center_result_stack.currentWidget() is w.project_board_view
+            self.board_inspector.actions.setVisible(is_board)
+            self.reference_page.setCurrentWidget(self.board_inspector.page if is_board else self.reference_collection)
+            w.right_tab_widget.setTabText(self.reference_index, '图片属性' if is_board else '参考')
+            if is_board:
+                self.board_inspector.refresh()
+                if not self._on_board and w.current_creative_project_id:
+                    w.right_tab_widget.setCurrentIndex(self.reference_index)
+            self._on_board = is_board
             is_search = (is_gallery and w.current_result_mode != 'creative_node') or w.center_result_stack.currentWidget() is self.search_empty
             self.overview_button.setEnabled(bool(w.current_creative_project_id))
             cw.collected_button.hide()
@@ -948,8 +965,8 @@ class CreativeFlow(QObject):
                     self.target_layout.addWidget(query)
                 if not rows:
                     self.target_layout.addWidget(label('先写一条想法，也可以直接添加找图目标。', role='muted'))
-            ids = w.store.creative_node_image_ids(node.id, include_descendants=True) if node else []
-            memberships = self.tray_memberships(node)
+            ids = w.store.creative_node_image_ids(node.id, include_descendants=True) if node and not is_board else []
+            memberships = self.tray_memberships(node) if not is_board else {}
             tray_key = (node.id if node else None, tuple(ids), repr(memberships))
             if tray_key != self._tray_key:
                 self._tray_key = tray_key

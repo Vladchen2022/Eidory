@@ -40,14 +40,25 @@ class WorkflowUpgrade(QObject):
     def _build(self):
         w, cw = self.w, self.w.creative_workspace
         tools = QPushButton('项目工具 ▾')
-        tools.setAccessibleName('项目总览、方案与导入导出')
+        tools.setAccessibleName('项目工具')
         menu = QMenu(tools)
         self.project_actions = []
-        for label, callback in [('项目总览', self.show_overview), ('方案版本…', self.show_versions),
-                                ('功能准备检查…', self.show_readiness), ('导出可编辑项目包…', self.export_package), ('导入可编辑项目包…', self.import_package)]:
+        for label, callback, needs_project in [
+                ('主题与补充设定…', lambda: w.creative_flow.edit_context(), True),
+                ('项目检查…', self.show_overview, True),
+                ('方案版本…', self.show_versions, True),
+                ('导出创作参考包…', cw.export_project, True),
+                ('导出可编辑项目包…', self.export_package, True),
+                ('导入可编辑项目包…', self.import_package, False)]:
             action = menu.addAction(label, callback)
-            if callback in (self.show_overview, self.show_versions, self.export_package):
+            if needs_project:
                 self.project_actions.append(action)
+        menu.addSeparator()
+        self.batch_action = menu.addAction('批量补全未确定的内容', w.generate_all_creative_nodes_button.click)
+        self.copy_action = menu.addAction('项目文案', w.open_creative_copy_button.click)
+        menu.addAction('探索灵感方向', cw.show_probe)
+        menu.aboutToShow.connect(lambda: self.batch_action.setEnabled(w.generate_all_creative_nodes_button.isEnabled()))
+        menu.aboutToShow.connect(lambda: self.copy_action.setEnabled(w.open_creative_copy_button.isEnabled()))
         tools.setMenu(menu)
         cw.navigation.layout().addWidget(tools)
         self.tools = tools
@@ -356,7 +367,7 @@ class WorkflowUpgrade(QObject):
             return
         self.flush()
         dialog = QDialog(self.w)
-        dialog.setWindowTitle('项目总览 · '+self.w.store.get_creative_project(pid).title)
+        dialog.setWindowTitle('项目检查 · '+self.w.store.get_creative_project(pid).title)
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel('先处理待采纳与需复核内容，再选择主参考；不需要参考图的节点可明确标记。'))
         rows = self.state.overview(pid)

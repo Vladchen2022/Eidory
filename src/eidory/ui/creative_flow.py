@@ -76,7 +76,6 @@ class CreativeFlow(QObject):
         self.refreshing = False
         self.routing = False
         self._cards_key = self._entries_key = self._targets_key = self._tray_key = None
-        self._recent_key = None
         self._last_project = window.current_creative_project_id
         self._search_dirty_node = None
         self._result_node_id = None
@@ -113,7 +112,6 @@ class CreativeFlow(QObject):
         empty.setAlignment(Qt.AlignmentFlag.AlignTop)
         empty.addWidget(label('先选一个找图目标', role='flowTitle'))
         empty.addWidget(label('在右侧添加想找的内容，或返回构思写下已经想到的内容。', role='muted'))
-        button('返回构思', self.show_planning, empty)
         self.w.center_result_stack.addWidget(self.search_empty)
         self.start = QWidget()
         layout = QVBoxLayout(self.start)
@@ -148,19 +146,9 @@ class CreativeFlow(QObject):
         self.create_button = button('开始构思', self.create_project, actions, primary=True)
         self.create_button.setEnabled(False)
         self.start_brief.textChanged.connect(lambda: self.create_button.setEnabled(bool(self.start_brief.toPlainText().strip())))
-        button('先浏览图库', self.browse_library, actions)
         button('让 AI 提供主题', self.suggest_project, actions)
         actions.addStretch()
         layout.addLayout(actions)
-        self.recent_projects = QWidget()
-        self.recent_projects.setObjectName('recentCreativeProjects')
-        self.recent_projects.setMaximumWidth(760)
-        self.recent_projects.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self.recent_layout = QVBoxLayout(self.recent_projects)
-        self.recent_layout.setContentsMargins(0, 12, 0, 0)
-        self.recent_layout.setSpacing(6)
-        self.recent_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(self.recent_projects)
         layout.addStretch(1)
         self.home_stack.addWidget(self.start)
         self.overview = QWidget()
@@ -171,7 +159,6 @@ class CreativeFlow(QObject):
         heading = QHBoxLayout()
         self.project_title = label('', role='flowTitle')
         heading.addWidget(self.project_title, 1)
-        button('主题与补充设定', self.edit_context, heading)
         outer.addLayout(heading)
         self.project_brief = label('', role='muted')
         outer.addWidget(self.project_brief)
@@ -181,12 +168,6 @@ class CreativeFlow(QObject):
         self.cards_layout.setContentsMargins(0, 0, 0, 0)
         self.cards_layout.setSpacing(12)
         outer.addWidget(self.cards_widget)
-        finish = QHBoxLayout()
-        button('整理项目看板', self.show_project_board, finish, primary=True)
-        button('保存与恢复方案', self.w.workflow_upgrade.show_versions, finish)
-        button('导出创作参考包', self.cw.export_project, finish)
-        finish.addStretch()
-        outer.addLayout(finish)
         self.overview.installEventFilter(self)
         self.home_stack.addWidget(self.overview)
 
@@ -208,22 +189,6 @@ class CreativeFlow(QObject):
         self.w._refresh_creative_projects(select_project_id=project_id)
         self.show_overview()
 
-    def refresh_recent(self):
-        projects = self.w.store.list_creative_projects()[:5]
-        key = tuple((p.id, p.title, p.image_count) for p in projects)
-        if key == self._recent_key:
-            return
-        self._recent_key = key
-        clear_layout(self.recent_layout)
-        if projects:
-            self.recent_layout.addWidget(label('继续已有项目', role='flowSubtitle'))
-        for project in projects:
-            entry = button(f'{project.title}  ·  {project.image_count} 张参考',
-                           lambda _=False, pid=project.id: self.resume_project(pid), self.recent_layout)
-            # macOS button layout insets must not eat the visible row spacing.
-            entry.setAttribute(Qt.WidgetAttribute.WA_LayoutUsesWidgetRect)
-            entry.setToolTip(entry.text())
-
     def suggest_project(self):
         w = self.w
         w.creative_template_combo.setCurrentIndex(w.creative_template_combo.findData(self.start_template.currentData()))
@@ -241,19 +206,9 @@ class CreativeFlow(QObject):
         self.editor_top = QWidget()
         row = QHBoxLayout(self.editor_top)
         row.setContentsMargins(0, 0, 0, 0)
-        button('‹ 项目全貌', self.show_overview, row)
         self.editor_title = label('', role='flowTitle')
         row.addWidget(self.editor_title, 1)
-        self.editor_find = button('找参考 →', lambda: self.open_search(), row, primary=True)
-        more = QPushButton('更多 ▾')
-        menu = QMenu(more)
-        menu.addAction('主题与补充设定…', self.edit_context)
-        menu.addAction('内容形式与恢复…', self.editor_options)
-        menu.addAction('批量补全未确定的内容', w.generate_all_creative_nodes_button.click)
-        menu.addAction('项目文案', w.open_creative_copy_button.click)
-        menu.addAction('探索灵感方向', cw.show_probe)
-        more.setMenu(menu)
-        row.addWidget(more)
+        button('内容选项', self.editor_options, row)
         cw.planning.layout().insertWidget(0, self.editor_top)
         node_layout = w.creative_node_note_input.parentWidget().layout()
         node_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -314,7 +269,11 @@ class CreativeFlow(QObject):
     def _build_reference_panel(self):
         self.reference_page = QStackedWidget()
         self.reference_collection = QWidget()
-        self.reference_page.addWidget(self.reference_collection)
+        self.reference_scroll = QScrollArea()
+        self.reference_scroll.setWidgetResizable(True)
+        self.reference_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.reference_scroll.setWidget(self.reference_collection)
+        self.reference_page.addWidget(self.reference_scroll)
         layout = QVBoxLayout(self.reference_collection)
         layout.setContentsMargins(8, 10, 8, 8)
         self.reference_title = label('创作参考', role='flowTitle')
@@ -371,7 +330,6 @@ class CreativeFlow(QObject):
         row = QHBoxLayout()
         self.undo_remove = button('撤销移出', self.restore_reference, row)
         self.undo_remove.hide()
-        button('项目看板 →', self.show_project_board, row)
         layout.addLayout(row)
         self.reference_index = self.w.right_tab_widget.addTab(self.reference_page, '参考')
         from eidory.ui.board_inspector import BoardInspector
@@ -382,8 +340,14 @@ class CreativeFlow(QObject):
         notice.setContentsMargins(2, 4, 2, 4)
         self.search_context = label('')
         notice.addWidget(self.search_context, 1)
-        button('返回构思', self.show_planning, notice)
         self.search_refresh = button('更新找图结果', self.run_targets, notice, primary=True)
+        # Keep the original idea in sight while choosing visual references.
+        self.search_brief = label('', role='muted')
+        self.search_brief.setAccessibleName('当前构思摘要')
+        self.search_brief.setWordWrap(False)
+        self.search_brief.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Maximum)
+        self.search_brief.installEventFilter(self)
+        notice.insertWidget(1, self.search_brief, 1)
         center = self.w.center_result_stack.parentWidget().layout()
         center.insertWidget(center.indexOf(self.w.center_result_stack), self.search_notice)
 
@@ -783,6 +747,8 @@ class CreativeFlow(QObject):
             self.w.right_tab_widget.setCurrentIndex(self.reference_index)
 
     def eventFilter(self, obj, event):
+        if obj is getattr(self, 'search_brief', None) and event.type() in (QEvent.Type.Resize, QEvent.Type.FontChange):
+            self._update_search_brief()
         if obj is self.overview and event.type() == QEvent.Type.Resize:
             QTimer.singleShot(0, self.refresh)
         return False
@@ -868,7 +834,6 @@ class CreativeFlow(QObject):
         self._project_actions.hide()
         self.editor_top.setVisible(not probe)
         self.editor_title.setText(node.title if node else '')
-        self.editor_find.setEnabled(node is not None)
         cw.format_combo.hide()
         cw.restore_button.hide()
         # Hide the old format label, keeping the lock command visible.
@@ -917,6 +882,10 @@ class CreativeFlow(QObject):
         self.target_run.setEnabled(self.w.search_button.isEnabled())
         self.search_refresh.setEnabled(self.w.search_button.isEnabled())
         self.target_hint.setText('目标已修改，更新结果后再收集。' if dirty else '各项分别找图，结果合并显示。')
+        idea = ' '.join(node.note.split()) if node else ''
+        self.search_brief.setToolTip(node.note if node else '')
+        self._update_search_brief()
+        self.search_brief.setVisible(bool(idea))
         self.search_context.setText(('目标已修改 · 仍显示上次结果' if dirty else '正在为「' + node.title + '」找参考') if node else '图库浏览')
         if busy and node:
             self.search_context.setText(f'正在为「{node.title}」更新结果…')
@@ -924,6 +893,12 @@ class CreativeFlow(QObject):
             self.cw.collect_button.setEnabled(False)
         if hasattr(self.w, "simple_search"):
             self.w.simple_search.refresh()
+
+    def _update_search_brief(self):
+        idea = ' '.join(self.search_brief.toolTip().split())
+        self.search_brief.setText(self.search_brief.fontMetrics().elidedText(
+            '构思：' + idea if idea else '', Qt.TextElideMode.ElideRight,
+            max(0, self.search_brief.contentsRect().width())))
 
     def refresh(self, *_args):
         if self.refreshing or getattr(self, '_refresh_batch_depth', 0):
@@ -949,7 +924,7 @@ class CreativeFlow(QObject):
             is_gallery = w.center_result_stack.currentWidget() is w.grid_view
             is_board = w.center_result_stack.currentWidget() is w.project_board_view
             self.board_inspector.actions.setVisible(is_board)
-            self.reference_page.setCurrentWidget(self.board_inspector.page if is_board else self.reference_collection)
+            self.reference_page.setCurrentWidget(self.board_inspector.page if is_board else self.reference_scroll)
             w.right_tab_widget.setTabText(self.reference_index, '图片属性' if is_board else '参考')
             if is_board:
                 self.board_inspector.refresh()
@@ -960,6 +935,7 @@ class CreativeFlow(QObject):
                 self.board_inspector.flush_note()
             is_search = (is_gallery and w.current_result_mode != 'creative_node') or w.center_result_stack.currentWidget() is self.search_empty
             self.overview_button.setEnabled(bool(w.current_creative_project_id))
+            self.overview_button.setVisible(bool(node and node.parent_id is not None))
             cw.collected_button.hide()
             if w.center_result_stack.currentWidget() is self.search_empty or (is_gallery and w.current_result_mode == 'creative_node'):
                 for i, b in enumerate(w.workspace_chrome.stage_buttons):
@@ -971,8 +947,6 @@ class CreativeFlow(QObject):
                 self.home_stack.setCurrentWidget(self.overview if w.current_creative_project_id else self.start)
                 if w.current_creative_project_id:
                     self.refresh_cards()
-                else:
-                    self.refresh_recent()
             if is_board:
                 self.target_area.hide()
                 self.search_notice.hide()

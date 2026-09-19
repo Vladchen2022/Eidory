@@ -172,15 +172,23 @@ def test_search_query_is_saved_without_requiring_focus_change(window):
     assert any(c.value == '机器人关节' for c in w.filter_workflow.plan().positive_filters)
 
 
-def test_start_recent_project_resumes_existing_content(window):
+def test_project_picker_resumes_existing_content(window, app):
+    from eidory.ui.main_window import PROJECT_LIST_ID_ROLE, PROJECT_LIST_KIND_ROLE
     w, f = window, window.creative_flow
     pid, node, _ = make_project(w)
-    f.refresh_recent()
-    assert any(str(pid) == str(p[0]) for p in f._recent_key)
-    f.resume_project(pid)
+    chrome = w.workspace_chrome
+    chrome.open_library()
+    chrome.open_project_picker()
+    item = next(w.temp_project_list.item(i) for i in range(w.temp_project_list.count())
+                if w.temp_project_list.item(i).data(PROJECT_LIST_KIND_ROLE) == 'creative'
+                and w.temp_project_list.item(i).data(PROJECT_LIST_ID_ROLE) == pid)
+    w.temp_project_list.setCurrentItem(item)
+    assert w.current_creative_project_id is None
+    chrome._activate_project(item)
+    assert not chrome.project_picker.isVisible()
     assert w.current_creative_project_id == pid
     assert w.creative_project_combo.currentData() == pid
-    assert w.center_result_stack.currentWidget() is f.home
+    assert w.center_result_stack.currentWidget() is w.project_board_view
     assert w.store.get_creative_node(node.id).note == node.note
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from weakref import ref
 
-from PySide6.QtCore import QObject, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtGui import QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QMenu, QPushButton,
@@ -97,39 +97,24 @@ class WorkspaceChrome(QObject):
         projects = QWidget()
         project_layout = QVBoxLayout(projects)
         project_layout.setContentsMargins(0, 8, 0, 0)
-        self.new_project_button = self._button("＋ 新建创作项目", cw.new_project, project_layout)
-        split = QSplitter(Qt.Orientation.Vertical)
-        split.setChildrenCollapsible(False)
         current = QWidget()
         current_layout = QVBoxLayout(current)
         current_layout.setContentsMargins(0, 0, 0, 0)
-        self.node_heading = QLabel("当前项目节点")
+        self.node_heading = QLabel("创作内容")
         self.node_heading.setProperty("role", "sectionTitle")
         current_layout.addWidget(self.node_heading)
         w.creative_node_tree.setMinimumHeight(120)
         w.creative_node_tree.setMaximumHeight(16777215)
         current_layout.addWidget(w.creative_node_tree, 1)
         w.creative_node_tree.show()
-        w.creative_node_status_label.setWordWrap(True)
-        w.creative_node_status_label.setMaximumHeight(72)
-        w.creative_node_status_label.setProperty("role", "muted")
-        current_layout.addWidget(w.creative_node_status_label)
-        w.creative_node_status_label.show()
+        # The stage strip already names the active content and reference count.
+        w.creative_node_status_label.hide()
         self.project_node_panel = current
-        split.addWidget(current)
-        saved = QWidget()
-        saved_layout = QVBoxLayout(saved)
-        saved_layout.setContentsMargins(0, 8, 0, 0)
-        heading = QLabel("项目与参考集")
-        heading.setProperty("role", "sectionTitle")
-        saved_layout.addWidget(heading)
-        w.temp_project_list.setMinimumHeight(130)
-        saved_layout.addWidget(w.temp_project_list, 1)
-        w.temp_project_list.show()
-        split.addWidget(saved)
-        split.setSizes([400, 220])
-        project_layout.addWidget(split, 1)
-        self.explore_button = self._button("探索灵感方向", cw.show_probe, project_layout)
+        project_layout.addWidget(current, 1)
+        self.project_empty = QLabel("尚未选择项目")
+        self.project_empty.setProperty("role", "muted")
+        self.project_empty.setAlignment(Qt.AlignmentFlag.AlignTop)
+        project_layout.addWidget(self.project_empty, 1)
         self.navigation_tabs.addTab(projects, "项目")
         self.navigation_tabs.setCurrentIndex(w._setting_int("ui.navigation_tab", 0, 0, 1))
         self.navigation_tabs.currentChanged.connect(lambda i: w.store.set_setting("ui.navigation_tab", str(i)))
@@ -151,7 +136,6 @@ class WorkspaceChrome(QObject):
         cw.reference_input.setMinimumHeight(140)
         cw.reference_input.setMaximumHeight(280)
         side.addStretch(1)
-        self.export_button = self._button("导出创作参考包…", cw.export_project, side)
         w.right_tab_widget.setTabText(1, "用途")
 
     def _build_header(self):
@@ -169,11 +153,35 @@ class WorkspaceChrome(QObject):
         self.left_button.setCheckable(True)
         self.exit_focus_button = self._button("退出专注", lambda: w._set_board_focus_mode(False), row, primary=True)
         self.exit_focus_button.hide()
-        w.creative_project_combo.setMaximumWidth(330)
-        w.creative_project_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        w.creative_project_combo.setMinimumContentsLength(12)
-        row.addWidget(w.creative_project_combo)
-        w.creative_project_combo.show()
+        # Keep the combo as the existing project-state adapter, not a second
+        # user-facing selector beside the saved-project list.
+        w.creative_project_combo.setParent(self.adapters)
+        w.creative_project_combo.hide()
+        self.project_button = self._button("独立图库 ▾", lambda: self.open_project_picker(), row)
+        self.project_button.setAccessibleName("选择项目或独立图库")
+        self.project_button.setMaximumWidth(330)
+        self.project_picker = QDialog(w)
+        self.project_picker.setWindowTitle("选择项目或参考集")
+        self.project_picker.setWindowModality(Qt.WindowModality.WindowModal)
+        picker_layout = QVBoxLayout(self.project_picker)
+        picker_actions = QHBoxLayout()
+        self.library_button = self._button("独立图库", self.open_library, picker_actions)
+        self.new_project_button = self._button("＋ 新建创作项目", self.new_project, picker_actions)
+        picker_layout.addLayout(picker_actions)
+        picker_layout.addWidget(w.temp_project_list, 1)
+        w.temp_project_list.setMinimumHeight(180)
+        w.temp_project_list.show()
+        w.temp_project_list.itemSelectionChanged.disconnect(w._load_selected_temporary_project)
+        w.temp_project_list.itemSelectionChanged.connect(self._project_selection_changed)
+        # Loading a project rebuilds (and deletes) its QListWidgetItem objects.
+        # Use one itemClicked receiver: a second Python receiver would make
+        # PySide wrap the already-freed signal argument and crash on macOS.
+        w.temp_project_list.itemClicked.disconnect(w._handle_project_sidebar_item_clicked)
+        w.temp_project_list.itemClicked.connect(self._activate_project)
+        w.temp_project_list.itemActivated.connect(self._activate_project)
+        w.temp_project_list.installEventFilter(self)
+        self.library_button.setAutoDefault(False)
+        self.new_project_button.setAutoDefault(False)
         row.addStretch(1)
         self.tasks_button = self._button("后台任务", lambda: self.open_global_panel(3), row)
         self.settings_button = self._button("设置", lambda: self.open_global_panel(4), row)
@@ -183,6 +191,55 @@ class WorkspaceChrome(QObject):
         w.central_layout.setStretch(w.central_layout.indexOf(w.root_splitter), 1)
         w.root_splitter.widget(2).setObjectName("referenceSidebar")
         w.root_splitter.setHandleWidth(6)
+
+    def open_project_picker(self):
+        screen = self.project_button.screen().availableGeometry()
+        self.project_picker.resize(min(480, screen.width() - 16), min(470, screen.height() - 40))
+        if not any(self.w.project_sidebar_expanded_sections.values()):
+            self.w._set_project_sidebar_expanded_section("creative")
+            self.w._refresh_project_sidebar()
+        self.project_picker.show()
+        self.project_picker.raise_()
+        self.project_picker.activateWindow()
+        self.w.temp_project_list.setFocus()
+
+    def eventFilter(self, watched, event):
+        if (watched is self.w.temp_project_list and self.project_picker.isVisible()
+                and event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress)
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)):
+            event.accept()
+            if event.type() == QEvent.Type.KeyPress and not event.isAutoRepeat():
+                item = self.w.temp_project_list.currentItem()
+                if item:
+                    self._activate_project(item)
+            return True
+        return False
+
+    def _project_selection_changed(self):
+        # Arrow keys browse the chooser without loading every intermediate
+        # project's board. Mouse click / Enter explicitly activate a row.
+        if not self.project_picker.isVisible():
+            self.w._load_selected_temporary_project()
+
+    def _project_picked(self, *_):
+        # Selection may rebuild the list; use its new current item, not the
+        # signal's potentially deleted QListWidgetItem wrapper.
+        item = self.w.temp_project_list.currentItem()
+        if item and item.data(Qt.ItemDataRole.UserRole) is not None:
+            self.project_picker.hide()
+
+    def _activate_project(self, item):
+        self.w._handle_project_sidebar_item_clicked(item)
+        self._project_picked()
+
+    def open_library(self):
+        self.project_picker.hide()
+        self.w._load_creative_project(None)
+        self.navigation_tabs.setCurrentIndex(0)
+
+    def new_project(self):
+        self.project_picker.hide()
+        self.w.creative_workspace.new_project()
 
     def _build_selection_bar(self):
         w = self.w
@@ -482,9 +539,16 @@ class WorkspaceChrome(QObject):
             if project_id:
                 self.navigation_tabs.setCurrentIndex(1)
         self.project_node_panel.setVisible(bool(project_id))
+        self.project_empty.setVisible(not bool(project_id))
         if w.creative_project_combo.count() and w.creative_project_combo.itemData(0) is None:
             w.creative_project_combo.setItemText(0, "独立图库")
         self._sync_temporary_context()
+        title = w.creative_project_combo.currentText()
+        if project_id:
+            title = title.rsplit(" (", 1)[0].removeprefix("⬆ ")
+        self.project_button.setText(self.project_button.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, 280) + " ▾")
+        self.project_button.setToolTip(title)
+        w.creative_node_status_label.hide()
         is_gallery = w.center_result_stack.currentWidget() is w.grid_view
         is_board = w.center_result_stack.currentWidget() is w.project_board_view
         phase = 3 if is_board else 0 if not is_gallery else 2 if w.current_result_mode == "creative_node" else 1
@@ -509,7 +573,7 @@ class WorkspaceChrome(QObject):
         w.show_project_board_button.hide()
         for widget in (w.shuffle_results_button, w.save_result_set_button, w.thumbnail_size_label, w.thumbnail_size_slider):
             widget.setVisible(is_gallery)
-        self.export_button.setEnabled(bool(project_id))
+
         self.refresh_selection()
         self.sync_sidebars()
         if hasattr(w, 'creative_flow'):

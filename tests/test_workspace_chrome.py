@@ -17,7 +17,8 @@ def test_navigation_preserves_project_filters_and_selection(window, app):
     before = w.grid_view.selected_image_ids()
     chrome = w.workspace_chrome
     assert w.root_splitter.widget(0).isAncestorOf(w.creative_node_tree)
-    assert chrome.header.isAncestorOf(w.creative_project_combo)
+    assert chrome.header.isAncestorOf(chrome.project_button)
+    assert w.creative_project_combo.isHidden()
     for index in (0, 1, 0):
         chrome.navigation_tabs.setCurrentIndex(index)
         app.processEvents()

@@ -191,6 +191,7 @@ class EditHistory(QObject):
         if isinstance(focus, (QLineEdit, QTextEdit, QPlainTextEdit)) and not focus.isReadOnly():
             (focus.undo if backwards else focus.redo)()
             return
+        self.w.project_board_view.flush_pending_layout_change()
         source, destination = (self.past, self.future) if backwards else (self.future, self.past)
         if not source:
             if backwards:

@@ -4,6 +4,7 @@ from PySide6.QtCore import QObject, QRectF, Qt, QEvent, QTimer
 from PySide6.QtGui import QPainter, QPen
 from PySide6.QtWidgets import QWidget, QPushButton, QMenu
 from eidory.ui.theme_colors import theme_color
+from eidory.ui.board_shortcuts import set_board_button_text
 
 
 class BoardMap(QWidget):
@@ -96,7 +97,7 @@ class BoardNavigation(QObject):
         self.map.setVisible(self.board.isVisible() and self.map_enabled and len(self.board._image_items) >= 12)
         self.map.raise_()
         self.map.update()
-        self.button.setText("主参考突出 ▾" if self.primary_only else "定位 ▾")
+        set_board_button_text(self.button, "主参考突出 ▾" if self.primary_only else "定位 ▾")
         has_primary = any("主参考" in labels for labels in self.board._board_badges.values())
         for iid, item in self.board._image_items.items():
             primary = any('主参考' in label for label in self.board._board_badges.get(iid, []))

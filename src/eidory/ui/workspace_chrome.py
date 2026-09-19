@@ -330,6 +330,9 @@ class WorkspaceChrome(QObject):
         self.w.board_hide_selected_button.setToolTip(
             ("Focus board" if english else "专注看板") + f"（{shortcut}）")
         self.board_tools.more.setText("More ▾" if english else "更多 ▾")
+        self.w.board_grayscale_button.setToolTip("有选图时只切换所选图片；未选图时统一切换全部图片的黑白显示")
+        if hasattr(self.w, 'board_shortcuts'):
+            self.w.board_shortcuts.refresh_labels()
         self.board_tools.timer.start(0)
 
     def _inspector_changed(self, index):

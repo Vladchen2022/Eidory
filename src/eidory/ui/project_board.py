@@ -10,7 +10,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal, QSignalBlocker
 from PySide6.QtGui import (
     QColor,
     QFontMetrics,
@@ -1794,12 +1794,25 @@ class ProjectBoardView(QGraphicsView):
         return changed
 
     def toggle_selected_grayscale(self) -> int:
-        changed = 0
-        for item in self._selected_image_items():
-            if isinstance(item, BoardImageItem):
-                item.toggle_grayscale()
-                changed += 1
-        return changed
+        items = [item for item in (self._selected_image_items() or list(self._image_items.values()))
+                 if isinstance(item, BoardImageItem)]
+        if not items:
+            return 0
+        # A mixed selection becomes uniformly monochrome, then uniformly color.
+        grayscale = not all(item.is_grayscale() for item in items)
+        changed = [item for item in items if item.is_grayscale() != grayscale]
+        self.flush_pending_layout_change()
+        previous = self._suppress_layout_changed
+        self._suppress_layout_changed = True
+        try:
+            for item in changed:
+                item.set_grayscale(grayscale)
+        finally:
+            self._suppress_layout_changed = previous
+        if changed:
+            self._schedule_layout_changed()
+            self.flush_pending_layout_change()
+        return len(changed)
 
     def edit_selected_local_display(self) -> bool:
         selected = [item for item in self._selected_image_items() if isinstance(item, BoardImageItem)]
@@ -2000,9 +2013,16 @@ class ProjectBoardView(QGraphicsView):
 
     def _restore_layout(self, payload):
         undo, redo = list(self._undo_layouts), list(self._redo_layouts)
+        selected_ids = self.selected_image_ids()
         transform = self.transform()
         center = self.mapToScene(self.viewport().rect().center())
         self.set_images(list(self._images_by_id.values()), title=self._board_title, layout_payload=payload, badges_by_image_id=self._board_badges)
+        with QSignalBlocker(self._scene):
+            for image_id in selected_ids:
+                item = self._image_items.get(image_id)
+                if item is not None and item.isVisible():
+                    item.setSelected(True)
+        self._emit_selection_changed()
         self._undo_layouts, self._redo_layouts = undo, redo
         self.setTransform(transform)
         self.centerOn(center)
@@ -2052,23 +2072,14 @@ class ProjectBoardView(QGraphicsView):
         self._schedule_visible_quality()
 
     def wheelEvent(self, event) -> None:
-        modifiers = event.modifiers()
-        zoom_modifier = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
-        if modifiers & zoom_modifier:
-            raw_delta = event.angleDelta().y()
-            if raw_delta == 0:
-                raw_delta = event.pixelDelta().y()
-            delta = max(-160, min(160, raw_delta))
-            if delta == 0:
-                event.accept()
-                return
-            factor = 1.12 if delta > 0 else 1 / 1.12
-            self._view_mode = "manual"
+        # Plain wheel zooms the canvas and its images together. Small trackpad
+        # deltas stay proportional instead of jumping a full step per event.
+        delta = event.angleDelta().y() or event.pixelDelta().y()
+        if delta:
+            factor = 1.12 ** (max(-240, min(240, delta)) / 120)
             self._last_fit_selection_ids = ()
-            self._zoom_by(factor)
-            event.accept()
-            return
-        super().wheelEvent(event)
+            self._zoom_by(factor, anchor_pos=event.position().toPoint(), defer_quality=True)
+        event.accept()
 
     def keyPressEvent(self, event) -> None:
         undo_modifier = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
@@ -2458,18 +2469,22 @@ class ProjectBoardView(QGraphicsView):
     def select_image_id(self, image_id: int) -> None:
         self._select_image_id(image_id)
 
-    def _zoom_by(self, factor: float) -> None:
+    def _zoom_by(self, factor: float, *, anchor_pos=None, defer_quality=False) -> None:
         next_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
-        if abs(next_zoom - self._zoom) < 0.001:
+        if abs(next_zoom - self._zoom) < 1e-9:
             return
-        if factor > 1:
+        if factor > 1 and not defer_quality:
             self._ensure_focus_quality_for_items(self._selected_image_items(), target_zoom=next_zoom)
         scale_factor = next_zoom / max(0.001, self._zoom)
         center = self.mapToScene(self.viewport().rect().center())
+        under_pointer = self.mapToScene(anchor_pos) if anchor_pos is not None else None
         anchor = self.transformationAnchor()
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.scale(scale_factor, scale_factor)
         self.centerOn(center)
+        if under_pointer is not None:
+            self.centerOn(self.mapToScene(self.viewport().rect().center())
+                          + under_pointer - self.mapToScene(anchor_pos))
         self.setTransformationAnchor(anchor)
         self._view_mode = "manual"
         self._zoom = next_zoom

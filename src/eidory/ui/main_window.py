@@ -1693,6 +1693,8 @@ class MainWindow(QMainWindow):
         self.image_memory_budget = ImageMemoryBudget(self)
         from eidory.ui.responsive_chrome import ResponsiveChrome
         self.responsive_chrome = ResponsiveChrome(self)
+        from eidory.ui.board_shortcuts import BoardShortcuts
+        self.board_shortcuts = BoardShortcuts(self)
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
         self._ensure_temporary_import_collection()
         self._refresh_folders()
@@ -16900,8 +16902,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已左右翻转：{changed} 张")
 
     def _toggle_board_selected_grayscale(self) -> None:
+        scope = "所选图片" if self.project_board_view.selected_image_ids() else "全部图片"
         changed = self.project_board_view.toggle_selected_grayscale()
-        self.statusBar().showMessage(f"已切换黑白显示：{changed} 张")
+        self.statusBar().showMessage(f"已切换{scope}黑白显示：{changed} 张")
 
     def _refresh_board_local_display_button_state(self) -> None:
         if not hasattr(self, "board_toggle_local_display_button"):

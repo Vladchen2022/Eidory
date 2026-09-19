@@ -301,12 +301,12 @@ def test_board_toolbar_overflows_without_losing_actions_or_board_state(window, l
     assert not w.board_grayscale_button.isVisible()
     toolbar.build_menu()
     transform = board.transform()
-    action = next(a for a in toolbar.menu.actions() if a.text() == '黑白显示')
+    action = next(a for a in toolbar.menu.actions() if a.text() == '黑白显示 (B)')
     action.trigger()
     assert board.layout_payload()['items'][str(iid)]['grayscale'] is True
     assert board.selected_image_ids() == [iid]
     assert board.transform() == transform
-    local = next(a for a in toolbar.menu.actions() if a.text() == '局部／全图切换')
+    local = next(a for a in toolbar.menu.actions() if a.text() == '局部／全图切换 (V)')
     assert not local.isEnabled()
     from unittest.mock import patch
     with patch.object(w, '_set_native_window_pinned', return_value=True):
@@ -314,7 +314,7 @@ def test_board_toolbar_overflows_without_losing_actions_or_board_state(window, l
         w.board_pin_button.setChecked(True)
         assert w._board_window_pinned
         toolbar.build_menu()
-        pin = next(a for a in toolbar.menu.actions() if a.text() == '窗口置顶')
+        pin = next(a for a in toolbar.menu.actions() if a.text() == '窗口置顶 (P)')
         assert pin.isChecked()
         pin.trigger()
         assert not w._board_window_pinned

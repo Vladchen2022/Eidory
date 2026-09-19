@@ -9,6 +9,7 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
 
 from eidory.core.project_state import PURPOSES, REFERENCE_STATUSES
+from eidory.ui.board_shortcuts import set_board_button_text
 
 
 class BoardInspector(QObject):
@@ -137,7 +138,7 @@ class BoardInspector(QObject):
         button.setCheckable(True)
         with QSignalBlocker(button):
             button.setChecked(grouped)
-        button.setText('取消分区 · 自由排列' if grouped else '按节点分区')
+        set_board_button_text(button, '取消分区 · 自由排列' if grouped else '按节点分区')
         button.setToolTip('仅移除分区框，保留图片当前位置；可撤销。' if grouped else '按节点整理图片；再次点击可取消分区。')
 
     def active_links(self):

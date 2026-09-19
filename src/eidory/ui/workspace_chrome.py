@@ -4,7 +4,7 @@ from __future__ import annotations
 from weakref import ref
 
 from PySide6.QtCore import QObject, Qt, QTimer
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QMenu, QPushButton,
     QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
@@ -217,31 +217,23 @@ class WorkspaceChrome(QObject):
         cw.context_label.setProperty("role", "muted")
 
     def _build_board_tools(self):
+        from eidory.ui.overflow_toolbar import OverflowToolbar
+
         w = self.w
         cw = w.creative_workspace
-        self.board_tools = QWidget()
+        self.board_tools = OverflowToolbar()
         self.board_tools.setObjectName("boardTools")
-        self.board_tools.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        row = QHBoxLayout(self.board_tools)
-        row.setContentsMargins(0, 2, 0, 4)
-        row.setSpacing(6)
         for button in (w.board_fit_all_button, *cw.board_buttons):
-            row.addWidget(button)
-        row.addStretch(1)
-        more = QPushButton("更多 ▾")
-        menu = QMenu(more)
-        for button, label in (
-            (w.board_pin_button, "窗口置顶"),
-            (w.board_hide_selected_button, "专注看板（" + w.board_focus_shortcut.key().toString(QKeySequence.SequenceFormat.NativeText) + "）"),
-            (w.board_flip_button, "左右翻转"), (w.board_grayscale_button, "黑白显示"),
-            (w.board_edit_local_display_button, "编辑局部显示"),
-            (w.board_toggle_local_display_button, "局部／全图切换"),
+            self.board_tools.add_button(button)
+        self.board_section_lock_button = QPushButton("锁定／解锁所选分区")
+        self.board_section_lock_button.clicked.connect(w.project_board_view.toggle_section_lock)
+        for button in (
+            w.board_pin_button, w.board_hide_selected_button,
+            w.board_flip_button, w.board_grayscale_button,
+            w.board_edit_local_display_button, w.board_toggle_local_display_button,
+            self.board_section_lock_button,
         ):
-            button.setParent(self.adapters)
-            menu.addAction(label, button.click)
-        menu.addAction("锁定／解锁所选分区", w.project_board_view.toggle_section_lock)
-        more.setMenu(menu)
-        row.addWidget(more)
+            self.board_tools.add_button(button)
         w.center_result_stack.parentWidget().layout().insertWidget(1, self.board_tools)
 
     def _build_global_panels(self):
@@ -317,6 +309,28 @@ class WorkspaceChrome(QObject):
         self.w.right_tab_widget.setTabText(1, "Usage" if english else "用途")
         self.w.add_collection_button.setText("＋ Folder" if english else "＋ 文件夹")
         self.w.search_creative_node_button.setText("Find References" if english else "用此语句找参考")
+        for button, chinese, translated in (
+            (self.w.board_pin_button, "窗口置顶", "Keep on Top"),
+            (self.w.board_hide_selected_button, "专注看板", "Focus Board"),
+            (self.w.board_flip_button, "左右翻转", "Flip Horizontally"),
+            (self.w.board_grayscale_button, "黑白显示", "Grayscale"),
+            (self.w.board_edit_local_display_button, "编辑局部显示", "Edit Local View"),
+            (self.w.board_toggle_local_display_button, "局部／全图切换", "Local / Full"),
+            (self.board_section_lock_button, "锁定／解锁所选分区", "Lock / Unlock Sections"),
+        ):
+            # Former icon-only controls now have readable labels. Let the font
+            # and theme determine their size, including after language changes.
+            button.setMinimumSize(0, 0)
+            button.setMaximumSize(16777215, 16777215)
+            button.setProperty("eidoryBoardIcon", None)
+            button.setIcon(QIcon())
+            button.setText(translated if english else chinese)
+            button.setAccessibleName(button.text())
+        shortcut = self.w.board_focus_shortcut.key().toString(QKeySequence.SequenceFormat.NativeText)
+        self.w.board_hide_selected_button.setToolTip(
+            ("Focus board" if english else "专注看板") + f"（{shortcut}）")
+        self.board_tools.more.setText("More ▾" if english else "更多 ▾")
+        self.board_tools.timer.start(0)
 
     def _inspector_changed(self, index):
         if index in (3, 4):

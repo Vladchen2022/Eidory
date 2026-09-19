@@ -277,3 +277,77 @@ def test_accessibility_toggle_changes_stage_content(window, app):
         else:
             assert w.center_result_stack.currentWidget() is not w.grid_view
             assert w.center_result_stack.currentWidget() is not w.project_board_view
+
+
+def test_board_toolbar_overflows_without_losing_actions_or_board_state(window, library, app):
+    from test_board_inspector import board_project
+
+    w = window
+    board_project(w, library[2])
+    board = w.project_board_view
+    iid = library[2][0].id
+    board.select_image_id(iid)
+    toolbar = w.workspace_chrome.board_tools
+    layout = board.layout_payload()
+    w.resize(2400, 900)
+    QTest.qWait(50)
+    assert not toolbar.more.isVisible()
+    assert w.board_grayscale_button.isVisible()
+    assert w.workspace_chrome.board_section_lock_button.isVisible()
+
+    w.resize(1050, 900)
+    QTest.qWait(50)
+    assert toolbar.more.isVisible()
+    assert not w.board_grayscale_button.isVisible()
+    toolbar.build_menu()
+    transform = board.transform()
+    action = next(a for a in toolbar.menu.actions() if a.text() == '黑白显示')
+    action.trigger()
+    assert board.layout_payload()['items'][str(iid)]['grayscale'] is True
+    assert board.selected_image_ids() == [iid]
+    assert board.transform() == transform
+    local = next(a for a in toolbar.menu.actions() if a.text() == '局部／全图切换')
+    assert not local.isEnabled()
+    from unittest.mock import patch
+    with patch.object(w, '_set_native_window_pinned', return_value=True):
+        # Native accessibility can toggle a button without sending clicked().
+        w.board_pin_button.setChecked(True)
+        assert w._board_window_pinned
+        toolbar.build_menu()
+        pin = next(a for a in toolbar.menu.actions() if a.text() == '窗口置顶')
+        assert pin.isChecked()
+        pin.trigger()
+        assert not w._board_window_pinned
+        assert not w.board_pin_button.isChecked()
+    w.resize(2400, 900)
+    QTest.qWait(50)
+    assert not toolbar.more.isVisible()
+    w.board_grayscale_button.click()
+    assert board.layout_payload() == layout
+
+
+def test_board_toolbar_adapts_to_font_and_stage_changes_without_clipping(window, library, app):
+    from test_board_inspector import board_project
+    from PySide6.QtWidgets import QPushButton
+
+    w = window
+    board_project(w, library[2])
+    toolbar = w.workspace_chrome.board_tools
+    for width, points in ((2400, 13), (1250, 20), (1050, 20), (1800, 16), (2400, 13)):
+        w.resize(width, 900)
+        for b in toolbar.findChildren(QPushButton):
+            font = b.font()
+            font.setPointSize(points)
+            b.setFont(font)
+        w.creative_flow.show_planning()
+        w.creative_flow.show_project_board()
+        QTest.qWait(50)
+        toolbar.build_menu()
+        visible = [b for b in toolbar.findChildren(QPushButton) if b.isVisible()]
+        visible.sort(key=lambda b: b.x())
+        for b in visible:
+            assert b.width() >= min(b.maximumWidth(), b.sizeHint().width())
+            assert b.geometry().right() < toolbar.width()
+        assert all(a.geometry().right() < b.x() for a, b in zip(visible, visible[1:]))
+        assert len(toolbar.menu.actions()) == len(toolbar.overflow)
+        assert all(not b.isVisible() for b in toolbar.overflow)

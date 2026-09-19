@@ -3631,7 +3631,7 @@ class MainWindow(QMainWindow):
         self.show_gallery_button.clicked.connect(self._show_gallery_view)
         self.show_project_board_button.clicked.connect(self._show_current_project_board)
         self.save_project_board_layout_button.clicked.connect(self._save_current_creative_board_layout)
-        self.board_pin_button.clicked.connect(self._toggle_board_window_pin)
+        self.board_pin_button.toggled.connect(self._toggle_board_window_pin)
         self.board_hide_selected_button.clicked.connect(self._toggle_board_focus_mode)
         self.board_fit_all_button.clicked.connect(self._fit_board_all_images)
         self.board_flip_button.clicked.connect(self._flip_board_selected_images)
@@ -16676,6 +16676,8 @@ class MainWindow(QMainWindow):
         ]
         for button in board_buttons:
             button.setVisible(visible)
+        if hasattr(self, "workspace_chrome"):
+            self.workspace_chrome.board_tools.refresh()
         self.board_pin_button.setChecked(self._board_window_pinned)
         self._refresh_board_local_display_button_state()
         if hasattr(self, "board_focus_shortcut"):

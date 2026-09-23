@@ -1230,6 +1230,39 @@ class MetadataStore:
                 counts[collection_id] = int(row["count"])
         return counts
 
+    def collection_file_records(self, collection_id: int) -> list[dict[str, object]]:
+        """Read every linked file, including missing ones, once across a subtree."""
+        with self.connect(readonly=True) as conn:
+            rows = conn.execute(
+                """
+                WITH RECURSIVE subtree(id) AS (
+                    SELECT id FROM collections WHERE id = ?
+                    UNION ALL
+                    SELECT c.id FROM collections c JOIN subtree s ON c.parent_id = s.id
+                )
+                SELECT DISTINCT i.id, i.file_path, i.is_missing, i.modified_time_ns,
+                       f.folder_path
+                FROM images i JOIN folders f ON f.id = i.folder_id
+                JOIN image_collections ic ON ic.image_id = i.id
+                JOIN subtree s ON s.id = ic.collection_id
+                """,
+                (collection_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def apply_file_availability(self, updates: Sequence[tuple[int, int, str, int, int]]) -> None:
+        # Filesystem checks run before this short transaction. Do not overwrite a
+        # concurrent scan/relink, or recreate a record the user has removed.
+        if not updates:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                """UPDATE images SET is_missing = ?
+                   WHERE id = ? AND file_path = ? AND is_missing = ?
+                     AND modified_time_ns = ?""",
+                updates,
+            )
+
     def collection_paths_for_image(self, image_id: int) -> list[str]:
         collections = self.list_collections()
         by_id = {collection.id: collection for collection in collections}

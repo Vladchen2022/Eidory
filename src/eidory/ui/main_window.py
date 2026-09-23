@@ -160,6 +160,7 @@ from eidory.core.media_types import (
 )
 from eidory.core.media_tools import find_media_tool
 from eidory.core.metadata_store import MetadataStore
+from eidory.core.folder_recount import FolderRecount, recount_collection
 from eidory.core.reference_grouping import ReferenceGroup, cluster_reference_vectors
 from eidory.core.scanner import ImageScanner, ScanResult
 from eidory.core.search_filters import (
@@ -1570,6 +1571,7 @@ class MainWindow(QMainWindow):
         self._creative_direct_image_ids_cache: dict[int, set[int]] = {}
         self._result_status_counts_cache: tuple[float, int, int] | None = None
         self._collection_image_counts_status_cache: tuple[float, dict[int, int]] | None = None
+        self._folder_recount_running = False
         self._result_status_cache_ttl_seconds = 2.0
         self._applying_view_payload = False
         self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
@@ -9812,6 +9814,8 @@ class MainWindow(QMainWindow):
         elif action == actions["import_tree"]:
             parent_id = int(collection_id) if collection_id is not None else None
             self._choose_import_folder_for_collection(parent_id, preserve_structure=True)
+        elif action == actions["recount"] and has_collection:
+            self._recount_collection(int(collection_id))
 
     def _build_collection_context_menu(self, item: QTreeWidgetItem | None) -> tuple[QMenu, dict[str, object]]:
         collection_id = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
@@ -9842,7 +9846,70 @@ class MainWindow(QMainWindow):
             actions["exclude_from_search"].setText("已被上级文件夹排除")
             actions["exclude_from_search"].setEnabled(False)
         actions["import_tree"].setEnabled(not is_virtual)
+        menu.addSeparator()
+        actions["recount"] = menu.addAction("刷新文件夹数量")
+        actions["recount"].setToolTip("核对本文件夹及子文件夹已收录的文件，更新可用数量")
+        actions["recount"].setEnabled(
+            has_collection and not is_virtual and not self._folder_recount_running
+            and not self._database_maintenance_active
+        )
         return menu, actions
+
+    def _recount_collection(self, collection_id: int) -> None:
+        if self._folder_recount_running or self._database_maintenance_active:
+            return
+        name = self._collection_name(collection_id)
+        if not name:
+            return
+        self._folder_recount_running = True
+        self.statusBar().showMessage(f"正在核对“{name}”的文件与数量…")
+
+        def run() -> None:
+            try:
+                result = recount_collection(self.store, collection_id)
+                self.events.put(("folder_recount_done", (name, result, "")))
+            except Exception as exc:
+                self.events.put(("folder_recount_done", (name, None, str(exc))))
+
+        self._start_background_task(
+            run, name="folder-recount",
+            on_rejected=lambda: setattr(self, "_folder_recount_running", False),
+        )
+
+    def _handle_folder_recount_done(self, payload: object) -> None:
+        name, result, error = payload
+        self._folder_recount_running = False
+        if error:
+            self._record_error(f"刷新文件夹数量失败：{error}")
+            QMessageBox.warning(self, "刷新文件夹数量", f"核对失败：{error}")
+            return
+        assert isinstance(result, FolderRecount)
+        self._clear_selection_detail_caches()
+        self._refresh_collections()
+        self._refresh_tags()
+        if result.newly_missing or result.recovered:
+            self.vector_index.invalidate()
+            self._refresh_current_results_for_filters()
+        else:
+            self._refresh_filter_chain_ui()
+        summary = f"“{name}”：{result.before:,} → {result.available:,} 个可用，{result.missing:,} 个缺失"
+        self._record_operation_history(summary)
+        self.statusBar().showMessage(summary)
+        message = QMessageBox(self)
+        message.setWindowTitle("文件夹数量已刷新" if not result.unchecked else "文件夹数量核对未完成")
+        message.setIcon(QMessageBox.Icon.Information if not result.unchecked else QMessageBox.Icon.Warning)
+        message.setText(summary)
+        text = (f"本次发现缺失 {result.newly_missing:,} 个，恢复可用 {result.recovered:,} 个。\n"
+                "数量包含子文件夹，按已收录的文件统计；本次核对保留缺失记录、标签和项目关联。")
+        if result.unchecked:
+            text += f"\n有 {result.unchecked:,} 个文件无法核对，仍按原记录计数。请检查磁盘连接或权限。"
+        message.setInformativeText(text)
+        details = ["可用文件所在位置（包含子文件夹）："]
+        details.extend(f"{count:,} 个  {path}" for path, count in result.locations)
+        details.extend(result.errors)
+        details.append("本操作不导入新文件。复制导入后，删除原始位置的文件不会删除图库中的副本。")
+        message.setDetailedText("\n".join(details))
+        message.exec()
 
     def _set_collection_search_excluded(self, collection_id: int, *, excluded: bool) -> None:
         changed = (
@@ -12771,7 +12838,10 @@ class MainWindow(QMainWindow):
         roots, results, failures = payload
         self._watch_scan_running = False
         self._delete_scan_removed_thumbnails(results)
-        self._refresh_after_scan_database_change(preserve_current_view=True)
+        # A deleted file must disappear from the wall as well as the sidebar.
+        self._refresh_after_scan_database_change(
+            preserve_current_view=not any(result.missing_marked for result in results)
+        )
         scanned = sum(result.scanned_files for result in results)
         new_files = sum(result.new_files for result in results)
         changed_files = sum(result.changed_files for result in results)
@@ -13370,6 +13440,8 @@ class MainWindow(QMainWindow):
                 self._handle_scan_missing_done(payload)
             elif kind == "watch_scan_done":
                 self._handle_watch_scan_done(payload)
+            elif kind == "folder_recount_done":
+                self._handle_folder_recount_done(payload)
             elif kind == "file_watch_paths_ready":
                 self._handle_file_watch_paths_ready(payload)
             elif kind == "duplicates_done":
@@ -14021,6 +14093,8 @@ class MainWindow(QMainWindow):
         self.folder_tree.blockSignals(False)
 
     def _refresh_collections(self, select_collection_id: int | None = None) -> None:
+        self._collection_image_counts_status_cache = None
+        self._result_status_counts_cache = None
         self._image_collection_paths_cache.clear()
         current = select_collection_id
         current_virtual_filter = self.current_virtual_filter
@@ -18132,6 +18206,7 @@ class MainWindow(QMainWindow):
         item.setData(0, COLLECTION_SEARCH_EXCLUDED_DIRECT_ROLE, search_excluded_direct)
         item.setData(0, COLLECTION_SEARCH_EXCLUDED_MATCH_ROLE, search_excluded_match_id)
         item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        item.setToolTip(1, "已收录的可用文件数量（含子文件夹、同一记录只计一次）。右键可刷新文件夹数量。")
         self._apply_collection_tree_level_style(item, depth)
         if search_excluded_match_id is not None:
             set_item_theme(item, foreground="marker", column=0)

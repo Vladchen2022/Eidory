@@ -150,9 +150,13 @@ class ImageScanner:
             if file_path in normalized_skip_paths:
                 seen_paths.append(file_path)
                 continue
+            try:
+                stat = os.stat(file_path, follow_symlinks=False)
+            except FileNotFoundError:
+                # The watcher may scan while a batch deletion is still running.
+                continue
             scanned += 1
             seen_paths.append(file_path)
-            stat = os.stat(file_path, follow_symlinks=False)
             cached_metadata = existing_metadata.get(file_path)
             if self._can_reuse_media_metadata(cached_metadata, stat):
                 assert cached_metadata is not None
@@ -320,7 +324,13 @@ class ImageScanner:
     @staticmethod
     def _iter_image_files(root: str) -> list[str]:
         paths: list[str] = []
-        for current_root, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        def raise_walk_error(error: OSError) -> None:
+            # An unreadable subtree is not evidence that its files were deleted.
+            raise error
+
+        for current_root, dirnames, filenames in os.walk(
+            root, topdown=True, followlinks=False, onerror=raise_walk_error,
+        ):
             dirnames[:] = [
                 dirname
                 for dirname in dirnames

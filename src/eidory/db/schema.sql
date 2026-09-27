@@ -1,5 +1,17 @@
 PRAGMA foreign_keys = ON;
 
+-- Generation candidates never enter images/index queues until explicitly adopted.
+CREATE TABLE IF NOT EXISTS generated_reference_jobs (
+    id TEXT PRIMARY KEY,
+    project_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_generated_reference_project
+ON generated_reference_jobs(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_generated_reference_state
+ON generated_reference_jobs(json_extract(payload, '$.state'));
+
 CREATE TABLE IF NOT EXISTS folders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     folder_path TEXT NOT NULL UNIQUE,

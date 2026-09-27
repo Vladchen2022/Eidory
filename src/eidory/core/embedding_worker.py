@@ -43,10 +43,25 @@ class EmbeddingWorker(threading.Thread):
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()
+        self._generation_ready = threading.Event()
+        self._generation_ready.set()
+
+    def set_generation_hold(self, hold: bool) -> None:
+        if hold:
+            self._generation_ready.clear()
+        else:
+            self._generation_ready.set()
+
+    def _wait_ready(self) -> bool:
+        while not self._stop_event.is_set():
+            if self._pause_event.wait(.1) and self._generation_ready.wait(.1):
+                return not self._stop_event.is_set()
+        return False
 
     def stop(self) -> None:
         self._stop_event.set()
         self._pause_event.set()
+        self._generation_ready.set()
 
     def pause(self) -> None:
         self._pause_event.clear()
@@ -59,8 +74,7 @@ class EmbeddingWorker(threading.Thread):
     def run(self) -> None:
         self._emit(None, None, "running", "embedding worker started")
         while not self._stop_event.is_set():
-            self._pause_event.wait()
-            if self._stop_event.is_set():
+            if not self._wait_ready():
                 break
             jobs = self.store.next_embedding_jobs(
                 model_name=self.provider.model_name,
@@ -74,7 +88,8 @@ class EmbeddingWorker(threading.Thread):
             for image in jobs:
                 if self._stop_event.is_set():
                     break
-                self._pause_event.wait()
+                if not self._wait_ready():
+                    break
                 self._process_image(image)
         self._emit(None, None, "stopped", "embedding worker stopped")
 

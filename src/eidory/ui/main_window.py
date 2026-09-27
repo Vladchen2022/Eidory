@@ -1697,6 +1697,8 @@ class MainWindow(QMainWindow):
         self.responsive_chrome = ResponsiveChrome(self)
         from eidory.ui.board_shortcuts import BoardShortcuts
         self.board_shortcuts = BoardShortcuts(self)
+        from eidory.ui.generated_references import ReferenceGeneration
+        self.reference_generation = ReferenceGeneration(self)
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
         self._ensure_temporary_import_collection()
         self._refresh_folders()
@@ -1864,6 +1866,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._closing = True
+        if hasattr(self, 'reference_generation'):
+            self.reference_generation.close()
         if hasattr(self, "task_control"):
             self.task_control.cancel()
         if hasattr(self, "simple_search"):
@@ -13241,6 +13245,9 @@ class MainWindow(QMainWindow):
         return removed_roots, removed_images
 
     def _start_embedding(self) -> None:
+        if hasattr(self, 'reference_generation') and self.reference_generation.active():
+            self.statusBar().showMessage('正在生成参考，完成后可继续语义索引')
+            return
         if self._database_maintenance_active:
             self.statusBar().showMessage("数据库维护中，暂不启动语义索引")
             return
@@ -13272,6 +13279,9 @@ class MainWindow(QMainWindow):
         self._start_embedding()
 
     def _start_ai_vision(self) -> None:
+        if hasattr(self, 'reference_generation') and self.reference_generation.active():
+            self.statusBar().showMessage('正在生成参考，完成后可继续 AI 识别')
+            return
         if self._database_maintenance_active:
             self.statusBar().showMessage("数据库维护中，暂不启动 AI 识别")
             return
@@ -13330,6 +13340,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已移除 AI 识别文件夹" if removed else "AI 识别文件夹不存在")
 
     def _start_ai_character_vision(self) -> None:
+        if hasattr(self, 'reference_generation') and self.reference_generation.active():
+            self.statusBar().showMessage('正在生成参考，完成后可继续 AI 识别')
+            return
         if self._database_maintenance_active:
             self.statusBar().showMessage("数据库维护中，暂不启动 AI 角色识别")
             return

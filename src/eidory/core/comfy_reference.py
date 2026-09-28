@@ -164,6 +164,10 @@ class ComfyClient:
             if not schema:
                 raise ValueError('ComfyUI 缺少节点：' + kind)
             for field, rule in schema.get('input', {}).get('required', {}).items():
+                if kind == 'LoadImage' and field == 'image':
+                    # The upload route supports subfolders which aren't enumerated
+                    # by the UI combo. /prompt validates the actual uploaded path.
+                    continue
                 value = node['inputs'].get(field)
                 if isinstance(rule[0], list) and value is not None and not isinstance(value, list) and value not in rule[0]:
                     raise ValueError(f'{kind} 的 {field} 不可用：{value}')
@@ -230,6 +234,9 @@ class GeneratedReferences:
     def create(self, node_id, prompt, template, url, *, width=None, height=None):
         if self.active():
             raise ValueError('请等待当前生成完成，或先取消当前任务。')
+        with self.store.connect(readonly=True) as conn:
+            if conn.execute("SELECT 1 FROM image_upscale_jobs WHERE json_extract(payload,'$.state') IN ('submitting','unknown','queued','running','downloading') LIMIT 1").fetchone():
+                raise ValueError('请等待当前 AI 放大完成，或先取消放大任务。')
         node = self.store.get_creative_node(node_id)
         if not node or not prompt.strip():
             raise ValueError('需要有效的创作节点和图片描述。')

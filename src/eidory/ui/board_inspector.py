@@ -129,6 +129,9 @@ class BoardInspector(QObject):
 
     def refresh_preview(self, image_id):
         if self.selected_ids() == [image_id]:
+            image = self.w._board_image_by_id.get(image_id)
+            if image:
+                self.info.setText(f'{image.file_name}\n{image.width} × {image.height} · {image.file_size / 1024:.0f} KB\n{image.file_path}')
             item = self.w.project_board_view._image_items.get(image_id)
             if hasattr(item, 'source_pixmap'):
                 self.preview.setPixmap(item.source_pixmap().scaled(240, 140, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))

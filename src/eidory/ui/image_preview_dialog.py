@@ -1330,6 +1330,7 @@ def _retain_detached_linetop_overlay(overlay: QObject) -> None:
 
 class ImagePreviewDialog(QDialog):
     imageChanged = Signal(object)
+    upscaleRequested = Signal(object)
     favoriteChanged = Signal(object)
     feedbackSaved = Signal(object, str)
     indexRemoved = Signal(object)
@@ -1478,6 +1479,9 @@ class ImagePreviewDialog(QDialog):
         self.next_button = QPushButton("下一张")
         self.fit_button = QPushButton("适应窗口")
         self.actual_size_button = QPushButton("100%")
+        self.upscale_button = QPushButton("AI 放大")
+        self.upscale_button.setToolTip("使用 SeedVR2 7B 放大原图，对比后决定是否替换")
+        self.upscale_button.clicked.connect(lambda: self.upscaleRequested.emit(self.current_image()))
         self.grayscale_button = QPushButton()
         self.grayscale_button.setCheckable(True)
         _configure_preview_icon_button(
@@ -1575,6 +1579,7 @@ class ImagePreviewDialog(QDialog):
         controls.addWidget(self.next_button)
         controls.addWidget(self.fit_button)
         controls.addWidget(self.actual_size_button)
+        controls.addWidget(self.upscale_button)
         controls.addWidget(self.grayscale_button)
         controls.addWidget(self.mirror_button)
         controls.addSpacing(8)
@@ -1759,6 +1764,7 @@ class ImagePreviewDialog(QDialog):
     def _refresh(self) -> None:
         self._preview_refine_timer.stop()
         image = self.current_image()
+        self.upscale_button.setEnabled(bool(image and not image.is_missing and not is_supported_video(image.file_path)))
         if image is None:
             self.info_label.setText("-")
             self._set_linetop_compare_original(False, rerender=False)

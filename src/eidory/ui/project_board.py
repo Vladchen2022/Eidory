@@ -1625,6 +1625,21 @@ class ProjectBoardView(QGraphicsView):
         self._pending_image_loads.add(token)
         self._image_loader.request(token, [str(p) for p in paths if p], side, urgent=side > MAX_BOARD_THUMBNAIL_SIDE)
 
+    def refresh_media_image(self, image):
+        """Replace pixels without rebuilding the scene, undo history or camera."""
+        if image.id not in self._images_by_id:
+            return
+        self._images_by_id[image.id] = image
+        self._image_generation += 1
+        self._image_loader.reset()
+        self._pending_image_loads.clear()
+        self._pending_local_edit = None
+        self._thumbnail_pixmaps.pop(image.id, None)
+        self._loaded_image_sides.pop(image.id, None)
+        self._failed_image_ids.discard(image.id)
+        self._request_image(image.id, MAX_BOARD_THUMBNAIL_SIDE)
+        self._schedule_visible_quality()
+
     def _image_loaded(self, token, image, path):
         self._pending_image_loads.discard(token)
         generation, iid, side = token

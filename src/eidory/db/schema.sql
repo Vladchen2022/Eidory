@@ -464,3 +464,20 @@ CREATE TABLE IF NOT EXISTS creative_project_snapshots (
     created_at TEXT NOT NULL,
     payload_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS image_upscale_jobs (
+    id TEXT PRIMARY KEY,
+    image_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_upscale_image ON image_upscale_jobs(image_id, created_at);
+-- Kept independently of image deletion so recovery never loses the original file.
+CREATE TABLE IF NOT EXISTS image_replacements (
+    id TEXT PRIMARY KEY,
+    image_id INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_replacement_image ON image_replacements(image_id, created_at);

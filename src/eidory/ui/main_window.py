@@ -1699,6 +1699,8 @@ class MainWindow(QMainWindow):
         self.board_shortcuts = BoardShortcuts(self)
         from eidory.ui.generated_references import ReferenceGeneration
         self.reference_generation = ReferenceGeneration(self)
+        from eidory.ui.image_upscale import ImageUpscaler
+        self.image_upscaler = ImageUpscaler(self)
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
         self._ensure_temporary_import_collection()
         self._refresh_folders()
@@ -1868,6 +1870,8 @@ class MainWindow(QMainWindow):
         self._closing = True
         if hasattr(self, 'reference_generation'):
             self.reference_generation.close()
+        if hasattr(self, 'image_upscaler'):
+            self.image_upscaler.close()
         if hasattr(self, "task_control"):
             self.task_control.cancel()
         if hasattr(self, "simple_search"):
@@ -9052,6 +9056,7 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         dialog.imageChanged.connect(self._sync_preview_selection)
+        dialog.upscaleRequested.connect(self.image_upscaler.open)
         dialog.favoriteChanged.connect(self._handle_preview_favorite_changed)
         dialog.feedbackSaved.connect(self._handle_preview_feedback_saved)
         dialog.indexRemoved.connect(self._handle_preview_index_removed)

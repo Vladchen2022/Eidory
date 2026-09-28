@@ -260,7 +260,9 @@ class ReferenceGeneration(QObject):
         job = self.active()
         self.entry.setText('生成参考 · 进行中' if job else '生成参考')
         if self.panel:
-            self.panel.generate.setEnabled(not self.working and not job and bool(self.template()))
+            upscaler = getattr(w, 'image_upscaler', None)
+            upscale_busy = bool(upscaler and (upscaler.working or upscaler.repo.active()))
+            self.panel.generate.setEnabled(not self.working and not job and not upscale_busy and bool(self.template()))
             self.panel.cancel.setEnabled(bool(job) and not self.working)
             self.panel.settings.setEnabled(not self.working and not job)
             self.panel.refresh_candidates()
@@ -536,6 +538,8 @@ class ReferenceGeneration(QObject):
             self.run(lambda: self.repo.discard(job['id'], undo=job['state'] == 'discarded'), self.job_updated)
 
     def hold_indexing(self, hold):
+        upscaler = getattr(self.w, 'image_upscaler', None)
+        hold = bool(hold or (upscaler and (upscaler.working or upscaler.repo.active())))
         for worker in (self.w.embedding_worker, self.w.ai_vision_worker, self.w.ai_character_vision_worker):
             if worker is not None and worker.is_alive():
                 worker.set_generation_hold(hold)

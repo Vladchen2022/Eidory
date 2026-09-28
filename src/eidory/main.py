@@ -29,6 +29,8 @@ def main() -> int:
 
     store = MetadataStore(paths.database_path)
     store.initialize()
+    from eidory.core.image_upscale import ImageReplacement
+    ImageReplacement(store, paths).recover()
 
     app = QApplication(sys.argv)
     configure_qt_accessibility()

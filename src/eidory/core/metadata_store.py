@@ -1881,6 +1881,17 @@ class MetadataStore:
             or int(existing["modified_time_ns"]) != modified_time_ns
             or bool(existing["is_missing"])
         )
+        if changed and conn.execute(
+            "SELECT 1 FROM image_replacements WHERE image_id=? LIMIT 1", (existing["id"],)
+        ).fetchone():
+            # A scan can have read the old stat before an atomic AI replacement.
+            # Never invalidate preserved annotations using that obsolete observation.
+            try:
+                current_stat = os.stat(file_path)
+            except OSError:
+                current_stat = None
+            if current_stat and (current_stat.st_size, current_stat.st_mtime_ns) != (file_size, modified_time_ns):
+                return int(existing["id"]), "unchanged"
         conn.execute(
             """
             UPDATE images

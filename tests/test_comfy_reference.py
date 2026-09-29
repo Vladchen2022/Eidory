@@ -8,6 +8,8 @@ import pytest
 import requests
 from PIL import Image
 from PySide6.QtWidgets import QPushButton
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 
 from test_filter_workflow import app, library, window
 from eidory.core.comfy_reference import (
@@ -15,6 +17,7 @@ from eidory.core.comfy_reference import (
 )
 from eidory.core.creative_workspace import CreativeWorkspaceStore
 from eidory.core.creative_entries import encode_entries, new_entry
+from eidory.core.comfy_workflows import ReferenceWorkflows, builtin_template
 
 
 @pytest.fixture
@@ -186,6 +189,7 @@ def test_single_generation_entry_and_context_guard(window, generation, graph):
     w._load_creative_project(project, select_node_id=node)
     w.creative_workspace.show_candidates()
     w.store.set_setting('comfy.template', json.dumps(prepare_template(graph)))
+    w.store.set_setting('comfy.profile', 'original')
     c = w.reference_generation
     c.refresh()
     assert c.entry.isVisible() and c.entry.isEnabled()
@@ -198,6 +202,101 @@ def test_single_generation_entry_and_context_guard(window, generation, graph):
     w._load_creative_project(None)
     c.refresh()
     assert not c.entry.isEnabled()
+
+
+def test_turbo_is_upgrade_default_and_legacy_binding_is_preserved(library, graph):
+    _, store, _ = library
+    saved = json.dumps(prepare_template(graph))
+    store.set_setting('comfy.template', saved)
+    profiles = ReferenceWorkflows(store)
+    assert profiles.selected() == 'turbo'
+    turbo = profiles.template()
+    assert turbo['seed_node'] == '13' and turbo['seed_field'] == 'noise_seed'
+    assert turbo['graph']['11']['inputs']['strength'] == 1.0
+    profiles.select('original')
+    assert ReferenceWorkflows(store).selected() == 'original'
+    assert profiles.template()['graph']['6']['inputs'] == graph['6']['inputs']
+    profiles.import_custom(graph, 'my-workflow.json')
+    assert profiles.selected() == 'custom'
+    assert [p[0] for p in profiles.options()] == ['turbo', 'original', 'custom']
+    assert store.get_setting('comfy.template') == saved
+
+
+def test_turbo_job_binds_noise_and_preserves_six_step_graph(generation):
+    repo, _, node = generation
+    template = ReferenceWorkflows(repo.store).template()
+    before = copy.deepcopy(template)
+    job = repo.create(node, '茶馆里的机器人', template, 'http://localhost:8188', width=1024, height=1024)
+    submitted = job['workflow']
+    assert submitted['13']['inputs']['noise_seed'] == job['seed']
+    assert submitted['13']['inputs']['noise_seed'] != 0
+    assert 'seed' not in submitted['6']['inputs']
+    assert submitted['4']['inputs']['prompt'] == '茶馆里的机器人'
+    assert submitted['15']['inputs']['nodes'] == '1.0, 0.9375, 0.875, 0.75, 0.5, 0.25'
+    assert job['workflow_id'] == 'turbo' and '6 步' in job['workflow_name']
+    assert template == before
+    with patch.object(ComfyClient, 'validate'), patch.object(ComfyClient, 'request', return_value={'prompt_id': job['id']}) as request:
+        assert repo.submit(job['id'])['state'] == 'queued'
+        assert request.call_args.kwargs['json']['prompt'] == submitted
+
+
+def test_turbo_rejects_incompatible_size_before_creating_job(generation):
+    repo, _, node = generation
+    with pytest.raises(ValueError, match='32'):
+        repo.create(node, 'robot', builtin_template(), 'http://localhost:8188', width=1000, height=1024)
+    assert repo.active() is None
+
+
+def test_unsupported_advanced_sampler_is_rejected():
+    graph = builtin_template()['graph']
+    graph['12']['class_type'] = 'CFGGuider'
+    with pytest.raises(ValueError, match='BasicGuider'):
+        prepare_template(graph)
+
+
+def test_panel_switch_and_regenerate_use_original_result_snapshot(window, generation, graph):
+    repo, project, node = generation
+    window._refresh_creative_projects(select_project_id=project)
+    window._load_creative_project(project, select_node_id=node)
+    window.store.set_setting('comfy.template', json.dumps(prepare_template(graph)))
+    c = window.reference_generation
+    c.open()
+    p = c.panel
+    assert p.workflow.currentData() == 'turbo'
+    assert (p.width.value(), p.height.value()) == (1024, 1024)
+    prompt = p.prompt.toPlainText()
+    QTest.mouseClick(p.workflow, Qt.MouseButton.LeftButton)
+    assert p.workflow.view().isVisible()
+    QTest.keyClick(p.workflow, Qt.Key.Key_Down)
+    QTest.keyClick(p.workflow, Qt.Key.Key_Return)
+    assert p.workflow.currentData() == 'original'
+    assert repo.all(project) == []  # Enter must not submit even a failed job.
+    assert (p.width.value(), p.height.value()) == (1152, 2048)
+    assert '40 步' in p.sampling.text()
+    assert p.prompt.toPlainText() == prompt
+    job = ready(repo, node, graph)
+    p.refresh_candidates(select_id=job['id'])
+    p.workflow.setCurrentIndex(p.workflow.findData('turbo'))
+    assert '6 步' in p.sampling.text()
+    with patch.object(c, 'generate') as generate:
+        c.regenerate()
+    snapshot = generate.call_args.kwargs['template']
+    assert p.workflow.currentData() == 'history'
+    assert '原结果' in p.workflow.currentText()
+    assert snapshot['graph']['6']['class_type'] == 'KSampler'
+    assert '40 步' in p.sampling.text()
+    assert (p.width.value(), p.height.value()) == (1152, 2048)
+    assert c.workflows.selected() == 'turbo'
+    assert c.template() == snapshot
+
+
+def test_missing_turbo_does_not_silently_run_original(generation):
+    repo, _, node = generation
+    job = repo.create(node, 'robot', builtin_template(), 'http://localhost:8188')
+    with patch.object(ComfyClient, 'validate', side_effect=ValueError('ViggleTurboLora 不可用')), patch.object(ComfyClient, 'request') as request:
+        failed = repo.submit(job['id'])
+    assert failed['state'] == 'failed' and 'ViggleTurboLora' in failed['error']
+    assert not request.called
 
 
 def test_resource_hold_does_not_resume_user_paused_index(library):

@@ -16,8 +16,9 @@ from PySide6.QtWidgets import (
 )
 
 from eidory.core.comfy_reference import (
-    ACTIVE_STATES, STATE_LABELS, ComfyClient, GeneratedReferences, build_prompt, local_url, prepare_template, connection_message,
+    ACTIVE_STATES, STATE_LABELS, ComfyClient, GeneratedReferences, build_prompt, local_url, prepare_template, connection_message, sampling_description,
 )
+from eidory.core.comfy_workflows import ReferenceWorkflows
 
 
 def text_label(text=''):
@@ -44,6 +45,16 @@ class GenerationPanel(QDialog):
         self.heading = text_label(project.title + ' / ' + node.title)
         self.heading.setProperty('role', 'flowTitle')
         outer.addWidget(self.heading)
+        workflow_row = QHBoxLayout()
+        workflow_row.addWidget(text_label('工作流'))
+        self.workflow = QComboBox()
+        self.workflow.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.workflow.setAccessibleName('生成参考工作流')
+        self.history_template = None
+        self.sync_workflows()
+        self.workflow.currentIndexChanged.connect(self.change_workflow)
+        workflow_row.addWidget(self.workflow, 1)
+        outer.addLayout(workflow_row)
         self.prompt = QTextEdit()
         self.prompt.setAcceptRichText(False)
         self.prompt.setAccessibleName('生成参考的图片描述')
@@ -74,15 +85,13 @@ class GenerationPanel(QDialog):
         self.url.setAccessibleName('本机 ComfyUI 地址')
         form.addRow('服务地址', self.url)
         binding = QHBoxLayout()
-        self.workflow_name = text_label(controller.w.store.get_setting('comfy.workflow_name', '尚未绑定 API 工作流'))
-        binding.addWidget(self.workflow_name, 1)
-        self.import_button = QPushButton('选择 API 工作流…')
+        self.import_button = QPushButton('导入自定义 API 工作流…')
         self.import_button.clicked.connect(controller.import_workflow)
         binding.addWidget(self.import_button)
         self.check = QPushButton('检查连接')
         self.check.clicked.connect(controller.check_connection)
         binding.addWidget(self.check)
-        form.addRow('工作流', binding)
+        form.addRow(binding)
         dimensions = QHBoxLayout()
         self.width, self.height = QSpinBox(), QSpinBox()
         for spin in (self.width, self.height):
@@ -149,6 +158,11 @@ class GenerationPanel(QDialog):
         done.clicked.connect(self.close)
         actions.addWidget(done)
         outer.addLayout(actions)
+        # Enter while choosing a workflow/editing dimensions must not submit
+        # an expensive generation or adopt a candidate via QDialog defaults.
+        for button in self.findChildren(QPushButton):
+            button.setAutoDefault(False)
+            button.setDefault(False)
         self._list_key = None
         self.apply_template()
         self.settings_toggle.setChecked(not bool(controller.template()))
@@ -158,14 +172,37 @@ class GenerationPanel(QDialog):
         self.settings.setVisible(checked)
         self.settings_toggle.setText('生成设置 ▾' if checked else '生成设置 ▸')
 
+    def sync_workflows(self):
+        self.workflow.blockSignals(True)
+        self.workflow.clear()
+        for key, name in self.c.workflows.options():
+            self.workflow.addItem(name, key)
+        self.workflow.setCurrentIndex(self.workflow.findData(self.c.workflows.selected()))
+        self.workflow.blockSignals(False)
+        self.history_template = None
+
+    def change_workflow(self, _index):
+        if self.workflow.currentData() != 'history':
+            try:
+                self.c.workflows.select(self.workflow.currentData())
+            except (ValueError, KeyError, TypeError) as exc:
+                self.status.setText('工作流不可用：' + str(exc))
+                self.generate.setEnabled(False)
+                return
+        self.apply_template()
+        self.connection.setText('本机 ComfyUI')
+        self.status.setText('已切换工作流，尺寸使用该工作流的默认值；图片描述保留。')
+        self.c.refresh()
+
     def apply_template(self):
         template = self.c.template()
         if template:
             latent = template['graph'][template['latent_node']]['inputs']
             self.width.setValue(latent['width'])
             self.height.setValue(latent['height'])
-            sampler = template['graph'][template['sampler_node']]['inputs']
-            self.sampling.setText(f"{sampler['steps']} 步 · {sampler['sampler_name']} / {sampler['scheduler']} · CFG {sampler['cfg']} · 每次新种子")
+            for spin in (self.width, self.height):
+                spin.setSingleStep(template.get('size_multiple', 8))
+            self.sampling.setText(sampling_description(template))
 
     def selected_job(self):
         item = self.candidates.currentItem()
@@ -207,7 +244,8 @@ class GenerationPanel(QDialog):
         self.discard.setEnabled(bool(job and job['state'] in {'ready', 'discarded'} and not busy))
         self.discard.setText('撤销丢弃' if job and job['state'] == 'discarded' else '丢弃')
         if job:
-            self.details.setText(job.get('error') or f"{STATE_LABELS[job['state']]} · {job.get('width', '—')} × {job.get('height', '—')} · 种子 {job['seed']}\n" +
+            workflow = job.get('workflow_name')
+            self.details.setText(job.get('error') or (workflow + ' · ' if workflow else '') + f"{STATE_LABELS[job['state']]} · {job.get('width', '—')} × {job.get('height', '—')} · 种子 {job['seed']}\n" +
                                  ('保存位置：' + job['file_path'] if job['state'] == 'adopted' else '临时生成／' + job['project_title']))
         else:
             self.details.setText('这里还没有生成结果。生成后可以预览、采用或丢弃。')
@@ -220,6 +258,7 @@ class ReferenceGeneration(QObject):
         super().__init__(window)
         self._window = ref(window)
         self.repo = GeneratedReferences(window.store, window.paths)
+        self.workflows = ReferenceWorkflows(window.store)
         self.panel = None
         self.working = False
         self.held_workers = []
@@ -246,8 +285,11 @@ class ReferenceGeneration(QObject):
 
     def template(self):
         try:
-            return json.loads(self.w.store.get_setting('comfy.template', '') or 'null')
-        except ValueError:
+            if self.panel and self.panel.workflow.currentData() == 'history':
+                return self.panel.history_template
+            profile = self.panel.workflow.currentData() if self.panel else None
+            return self.workflows.template(profile)
+        except (ValueError, KeyError, TypeError):
             return None
 
     def active(self):
@@ -265,6 +307,7 @@ class ReferenceGeneration(QObject):
             self.panel.generate.setEnabled(not self.working and not job and not upscale_busy and bool(self.template()))
             self.panel.cancel.setEnabled(bool(job) and not self.working)
             self.panel.settings.setEnabled(not self.working and not job)
+            self.panel.workflow.setEnabled(not self.working and not job)
             self.panel.refresh_candidates()
             if job:
                 progress = self.progress_values.get(job['id'])
@@ -325,10 +368,8 @@ class ReferenceGeneration(QObject):
         try:
             if Path(path).stat().st_size > 4 * 1024 * 1024:
                 raise ValueError('工作流 JSON 过大。')
-            template = prepare_template(json.loads(Path(path).read_text(encoding='utf-8')))
-            self.w.store.set_setting('comfy.template', json.dumps(template, ensure_ascii=False))
-            self.w.store.set_setting('comfy.workflow_name', Path(path).name)
-            self.panel.workflow_name.setText(Path(path).name)
+            self.workflows.import_custom(json.loads(Path(path).read_text(encoding='utf-8')), Path(path).name)
+            self.panel.sync_workflows()
             self.panel.apply_template()
             self.panel.status.setText('工作流已绑定。模型和采样参数保留，输出作为临时候选接收。')
             self.refresh()
@@ -430,9 +471,13 @@ class ReferenceGeneration(QObject):
             return
         self.panel.prompt.setPlainText(job['prompt'])
         template = prepare_template(job['workflow'])
-        latent = template['graph'][template['latent_node']]['inputs']
-        self.panel.width.setValue(latent['width'])
-        self.panel.height.setValue(latent['height'])
+        template.update(workflow_id=job.get('workflow_id', 'original'),
+                        workflow_name=job.get('workflow_name') or '原结果工作流')
+        # Reuse the immutable result snapshot, not today's profile/settings.
+        self.panel.sync_workflows()
+        self.panel.history_template = template
+        self.panel.workflow.addItem(template['workflow_name'] + '（原结果参数）', 'history')
+        self.panel.workflow.setCurrentIndex(self.panel.workflow.findData('history'))
         self.generate(template=template)
 
     def preview(self):

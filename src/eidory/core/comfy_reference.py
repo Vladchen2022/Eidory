@@ -84,26 +84,55 @@ def prepare_template(graph: dict) -> dict:
                 visit(value[0])
     visit(output)
     graph = {k: deepcopy(v) for k, v in graph.items() if k in reachable}
-    samplers = [k for k, n in graph.items() if n['class_type'] == 'KSampler']
+    samplers = [k for k, n in graph.items() if n['class_type'] in {'KSampler', 'SamplerCustomAdvanced'}]
     if len(samplers) != 1:
-        raise ValueError('首版需要一个 KSampler 采样节点。')
+        raise ValueError('需要一个 KSampler 或受支持的高级采样节点。')
     sampler = samplers[0]
     try:
-        positive = graph[sampler]['inputs']['positive'][0]
+        seed_node, seed_field = sampler, 'seed'
+        advanced = graph[sampler]['class_type'] == 'SamplerCustomAdvanced'
+        if advanced:
+            guider = graph[sampler]['inputs']['guider'][0]
+            noise = graph[sampler]['inputs']['noise'][0]
+            sigmas = graph[sampler]['inputs']['sigmas'][0]
+            sampler_select = graph[sampler]['inputs']['sampler'][0]
+            assert graph[guider]['class_type'] == 'BasicGuider'
+            assert graph[noise]['class_type'] == 'RandomNoise'
+            assert graph[sigmas]['class_type'] == 'ViggleTurboSigmas'
+            assert graph[sampler_select]['class_type'] == 'KSamplerSelect'
+            positive = graph[guider]['inputs']['conditioning'][0]
+            seed_node, seed_field = noise, 'noise_seed'
+        else:
+            positive = graph[sampler]['inputs']['positive'][0]
         latent = graph[sampler]['inputs']['latent_image'][0]
+        if advanced:
+            assert graph[sigmas]['inputs']['latent'] == graph[sampler]['inputs']['latent_image']
         encoder_type = graph[positive]['class_type']
         field = {'TextEncodeQwenImage21': 'prompt', 'CLIPTextEncode': 'text'}[encoder_type]
         assert graph[latent]['class_type'] in {'EmptyLatentImage', 'EmptySD3LatentImage'}
         assert not any(n['class_type'] == 'LoadImage' for n in graph.values())
     except (KeyError, IndexError, TypeError, AssertionError):
-        raise ValueError('请选择直接连接文字编码和空白画布的文生图工作流；首版不支持图生图。') from None
+        raise ValueError('请选择直接连接文字编码和空白画布的文生图工作流；高级采样支持 BasicGuider、RandomNoise 与 ViggleTurboSigmas。') from None
     # PreviewImage is a transport cache, not a permanent ComfyUI output. The
     # original file and its sampling parameters are never modified.
     graph[output] = {'class_type': 'PreviewImage', 'inputs': {'images': graph[output]['inputs']['images']}}
     graph[positive]['inputs'][field] = ''
     graph[latent]['inputs']['batch_size'] = 1
     return {'graph': graph, 'prompt_node': positive, 'prompt_field': field,
-            'sampler_node': sampler, 'latent_node': latent, 'output_node': output}
+            'sampler_node': sampler, 'seed_node': seed_node, 'seed_field': seed_field,
+            'size_multiple': 32 if advanced else 8, 'latent_node': latent, 'output_node': output}
+
+
+def sampling_description(template):
+    graph = template['graph']
+    sampler = graph[template['sampler_node']]
+    values = sampler['inputs']
+    if sampler['class_type'] == 'SamplerCustomAdvanced':
+        sigmas = graph[values['sigmas'][0]]['inputs']['nodes']
+        steps = len([v for v in sigmas.split(',') if v.strip()])
+        method = graph[values['sampler'][0]]['inputs']['sampler_name']
+        return f'{steps} 步 · {method} · Turbo 专用调度 · 无额外 CFG · 每次新种子'
+    return f"{values['steps']} 步 · {values['sampler_name']} / {values['scheduler']} · CFG {values['cfg']} · 每次新种子"
 
 
 def build_prompt(store, node_id: int) -> str:
@@ -244,16 +273,18 @@ class GeneratedReferences:
         graph = deepcopy(template['graph'])
         graph[template['prompt_node']]['inputs'][template['prompt_field']] = prompt.strip()
         seed = secrets.randbelow(2**53)
-        graph[template['sampler_node']]['inputs']['seed'] = seed
+        graph[template.get('seed_node', template['sampler_node'])]['inputs'][template.get('seed_field', 'seed')] = seed
+        multiple = template.get('size_multiple', 8)
         for field, value in [('width', width), ('height', height)]:
-            if value is not None:
-                if value < 256 or value > 4096 or value % 8:
-                    raise ValueError('图片尺寸需为 256–4096 之间的 8 的倍数。')
-                graph[template['latent_node']]['inputs'][field] = value
+            value = graph[template['latent_node']]['inputs'][field] if value is None else value
+            if value < 256 or value > 4096 or value % multiple:
+                raise ValueError(f'图片尺寸需为 256–4096 之间的 {multiple} 的倍数。')
+            graph[template['latent_node']]['inputs'][field] = value
         key = str(uuid.uuid4())
         job = dict(id=key, prompt_id=key, project_id=node.project_id, node_id=node.id,
                    project_title=project.title, node_title=node.title, prompt=prompt.strip(),
                    seed=seed, workflow=graph, output_node=template['output_node'], url=local_url(url),
+                   workflow_id=template.get('workflow_id', 'custom'), workflow_name=template.get('workflow_name', ''),
                    created_at=utc_now_iso(), submitted_at=time.time(), state='submitting', error='',
                    client_id='eidory-' + key)
         self.save(job)  # Durable identity exists before the HTTP request.

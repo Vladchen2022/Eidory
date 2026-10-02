@@ -118,4 +118,4 @@ class TaskControl(QObject):
             if completed:
                 pid, node_id = job.batch
                 self.w._handle_creative_all_node_notes_done(pid, node_id, completed, [], '')
-        self.w.statusBar().showMessage('已取消；已完成建议保留，未完成响应不会写入。')
+        self.w.statusBar().showMessage('已停止本地等待；已完成建议保留，后续响应不会写入。服务端是否停止尚未确认。')

@@ -529,7 +529,7 @@ class BoardImageItem(QGraphicsPixmapItem):
                 pixmap = pixmap.transformed(QTransform().scale(-1, 1), Qt.TransformationMode.SmoothTransformation)
             self._display_variant_cache[cache_key] = QPixmap(pixmap)
             self._display_variant_cache.move_to_end(cache_key)
-            while len(self._display_variant_cache) > 4:
+            while len(self._display_variant_cache) > 1:
                 self._display_variant_cache.popitem(last=False)
         current_width = self._display_width
         self._aspect_ratio = self._source_aspect_ratio
@@ -1699,6 +1699,8 @@ class ProjectBoardView(QGraphicsView):
         if aspect_changed:
             self._schedule_refit_current_view_mode()
         self.imageLoaded.emit(iid)
+        if side > MAX_BOARD_THUMBNAIL_SIDE:
+            self.trim_image_memory(getattr(self, '_image_memory_budget', 200 * 1024 * 1024))
         if side > MAX_BOARD_THUMBNAIL_SIDE and self._pending_local_edit == (generation, iid):
             self._pending_local_edit = None
             if iid in self.selected_image_ids():
@@ -1715,43 +1717,58 @@ class ProjectBoardView(QGraphicsView):
         rendered = max(item.sceneBoundingRect().width(), item.sceneBoundingRect().height()) * self._zoom * self.devicePixelRatioF()
         return rendered > max(thumbnail.width(), thumbnail.height()) * .92
 
-    def trim_image_memory(self, budget):
-        # Downgrade offscreen pixel buffers, retaining positions, edits and a
-        # small preview. Visible images regain resolution through the loader.
+    def _item_pixel_cost(self, item):
+        buffers = {pix.cacheKey(): pix.width() * pix.height() * 4
+                   for pix in (item.source_pixmap(), item.pixmap(), self._thumbnail_pixmaps.get(item.image_id, QPixmap()), *item._display_variant_cache.values())
+                   if not pix.isNull()}
+        return sum(buffers.values())
+
+    def _quality_side_limit(self):
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
-        def cost(item):
-            pix = item.source_pixmap()
-            return pix.width() * pix.height() * 4
+        count = max(1, sum(item.isVisible() and visible.intersects(item.sceneBoundingRect())
+                           for item in self._image_items.values()))
+        budget = getattr(self, '_image_memory_budget', 200 * 1024 * 1024)
+        side = max(128, int(math.sqrt(max(1, budget) / (count * 8))))
+        return min(MAX_BOARD_FOCUS_PIXMAP_SIDE, 2 ** int(math.floor(math.log2(side))))
+
+    def trim_image_memory(self, budget):
+        # Count source, displayed and transformed pixels, including shared Qt
+        # buffers only once per item. Pixel downgrades never change the layout.
+        self._image_memory_budget = max(1, budget)
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
         items = [item for item in self._image_items.values() if isinstance(item, BoardImageItem)]
-        total = sum(cost(item) for item in items)
-        candidates = sorted(items, key=lambda item: (self.isVisible() and visible.intersects(item.sceneBoundingRect()), -cost(item)))
+        total = sum(self._item_pixel_cost(item) for item in items)
+        quality_limit = self._quality_side_limit()
+        offscreen_limit = min(128, max(1, int(math.sqrt(max(1, budget) / max(1, len(items) * 8)))))
+        candidates = sorted(items, key=lambda item: (self.isVisible() and visible.intersects(item.sceneBoundingRect()), -self._item_pixel_cost(item)))
         previous = self._suppress_layout_changed
         self._suppress_layout_changed = True
         try:
             for item in candidates:
                 if total <= budget:
                     break
-                if self.isVisible() and visible.intersects(item.sceneBoundingRect()):
-                    continue
-                old = cost(item)
-                pix = item.source_pixmap().scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                old = self._item_pixel_cost(item)
+                side = quality_limit if self.isVisible() and visible.intersects(item.sceneBoundingRect()) else offscreen_limit
+                side = min(side, max(item.source_pixmap().width(), item.source_pixmap().height()))
+                pix = item.source_pixmap().scaled(side, side, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 item.replace_source_pixmap(pix, allow_smaller=True)
-                self._thumbnail_pixmaps[item.image_id] = pix
-                self._loaded_image_sides[item.image_id] = 128
+                self._thumbnail_pixmaps[item.image_id] = pix if max(pix.width(), pix.height()) <= MAX_BOARD_THUMBNAIL_SIDE else pix.scaled(MAX_BOARD_THUMBNAIL_SIDE, MAX_BOARD_THUMBNAIL_SIDE, Qt.AspectRatioMode.KeepAspectRatio)
+                self._loaded_image_sides[item.image_id] = max(pix.width(), pix.height())
                 self._focus_quality_image_ids.discard(item.image_id)
-                total -= old - cost(item)
+                total -= old - self._item_pixel_cost(item)
         finally:
             self._suppress_layout_changed = previous
         return total
 
     def _refresh_visible_quality(self):
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        upgrade = []
         for iid, item in self._image_items.items():
             if not isinstance(item, BoardImageItem):
                 continue
             needs_high = iid not in self._failed_image_ids and self.isVisible() and item.isVisible() and visible.intersects(item.sceneBoundingRect()) and self._needs_focus_quality_upgrade_from_thumbnail(item)
             if needs_high:
-                self._ensure_focus_quality_for_items([item], force=True)
+                upgrade.append(item)
             elif iid in self._focus_quality_image_ids and iid in self._thumbnail_pixmaps:
                 self._focus_quality_image_ids.discard(iid)
                 previous = self._suppress_layout_changed
@@ -1761,6 +1778,8 @@ class ProjectBoardView(QGraphicsView):
                     self._loaded_image_sides[iid] = MAX_BOARD_THUMBNAIL_SIDE
                 finally:
                     self._suppress_layout_changed = previous
+        if upgrade:
+            self._ensure_focus_quality_for_items(upgrade, force=True)
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -2711,13 +2730,14 @@ class ProjectBoardView(QGraphicsView):
         target_zoom: float | None = None,
         force: bool = False,
     ) -> None:
+        quality_limit = self._quality_side_limit()
         for item in items:
             if not isinstance(item, BoardImageItem):
                 continue
             image_id = int(item.image_id)
             rendered = max(item.sceneBoundingRect().width(), item.sceneBoundingRect().height()) * (target_zoom or self._zoom) * self.devicePixelRatioF()
-            wanted = min(MAX_BOARD_FOCUS_PIXMAP_SIDE, max(768, 2 ** int(math.ceil(math.log2(max(1, rendered))))))
-            if image_id in self._focus_quality_image_ids and self._loaded_image_sides.get(image_id, 0) >= wanted:
+            wanted = min(quality_limit, max(768, 2 ** int(math.ceil(math.log2(max(1, rendered))))))
+            if self._loaded_image_sides.get(image_id, 0) >= wanted:
                 continue
             if not force and target_zoom is not None and not self._needs_focus_quality_upgrade(item, target_zoom):
                 continue

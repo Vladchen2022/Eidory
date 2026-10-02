@@ -906,6 +906,8 @@ class CreativeFlow(QObject):
         self.refreshing = True
         try:
             w, cw = self.w, self.cw
+            if hasattr(w, 'edit_history'):
+                w.edit_history.refresh()
             node = w._current_creative_node()
             on_start = not w.current_creative_project_id and w.center_result_stack.currentWidget() is self.home
             if on_start and not self._start_hides_inspector:

@@ -14,6 +14,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
 import html as html_lib
+import filecmp
 import json
 import mimetypes
 import urllib.error
@@ -1718,8 +1719,8 @@ class MainWindow(QMainWindow):
         self._refresh_file_watcher()
         if startup_removed_images:
             message = (
-                f"启动清理：移除 {startup_removed_roots} 个已不存在导入目录，"
-                f"{startup_removed_images} 张失效索引"
+                f"启动检查：{startup_removed_roots} 个导入目录暂不可用，"
+                f"标记缺失 {startup_removed_images} 张；项目与标注已保留"
             )
             self._record_operation_history(message)
             self.statusBar().showMessage(message)
@@ -4046,16 +4047,16 @@ class MainWindow(QMainWindow):
                 restore_temp_path = self.paths.database_path.with_name(
                     f".eidory-restore-{timestamp}.sqlite3"
                 )
-                source_uri = f"{source_path.resolve().as_uri()}?mode=ro"
-                with self._connect_sqlite_database(source_uri, uri=True) as source:
-                    with self._connect_sqlite_database(restore_temp_path) as target:
-                        source.backup(target)
-                shutil.move(str(restore_temp_path), self.paths.database_path)
-                for suffix in ("-wal", "-shm"):
-                    self.paths.database_path.with_name(
-                        f"{self.paths.database_path.name}{suffix}"
-                    ).unlink(missing_ok=True)
-                self.store.initialize()
+                from eidory.core.database_restore import prepare_database, install_database
+                prepare_database(source_path, restore_temp_path)
+                # Leave old IDs while they still refer to the old database.
+                for preview in list(self._preview_dialogs):
+                    preview.close()
+                for controller in (self.reference_generation, self.image_upscaler):
+                    if controller.panel:
+                        controller.panel.close()
+                self._load_creative_project(None, save_current_editor=False)
+                install_database(self.store, restore_temp_path, backup_path)
             self._refresh_after_database_change()
         except Exception as exc:
             if restore_temp_path is not None:
@@ -4070,27 +4071,14 @@ class MainWindow(QMainWindow):
     def _validate_database_file(database_path: Path) -> tuple[bool, str]:
         if not database_path.is_file():
             return False, "文件不存在"
+        from tempfile import TemporaryDirectory
+        from eidory.core.database_restore import prepare_database
         try:
-            uri = f"{database_path.resolve().as_uri()}?mode=ro"
-            with MainWindow._connect_sqlite_database(uri, uri=True) as conn:
-                row = conn.execute("PRAGMA integrity_check").fetchone()
-                if row is None or str(row[0]) != "ok":
-                    return False, str(row[0]) if row is not None else "integrity_check 无结果"
-                table_rows = conn.execute(
-                    """
-                    SELECT name
-                    FROM sqlite_master
-                    WHERE type = 'table'
-                      AND name IN ('folders', 'images', 'app_settings')
-                    """
-                ).fetchall()
+            with TemporaryDirectory(prefix="eidory-restore-check-") as directory:
+                prepare_database(database_path, Path(directory) / "checked.sqlite3")
+            return True, "ok"
         except Exception as exc:
             return False, str(exc)
-        found_tables = {str(row[0]) for row in table_rows}
-        missing = {"folders", "images", "app_settings"} - found_tables
-        if missing:
-            return False, f"缺少表：{', '.join(sorted(missing))}"
-        return True, "ok"
 
     def _refresh_path_remap_candidates(self) -> None:
         if not hasattr(self, "path_remap_old_combo"):
@@ -4169,6 +4157,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
     def _refresh_after_database_change(self) -> None:
+        self._disconnected_watch_roots = set()
+        self._pending_watch_scan_roots.clear()
+        self._clear_last_removal_undo(cleanup_backups=True)
+        if hasattr(self, 'edit_history'):
+            self.edit_history._histories.clear()
+            self.edit_history._typing = None
+            self.edit_history.refresh()
         self._invalidate_near_duplicate_hash_cache()
         self._clear_selection_detail_caches()
         self.current_language = self._setting_choice("ui.language", "zh", {"zh", "en"})
@@ -4178,6 +4173,7 @@ class MainWindow(QMainWindow):
         self._refresh_folders()
         self._refresh_collections()
         self._refresh_temporary_projects()
+        self._refresh_creative_projects(save_current_editor=False)
         self._refresh_tags()
         self._refresh_saved_views()
         self._refresh_inspiration_history()
@@ -8407,7 +8403,10 @@ class MainWindow(QMainWindow):
         }
 
     def _selected_grid_image(self) -> ImageItem | None:
-        return self.grid_view.current_image() or self.selected_image
+        selected = self._selected_grid_images()
+        current = self.grid_view.current_image()
+        return next((image for image in selected if current and image.id == current.id),
+                    selected[0] if selected else None)
 
     def _open_selected_original(self) -> None:
         image = self._selected_grid_image()
@@ -8445,11 +8444,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已复制路径")
 
     def _selected_grid_images(self) -> list[ImageItem]:
-        selected = self.grid_view.selected_images()
-        if selected:
-            return selected
-        image = self._selected_grid_image()
-        return [image] if image is not None else []
+        if self.center_result_stack.currentWidget() is self.project_board_view:
+            return self.store.images_by_ids(self.project_board_view.selected_image_ids())
+        if self.center_result_stack.currentWidget() is not self.grid_view:
+            return []
+        return self.grid_view.selected_images()
 
     def _refresh_temp_project_save_button(self, count: int | None = None) -> None:
         if not hasattr(self, "save_temp_project_button"):
@@ -9055,7 +9054,8 @@ class MainWindow(QMainWindow):
             thumbnail_dir=self.paths.thumbnail_dir,
             parent=self,
         )
-        dialog.imageChanged.connect(self._sync_preview_selection)
+        dialog._selection_context = self._preview_selection_context()
+        dialog.imageChanged.connect(lambda image, context=dialog._selection_context: self._sync_preview_selection(image, context))
         dialog.upscaleRequested.connect(self.image_upscaler.open)
         dialog.favoriteChanged.connect(self._handle_preview_favorite_changed)
         dialog.feedbackSaved.connect(self._handle_preview_feedback_saved)
@@ -9071,7 +9071,7 @@ class MainWindow(QMainWindow):
     def _handle_preview_dialog_finished(self, dialog: ImagePreviewDialog) -> None:
         current = dialog.current_image()
         if current is not None and (self.selected_image is None or self.selected_image.id != current.id):
-            self._sync_preview_selection(current)
+            self._sync_preview_selection(current, getattr(dialog, '_selection_context', None))
         self._preview_dialogs.discard(dialog)
         dialog.deleteLater()
 
@@ -9089,25 +9089,35 @@ class MainWindow(QMainWindow):
                 return board_images
         return self.grid_view.images()
 
-    def _sync_preview_selection(self, image: ImageItem) -> None:
-        self.selected_image = image
-        self.grid_view.select_image_id(image.id)
-        if (
-            self.center_result_stack.currentWidget() is self.project_board_view
-            and image.id in self._board_image_by_id
-        ):
+    def _preview_selection_context(self):
+        return (self.current_creative_project_id, self.current_creative_node_id,
+                self.current_temp_project_id, self.center_result_stack.currentWidget())
+
+    def _sync_preview_selection(self, image: ImageItem, context=None) -> None:
+        if context is not None and context != self._preview_selection_context():
+            return
+        if self.center_result_stack.currentWidget() is self.project_board_view:
+            if image.id not in self._board_image_by_id:
+                return
             self.project_board_view.select_image_id(image.id)
+        else:
+            if image.id not in self.grid_view._indexes_by_image_id:
+                return
+            self.grid_view.select_image_id(image.id)
+        self.selected_image = image
         self._queue_selection_detail_state([image])
 
     def _handle_preview_favorite_changed(self, image: ImageItem) -> None:
-        self.selected_image = image
-        self._show_image_details(image)
+        if image.id in {item.id for item in self._selected_grid_images()}:
+            self.selected_image = image
+            self._show_image_details(image)
         if self._selected_status_filter() == "favorite" and not image.is_favorite:
             self._refresh_current_results_for_filters()
 
     def _handle_preview_feedback_saved(self, image: ImageItem, _label: str) -> None:
-        self.selected_image = image
-        self._refresh_feedback_buttons(image)
+        if image.id in {item.id for item in self._selected_grid_images()}:
+            self.selected_image = image
+            self._refresh_feedback_buttons(image)
         self._update_search_diagnostics(self.current_semantic_filtered_images)
 
     def _handle_preview_index_removed(self, image: ImageItem) -> None:
@@ -12576,6 +12586,7 @@ class MainWindow(QMainWindow):
             "source_backups": list(source_backups),
             "backup_dir": str(backup_dir) if backup_dir is not None else "",
             "label": label,
+            "context": (self.current_creative_project_id, self.current_temp_project_id),
         }
         if hasattr(self, "undo_removal_action"):
             self.undo_removal_action.setEnabled(True)
@@ -12595,6 +12606,9 @@ class MainWindow(QMainWindow):
         if undo is None:
             self.statusBar().showMessage("没有可撤销的删除/移除操作")
             return
+        if undo.get("context") != (self.current_creative_project_id, self.current_temp_project_id):
+            self.statusBar().showMessage("当前项目没有可撤销的删除；请返回执行删除的项目")
+            return
         image_ids = [int(image_id) for image_id in undo.get("image_ids", [])]  # type: ignore[arg-type]
         restore_ids = set(image_ids)
         failures: list[str] = []
@@ -12604,6 +12618,10 @@ class MainWindow(QMainWindow):
             image_id = int(backup.get("image_id", 0) or 0)
             original_path = Path(str(backup.get("original_path", "")))
             backup_path = Path(str(backup.get("backup_path", "")))
+            if original_path.exists() and backup_path.exists() and not filecmp.cmp(original_path, backup_path, shallow=False):
+                failures.append(f"{original_path.name}: 原路径已有其他内容，未覆盖；撤销备份仍保留")
+                restore_ids.discard(image_id)
+                continue
             if not original_path.exists():
                 if not backup_path.exists():
                     failures.append(f"{original_path.name}: 撤销备份不存在")
@@ -12611,7 +12629,7 @@ class MainWindow(QMainWindow):
                     continue
                 try:
                     original_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(backup_path), str(original_path))
+                    shutil.copy2(backup_path, original_path)
                 except Exception as exc:
                     failures.append(f"{original_path.name}: 无法恢复源文件：{exc}")
                     restore_ids.discard(image_id)
@@ -12620,14 +12638,17 @@ class MainWindow(QMainWindow):
         snapshot = undo.get("snapshot")
         restored = 0
         if isinstance(snapshot, dict) and restore_ids:
-            restored = self.store.restore_images_snapshot(snapshot, image_ids=sorted(restore_ids))
+            try:
+                restored = self.store.restore_images_snapshot(snapshot, image_ids=sorted(restore_ids))
+            except Exception as exc:
+                QMessageBox.warning(self, "无法撤销", f"未恢复索引：{exc}\n撤销记录和源文件备份仍保留。")
+                return
             self.vector_index.invalidate()
         backup_dir = undo.get("backup_dir")
-        self._last_removal_undo = None
-        if hasattr(self, "undo_removal_action"):
-            self.undo_removal_action.setEnabled(False)
-        if isinstance(backup_dir, str) and backup_dir:
-            shutil.rmtree(backup_dir, ignore_errors=True)
+        if failures:
+            undo['image_ids'] = sorted(set(image_ids) - restore_ids)
+        else:
+            self._clear_last_removal_undo(cleanup_backups=True)
         self._refresh_after_library_removal()
         if failures:
             QMessageBox.warning(
@@ -12683,8 +12704,8 @@ class MainWindow(QMainWindow):
         removed_roots, removed_images = self._cleanup_missing_active_scan_roots()
         if removed_images:
             message = (
-                f"已移除 {removed_roots} 个已不存在导入目录，"
-                f"{removed_images} 张失效索引"
+                f"{removed_roots} 个导入目录暂不可用，"
+                f"标记缺失 {removed_images} 张；项目与标注已保留"
             )
             self._record_operation_history(message)
             self.statusBar().showMessage(message)
@@ -12694,10 +12715,8 @@ class MainWindow(QMainWindow):
             self._file_watch_clear_requested.emit()
             return
         roots_to_watch: list[str] = []
-        for folder in self.store.list_folders_with_collection_images():
+        for folder in self.store.list_folders_with_collection_images(include_missing=True):
             root = self._normalize_folder_path(folder.folder_path)
-            if not os.path.isdir(root):
-                continue
             roots_to_watch.append(root)
         if not roots_to_watch:
             self._file_watch_configured_count = 0
@@ -12740,11 +12759,16 @@ class MainWindow(QMainWindow):
             if isinstance(directory, str) and isinstance(root, str)
         ]
         next_watch_path_roots = {directory: root for directory, root in watch_pairs}
+        extra_roots = {}
+        for directory, root in watch_pairs:
+            extra_roots.setdefault(directory, set()).add(root)
+        self._watch_path_extra_roots = extra_roots
+        self._queue_reconnected_watch_roots()
         if next_watch_path_roots == self._watch_path_roots:
             self._pending_watch_path_total = 0
             return
         self._watch_path_roots = next_watch_path_roots
-        paths_to_watch = [directory for directory, _root in watch_pairs]
+        paths_to_watch = list(next_watch_path_roots)
         if paths_to_watch:
             self._pending_watch_path_total = len(paths_to_watch)
             self._file_watch_configure_requested.emit(paths_to_watch)
@@ -12755,6 +12779,15 @@ class MainWindow(QMainWindow):
     def _handle_file_watch_configured(self, count: int) -> None:
         self._file_watch_configured_count = max(0, int(count))
         self._pending_watch_path_total = 0
+        self._queue_reconnected_watch_roots()
+
+    def _queue_reconnected_watch_roots(self) -> None:
+        disconnected = getattr(self, '_disconnected_watch_roots', set())
+        returning = {root for root in disconnected if os.path.isdir(root)}
+        if returning and self.file_watch_enabled and not self._database_maintenance_active:
+            disconnected.difference_update(returning)
+            self._pending_watch_scan_roots.update(returning)
+            self.watch_scan_timer.start(1500)
 
     def _handle_file_watch_worker_failed(self, message: str) -> None:
         self._file_watch_configured_count = 0
@@ -12765,13 +12798,20 @@ class MainWindow(QMainWindow):
     @classmethod
     def _watched_directories_for_roots(cls, roots: Sequence[str]) -> list[tuple[str, str]]:
         pairs: list[tuple[str, str]] = []
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         for root in roots:
             normalized_root = os.path.abspath(root)
-            for directory in cls._watched_directories_for_root(normalized_root):
-                if directory in seen:
+            directories = cls._watched_directories_for_root(normalized_root)
+            # A watched directory can disappear without notifying its own watch.
+            # Its parent catches removal, and remains available for reconnection.
+            parent = Path(normalized_root).parent
+            while not parent.is_dir() and parent != parent.parent:
+                parent = parent.parent
+            directories.append(str(parent))
+            for directory in directories:
+                if (directory, normalized_root) in seen:
                     continue
-                seen.add(directory)
+                seen.add((directory, normalized_root))
                 pairs.append((directory, normalized_root))
         return pairs
 
@@ -12805,7 +12845,24 @@ class MainWindow(QMainWindow):
                     break
         if root is None:
             return
-        self._pending_watch_scan_roots.add(root)
+        roots = getattr(self, '_watch_path_extra_roots', {}).get(normalized, {root})
+        missing_roots = None
+        for candidate in roots:
+            if not os.path.isdir(candidate):
+                if not hasattr(self, '_disconnected_watch_roots'):
+                    self._disconnected_watch_roots = set()
+                self._disconnected_watch_roots.add(candidate)
+            if normalized != candidate and not self._path_is_in_folder(normalized, candidate) and os.path.isdir(candidate):
+                # Ignore unrelated sibling changes; only a returning root needs
+                # scanning when the event comes from its parent directory.
+                if missing_roots is None:
+                    missing_roots = {self._normalize_folder_path(folder.folder_path)
+                                     for folder in self.store.folders_with_missing_images()}
+                if candidate not in missing_roots:
+                    continue
+            self._pending_watch_scan_roots.add(candidate)
+        if not self._pending_watch_scan_roots:
+            return
         self.watch_scan_timer.start(1500)
         self.statusBar().showMessage("检测到本地文件变化，准备增量扫描")
 
@@ -12857,7 +12914,7 @@ class MainWindow(QMainWindow):
         removed = sum(result.missing_marked for result in results)
         message = (
             f"自动扫描完成：目录 {len(roots)}，扫描 {scanned}，"
-            f"新增 {new_files}，变化 {changed_files}，移除索引 {removed}，失败 {len(failures)}"
+            f"新增 {new_files}，变化 {changed_files}，标记缺失 {removed}，失败 {len(failures)}"
         )
         if failures:
             self._record_error("自动监听扫描失败：" + " | ".join(failures[:5]))
@@ -13234,14 +13291,16 @@ class MainWindow(QMainWindow):
         removed_roots = 0
         removed_images = 0
         thumbnail_paths: list[str] = []
-        for folder in self.store.list_folders_with_collection_images():
+        for folder in self.store.list_folders_with_collection_images(include_missing=True):
             if not folder.last_scanned_at:
                 continue
             root = self._normalize_folder_path(folder.folder_path)
             if os.path.isdir(root):
                 continue
-            folder_thumbnails, folder_removed = self.store.remove_folder_from_library(folder.id)
-            thumbnail_paths.extend(folder_thumbnails)
+            if not hasattr(self, '_disconnected_watch_roots'):
+                self._disconnected_watch_roots = set()
+            self._disconnected_watch_roots.add(root)
+            folder_removed = self.store.mark_missing_for_folder(folder.id, ())
             removed_roots += 1
             removed_images += folder_removed
         if removed_images:
@@ -13743,7 +13802,7 @@ class MainWindow(QMainWindow):
         self._delete_scan_removed_thumbnails([result])
         self._refresh_after_scan_database_change()
         self.statusBar().showMessage(
-            f"扫描完成：新增 {result.new_files}，变化 {result.changed_files}，移除索引 {result.missing_marked}"
+            f"扫描完成：新增 {result.new_files}，变化 {result.changed_files}，标记缺失 {result.missing_marked}"
         )
 
     def _handle_scan_all_done(self, results: list[ScanResult]) -> None:
@@ -13757,7 +13816,7 @@ class MainWindow(QMainWindow):
         removed = sum(result.missing_marked for result in results)
         message = (
             f"全部重新扫描完成：目录 {len(results)}，扫描 {scanned}，"
-            f"新增 {new_files}，变化 {changed_files}，移除索引 {removed}"
+            f"新增 {new_files}，变化 {changed_files}，标记缺失 {removed}"
         )
         self.settings_status_label.setText(message)
         self.statusBar().showMessage(message)
@@ -13787,7 +13846,7 @@ class MainWindow(QMainWindow):
         removed = sum(result.missing_marked for result in results)
         message = (
             f"扫描缺失所在目录完成：目录 {len(results)}，扫描 {scanned}，"
-            f"恢复/变化 {recovered}，移除索引 {removed}"
+            f"恢复/变化 {recovered}，标记缺失 {removed}"
         )
         self.settings_status_label.setText(message)
         self.statusBar().showMessage(message)
@@ -13842,7 +13901,7 @@ class MainWindow(QMainWindow):
         message = (
             f"导入文件夹完成：目标 {parent_name}，文件夹 {len(folder_paths)}，"
             f"扫描 {scanned}，新增 {new_files}，变化 {changed_files}，"
-            f"移除索引 {removed}，加入 {assigned}"
+            f"标记缺失 {removed}，加入 {assigned}"
         )
         self._record_operation_history(message)
         self.statusBar().showMessage(message)
@@ -13876,7 +13935,7 @@ class MainWindow(QMainWindow):
         message = (
             f"拖入导入完成：目标 {target_name}，图片 {len(file_paths)}，"
             f"文件夹 {len(folder_paths)}，扫描 {scanned}，新增 {new_files}，"
-            f"变化 {changed_files}，移除索引 {removed}，加入 {assigned}"
+            f"变化 {changed_files}，标记缺失 {removed}，加入 {assigned}"
         )
         self._record_operation_history(message)
         self.statusBar().showMessage(message)

@@ -811,16 +811,16 @@ class MetadataStore:
         with self.connect(readonly=True) as conn:
             return [self._folder_from_row(row) for row in conn.execute(sql, params)]
 
-    def list_folders_with_collection_images(self) -> list[FolderItem]:
+    def list_folders_with_collection_images(self, *, include_missing=False) -> list[FolderItem]:
         with self.connect(readonly=True) as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT DISTINCT f.*
                 FROM folders f
                 JOIN images i ON i.folder_id = f.id
                 JOIN image_collections ic ON ic.image_id = i.id
                 WHERE f.is_active = 1
-                  AND i.is_missing = 0
+                  {'' if include_missing else 'AND i.is_missing = 0'}
                 ORDER BY f.folder_path COLLATE NOCASE
                 """
             ).fetchall()
@@ -1095,7 +1095,6 @@ class MetadataStore:
                     changed = (
                         int(row["file_size"]) != file_size
                         or int(row["modified_time_ns"]) != modified_time_ns
-                        or bool(row["is_missing"])
                     )
                     conn.execute(
                         """
@@ -1879,7 +1878,6 @@ class MetadataStore:
         changed = (
             int(existing["file_size"]) != file_size
             or int(existing["modified_time_ns"]) != modified_time_ns
-            or bool(existing["is_missing"])
         )
         if changed and conn.execute(
             "SELECT 1 FROM image_replacements WHERE image_id=? LIMIT 1", (existing["id"],)
@@ -3511,6 +3509,9 @@ class MetadataStore:
                     f"SELECT * FROM temporary_project_images WHERE image_id IN ({placeholders})",
                     clean_ids,
                 ),
+                **{table: rows(conn, f"SELECT * FROM {table} WHERE image_id IN ({placeholders})", clean_ids)
+                   for table in ("creative_node_images", "creative_reference_decisions",
+                                 "creative_reference_notes", "ai_vision_tags")},
             }
 
     def restore_images_snapshot(
@@ -3545,10 +3546,26 @@ class MetadataStore:
                 [tuple(row.get(column) for column in columns) for row in rows_to_insert],
             )
 
+        image_rows = table_rows("images", id_key="id")
+        for saved in image_rows:
+            try:
+                stat = os.stat(str(saved['file_path']))
+            except FileNotFoundError:
+                saved['is_missing'] = 1
+            else:
+                if (stat.st_size, stat.st_mtime_ns) != (saved['file_size'], saved['modified_time_ns']):
+                    raise ValueError("原路径的源文件已改变，未恢复旧图片的标注")
+                saved['is_missing'] = 0
         with self.connect() as conn:
+            # Never attach a deleted image's annotations to a reused ID/path.
+            for saved in image_rows:
+                existing = conn.execute("SELECT * FROM images WHERE id=? OR file_path=?",
+                                        (saved["id"], saved["file_path"])).fetchall()
+                if any(row["id"] != saved["id"] or any(row[key] != saved[key] for key in
+                       ("file_path", "file_size", "modified_time_ns")) for row in existing):
+                    raise ValueError("图片路径或记录已被其他内容占用，未覆盖现有图片")
             insert_rows(conn, "folders", table_rows("folders", id_key="id"))
             insert_rows(conn, "tags", table_rows("tags"))
-            image_rows = table_rows("images", id_key="id")
             insert_rows(conn, "images", image_rows)
             insert_rows(conn, "embeddings", table_rows("embeddings"))
             insert_rows(conn, "color_features", table_rows("color_features"))
@@ -3556,6 +3573,8 @@ class MetadataStore:
             insert_rows(conn, "image_collections", table_rows("image_collections"))
             insert_rows(conn, "search_feedback", table_rows("search_feedback"))
             insert_rows(conn, "temporary_project_images", table_rows("temporary_project_images"))
+            for table in ("creative_node_images", "creative_reference_decisions", "creative_reference_notes", "ai_vision_tags"):
+                insert_rows(conn, table, table_rows(table))
             self._delete_unused_tags(conn)
             placeholders = ",".join("?" for _ in clean_ids)
             row = conn.execute(
@@ -6477,6 +6496,11 @@ class MetadataStore:
                 (image_id, analysis_type, provider_name, model_name, prompt_version, now, now),
             )
 
+    def mark_ai_vision_interrupted(self, image_id, *, analysis_type):
+        with self.connect() as conn:
+            conn.execute("UPDATE ai_vision_tags SET status='pending', error_message=NULL, updated_at=? WHERE image_id=? AND analysis_type=? AND status='processing'",
+                         (utc_now_iso(), image_id, normalize_ai_vision_analysis_type(analysis_type)))
+
     def upsert_ai_vision_success(
         self,
         *,
@@ -7280,13 +7304,6 @@ class MetadataStore:
 
     @staticmethod
     def _delete_unused_tags(conn: sqlite3.Connection) -> None:
-        conn.execute(
-            """
-            DELETE FROM tags
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM image_tags it
-                WHERE it.tag_id = tags.id
-            )
-            """
-        )
+        # Tags are user definitions, including deliberately empty tags. Only
+        # the explicit delete/merge actions may remove their definitions.
+        return

@@ -9,13 +9,10 @@ from pathlib import Path
 from PySide6.QtCore import (
     QEvent,
     QMimeData,
-    QObject,
     QPoint,
     QRect,
-    QRunnable,
     QSize,
     Qt,
-    QThreadPool,
     QTimer,
     QUrl,
     Signal,
@@ -27,33 +24,11 @@ from eidory.core.media_types import is_supported_video
 from eidory.models import ImageItem
 from eidory.ui.collection_tree import IMAGE_IDS_MIME, CollectionTreeWidget
 from eidory.ui.drop_import_box import payload_from_mime_data, payload_supports_mime_data
+from eidory.ui.board_image_loader import BoardImageLoader
 
 
 PixmapCacheKey = tuple[str, int, int, int]
 RESIZE_LAYOUT_DELAY_MS = 35
-
-
-class _PixmapLoadSignals(QObject):
-    loaded = Signal(object, object)
-
-
-class _PixmapLoadTask(QRunnable):
-    def __init__(
-        self,
-        key: PixmapCacheKey,
-        path: Path,
-        max_side: int,
-        signals: _PixmapLoadSignals,
-    ):
-        super().__init__()
-        self.key = key
-        self.path = path
-        self.max_side = max_side
-        self.signals = signals
-
-    def run(self) -> None:
-        image = JustifiedImageGridView._load_scaled_image(self.path, self.max_side)
-        self.signals.loaded.emit(self.key, image)
 
 
 class JustifiedImageGridView(QAbstractScrollArea):
@@ -95,10 +70,10 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._resize_layout_timer.setSingleShot(True)
         self._resize_layout_timer.setInterval(RESIZE_LAYOUT_DELAY_MS)
         self._resize_layout_timer.timeout.connect(self._run_scheduled_layout_rebuild)
-        self._pixmap_load_signals = _PixmapLoadSignals()
-        self._pixmap_load_signals.loaded.connect(self._handle_async_pixmap_loaded)
-        self._thread_pool = QThreadPool(self)
-        self._thread_pool.setMaxThreadCount(2)
+        self._load_generation = 0
+        self._image_loader = BoardImageLoader(self)
+        self._image_loader.loaded.connect(self._handle_current_pixmap_loaded)
+        self._thread_pool = self._image_loader.pool
         self._cache_limit = 700
         self._cache_byte_limit = 180 * 1024 * 1024
         self._pending_load_limit = 48
@@ -182,8 +157,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         new_layout_signature = self._layout_keys(new_images)
         should_rebuild_layout = self._layout_signature != new_layout_signature
         if should_rebuild_layout:
-            self._pending_pixmap_loads.clear()
-            self._loaded_pixmap_results.clear()
+            self._reset_image_requests()
         self._images = new_images
         self._layout_signature = new_layout_signature
         self._badges_by_image_id = dict(badges_by_image_id or {})
@@ -261,8 +235,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         if next_size == self._target_height:
             return
         self._target_height = next_size
-        self._pending_pixmap_loads.clear()
-        self._loaded_pixmap_results.clear()
+        self._reset_image_requests()
         self._rebuild_layout()
         self.viewport().update()
 
@@ -274,7 +247,14 @@ class JustifiedImageGridView(QAbstractScrollArea):
             self._update_scroll_range()
 
     def _handle_scroll_value_changed(self, _value: int) -> None:
+        if abs(_value - getattr(self, '_load_viewport_y', 0)) >= max(1, self.viewport().height() // 2):
+            self._load_viewport_y = _value
+            self._reset_image_requests()
         self._schedule_viewport_update()
+
+    def hideEvent(self, event) -> None:
+        self._reset_image_requests()
+        super().hideEvent(event)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self.viewport())
@@ -830,6 +810,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         return reader.read()
 
     def clear_pixmap_cache(self):
+        self._reset_image_requests()
         self._pixmap_cache.clear()
         self._pixmap_cache_bytes.clear()
         self._pixmap_cache_total_bytes = 0
@@ -858,9 +839,18 @@ class JustifiedImageGridView(QAbstractScrollArea):
             return
         self._pending_pixmap_loads.add(key)
         source, _mtime, _size, max_side = key
-        self._thread_pool.start(
-            _PixmapLoadTask(key, Path(source), max_side, self._pixmap_load_signals)
-        )
+        self._image_loader.request((self._load_generation, key), [source], max_side, urgent=True)
+
+    def _reset_image_requests(self):
+        self._load_generation += 1
+        self._image_loader.reset()
+        self._pending_pixmap_loads.clear()
+        self._loaded_pixmap_results.clear()
+
+    def _handle_current_pixmap_loaded(self, token, image, _path):
+        generation, key = token
+        if generation == self._load_generation:
+            self._handle_async_pixmap_loaded(key, image)
 
     def _handle_async_pixmap_loaded(self, key: object, image: object) -> None:
         cache_key = key

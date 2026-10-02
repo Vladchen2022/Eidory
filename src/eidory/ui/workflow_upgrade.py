@@ -520,10 +520,10 @@ class WorkflowUpgrade(QObject):
                 self.w._load_creative_project(pid)
                 self.w.creative_workspace.show_planning()
                 self.w.statusBar().showMessage(f'已导入可编辑项目 · {len(missing)} 个文件缺失')
-            self.run_job('正在导入项目与素材…', lambda: import_project_package(self.w.store, path, self.w.paths.data_dir), loaded)
+            self.run_job('正在导入项目与素材…', lambda: import_project_package(self.w.store, path, self.w.paths.data_dir), loaded, modal=False)
         self.run_job('正在校验项目包…', lambda: inspect_project_package(path), preview)
 
-    def run_job(self, label, work, done, *, silent=False):
+    def run_job(self, label, work, done, *, silent=False, modal=True):
         from uuid import uuid4
         key = uuid4().hex
         progress = None
@@ -531,7 +531,7 @@ class WorkflowUpgrade(QObject):
             progress = QProgressDialog(label, '', 0, 0, self.w)
             progress.setWindowTitle('Eidory')
             progress.setCancelButton(None)
-            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+            progress.setWindowModality(Qt.WindowModality.ApplicationModal if modal else Qt.WindowModality.NonModal)
             progress.show()
         self.jobs[key] = (done, progress, silent)
         def run():

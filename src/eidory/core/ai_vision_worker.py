@@ -47,6 +47,7 @@ class AIVisionWorker(threading.Thread):
         self.idle_sleep_seconds = idle_sleep_seconds
         self.on_progress = on_progress
         self._stop_event = threading.Event()
+        self.provider.cancel_event = self._stop_event
         self._pause_event = threading.Event()
         self._pause_event.set()
         self._generation_ready = threading.Event()
@@ -78,7 +79,12 @@ class AIVisionWorker(threading.Thread):
         self._emit(None, None, "running", "AI vision resumed")
 
     def run(self) -> None:
-        model_name = self.provider.resolved_model_name()
+        try:
+            model_name = self.provider.resolved_model_name()
+        except Exception:
+            if self._stop_event.is_set():
+                return
+            raise
         self._emit(None, None, "running", "AI vision worker started")
         while not self._stop_event.is_set():
             if not self._wait_ready():
@@ -125,6 +131,9 @@ class AIVisionWorker(threading.Thread):
         self._emit(image.id, image.file_name, "processing", "analyzing image")
         try:
             analysis = self._analyze_with_retries(image)
+            if self._stop_event.is_set():
+                self.store.mark_ai_vision_interrupted(image.id, analysis_type=self.analysis_type)
+                return
             self.store.upsert_ai_vision_success(
                 image_id=image.id,
                 provider_name=self.provider.provider_name,
@@ -136,6 +145,9 @@ class AIVisionWorker(threading.Thread):
             )
             self._emit(image.id, image.file_name, "ready", "AI vision ready")
         except Exception as exc:
+            if self._stop_event.is_set():
+                self.store.mark_ai_vision_interrupted(image.id, analysis_type=self.analysis_type)
+                return
             self.store.mark_ai_vision_failed(
                 image_id=image.id,
                 provider_name=self.provider.provider_name,

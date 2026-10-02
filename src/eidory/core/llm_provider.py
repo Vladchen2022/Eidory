@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 import requests
 
+from eidory.core.cancellable_http import post_json, get_json
+
 from eidory.core.ai_vision import (
     AI_VISION_FIELD_VALUES,
     AI_VISION_LIGHTING_VALUES,
@@ -1039,11 +1041,11 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
         response = None
         for attempt in range(2):
             try:
-                response = requests.post(
+                response = post_json(
                     f"{self.base_url}/chat/completions",
                     json=payload,
                     headers=headers,
-                    timeout=self.timeout_seconds,
+                    timeout=self.timeout_seconds, cancel=getattr(self, "cancel_event", None),
                 )
                 if response.status_code in {400, 422} and (
                     (prefer_json and "response_format" in payload) or "reasoning_effort" in payload
@@ -1051,11 +1053,11 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
                     if prefer_json:
                         payload.pop("response_format", None)
                     payload.pop("reasoning_effort", None)
-                    response = requests.post(
+                    response = post_json(
                         f"{self.base_url}/chat/completions",
                         json=payload,
                         headers=headers,
-                        timeout=self.timeout_seconds,
+                        timeout=self.timeout_seconds, cancel=getattr(self, "cancel_event", None),
                     )
                 response.raise_for_status()
                 break
@@ -1150,7 +1152,7 @@ search_query 不超过 120 字。{'所有字段使用英文。' if language == '
 
     def _first_available_model(self) -> str:
         try:
-            response = requests.get(f"{self.base_url}/models", headers=self._headers(), timeout=5)
+            response = get_json(f"{self.base_url}/models", headers=self._headers(), timeout=5, cancel=getattr(self, "cancel_event", None))
             response.raise_for_status()
             data = response.json()
             models = data.get("data", [])

@@ -100,7 +100,7 @@ def test_scan_survives_file_deleted_after_directory_listing(library):
     with patch.object(scanner, '_iter_image_files', return_value=listing):
         result = scanner.scan_folder(root)
     assert (result.scanned_files, result.missing_marked) == (3, 1)
-    assert store.get_image(images[0].id) is None
+    assert store.get_image(images[0].id).is_missing
 
 
 def test_scan_does_not_remove_records_on_unreadable_subdirectory(library):

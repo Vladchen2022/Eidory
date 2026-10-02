@@ -87,7 +87,7 @@ class UpscaleJobs(GeneratedReferences):
 
     def active(self):
         with self.store.connect(readonly=True) as conn:
-            row = conn.execute("SELECT payload FROM image_upscale_jobs WHERE json_extract(payload,'$.state') IN ('submitting','unknown','queued','running','downloading') ORDER BY created_at LIMIT 1").fetchone()
+            row = conn.execute("SELECT payload FROM image_upscale_jobs WHERE json_extract(payload,'$.state') IN ('submitting','unknown','queued','running','downloading','offline') ORDER BY created_at LIMIT 1").fetchone()
         return json.loads(row[0]) if row else None
 
     def get(self, job_id):

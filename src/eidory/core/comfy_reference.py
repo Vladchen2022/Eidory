@@ -22,11 +22,12 @@ from eidory.core.thumbnailer import Thumbnailer
 from eidory.core.time_utils import utc_now_iso
 
 
-ACTIVE_STATES = {'submitting', 'unknown', 'queued', 'running', 'downloading'}
+ACTIVE_STATES = {'submitting', 'unknown', 'queued', 'running', 'downloading', 'offline'}
 STATE_LABELS = {
     'submitting': '正在提交', 'unknown': '连接中断，正在核对原任务',
     'queued': '等待 ComfyUI', 'running': '正在生成', 'downloading': '正在保存候选',
     'ready': '待采用', 'adopted': '已采用并保存', 'discarded': '已丢弃，可撤销',
+    'offline': '服务离线，等待重连', 'paused': '已停止等待，服务端状态未确认',
     'cancelled': '已取消', 'failed': '生成失败', 'missing': '服务中未找到原任务',
 }
 
@@ -240,7 +241,7 @@ class GeneratedReferences:
 
     def active(self):
         with self.store.connect(readonly=True) as conn:
-            row = conn.execute("SELECT json_remove(payload, '$.workflow') FROM generated_reference_jobs WHERE json_extract(payload, '$.state') IN ('submitting','unknown','queued','running','downloading') ORDER BY created_at LIMIT 1").fetchone()
+            row = conn.execute("SELECT json_remove(payload, '$.workflow') FROM generated_reference_jobs WHERE json_extract(payload, '$.state') IN ('submitting','unknown','queued','running','downloading','offline') ORDER BY created_at LIMIT 1").fetchone()
         return json.loads(row[0]) if row else None
 
     def get(self, job_id):
@@ -264,7 +265,7 @@ class GeneratedReferences:
         if self.active():
             raise ValueError('请等待当前生成完成，或先取消当前任务。')
         with self.store.connect(readonly=True) as conn:
-            if conn.execute("SELECT 1 FROM image_upscale_jobs WHERE json_extract(payload,'$.state') IN ('submitting','unknown','queued','running','downloading') LIMIT 1").fetchone():
+            if conn.execute("SELECT 1 FROM image_upscale_jobs WHERE json_extract(payload,'$.state') IN ('submitting','unknown','queued','running','downloading','offline') LIMIT 1").fetchone():
                 raise ValueError('请等待当前 AI 放大完成，或先取消放大任务。')
         node = self.store.get_creative_node(node_id)
         if not node or not prompt.strip():
@@ -317,6 +318,8 @@ class GeneratedReferences:
         job = self.get(job_id)
         if job['state'] not in ACTIVE_STATES:
             return job
+        if job.get('next_check_at', 0) > time.time():
+            return job
         client = ComfyClient(job['url'])
         try:
             history = client.request('GET', '/history/' + job['prompt_id'])
@@ -355,8 +358,12 @@ class GeneratedReferences:
                     job.setdefault('not_found_since', time.time())
                     if time.time() - job['not_found_since'] > 45:
                         job.update(state='missing', error='ComfyUI 未保留此任务。未重复提交；请检查服务后再生成。')
+            if job['state'] == 'offline':
+                job.update(state='unknown', error='服务已连接，正在核对原任务。')
+            job.pop('next_check_at', None)
+            job.pop('connection_failures', None)
         except requests.RequestException:
-            job['error'] = '暂时无法连接 ComfyUI，保留原任务并自动重连。'
+            self._mark_offline(job)
         except (ValueError, OSError) as exc:
             # Preserve downloadable results for another attempt, including disk full.
             job['error'] = str(exc)
@@ -367,10 +374,19 @@ class GeneratedReferences:
         job = self.get(job_id)
         if job['state'] not in ACTIVE_STATES:
             return job
+        if job['state'] == 'offline':
+            job.update(state='paused', error='已停止本地等待；服务端是否停止尚未确认，可继续核对原任务。')
+            self.save(job)
+            return job
         # This local server's atomic per-job endpoint avoids a global interrupt
         # racing with a browser-owned job. No global-interrupt fallback.
         client = ComfyClient(job['url'])
-        result = client.request('POST', '/api/jobs/' + job['prompt_id'] + '/cancel', json={})
+        try:
+            result = client.request('POST', '/api/jobs/' + job['prompt_id'] + '/cancel', json={})
+        except requests.RequestException:
+            self._mark_offline(job)
+            self.save(job)
+            return job
         if result.get('cancelled'):
             job.update(state='cancelled', error='')
             self.save(job)
@@ -380,6 +396,28 @@ class GeneratedReferences:
                 job['error'] = '服务尚未确认取消，继续核对任务。'
                 self.save(job)
         return job
+
+    @staticmethod
+    def _mark_offline(job):
+        failures = job.get('connection_failures', 0) + 1
+        job.update(state='offline', connection_failures=failures,
+                   next_check_at=time.time() + min(60, 2 ** min(failures, 6)),
+                   error='ComfyUI 离线，保留原任务并自动重连；可停止等待。')
+
+    def resume(self, job_id):
+        job = self.get(job_id)
+        if job['state'] != 'paused':
+            return job
+        if self.active():
+            raise ValueError('请先等待当前任务结束。')
+        with self.store.connect(readonly=True) as conn:
+            for table in ('generated_reference_jobs', 'image_upscale_jobs'):
+                if conn.execute(f"SELECT 1 FROM {table} WHERE json_extract(payload,'$.state') IN ('submitting','unknown','queued','running','downloading','offline') LIMIT 1").fetchone():
+                    raise ValueError('请先等待当前生图或放大任务结束。')
+        job.update(state='unknown', error='正在核对原任务，不重复提交。')
+        job.pop('next_check_at', None)
+        self.save(job)
+        return self.reconcile(job_id)
 
     def discard(self, job_id, *, undo=False):
         job = self.get(job_id)

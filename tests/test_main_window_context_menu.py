@@ -2085,6 +2085,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.app.processEvents()
 
             image = self._image(1)
+            window._show_gallery_view()
+            window.grid_view.set_images([image])
             with patch.object(window, "_show_image_details") as show_image_details:
                 window._sync_preview_selection(image)
                 self.app.processEvents()
@@ -3321,7 +3323,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual({image.id for image in window.grid_view.images()}, {untagged_id})
             window.close()
 
-    def test_startup_removes_previously_scanned_active_roots_missing_on_disk(self) -> None:
+    def test_startup_preserves_previously_scanned_active_roots_missing_on_disk(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -3352,8 +3354,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
 
-            self.assertIsNone(store.get_folder(folder_id))
-            self.assertIsNone(store.get_image(image_id))
+            self.assertIsNotNone(store.get_folder(folder_id))
+            self.assertTrue(store.get_image(image_id).is_missing)
             self.assertEqual(store.list_collections_with_counts()[0][1], 0)
             window.close()
 
@@ -4503,7 +4505,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 width=100,
                 height=100,
                 created_time_ns=None,
-                modified_time_ns=1,
+                modified_time_ns=media_path.stat().st_mtime_ns,
             )
             collection_id = store.create_collection("测试文件夹")
             store.assign_images_to_collection([image_id], collection_id)
@@ -4552,7 +4554,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 width=100,
                 height=100,
                 created_time_ns=None,
-                modified_time_ns=1,
+                modified_time_ns=media_path.stat().st_mtime_ns,
             )
             image = store.list_images()[0]
             window = MainWindow(paths=paths, store=store)
@@ -8756,7 +8758,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual(restored.pos().y(), 355)
             window.close()
 
-    def test_parent_creative_board_refreshes_when_child_gets_more_images(self) -> None:
+    def test_parent_creative_board_refreshes_after_visible_wall_collects_child_images(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(
                 data_dir=Path(tmp) / "data",
@@ -8810,11 +8812,13 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.current_result_mode = "creative_node"
             window.current_creative_node_images = [new_image]
             window.current_creative_node_filtered_images = [new_image]
+            window._show_gallery_view()
             window.grid_view.set_images([new_image], selected_image_ids=[image_ids[1]])
 
             window._save_selection_to_current_creative_node()
 
             self.assertEqual(store.creative_node_image_ids(child_id), image_ids)
+            window._show_creative_board_for_node(int(root_id))
             self.assertEqual(window._current_board_node_id, int(root_id))
             self.assertEqual(window._current_board_image_ids, tuple(image_ids))
             self.assertEqual(set(window.project_board_view._image_items), set(image_ids))

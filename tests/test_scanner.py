@@ -48,7 +48,7 @@ class ScannerTest(unittest.TestCase):
             update_thumbnails.assert_called_once()
             color_successes.assert_called_once()
 
-    def test_scan_folder_generates_thumbnails_and_removes_deleted_files(self) -> None:
+    def test_scan_folder_generates_thumbnails_and_preserves_missing_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "library"
             hidden = root / ".hidden"
@@ -78,15 +78,15 @@ class ScannerTest(unittest.TestCase):
             result = scanner.scan_folder(str(root))
             self.assertEqual(result.scanned_files, 1)
             self.assertEqual(result.missing_marked, 1)
-            self.assertTrue(result.removed_thumbnail_paths)
+            self.assertFalse(result.removed_thumbnail_paths)
 
-            self.assertEqual(store.count_missing_images(), 0)
+            self.assertEqual(store.count_missing_images(), 1)
             self.assertEqual(
                 [image.file_name for image in store.list_images(limit=10)],
                 ["b.png"],
             )
 
-    def test_scan_missing_root_removes_folder_index(self) -> None:
+    def test_scan_missing_root_preserves_folder_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "library"
             root.mkdir()
@@ -105,8 +105,8 @@ class ScannerTest(unittest.TestCase):
 
             self.assertEqual(result.scanned_files, 0)
             self.assertEqual(result.missing_marked, 1)
-            self.assertEqual(store.count_images(), 0)
-            self.assertEqual(store.list_folders(include_inactive=True), [])
+            self.assertEqual(store.count_missing_images(), 1)
+            self.assertEqual(len(store.list_folders(include_inactive=True)), 1)
 
     def test_scan_folder_skip_paths_do_not_import_or_mark_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

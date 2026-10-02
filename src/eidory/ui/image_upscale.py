@@ -1,6 +1,8 @@
 """Single preview entry, background SeedVR jobs, and a shared-coordinate wipe comparison."""
 from __future__ import annotations
 
+import time
+
 from pathlib import Path
 from dataclasses import replace
 from weakref import ref
@@ -245,7 +247,7 @@ class UpscalePanel(QDialog):
         job = jobs[0] if jobs else None
         self.job = job
         # Reopening a running/completed candidate must show its submitted settings.
-        if job and job['state'] in ACTIVE_STATES | {'ready'}:
+        if job and job['state'] in ACTIVE_STATES | {'ready', 'paused'}:
             factor = job['factor']
             with QSignalBlocker(self.mode), QSignalBlocker(self.edge):
                 self.mode.setCurrentIndex(0 if factor == 2 else 1 if factor == 4 else 2)
@@ -254,6 +256,8 @@ class UpscalePanel(QDialog):
             original = job['source_info']
             self.dimensions.setText(f"{original['width']} × {original['height']} → {job['target_width']} × {job['target_height']} · 输出长边最多 4096")
         self.start.setText('再次放大' if job and job['state'] == 'applied' else '开始放大')
+        if job and job['state'] == 'paused':
+            self.start.setText('继续核对原任务')
         if job and job['state'] == 'applied' and self.info:
             try:
                 w, h = output_size(self.info['width'], self.info['height'], self.factor())
@@ -269,6 +273,7 @@ class UpscalePanel(QDialog):
         self.edge.setEnabled(self.mode.isEnabled())
         self.cancel.setVisible(same_active)
         self.cancel.setEnabled(same_active and not busy)
+        self.cancel.setText('停止等待' if active and active['state'] == 'offline' else '取消任务')
         self.progress.setVisible(busy or same_active)
         self.replace.setEnabled(ready and not busy)
         self.discard.setEnabled(bool(job and job['state'] in {'ready', 'discarded'}) and not busy and not active)
@@ -387,6 +392,9 @@ class ImageUpscaler(QObject):
         panel = self.panel
         if not panel or not panel.valid or self.working:
             return
+        if panel.job and panel.job['state'] == 'paused':
+            self.run(lambda: self.repo.resume(panel.job['id']), self.updated)
+            return
         image_id, factor = panel.image_id, panel.factor()
         url = self.w.store.get_setting('comfy.url', 'http://127.0.0.1:8188')
         panel.status.setText('正在准备原图并连接本机 ComfyUI…')
@@ -406,6 +414,8 @@ class ImageUpscaler(QObject):
             return
         job = self.repo.active()
         if job:
+            if job.get('next_check_at', 0) > time.time():
+                return
             self.run(lambda: self.repo.reconcile(job['id']), self.updated)
         elif self.panel:
             self.inspect()

@@ -103,17 +103,17 @@ class ImageScanner:
             folder = self.store.get_folder_by_path(root)
             if folder is None:
                 raise FileNotFoundError(f"folder does not exist: {root}")
-            thumbnail_paths, removed = self.store.remove_folder_from_library(folder.id)
+            # A disconnected disk is not an explicit request to delete metadata.
+            missing = self.store.mark_missing_for_folder(folder.id, ()) if mark_missing else 0
             return ScanResult(
                 folder_id=folder.id,
                 scanned_files=0,
                 new_files=0,
                 changed_files=0,
                 unchanged_files=0,
-                missing_marked=removed,
+                missing_marked=missing,
                 thumbnail_failures=0,
                 image_ids=(),
-                removed_thumbnail_paths=tuple(thumbnail_paths),
             )
 
         folder_id = self.store.add_folder(root)
@@ -185,7 +185,7 @@ class ImageScanner:
         removed_thumbnail_paths: list[str] = []
         missing_marked = 0
         if mark_missing:
-            removed_thumbnail_paths, missing_marked = self.store.remove_unseen_images_for_folder(
+            missing_marked = self.store.mark_missing_for_folder(
                 folder_id,
                 seen_paths,
             )

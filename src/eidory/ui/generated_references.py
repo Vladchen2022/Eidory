@@ -1,6 +1,8 @@
 """One search-stage entry to local generation, with durable project-scoped results."""
 from __future__ import annotations
 
+import time
+
 import json
 from datetime import datetime
 from pathlib import Path
@@ -241,6 +243,7 @@ class GenerationPanel(QDialog):
         self.adopt.setText('采用并保存到「' + job['node_title'] + '」' if job else '采用并保存')
         self.preview_button.setEnabled(has_image)
         self.regenerate.setEnabled(bool(job and not self.c.active() and not busy))
+        self.regenerate.setText('继续核对' if job and job['state'] == 'paused' else '再生成')
         self.discard.setEnabled(bool(job and job['state'] in {'ready', 'discarded'} and not busy))
         self.discard.setText('撤销丢弃' if job and job['state'] == 'discarded' else '丢弃')
         if job:
@@ -306,6 +309,7 @@ class ReferenceGeneration(QObject):
             upscale_busy = bool(upscaler and (upscaler.working or upscaler.repo.active()))
             self.panel.generate.setEnabled(not self.working and not job and not upscale_busy and bool(self.template()))
             self.panel.cancel.setEnabled(bool(job) and not self.working)
+            self.panel.cancel.setText('停止等待' if job and job['state'] == 'offline' else '取消任务')
             self.panel.settings.setEnabled(not self.working and not job)
             self.panel.workflow.setEnabled(not self.working and not job)
             self.panel.refresh_candidates()
@@ -314,7 +318,7 @@ class ReferenceGeneration(QObject):
                 suffix = f' {progress[0]}/{progress[1]}' if progress and job['state'] == 'running' else ''
                 self.panel.status.setText(f"{job['project_title']} / {job['node_title']} · {job.get('error') or STATE_LABELS[job['state']]}{suffix}")
             self.panel.progress.setVisible(bool(job))
-        self.hold_indexing(bool(job))
+        self.hold_indexing(bool(job and job['state'] != 'offline'))
 
     def open(self):
         node = self.w._current_creative_node()
@@ -446,6 +450,8 @@ class ReferenceGeneration(QObject):
             return
         job = self.active()
         if job:
+            if job.get('next_check_at', 0) > time.time():
+                return
             self.connect_progress(job)
             self.run(lambda: self.repo.reconcile(job['id']), self.job_updated)
         else:
@@ -460,6 +466,9 @@ class ReferenceGeneration(QObject):
     def regenerate(self):
         job = self.panel.selected_job()
         if not job:
+            return
+        if job['state'] == 'paused':
+            self.run(lambda: self.repo.resume(job['id']), self.job_updated)
             return
         # Explicitly keep the result's original node, even in the project-wide list.
         node = self.w.store.get_creative_node(job['node_id'])
@@ -584,7 +593,12 @@ class ReferenceGeneration(QObject):
 
     def hold_indexing(self, hold):
         upscaler = getattr(self.w, 'image_upscaler', None)
-        hold = bool(hold or (upscaler and (upscaler.working or upscaler.repo.active())))
+        upscale_job = upscaler.repo.active() if upscaler else None
+        upscale_offline = bool(upscale_job and upscale_job['state'] == 'offline')
+        own_job = self.active()
+        if (own_job and own_job['state'] == 'offline') or upscale_offline:
+            hold = False
+        hold = bool(hold or (upscaler and not upscale_offline and (upscaler.working or upscale_job)))
         for worker in (self.w.embedding_worker, self.w.ai_vision_worker, self.w.ai_character_vision_worker):
             if worker is not None and worker.is_alive():
                 worker.set_generation_hold(hold)

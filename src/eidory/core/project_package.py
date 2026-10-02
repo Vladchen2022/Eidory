@@ -90,22 +90,28 @@ def import_project_package(store, path, data_dir):
     owned.mkdir(parents=True)
     try:
         image_map = {}
+        staged = []
+        missing = []
+        # File I/O must finish before acquiring SQLite's single writer lock.
+        for record, source in prepared:
+            destination = owned / f'{record["id"]}{Path(record["name"]).suffix.lower()}'
+            available = source.is_file()
+            if available:
+                shutil.copy2(source, destination)
+                if record.get('sha256') and file_digest(destination) != record['sha256']:
+                    raise ValueError('复制期间素材已改变：' + record['name'])
+            else:
+                missing.append(record['name'])
+            staged.append((record, destination, destination.stat() if available else None))
         with store.connect() as c:
             now = utc_now_iso()
             folder = c.execute("INSERT INTO folders(folder_path,import_mode,added_at,is_active) VALUES (?,'indexed',?,1)", (str(owned), now)).lastrowid
-            for record, source in prepared:
-                # Import a private copy even for linked packages so deleting the package
-                # afterwards cannot break the imported project.
-                destination = owned / f'{record["id"]}{Path(record["name"]).suffix.lower()}'
-                available = source.is_file()
-                if available:
-                    shutil.copy2(source, destination)
-                st = destination.stat() if available else None
+            for record, destination, st in staged:
                 image_id, _ = store._upsert_image_on_connection(c, now=now, folder_id=folder,
                     file_path=str(destination), file_size=st.st_size if st else record.get('file_size', 0),
                     width=record.get('width'), height=record.get('height'), created_time_ns=None,
                     modified_time_ns=st.st_mtime_ns if st else 0, duration_ms=record.get('duration_ms'))
-                if not available:
+                if st is None:
                     c.execute('UPDATE images SET is_missing=1 WHERE id=?', (image_id,))
                 image_map[record['id']] = image_id
             node_map = {}

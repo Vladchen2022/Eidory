@@ -1,6 +1,7 @@
 """Bounded command history; database undo changes only fields the command touched."""
 from contextlib import contextmanager
 import time
+import json
 from functools import wraps
 from weakref import ref
 from PySide6.QtCore import QObject
@@ -29,7 +30,7 @@ class EditHistory(QObject):
     def __init__(self, window):
         super().__init__(window)
         self._window = ref(window)
-        self.past, self.future = [], []
+        self._histories = {}
         self.busy = False
         self.depth = 0
         self._typing = None
@@ -56,8 +57,24 @@ class EditHistory(QObject):
     def w(self):
         return self._window()
 
-    def snapshot(self, tables=None):
-        pid = self.w.current_creative_project_id
+    def context(self):
+        w = self.w
+        return (w.current_creative_project_id, w.current_temp_project_id)
+
+    @property
+    def past(self):
+        return self._histories.setdefault(self.context(), ([], []))[0]
+
+    @past.setter
+    def past(self, value):
+        self._histories[self.context()] = (value, self.future)
+
+    @property
+    def future(self):
+        return self._histories.setdefault(self.context(), ([], []))[1]
+
+    def snapshot(self, tables=None, *, context=None):
+        pid = (context or self.context())[0]
         if pid is None:
             return {}
         result = {}
@@ -79,17 +96,19 @@ class EditHistory(QObject):
             yield
             return
         self.w.project_board_view.flush_pending_layout_change()
+        context = self.context()
+        past, _future = self._histories.setdefault(context, ([], []))
         self.depth += 1
         try:
             typing_key = (self.w.current_creative_project_id, self.w.current_creative_node_id) if label == '修改找图目标' else None
             tables = ('creative_node_options',) if typing_key else None
-            before = self.snapshot(tables)
+            before = self.snapshot(tables, context=context)
             previous = self._typing
             merge = (typing_key is not None and previous is not None and previous[0] == typing_key
-                     and time.monotonic() - previous[1] < 1.2 and self.past
-                     and self.past[-1] is previous[3] and before == previous[4])
+                     and time.monotonic() - previous[1] < 1.2 and past
+                     and past[-1] is previous[3] and before == previous[4])
             yield
-            after = self.snapshot(tables)
+            after = self.snapshot(tables, context=context)
             if merge:
                 before = previous[2]
             changes = []
@@ -102,10 +121,10 @@ class EditHistory(QObject):
                     changes.append((key, old, new))
             if changes:
                 if merge:
-                    self.past.pop()
+                    past.pop()
                 self.push(label, lambda: self.restore(changes, backwards=True),
-                          lambda: self.restore(changes, backwards=False))
-                self._typing = (typing_key, time.monotonic(), before, self.past[-1], after) if typing_key else None
+                          lambda: self.restore(changes, backwards=False), context=context)
+                self._typing = (typing_key, time.monotonic(), before, past[-1], after) if typing_key else None
         finally:
             self.depth -= 1
 
@@ -159,22 +178,34 @@ class EditHistory(QObject):
         w = self.w
         key = (w.current_creative_project_id, w._current_board_node_id, w.current_temp_project_id)
         before, after = deepcopy(before), deepcopy(after)
-        def restore(payload):
+        def restore(payload, expected):
             current = (w.current_creative_project_id, w._current_board_node_id, w.current_temp_project_id)
             if key != current:
-                return False
+                pid, node_id, temp_id = key
+                if (pid, temp_id) != self.context():
+                    return False
+                getter, setter, target = ((w.store.get_creative_node_board_layout, w.store.save_creative_node_board_layout, node_id)
+                    if node_id else (w.store.get_creative_board_layout, w.store.save_creative_board_layout, pid)
+                    if pid else (w.store.get_temporary_project_board_layout, w.store.save_temporary_project_board_layout, temp_id))
+                saved = getter(target)
+                if not saved or json.loads(saved) != expected:
+                    return False
+                setter(target, json.dumps(payload, ensure_ascii=False))
+                return True
             if set(payload.get('items', {})) != set(w.project_board_view.layout_payload().get('items', {})):
                 return False
             w.project_board_view._restore_layout(payload)
             return True
-        self.push('看板布局', lambda: restore(before), lambda: restore(after))
+        self.push('看板布局', lambda: restore(before, after), lambda: restore(after, before))
 
-    def push(self, label, undo, redo):
+    def push(self, label, undo, redo, *, context=None):
         if self.busy:
             return
-        self.past.append((label, undo, redo))
-        self.past = self.past[-40:]
-        self.future.clear()
+        key = self.context() if context is None else context
+        past, future = self._histories.setdefault(key, ([], []))
+        past.append((label, undo, redo))
+        del past[:-40]
+        future.clear()
         self.refresh()
 
     def refresh(self):

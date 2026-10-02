@@ -1356,7 +1356,7 @@ class MetadataStoreTest(unittest.TestCase):
 
             store.set_image_tags(second, [])
             self.assertEqual(store.get_image_tags(second), [])
-            self.assertEqual(store.list_tags(), [])
+            self.assertEqual([tag.tag_name for tag in store.list_tags()], ["参考", "机械"])
 
             thumbnails = store.remove_images_from_library([first])
             self.assertEqual(thumbnails, [str(Path(tmp) / "thumb_1.webp")])
@@ -1388,7 +1388,7 @@ class MetadataStoreTest(unittest.TestCase):
             )
             self.assertEqual(store.get_image_tags(first), ["夜晚"])
             self.assertEqual(store.get_image_tags(second), ["人物"])
-            self.assertNotIn("室内", [tag.tag_name for tag in store.list_tags()])
+            self.assertIn("室内", [tag.tag_name for tag in store.list_tags()])
 
     def test_list_images_can_filter_multiple_tags_with_any_or_all_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1586,7 +1586,7 @@ class MetadataStoreTest(unittest.TestCase):
             self.assertIsNone(store.get_image(subtree_image))
             self.assertIsNotNone(store.get_image(root_image))
             self.assertIsNotNone(store.get_image(sibling_image))
-            self.assertEqual([tag.tag_name for tag in store.list_tags()], ["保留"])
+            self.assertEqual([tag.tag_name for tag in store.list_tags()], ["保留", "只在子树"])
 
             thumbnails, removed = store.remove_folder_from_library(folder_id)
             self.assertEqual(removed, 2)
@@ -1596,7 +1596,7 @@ class MetadataStoreTest(unittest.TestCase):
             )
             self.assertEqual(store.count_images(), 0)
             self.assertEqual(store.list_folders(include_inactive=True), [])
-            self.assertEqual(store.list_tags(), [])
+            self.assertEqual([tag.tag_name for tag in store.list_tags()], ["保留", "只在子树"])
 
     def test_restore_snapshot_recreates_folder_after_last_image_removal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

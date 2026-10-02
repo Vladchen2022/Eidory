@@ -9,6 +9,8 @@ from typing import Any
 
 import requests
 
+from eidory.core.cancellable_http import post_json, get_json
+
 from eidory.core.image_loader import MAX_AI_VISION_UPLOAD_BYTES, open_local_image
 
 
@@ -387,19 +389,19 @@ class AIVisionProvider:
         }
         headers = self._headers()
         try:
-            response = requests.post(
+            response = post_json(
                 f"{self.base_url}/chat/completions",
                 json=payload,
                 headers=headers,
-                timeout=self.timeout_seconds,
+                timeout=self.timeout_seconds, cancel=getattr(self, "cancel_event", None),
             )
             if response.status_code in {400, 422}:
                 payload.pop("response_format", None)
-                response = requests.post(
+                response = post_json(
                     f"{self.base_url}/chat/completions",
                     json=payload,
                     headers=headers,
-                    timeout=self.timeout_seconds,
+                    timeout=self.timeout_seconds, cancel=getattr(self, "cancel_event", None),
                 )
             response.raise_for_status()
         except requests.RequestException as exc:
@@ -442,19 +444,19 @@ class AIVisionProvider:
         }
         headers = self._headers()
         try:
-            response = requests.post(
+            response = post_json(
                 f"{self.base_url}/chat/completions",
                 json=payload,
                 headers=headers,
-                timeout=self.timeout_seconds,
+                timeout=self.timeout_seconds, cancel=getattr(self, "cancel_event", None),
             )
             if response.status_code in {400, 422}:
                 payload.pop("response_format", None)
-                response = requests.post(
+                response = post_json(
                     f"{self.base_url}/chat/completions",
                     json=payload,
                     headers=headers,
-                    timeout=self.timeout_seconds,
+                    timeout=self.timeout_seconds, cancel=getattr(self, "cancel_event", None),
                 )
             response.raise_for_status()
         except requests.RequestException as exc:
@@ -472,10 +474,10 @@ class AIVisionProvider:
 
     def _first_available_model(self) -> str:
         try:
-            response = requests.get(
+            response = get_json(
                 f"{self.base_url}/models",
                 headers=self._headers(),
-                timeout=5,
+                timeout=5, cancel=getattr(self, "cancel_event", None),
             )
             response.raise_for_status()
             models = response.json().get("data", [])

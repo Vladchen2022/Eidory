@@ -4054,7 +4054,10 @@ class MainWindow(QMainWindow):
                     preview.close()
                 for controller in (self.reference_generation, self.image_upscaler):
                     if controller.panel:
-                        controller.panel.close()
+                        panel = controller.panel
+                        controller.panel = None
+                        panel.close()
+                        panel.deleteLater()
                 self._load_creative_project(None, save_current_editor=False)
                 install_database(self.store, restore_temp_path, backup_path)
             self._refresh_after_database_change()
@@ -4180,6 +4183,9 @@ class MainWindow(QMainWindow):
         self._reload_images()
         self._refresh_embedding_stats()
         self._refresh_file_watcher()
+
+        if hasattr(self, 'reference_generation'):
+            self.reference_generation.refresh()
 
     def _set_maintenance_controls_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -12904,9 +12910,13 @@ class MainWindow(QMainWindow):
         roots, results, failures = payload
         self._watch_scan_running = False
         self._delete_scan_removed_thumbnails(results)
-        # A deleted file must disappear from the wall as well as the sidebar.
+        # Availability and content changes must reach the wall, including files
+        # returning with unchanged size and modification time.
         self._refresh_after_scan_database_change(
-            preserve_current_view=not any(result.missing_marked for result in results)
+            preserve_current_view=not any(
+                result.missing_marked or result.restored_files or result.new_files or result.changed_files
+                for result in results
+            )
         )
         scanned = sum(result.scanned_files for result in results)
         new_files = sum(result.new_files for result in results)

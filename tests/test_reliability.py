@@ -144,23 +144,49 @@ def test_undo_conflicting_source_keeps_backup_and_existing_file(window, library,
     assert w._last_removal_undo is None
 
 
-def test_restore_reloads_projects_and_discards_old_undo(window, tmp_path):
+def test_restore_reloads_projects_and_discards_old_undo(window, tmp_path, graph):
     w = window
     pid, node, _ = make_project(w)
     original = w.store.get_creative_node(node.id).note
     backup = tmp_path / 'old.sqlite3'
     with w.store.connect(readonly=True) as src, sqlite3.connect(backup) as dst:
         src.backup(dst)
+    controller = w.reference_generation
+    job = controller.repo.create(node.id, 'restore fixture', prepare_template(graph), 'http://localhost:8188')
+    job['state'] = 'ready'
+    controller.repo.save(job)
+    controller.open()
+    panel = controller.panel
+    assert panel.selected_job()['id'] == job['id']
     row = w.creative_flow.targets()[0]
     w.creative_flow.change_target(row['id'], query='恢复后不能再次写入的旧命令')
     assert w.edit_history.past
     with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(backup), '')), patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
         w._restore_database_from_file()
     assert w.current_creative_project_id is None
+    assert controller.panel is None
+    assert not controller.entry.isEnabled()
+    controller.refresh()
     assert not w.edit_history._histories.get((pid, None), ([], []))[0]
     w._load_creative_project(pid, select_node_id=node.id)
     assert w.store.get_creative_node(node.id).note == original
     assert not w.edit_history.past
+
+
+def test_generation_panel_tolerates_removed_selected_job(window, graph):
+    w = window
+    _, node, _ = make_project(w)
+    controller = w.reference_generation
+    job = controller.repo.create(node.id, 'missing job fixture', prepare_template(graph), 'http://localhost:8188')
+    job['state'] = 'ready'
+    controller.repo.save(job)
+    controller.open()
+    with w.store.connect() as conn:
+        conn.execute('DELETE FROM generated_reference_jobs WHERE id=?', (job['id'],))
+    controller.refresh()
+    assert controller.panel.selected_job() is None
+    assert controller.panel.candidates.count() == 0
+    assert not controller.panel.adopt.isEnabled()
 
 
 def test_real_watcher_restores_disconnected_roots_sharing_parent(window, library, tmp_path):

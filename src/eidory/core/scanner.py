@@ -29,6 +29,7 @@ class ScanResult:
     thumbnail_failures: int
     image_ids: tuple[int, ...]
     removed_thumbnail_paths: tuple[str, ...] = ()
+    restored_files: int = 0
 
 
 ScanProgressCallback = Callable[[int, str, str], None]
@@ -118,6 +119,11 @@ class ImageScanner:
 
         folder_id = self.store.add_folder(root)
         existing_metadata = self.store.scan_metadata_for_folder(folder_id)
+        with self.store.connect() as conn:
+            missing_paths = {row[0] for row in conn.execute(
+                "SELECT file_path FROM images WHERE folder_id = ? AND is_missing = 1",
+                (folder_id,),
+            )}
         seen_paths: list[str] = []
         scanned = 0
         new_files = 0
@@ -199,6 +205,7 @@ class ImageScanner:
             missing_marked=missing_marked,
             thumbnail_failures=thumbnail_failures,
             image_ids=tuple(image_ids),
+            restored_files=sum(item.file_path in missing_paths for item in scanned_media),
             removed_thumbnail_paths=tuple(removed_thumbnail_paths),
         )
 

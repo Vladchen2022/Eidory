@@ -208,7 +208,13 @@ class GenerationPanel(QDialog):
 
     def selected_job(self):
         item = self.candidates.currentItem()
-        return self.c.repo.get(item.data(Qt.ItemDataRole.UserRole)) if item else None
+        if not item:
+            return None
+        try:
+            return self.c.repo.get(item.data(Qt.ItemDataRole.UserRole))
+        except ValueError:
+            # A restore can replace the job list before this dialog refreshes.
+            return None
 
     def refresh_candidates(self, select_id=None):
         jobs = self.c.repo.all(self.project_id)

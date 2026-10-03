@@ -153,9 +153,12 @@ def test_recount_failure_allows_retry(window, library):
     assert warning.called
 
 
-@pytest.mark.parametrize('removed,preserve', [(0, True), (1, False)])
-def test_watch_scan_refreshes_stale_results_when_files_were_removed(window, removed, preserve):
-    result = ScanResult(1, 3, 0, 0, 3, removed, 0, ())
+@pytest.mark.parametrize('removed,restored,new,changed,preserve', [
+    (0, 0, 0, 0, True), (1, 0, 0, 0, False), (0, 1, 0, 0, False),
+    (0, 0, 1, 0, False), (0, 0, 0, 1, False),
+])
+def test_watch_scan_refreshes_stale_results_when_files_change(window, removed, restored, new, changed, preserve):
+    result = ScanResult(1, 3, new, changed, 3, removed, 0, (), restored_files=restored)
     with patch.object(window, '_refresh_after_scan_database_change') as refresh:
         window._handle_watch_scan_done((['test'], [result], []))
     refresh.assert_called_once_with(preserve_current_view=preserve)
@@ -177,12 +180,17 @@ def test_real_file_watcher_updates_sidebar_and_wall_without_manual_refresh(windo
 
     wait_until(lambda: window._file_watch_configured_count > 0)
     # Real filesystem event, through the Qt worker and its debounce timer.
+    originals = [Path(image.file_path).read_bytes() for image in images[:2]]
     Path(images[0].file_path).unlink()
     Path(images[1].file_path).unlink()
     wait_until(lambda: window.collection_tree.currentItem().text(1) == '2')
     assert len(window.grid_view.images()) == 2
     assert window._collection_image_counts_for_status()[parent] == 2
     assert not window._pending_watch_scan_roots
+    for image, content in zip(images[:2], originals):
+        Path(image.file_path).write_bytes(content)
+    wait_until(lambda: window.collection_tree.currentItem().text(1) == '4'
+               and len(window.grid_view.images()) == 4)
 
 
 def test_wall_delete_and_undo_update_sidebar_immediately(window, library, tmp_path):

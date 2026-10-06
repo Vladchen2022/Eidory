@@ -16,13 +16,14 @@ from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSlider,
     QScrollArea, QSizePolicy, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from eidory.core.creative_entries import decode_entries, encode_entries, composed_note, search_names
 from eidory.core.creative_templates import CREATIVE_TEMPLATES
 from eidory.core.search_targets import resolved_targets, target_signature
+from eidory.ui.inline_idea import InlineIdeaEditor, change_html
 
 
 def label(text, *, role=None):
@@ -80,6 +81,9 @@ class CreativeFlow(QObject):
         self._search_dirty_node = None
         self._result_node_id = None
         self._removed = None
+        self._inline = None
+        self._inline_key = None
+        self._target_widgets = {}
         self._start_hides_inspector = False
         self._build_home()
         self._refine_editor()
@@ -111,7 +115,7 @@ class CreativeFlow(QObject):
         empty.setContentsMargins(28, 28, 28, 28)
         empty.setAlignment(Qt.AlignmentFlag.AlignTop)
         empty.addWidget(label('先选一个找图目标', role='flowTitle'))
-        empty.addWidget(label('在右侧添加想找的内容，或返回构思写下已经想到的内容。', role='muted'))
+        empty.addWidget(label('在上方添加想找的内容，或返回构思写下已经想到的内容。', role='muted'))
         self.w.center_result_stack.addWidget(self.search_empty)
         self.start = QWidget()
         layout = QVBoxLayout(self.start)
@@ -231,6 +235,14 @@ class CreativeFlow(QObject):
         self.pending_layout.setContentsMargins(0, 0, 0, 0)
         self.pending_layout.setSpacing(8)
         cw.proposal_panel.layout().insertWidget(1, self.pending_cards)
+        self.prose_diff = label('')
+        self.prose_diff.setTextFormat(Qt.TextFormat.RichText)
+        self.prose_diff.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        cw.proposal_panel.layout().insertWidget(2, self.prose_diff)
+        self.edit_prose = QCheckBox('编辑建议文字')
+        self.edit_prose.toggled.connect(cw.proposal_input.setVisible)
+        cw.proposal_panel.layout().insertWidget(3, self.edit_prose)
+        cw.proposal_input.textChanged.connect(self.refresh_prose_diff)
         self.node_caption = next((node_layout.itemAt(i).widget() for i in range(node_layout.count())
                                   if isinstance(node_layout.itemAt(i).widget(), QLabel)
                                   and node_layout.itemAt(i).widget().text() == '当前节点说明'), None)
@@ -297,13 +309,14 @@ class CreativeFlow(QObject):
         self.target_hint = label('各项分别找图，结果合并显示。', role='muted')
         targets.addWidget(self.target_hint)
         row = QHBoxLayout()
+        self.target_actions = row
         self.target_run = button('找这些参考', self.run_targets, row, primary=True)
         button('＋ 找图目标', self.add_target, row)
         targets.addLayout(row)
         self.target_edit = QCheckBox('调整找图用语')
         self.target_edit.toggled.connect(self.show_target_queries)
         targets.addWidget(self.target_edit)
-        layout.addWidget(self.target_area)
+        # Search targets have one visible owner beside the results.
         tray_header = QHBoxLayout()
         self.tray_heading = label('已收集', role='sectionTitle')
         tray_header.addWidget(self.tray_heading, 1)
@@ -350,6 +363,89 @@ class CreativeFlow(QObject):
         notice.insertWidget(1, self.search_brief, 1)
         center = self.w.center_result_stack.parentWidget().layout()
         center.insertWidget(center.indexOf(self.w.center_result_stack), self.search_notice)
+        center.insertWidget(center.indexOf(self.w.center_result_stack), self.target_area)
+        self.target_scroll.setMinimumHeight(50)
+        self.target_scroll.setMaximumHeight(180)
+        self.target_edit.hide()
+        self.target_hint.hide()
+        self.target_overview = button('综合推荐', lambda: self.select_target_view(None), self.target_actions)
+        self.target_overview.setCheckable(True)
+        self.target_overview.clicked.disconnect()
+        self.target_overview.toggled.connect(lambda checked: self.select_target_view(None) if checked else None)
+        self.advanced_targets = button('组合筛选 ▸', self.toggle_advanced_targets, self.target_actions)
+        self.advanced_targets.setCheckable(True)
+        self.advanced_targets.clicked.disconnect()
+        self.advanced_targets.toggled.connect(lambda _: self.toggle_advanced_targets())
+        self.w.filter_panel.strengthChanged.connect(lambda _: self.refresh_target_controls())
+
+
+    def select_target_view(self, target_id):
+        row = next((r for r in self.targets() if r['id'] == target_id), None)
+        combo = self.w.workflow_upgrade.result_mode
+        index = combo.findData(row['query'] if row else None)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        self.refresh_target_controls()
+
+    def toggle_advanced_targets(self):
+        self.advanced_targets.setText('收起组合筛选 ▾' if self.advanced_targets.isChecked() else '组合筛选 ▸')
+        self.refresh_target_controls()
+
+    def refresh_target_controls(self):
+        w = self.w
+        node = w._current_creative_node()
+        active = bool(node and w.center_result_stack.currentWidget() in (w.grid_view, self.search_empty) and w.current_result_mode != 'creative_node')
+        w.workflow_upgrade.results_bar.setVisible(w.current_result_mode == 'search_chain' and w.center_result_stack.currentWidget() is w.grid_view and not active)
+        for box in w.filter_panel.section_boxes.values():
+            box.setVisible(not active or self.advanced_targets.isChecked())
+        if not active:
+            return
+        plan = w.filter_panel.draft
+        strengths = {str(f.value): f.score_threshold for f in plan.positive_filters if f.kind == 'semantic'}
+        current = w.workflow_upgrade.result_mode.currentData()
+        self.target_overview.blockSignals(True)
+        self.target_overview.setChecked(current is None)
+        self.target_overview.blockSignals(False)
+        for row in self.targets():
+            widgets = self._target_widgets.get(row['id'])
+            if not widgets:
+                continue
+            slider, caption, results = widgets
+            value = strengths.get(row['query'], row.get('strength', 50))
+            value = 50 if value is None else value
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+            caption.setText(str(value))
+            slider.setEnabled(row['enabled'] and w.search_button.isEnabled())
+            ids = getattr(w.workflow_upgrade, 'match_ids', {}).get(row['query'], set())
+            evaluated = w.workflow_upgrade.result_mode.findData(row['query']) >= 0
+            results.setText(str(len(ids)) + ' 张' if evaluated else '未检索')
+            results.setEnabled(row['enabled'] and evaluated)
+            results.blockSignals(True)
+            results.setChecked(current == row['query'])
+            results.blockSignals(False)
+
+    def change_target_strength(self, target_id, value):
+        row = next((r for r in self.targets() if r['id'] == target_id), None)
+        if row is None:
+            return
+        panel = self.w.filter_panel
+        matched = False
+        for gi, group in enumerate(panel.draft.include):
+            for fi, condition in enumerate(group.filters):
+                if condition.kind == 'semantic' and condition.value == row['query']:
+                    matched = True
+                    panel._change_strength('include', gi, fi, value)
+        rows = self.targets()
+        for target in rows:
+            if target['id'] == target_id:
+                target['strength'] = value
+        node = self.w._current_creative_node()
+        self.w.workflow_upgrade.state.set_options(node.id, search_targets_json=json.dumps({'signature': target_signature(node, self.cw.store.entries(node.id)), 'rows': rows}, ensure_ascii=False))
+        if not matched and hasattr(self.w, 'simple_search'):
+            self.w.simple_search.schedule('targets')
+        self.refresh_target_controls()
 
     def show_target_queries(self, shown):
         for field in self.target_content.findChildren(QLineEdit):
@@ -505,7 +601,9 @@ class CreativeFlow(QObject):
         if not self.w.search_button.isEnabled():
             self._search_dirty_node = node.id
             self.refresh_search_status()
-            self.w.statusBar().showMessage('正在找图，完成后可更新目标')
+            if hasattr(self.w, 'simple_search'):
+                self.w.simple_search.schedule('targets')
+            self.w.statusBar().showMessage('正在找图，完成后自动更新到当前目标')
             return
         self.w.workflow_upgrade.flush()
         rows = self.targets()
@@ -567,6 +665,7 @@ class CreativeFlow(QObject):
         node = self.w._current_creative_node()
         card = QWidget()
         card.setObjectName('creativeSuggestionCard' if pending else 'creativeIdeaCard')
+        card.setProperty('ideaId', row['id'])
         layout = QVBoxLayout(card)
         layout.setContentsMargins(12, 10, 12, 10)
         top = QHBoxLayout()
@@ -581,7 +680,19 @@ class CreativeFlow(QObject):
         else:
             button('找它的参考', lambda: self.open_search(node.id, row['id']), top)
         layout.addLayout(top)
-        if row['visual']:
+        if pending:
+            proposal = decode_entries(self.cw.store.node(node.id)['proposal_entries_json']) or {}
+            target = proposal.get('target')
+            marker = label('替换此想法的细节' if target else '新增想法 · 不改已有内容', role='muted')
+            layout.addWidget(marker)
+            if target:
+                diff = QLabel(change_html(target['visual'], row['visual']))
+                diff.setTextFormat(Qt.TextFormat.RichText)
+                diff.setWordWrap(True)
+                layout.addWidget(diff)
+            elif row['visual']:
+                layout.addWidget(label(row['visual']))
+        elif row['visual']:
             layout.addWidget(label(row['visual']))
         if not pending:
             actions = QHBoxLayout()
@@ -609,41 +720,72 @@ class CreativeFlow(QObject):
                 self.w.generate_creative_details_button.click()
                 break
 
-    @undoable("编辑想法")
     def edit_entry(self, row_id, *, pending=False):
-        state = self.cw.store.node(self.w.current_creative_node_id)
-        if state['locked']:
+        node = self.w._current_creative_node()
+        if not node or self.cw.store.node(node.id)['locked']:
             return
-        payload = decode_entries(state['proposal_entries_json']) if pending else self.cw.store.entries(self.w.current_creative_node_id)
+        payload = decode_entries(self.cw.store.node(node.id)['proposal_entries_json']) if pending else self.cw.store.entries(node.id)
         row = next((r for r in (payload or {}).get('rows', []) if r['id'] == row_id), None)
-        if row is None:
+        if not row:
             return
-        dialog = QDialog(self.w)
-        dialog.setWindowTitle('编辑创作内容')
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(label('内容名称'))
-        name = QLineEdit(row['name'])
-        name.setReadOnly(bool(pending and payload.get('target')))
-        layout.addWidget(name)
-        layout.addWidget(label('细节描述'))
-        visual = QTextEdit(row['visual'])
-        visual.setAcceptRichText(False)
-        layout.addWidget(visual)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(bool(name.text().strip()))
-        name.textChanged.connect(lambda s: buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(bool(s.strip())))
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        dialog.resize(580, 310)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            row.update(name=name.text().strip(), visual=visual.toPlainText().strip())
+        self.begin_inline(node.id, row, pending=pending, fixed_name=bool(pending and payload.get('target')))
+
+    def add_inline(self):
+        node = self.w._current_creative_node()
+        if node and not self.cw.store.node(node.id)['locked']:
+            self.begin_inline(node.id, None)
+
+    def begin_inline(self, node_id, row, *, pending=False, fixed_name=False):
+        if self._inline:
+            self._inline.finish()
+            if self._inline:
+                return
+        editor = InlineIdeaEditor((row or {}).get('name', ''), (row or {}).get('visual', ''), fixed_name=fixed_name)
+        self._inline, self._inline_key = editor, (node_id, (row or {}).get('id'), pending)
+        target = self.pending_layout if pending else self.idea_layout
+        card = next((target.itemAt(i).widget() for i in range(target.count())
+                     if target.itemAt(i).widget() and target.itemAt(i).widget().property('ideaId') == (row or {}).get('id')), None) if row else None
+        if card:
+            for widget in card.findChildren(QWidget):
+                widget.hide()
+            card.layout().addWidget(editor)
+        else:
+            target.addWidget(editor)
+        self.idea_cards.setVisible(True)
+        self.cw.entries_panel.setVisible(True)
+        editor.finished.connect(self.finish_inline)
+        (editor.visual if fixed_name else editor.name).setFocus()
+
+    @undoable("编辑想法")
+    def finish_inline(self, values):
+        editor, key = self._inline, self._inline_key
+        if not editor:
+            return
+        node_id, row_id, pending = key
+        self._inline = self._inline_key = None
+        editor.hide()
+        editor.deleteLater()
+        node = self.w.store.get_creative_node(node_id)
+        if values is not None and node and not self.cw.store.node(node_id)['locked']:
+            state = self.cw.store.node(node_id)
+            payload = decode_entries(state['proposal_entries_json']) if pending else self.cw.store.entries(node_id)
+            payload = payload or {'base_note': node.note, 'base_query': node.search_query, 'rows': []}
+            row = next((r for r in payload['rows'] if r['id'] == row_id), None)
+            if row_id is None:
+                from eidory.core.creative_entries import new_entry
+                payload['rows'].append(new_entry(*values))
+            elif row:
+                row.update(name=values[0], visual=values[1])
             if pending:
-                self.cw.store.save_node(self.w.current_creative_node_id, proposal_entries_json=encode_entries(payload), proposal_note=composed_note(payload), proposal_query=' '.join(search_names(payload)))
-                self.cw.reload_node(self.w.current_creative_node_id)
-            elif self.cw.store.save_entries(self.w.current_creative_node_id, payload, snapshot=True):
-                self.cw.invalidate_entry_search(self.w.current_creative_node_id)
-                self.cw.reload_node(self.w.current_creative_node_id)
+                self.cw.store.save_node(node_id, proposal_entries_json=encode_entries(payload), proposal_note=composed_note(payload))
+            elif row_id is None or row:
+                self.cw.store.save_entries(node_id, payload, snapshot=True)
+                self.cw.invalidate_entry_search(node_id)
+            self.w.statusBar().showMessage('想法已保存 · 可撤销')
+        self._entries_key = None
+        if node_id == self.w.current_creative_node_id:
+            self.cw.reload_node(node_id)
+        self.refresh()
 
     @undoable("采纳想法")
     def accept_one(self, row_id):
@@ -776,11 +918,21 @@ class CreativeFlow(QObject):
         if not project:
             return
         nodes = self.w.store.list_creative_nodes(project.id)
+        parents = {n.id: n.parent_id for n in nodes}
+        def in_branch(nid, parent):
+            seen = set()
+            while nid in parents and nid not in seen:
+                seen.add(nid)
+                nid = parents[nid]
+                if nid == parent:
+                    return True
+            return False
         root = next((n for n in nodes if n.parent_id is None), None)
         nodes = [n for n in nodes if root and n.parent_id == root.id]
         columns = max(1, min(3, (self.overview.width() - 40) // 270))
         states = [self.cw.store.node(n.id) for n in nodes]
-        key = (project, tuple(nodes), repr(states), columns)
+        checks = self.w.workflow_upgrade.state.overview(project.id)
+        key = (project, tuple(nodes), repr(states), repr(checks), columns)
         self.project_title.setText(project.title)
         self.project_brief.setText(project.brief)
         if key == self._cards_key:
@@ -813,12 +965,46 @@ class CreativeFlow(QObject):
             previews.addWidget(label(f'{len(ids)} 张参考' if ids else '尚未收集参考', role='muted'))
             previews.addStretch()
             layout.addLayout(previews)
+            branch = [r for r in checks if r['id'] == node.id or in_branch(r['id'], node.id)]
+            for record in branch:
+                line = QHBoxLayout()
+                caption = ('↳ ' + record['title'] + ' · ') if record['id'] != node.id else ''
+                line.addWidget(label(caption + str(record['primary_count']) + ' 张主参考', role='muted'), 1)
+                choice = QComboBox()
+                choice.setAccessibleName('参考需要：' + record['title'])
+                for title, value in [('需要参考', 'needed'), ('无需参考图', 'none'), ('参考已齐', 'resolved')]:
+                    choice.addItem(title, value)
+                choice.setCurrentIndex(choice.findData(record['requirement']))
+                choice.currentIndexChanged.connect(lambda _=False, nid=record['id'], box=choice: self.set_requirement(nid, box.currentData()))
+                line.addWidget(choice)
+                layout.addLayout(line)
+                if record['needs_review']:
+                    review = QHBoxLayout()
+                    review.addWidget(label(caption + '主题已改变，需复核', role='muted'), 1)
+                    button('已复核', lambda _=False, nid=record['id']: self.review_node(nid), review)
+                    layout.addLayout(review)
+                elif record['proposal'] or record['proposal_entries']:
+                    review = QHBoxLayout()
+                    button('审阅' + ('「'+record['title']+'」' if record['id'] != node.id else '') + ' AI 建议', lambda _=False, nid=record['id']: self.edit_node(nid), review)
+                    layout.addLayout(review)
             actions = QHBoxLayout()
             button('编辑构思', lambda _=False, nid=node.id: self.edit_node(nid), actions)
             button('找参考 →', lambda _=False, nid=node.id: self.open_search(nid), actions)
             actions.addStretch()
             layout.addLayout(actions)
             self.cards_layout.addWidget(card, index // columns, index % columns)
+
+    @undoable("调整参考需要")
+    def set_requirement(self, node_id, value):
+        self.w.workflow_upgrade.state.set_options(node_id, reference_requirement=value)
+        self._cards_key = None
+        QTimer.singleShot(0, self.refresh)
+
+    @undoable("复核项目设定")
+    def review_node(self, node_id):
+        self.w.workflow_upgrade.state.set_options(node_id, reviewed_context=self.w.workflow_upgrade.state.context_key(self.w.current_creative_project_id))
+        self._cards_key = None
+        self.refresh()
 
     def refresh_editor(self, node, state):
         w, cw = self.w, self.cw
@@ -833,6 +1019,8 @@ class CreativeFlow(QObject):
         w.ai_probe_mode_button.setVisible(probe)
         self._project_actions.hide()
         self.editor_top.setVisible(not probe)
+        if self._inline and self._inline_key[0] != (node.id if node else None):
+            self._inline.finish()
         self.editor_title.setText(node.title if node else '')
         cw.format_combo.hide()
         cw.restore_button.hide()
@@ -863,8 +1051,9 @@ class CreativeFlow(QObject):
         self.pending_cards.setVisible(pending is not None)
         cw.accept_button.setText('采用全部建议' if pending else '采用这段说明')
         cw.proposal_label.setText('AI 建议 · 尚未采用')
+        self.refresh_prose_diff()
         key = (node.id if node else None, state.get('entries_json'), state.get('proposal_entries_json'), state.get('locked'), w.generate_creative_details_button.isEnabled())
-        if key != self._entries_key:
+        if key != self._entries_key and not self._inline:
             self._entries_key = key
             clear_layout(self.idea_layout)
             clear_layout(self.pending_layout)
@@ -872,6 +1061,17 @@ class CreativeFlow(QObject):
                 self.idea_layout.addWidget(self._idea_card(row, locked=bool(state.get('locked'))))
             for row in (pending or {}).get('rows', []):
                 self.pending_layout.addWidget(self._idea_card(row, pending=True, locked=bool(state.get('locked')), detail=bool(pending.get('target'))))
+
+    def refresh_prose_diff(self):
+        node = self.w._current_creative_node()
+        state = self.cw.store.node(node.id) if node else {}
+        prose = bool(state.get('proposal_note') and not decode_entries(state.get('proposal_entries_json', '')))
+        self.prose_diff.setVisible(prose)
+        self.edit_prose.setVisible(prose)
+        self.cw.proposal_input.setVisible(prose and self.edit_prose.isChecked())
+        self.cw.partial_button.setVisible(prose and self.edit_prose.isChecked())
+        if prose:
+            self.prose_diff.setText('替换当前说明 · 红色为删去，绿色为新增<br>' + change_html(node.note, self.cw.proposal_input.toPlainText()))
 
     def refresh_search_status(self):
         node = self.w._current_creative_node()
@@ -889,6 +1089,12 @@ class CreativeFlow(QObject):
         self.search_context.setText(('目标已修改 · 仍显示上次结果' if dirty else '正在为「' + node.title + '」找参考') if node else '图库浏览')
         if busy and node:
             self.search_context.setText(f'正在为「{node.title}」更新结果…')
+        elif node and self.w.current_result_mode == 'search_chain':
+            target = self.w.workflow_upgrade.result_mode.currentData()
+            if target and target != '__toolbar__':
+                self.search_context.setText(f'仅看「{target}」 · {len(self.w.grid_view._images)} 张')
+            else:
+                self.search_context.setText(f'综合参考 · {len(self.w.grid_view._images)} 张')
         if dirty or busy:
             self.cw.collect_button.setEnabled(False)
         if hasattr(self.w, "simple_search"):
@@ -909,6 +1115,10 @@ class CreativeFlow(QObject):
             if hasattr(w, 'edit_history'):
                 w.edit_history.refresh()
             node = w._current_creative_node()
+            previews = [p for p in w._preview_dialogs if p.collect_title]
+            cw.collect_button.setVisible(not previews)
+            for preview in previews:
+                w._refresh_preview_collection(preview, preview.current_image())
             on_start = not w.current_creative_project_id and w.center_result_stack.currentWidget() is self.home
             if on_start and not self._start_hides_inspector:
                 self._start_hides_inspector = w._sidebar_visible[2]
@@ -928,9 +1138,11 @@ class CreativeFlow(QObject):
             self.board_inspector.actions.setVisible(is_board)
             self.reference_page.setCurrentWidget(self.board_inspector.page if is_board else self.reference_scroll)
             w.right_tab_widget.setTabText(self.reference_index, '图片属性' if is_board else '参考')
+            w.right_tab_widget.setTabVisible(1, not is_board)
+            self.grade_bar.setVisible(not is_board)
             if is_board:
                 self.board_inspector.refresh()
-                if not self._on_board and w.current_creative_project_id:
+                if w.right_tab_widget.currentIndex() == 1 or (not self._on_board and w.current_creative_project_id):
                     w.right_tab_widget.setCurrentIndex(self.reference_index)
             self._on_board = is_board
             if not is_board:
@@ -967,19 +1179,41 @@ class CreativeFlow(QObject):
             if key != self._targets_key:
                 self._targets_key = key
                 clear_layout(self.target_layout)
+                self._target_widgets = {}
+                self.target_scroll.setFixedHeight(min(150, max(46, len(rows) * 46)))
                 for row in rows:
+                    card = QWidget()
+                    card.setObjectName('searchTargetRow')
+                    line = QHBoxLayout(card)
+                    line.setContentsMargins(0, 2, 0, 2)
                     check = QCheckBox(row['name'])
                     check.setToolTip(row['name'])
                     check.setChecked(row['enabled'])
                     check.toggled.connect(lambda value, tid=row['id']: self.change_target(tid, enabled=value))
-                    self.target_layout.addWidget(check)
+                    line.addWidget(check)
                     query = QLineEdit(row['query'])
                     query.setAccessibleName('找图用语：' + row['name'])
-                    query.textChanged.connect(lambda value, tid=row['id']: self.change_target(tid, query=value))
-                    query.setVisible(self.target_edit.isChecked())
-                    self.target_layout.addWidget(query)
+                    query.textEdited.connect(lambda value, tid=row['id']: self.change_target(tid, query=value))
+                    line.addWidget(query, 1)
+                    slider = QSlider(Qt.Orientation.Horizontal)
+                    slider.setRange(0, 100)
+                    slider.setFixedWidth(120)
+                    slider.setAccessibleName('匹配强度：' + row['name'])
+                    slider.setToolTip('左：宽松，右：严格；自动更新')
+                    slider.valueChanged.connect(lambda value, tid=row['id']: self.change_target_strength(tid, value))
+                    line.addWidget(slider)
+                    strength = label('50')
+                    strength.setFixedWidth(26)
+                    line.addWidget(strength)
+                    results = QPushButton('查看结果')
+                    results.setCheckable(True)
+                    results.toggled.connect(lambda checked, tid=row['id']: self.select_target_view(tid) if checked else None)
+                    line.addWidget(results)
+                    self.target_layout.addWidget(card)
+                    self._target_widgets[row['id']] = (slider, strength, results)
                 if not rows:
                     self.target_layout.addWidget(label('先写一条想法，也可以直接添加找图目标。', role='muted'))
+            self.refresh_target_controls()
             ids = w.store.creative_node_image_ids(node.id, include_descendants=True) if node and not is_board else []
             memberships = self.tray_memberships(node) if not is_board else {}
             tray_key = (node.id if node else None, tuple(ids), repr(memberships))

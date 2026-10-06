@@ -266,10 +266,11 @@ class WorkspaceChrome(QObject):
         w.show_project_board_button.hide()
         # One navigation strip owns the four stages.
         self.stage_buttons = [cw.navigation.layout().itemAt(i).widget() for i in range(4)]
-        for button, callback in zip(self.stage_buttons, (cw.show_project_planning, cw.show_candidates, cw.show_collected, cw.show_board)):
+        for index, (button, callback) in enumerate(zip(self.stage_buttons, (cw.show_project_planning, cw.show_candidates, cw.show_collected, cw.show_board))):
             button.clicked.disconnect()
             button.setCheckable(True)
-            button.toggled.connect(lambda checked, action=callback: action() if checked else self.refresh())
+            button.toggled.connect(lambda checked, action=callback, stage=index:
+                action() if checked or (stage == 1 and self.w.current_result_mode == "creative_node") else self.refresh())
             button.setProperty("variant", "navigation")
         cw.context_label.setProperty("role", "muted")
 

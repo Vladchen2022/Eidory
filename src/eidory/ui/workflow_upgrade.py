@@ -45,7 +45,6 @@ class WorkflowUpgrade(QObject):
         self.project_actions = []
         for label, callback, needs_project in [
                 ('主题与补充设定…', lambda: w.creative_flow.edit_context(), True),
-                ('项目检查…', self.show_overview, True),
                 ('方案版本…', self.show_versions, True),
                 ('导出创作参考包…', cw.export_project, True),
                 ('导出可编辑项目包…', self.export_package, True),
@@ -59,6 +58,7 @@ class WorkflowUpgrade(QObject):
         menu.addAction('探索灵感方向', cw.show_probe)
         menu.aboutToShow.connect(lambda: self.batch_action.setEnabled(w.generate_all_creative_nodes_button.isEnabled()))
         menu.aboutToShow.connect(lambda: self.copy_action.setEnabled(w.open_creative_copy_button.isEnabled()))
+        self.tools_menu = menu
         tools.setMenu(menu)
         cw.navigation.layout().addWidget(tools)
         self.tools = tools
@@ -135,6 +135,8 @@ class WorkflowUpgrade(QObject):
 
     def flush(self):
         if hasattr(self.w, 'creative_flow'):
+            if self.w.creative_flow._inline:
+                self.w.creative_flow._inline.finish()
             self.w.creative_flow.board_inspector.flush_note()
         self.w.creative_workspace.save_context()
         self.w._save_current_creative_node_editor_snapshot()
@@ -284,6 +286,8 @@ class WorkflowUpgrade(QObject):
         self.w.grid_view.set_images(images, badges_by_image_id=badges)
         self.w.grid_view.select_image_ids(selected)
         self.result_hint.setText(f'当前视图 {len(images)} 张 · 分别检索，合并去重；命中标记不代表识别概率')
+        if hasattr(self.w, 'creative_flow'):
+            self.w.creative_flow.refresh_search_status()
 
     @undoable("调整参考等级与用途")
     def save_decision(self, *_args):
@@ -428,35 +432,32 @@ class WorkflowUpgrade(QObject):
         layout = QVBoxLayout(dialog)
         listing = QListWidget()
         listing.setAccessibleName('项目方案列表')
-        preview = QTextEdit()
-        preview.setReadOnly(True)
+        empty_hint = QLabel('还没有保存的方案。点击“保存当前方案”留下当前构思和看板。')
+        empty_hint.setWordWrap(True)
+        layout.addWidget(empty_hint)
+        from eidory.ui.project_diff import ProjectDiff
+        preview = ProjectDiff(self.w.store)
+        listing.setMaximumHeight(150)
         layout.addWidget(listing)
-        layout.addWidget(preview)
+        layout.addWidget(preview, 1)
         versions = []
         def reload():
             versions[:] = self.state.versions(pid)
             listing.clear()
             listing.addItems([v['title']+' · '+v['created_at'] for v in versions])
+            empty_hint.setVisible(not versions)
+            listing.setVisible(bool(versions))
+            preview.setVisible(bool(versions))
+            restore_button.setEnabled(bool(versions))
+            if versions:
+                listing.setCurrentRow(0)
         def show():
             i = listing.currentRow()
+            restore_button.setEnabled(0 <= i < len(versions))
             if i < 0:
                 return
             state = self.state.version(pid, versions[i]['id'])
-            current = capture_project(self.w.store, pid)
-            old = {n['id']: n for n in state['nodes']}
-            now = {n['id']: n for n in current['nodes']}
-            def stable(node):
-                return {k:v for k,v in (node or {}).items() if k not in {'created_at','updated_at'}}
-            changed = [now.get(n, old.get(n))['title'] for n in old.keys() | now.keys() if stable(old.get(n)) != stable(now.get(n))]
-            parts = [('条目、勾选与待采纳建议', 'creative_node_workflow'), ('搜索目标与参考需要', 'creative_node_options'), ('参考图片关联', 'creative_node_images'), ('参考等级与用途', 'creative_reference_decisions'), ('参考说明', 'creative_reference_notes'), ('节点看板布局', 'creative_node_board_layouts'), ('项目看板布局', 'creative_board_layouts'), ('项目补充信息与工作上下文', 'creative_project_context')]
-            differences = [label for label, table in parts if state['tables'].get(table) != current['tables'].get(table)]
-            if state['project'].get('brief') != current['project'].get('brief'):
-                differences.insert(0, '创作主题')
-            if state['project'].get('title') != current['project'].get('title'):
-                differences.insert(0, '项目名称')
-            differences = '；'.join(differences) or '无'
-
-            preview.setPlainText('主题：'+state['project']['brief']+'\n节点 '+str(len(old))+' 个；参考关联 '+str(len(state['tables']['creative_node_images']))+' 个\n与当前内容不同的节点：'+('、'.join(changed) or '无')+'\n其他差异：'+differences+'\n\n'+ '\n\n'.join(n['title']+'\n'+n['note'] for n in state['nodes']))
+            preview.display(state, capture_project(self.w.store, pid))
         listing.currentRowChanged.connect(show)
         actions = QHBoxLayout()
         def save():
@@ -483,7 +484,7 @@ class WorkflowUpgrade(QObject):
             self.w.creative_workspace.show_planning()
             dialog.accept()
         self.button('保存当前方案', save, actions)
-        self.button('恢复所选方案', restore, actions)
+        restore_button = self.button('恢复所选方案', restore, actions)
         self.button('关闭', dialog.accept, actions)
         layout.addLayout(actions)
         reload()

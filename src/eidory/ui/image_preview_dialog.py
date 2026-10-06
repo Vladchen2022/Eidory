@@ -1331,6 +1331,7 @@ def _retain_detached_linetop_overlay(overlay: QObject) -> None:
 class ImagePreviewDialog(QDialog):
     imageChanged = Signal(object)
     upscaleRequested = Signal(object)
+    collectRequested = Signal(object)
     favoriteChanged = Signal(object)
     feedbackSaved = Signal(object, str)
     indexRemoved = Signal(object)
@@ -1352,9 +1353,11 @@ class ImagePreviewDialog(QDialog):
         model_revision: str,
         embedding_dim: int,
         thumbnail_dir: Path | None = None,
+        collect_title: str = '',
         parent=None,
     ):
         super().__init__(parent)
+        self.collect_title = collect_title
         self.images = list(images)
         self.index = max(0, min(start_index, len(self.images) - 1))
         self.store = store
@@ -1479,6 +1482,10 @@ class ImagePreviewDialog(QDialog):
         self.next_button = QPushButton("下一张")
         self.fit_button = QPushButton("适应窗口")
         self.actual_size_button = QPushButton("100%")
+        self.collect_button = QPushButton('收集到「' + self.collect_title + '」 (Enter)')
+        self.collect_button.setVisible(bool(self.collect_title))
+        self.collect_button.clicked.connect(lambda: self.collectRequested.emit(self.current_image()))
+        self.collect_button.setAutoDefault(False)
         self.upscale_button = QPushButton("AI 放大")
         self.upscale_button.setToolTip("使用 SeedVR2 7B 放大原图，对比后决定是否替换")
         self.upscale_button.clicked.connect(lambda: self.upscaleRequested.emit(self.current_image()))
@@ -1580,6 +1587,7 @@ class ImagePreviewDialog(QDialog):
         controls.addWidget(self.fit_button)
         controls.addWidget(self.actual_size_button)
         controls.addWidget(self.upscale_button)
+        controls.addWidget(self.collect_button)
         controls.addWidget(self.grayscale_button)
         controls.addWidget(self.mirror_button)
         controls.addSpacing(8)
@@ -3466,6 +3474,9 @@ class ImagePreviewDialog(QDialog):
             (QKeySequence(Qt.Key.Key_Left), lambda: self._move(-1)),
             (QKeySequence(Qt.Key.Key_Up), lambda: self._move(-1)),
         ]
+        if self.collect_title:
+            shortcuts.append((QKeySequence(Qt.Key.Key_Return), lambda: self.collect_button.click() if self.collect_button.isEnabled() else None))
+            shortcuts.append((QKeySequence(Qt.Key.Key_Enter), lambda: self.collect_button.click() if self.collect_button.isEnabled() else None))
         for sequence, callback in shortcuts:
             shortcut = QShortcut(sequence, self)
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)

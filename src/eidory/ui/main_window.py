@@ -1702,6 +1702,8 @@ class MainWindow(QMainWindow):
         self.reference_generation = ReferenceGeneration(self)
         from eidory.ui.image_upscale import ImageUpscaler
         self.image_upscaler = ImageUpscaler(self)
+        from eidory.ui.removal_recovery import RemovalRecovery
+        self.removal_recovery = RemovalRecovery(self)
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
         self._ensure_temporary_import_collection()
         self._refresh_folders()
@@ -1906,6 +1908,8 @@ class MainWindow(QMainWindow):
         ):
             self.creative_node_imagination_setting_timer.stop()
             self._persist_creative_node_imagination()
+        if hasattr(self, 'creative_flow') and self.creative_flow._inline:
+            self.creative_flow._inline.finish()
         self.creative_workspace.save_context()
         self.creative_workspace.save_search()
         self._save_pending_note()
@@ -9058,11 +9062,14 @@ class MainWindow(QMainWindow):
             model_revision=self.embedding_provider.model_revision,
             embedding_dim=self.embedding_provider.dim,
             thumbnail_dir=self.paths.thumbnail_dir,
+            collect_title=self._current_creative_node().title if self._current_creative_node() and self.center_result_stack.currentWidget() is self.grid_view and self.current_result_mode != 'creative_node' else '',
             parent=self,
         )
         dialog._selection_context = self._preview_selection_context()
         dialog.imageChanged.connect(lambda image, context=dialog._selection_context: self._sync_preview_selection(image, context))
+        dialog.imageChanged.connect(lambda image, preview=dialog: self._refresh_preview_collection(preview, image))
         dialog.upscaleRequested.connect(self.image_upscaler.open)
+        dialog.collectRequested.connect(lambda image, preview=dialog: self._collect_from_preview(preview, image))
         dialog.favoriteChanged.connect(self._handle_preview_favorite_changed)
         dialog.feedbackSaved.connect(self._handle_preview_feedback_saved)
         dialog.indexRemoved.connect(self._handle_preview_index_removed)
@@ -9070,9 +9077,40 @@ class MainWindow(QMainWindow):
         dialog.setWindowModality(Qt.WindowModality.NonModal)
         dialog.finished.connect(lambda _result, preview=dialog: self._handle_preview_dialog_finished(preview))
         self._preview_dialogs.add(dialog)
+        self._refresh_preview_collection(dialog, start_image)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+        if dialog.collect_title:
+            self.creative_workspace.collect_button.hide()
+
+    def _refresh_preview_collection(self, dialog, image):
+        if not dialog.collect_title:
+            return
+        valid = dialog._selection_context == self._preview_selection_context()
+        dialog.collect_button.setEnabled(valid)
+        if not valid:
+            dialog.collect_button.setText('项目或节点已切换，请重新打开预览')
+            return
+        collected = image and image.id in self.store.creative_node_image_ids(self.current_creative_node_id, include_descendants=False)
+        dialog.collect_button.setText(('已收集到「' if collected else '收集到「') + dialog.collect_title + '」 (Enter)')
+
+    @undoable("收集预览图片")
+    def _collect_from_preview(self, dialog, image):
+        if dialog._selection_context != self._preview_selection_context():
+            dialog.collect_button.setEnabled(False)
+            dialog.collect_button.setText('项目或节点已切换，请重新打开预览')
+            return
+        node = self._current_creative_node()
+        if not node or not image or not self.search_button.isEnabled() or self.creative_flow._search_dirty_node == node.id:
+            dialog.collect_button.setText('等待找图完成后再收集')
+            return
+        changed = self.store.add_images_to_creative_node(node.id, [image.id], intent_label=node.title, intent_query=node.search_query or node.title)
+        if changed:
+            self._refresh_after_creative_node_images_changed(node)
+            self.workspace_chrome.record_collection(node, [image.id])
+        dialog.collect_button.setText('已收集到「' + node.title + '」 · 可继续下一张')
+        self.statusBar().showMessage('已收集：' + image.file_name)
 
     def _handle_preview_dialog_finished(self, dialog: ImagePreviewDialog) -> None:
         current = dialog.current_image()
@@ -9080,6 +9118,8 @@ class MainWindow(QMainWindow):
             self._sync_preview_selection(current, getattr(dialog, '_selection_context', None))
         self._preview_dialogs.discard(dialog)
         dialog.deleteLater()
+        self.workspace_chrome.refresh()
+        self.creative_workspace.collect_button.setVisible(not any(p.collect_title for p in self._preview_dialogs))
 
     def _preview_images_for(self, start_image: ImageItem) -> list[ImageItem]:
         if (
@@ -12426,7 +12466,7 @@ class MainWindow(QMainWindow):
         message.setText(f"已选择 {count} 个项目。请选择要执行的操作。")
         message.setInformativeText(
             "“只从软件移除”不会删除硬盘源文件。\n"
-            "“删除源文件”会先备份到临时撤销区，再把硬盘源文件移到废纸篓。"
+            "“删除源文件”会先备份到回收区（跨重启保留），再把硬盘源文件移到废纸篓。"
         )
         remove_button = message.addButton("只从软件移除", QMessageBox.ButtonRole.ActionRole)
         delete_button = message.addButton("删除源文件", QMessageBox.ButtonRole.DestructiveRole)
@@ -12453,19 +12493,45 @@ class MainWindow(QMainWindow):
         if not clean_images:
             return 0
         image_ids = [image.id for image in clean_images]
-        self._remove_images_from_duplicate_result_state(set(image_ids))
         undo_snapshot = snapshot or self.store.snapshot_images_for_restore(image_ids)
-        self.store.remove_images_from_library(image_ids)
+        try:
+            self._register_removal_undo(
+                image_ids=image_ids, snapshot=undo_snapshot,
+                source_backups=source_backups or [], backup_dir=backup_dir, label=undo_label,
+            )
+        except Exception as exc:
+            failures = []
+            for backup in source_backups or []:
+                target = Path(str(backup['original_path']))
+                if not target.exists():
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(backup['backup_path']), target)
+                    except OSError as error:
+                        failures.append(f'{target.name}: {error}')
+            detail = '\n'.join(failures[:6])
+            QMessageBox.warning(self, '未删除图片', f'无法保存回收记录，未移除图库信息：{exc}'
+                                + ('\n源文件还原失败，备份仍保留：\n' + detail if detail else ''))
+            return 0
+        try:
+            self.store.remove_images_from_library(image_ids)
+        except Exception as exc:
+            failures = []
+            for backup in source_backups or []:
+                target = Path(str(backup['original_path']))
+                if not target.exists():
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(backup['backup_path']), target)
+                    except OSError as error:
+                        failures.append(f'{target.name}: {error}')
+            detail = '\n'.join(failures[:6])
+            QMessageBox.warning(self, '未完成移除', f'图库信息未移除：{exc}\n回收记录与源文件备份仍保留。' + ('\n' + detail if detail else ''))
+            return 0
+        self._remove_images_from_duplicate_result_state(set(image_ids))
         self._invalidate_near_duplicate_hash_cache()
         self.vector_index.invalidate()
         self.selected_image = None
-        self._register_removal_undo(
-            image_ids=image_ids,
-            snapshot=undo_snapshot,
-            source_backups=source_backups or [],
-            backup_dir=backup_dir,
-            label=undo_label,
-        )
         self._refresh_after_library_removal()
         return len(image_ids)
 
@@ -12533,13 +12599,15 @@ class MainWindow(QMainWindow):
 
         if deleted_ids:
             deleted_images = [image for image in images if image.id in set(deleted_ids)]
-            self._remove_images_from_library_with_undo(
+            removed = self._remove_images_from_library_with_undo(
                 deleted_images,
                 undo_label=f"删除源文件 {len(deleted_ids)} 个",
                 snapshot=snapshot,
                 source_backups=source_backups,
                 backup_dir=backup_dir,
             )
+            if not removed:
+                return
         elif backup_dir.exists():
             shutil.rmtree(backup_dir, ignore_errors=True)
 
@@ -12585,8 +12653,7 @@ class MainWindow(QMainWindow):
         backup_dir: Path | None,
         label: str,
     ) -> None:
-        self._clear_last_removal_undo(cleanup_backups=True)
-        self._last_removal_undo = {
+        payload = {
             "image_ids": list(image_ids),
             "snapshot": snapshot,
             "source_backups": list(source_backups),
@@ -12594,12 +12661,14 @@ class MainWindow(QMainWindow):
             "label": label,
             "context": (self.current_creative_project_id, self.current_temp_project_id),
         }
+        self.removal_recovery.archive.save(payload)
+        self._last_removal_undo = payload
         if hasattr(self, "undo_removal_action"):
             self.undo_removal_action.setEnabled(True)
 
     def _clear_last_removal_undo(self, *, cleanup_backups: bool) -> None:
         undo = self._last_removal_undo
-        if undo is not None and cleanup_backups:
+        if undo is not None and cleanup_backups and not undo.get("archive_id"):
             backup_dir = undo.get("backup_dir")
             if isinstance(backup_dir, str) and backup_dir:
                 shutil.rmtree(backup_dir, ignore_errors=True)
@@ -12607,14 +12676,24 @@ class MainWindow(QMainWindow):
         if hasattr(self, "undo_removal_action"):
             self.undo_removal_action.setEnabled(False)
 
-    def _undo_last_library_removal(self) -> None:
+    def _undo_last_library_removal(self, *, from_archive=False) -> None:
         undo = self._last_removal_undo
         if undo is None:
             self.statusBar().showMessage("没有可撤销的删除/移除操作")
             return
-        if undo.get("context") != (self.current_creative_project_id, self.current_temp_project_id):
+        if undo.get("identity") != self.store.get_setting("library.recovery_identity"):
+            self.statusBar().showMessage("此记录属于其他数据库，未恢复")
+            return
+        if not from_archive and tuple(undo.get("context", ())) != (self.current_creative_project_id, self.current_temp_project_id):
             self.statusBar().showMessage("当前项目没有可撤销的删除；请返回执行删除的项目")
             return
+        if undo.get('archive_id'):
+            try:
+                undo = self.removal_recovery.archive.load(undo)
+                self._last_removal_undo = undo
+            except (OSError, ValueError, TypeError) as exc:
+                QMessageBox.warning(self, '无法恢复', f'回收记录无法读取：{exc}；记录与备份未删除。')
+                return
         image_ids = [int(image_id) for image_id in undo.get("image_ids", [])]  # type: ignore[arg-type]
         restore_ids = set(image_ids)
         failures: list[str] = []
@@ -12653,8 +12732,16 @@ class MainWindow(QMainWindow):
         backup_dir = undo.get("backup_dir")
         if failures:
             undo['image_ids'] = sorted(set(image_ids) - restore_ids)
+            self.removal_recovery.archive.save(undo)
         else:
-            self._clear_last_removal_undo(cleanup_backups=True)
+            self.removal_recovery.archive.remove(undo)
+            if isinstance(backup_dir, str) and backup_dir:
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            self._clear_last_removal_undo(cleanup_backups=False)
+            records = self.removal_recovery.archive.records()
+            if records:
+                self._last_removal_undo = records[0]
+                self.undo_removal_action.setEnabled(True)
         self._refresh_after_library_removal()
         if failures:
             QMessageBox.warning(
@@ -12667,9 +12754,14 @@ class MainWindow(QMainWindow):
 
     def _refresh_after_library_removal(self) -> None:
         self._invalidate_near_duplicate_hash_cache()
+        self._invalidate_creative_node_direct_image_cache()
         self._refresh_folders()
         self._refresh_collections()
         self._refresh_tags()
+        self._refresh_project_sidebar()
+        if self.current_creative_project_id is not None:
+            self._refresh_creative_node_tree(select_node_id=self.current_creative_node_id, save_current_editor=False)
+            self.creative_workspace.refresh()
         self._refresh_current_results_for_filters()
         self._refresh_embedding_stats()
         self._refresh_temp_project_save_button()
@@ -14541,6 +14633,8 @@ class MainWindow(QMainWindow):
                 self._clear_search()
             self._refresh_creative_template_preview_tree()
             self._sync_creative_node_panel()
+            if hasattr(self, "reference_generation"):
+                self.reference_generation.refresh()
             return
         project = self.store.get_creative_project(project_id)
         if project is not None:
@@ -17798,7 +17892,7 @@ class MainWindow(QMainWindow):
             self._set_combo_to_data(self.creative_project_combo, project_id_int)
             self.creative_project_combo.blockSignals(False)
             self._load_creative_project(project_id_int, show_board=True)
-            self.right_tab_widget.setCurrentIndex(1)
+            self.right_tab_widget.setCurrentIndex(self.creative_flow.reference_index)
             return
         if kind == "search":
             self._load_temporary_project(project_id_int)

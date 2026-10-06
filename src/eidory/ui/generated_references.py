@@ -108,9 +108,6 @@ class GenerationPanel(QDialog):
         form.addRow('尺寸', dimensions)
         self.sampling = text_label('保留工作流的模型、步数和采样参数，每次使用新种子。')
         form.addRow(self.sampling)
-        self.destination = QPushButton('设置采用后的保存位置…')
-        self.destination.clicked.connect(lambda: controller.choose_destination(self.project_id))
-        form.addRow('正式保存', self.destination)
         outer.addWidget(self.settings)
         self.settings.hide()
         self.status = text_label('候选不会进入普通图库；采用时保存并加入原节点。')
@@ -141,6 +138,22 @@ class GenerationPanel(QDialog):
         outer.addWidget(self.candidates, 1)
         self.details = text_label('生成结果会保留在这里，关闭窗口不会丢失。')
         outer.addWidget(self.details)
+        placement = QHBoxLayout()
+        placement.addWidget(text_label('采用后保存到'))
+        self.destination = QComboBox()
+        self.destination.setAccessibleName('采用后保存的图库文件夹')
+        self.destination.addItem('AI生成／' + project.title, None)
+        for collection in controller.w.store.list_collections():
+            self.destination.addItem(controller.w._collection_path_text(collection.id), collection.id)
+        saved = controller.w.store.get_setting('comfy.destination.' + str(self.project_id))
+        self.destination.setCurrentIndex(max(0, self.destination.findData(int(saved) if saved and saved.isdigit() else None)))
+        placement.addWidget(self.destination, 1)
+        outer.addLayout(placement)
+        self.destination_path = text_label()
+        self.destination_path.setProperty('role', 'muted')
+        outer.addWidget(self.destination_path)
+        self.destination.currentIndexChanged.connect(self.show_destination)
+        self.show_destination()
         actions = QHBoxLayout()
         self.adopt = QPushButton('采用并保存')
         self.adopt.setProperty('variant', 'primary')
@@ -169,6 +182,15 @@ class GenerationPanel(QDialog):
         self.apply_template()
         self.settings_toggle.setChecked(not bool(controller.template()))
         self.refresh_candidates()
+
+    def show_destination(self, *_):
+        cid = self.destination.currentData()
+        project = self.c.w.store.get_creative_project(self.project_id)
+        if not project:
+            return
+        path = self.c.w._collection_import_directory(cid) if cid else Path.home() / 'Pictures' / 'Eidory Imports' / 'AI生成' / self.c.w._safe_path_component(project.title)
+        self.destination_path.setText(str(path))
+        self.destination_path.setToolTip(str(path))
 
     def toggle_settings(self, checked):
         self.settings.setVisible(checked)
@@ -245,6 +267,7 @@ class GenerationPanel(QDialog):
         job = self.selected_job()
         busy = self.c.working
         has_image = bool(job and job.get('file_path') and Path(job['file_path']).is_file())
+        self.destination.setEnabled(not busy)
         self.adopt.setEnabled(bool(job and job['state'] == 'ready' and has_image and not busy))
         self.adopt.setText('采用并保存到「' + job['node_title'] + '」' if job else '采用并保存')
         self.preview_button.setEnabled(has_image)
@@ -534,37 +557,14 @@ class ReferenceGeneration(QObject):
 
     def choose_destination(self, project_id):
         project = self.w.store.get_creative_project(project_id)
-        if not project:
+        if not project or not self.panel or self.panel.project_id != project_id:
             return None
-        dialog = QDialog(self.panel)
-        dialog.setWindowTitle('采用后的保存位置')
-        dialog.resize(600, 190)
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(text_label('保存到图库文件夹；此项目以后沿用这里。'))
-        choice = QComboBox()
-        choice.setAccessibleName('生成参考永久保存的图库文件夹')
-        choice.addItem('AI生成／' + project.title, None)
-        for col in self.w.store.list_collections():
-            choice.addItem(self.w._collection_path_text(col.id), col.id)
-        layout.addWidget(choice)
-        location = text_label()
-        def describe():
-            cid = choice.currentData()
-            path = self.w._collection_import_directory(cid) if cid else Path.home() / 'Pictures' / 'Eidory Imports' / 'AI生成' / self.w._safe_path_component(project.title)
-            location.setText(str(path))
-        choice.currentIndexChanged.connect(describe)
-        describe()
-        layout.addWidget(location)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText('使用此位置')
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-        cid = choice.currentData()
+        cid = self.panel.destination.currentData()
         if cid is None:
             cid = self.w.store.ensure_collection_path(['AI生成', project.title])
+        if cid not in {c.id for c in self.w.store.list_collections()}:
+            self.panel.status.setText('保存文件夹已被删除，请重新选择')
+            return None
         self.w.store.set_setting('comfy.destination.' + str(project_id), str(cid))
         return cid
 
@@ -572,10 +572,7 @@ class ReferenceGeneration(QObject):
         job = self.panel.selected_job()
         if not job:
             return
-        raw = self.w.store.get_setting('comfy.destination.' + str(job['project_id']))
-        cid = int(raw) if raw and raw.isdigit() else None
-        if cid not in {c.id for c in self.w.store.list_collections()}:
-            cid = self.choose_destination(job['project_id'])
+        cid = self.choose_destination(job['project_id'])
         if cid is None:
             return
         directory = self.w._collection_import_directory(cid)

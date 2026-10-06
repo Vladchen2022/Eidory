@@ -43,7 +43,7 @@ class EditHistory(QObject):
         window.undo_removal_action.setShortcut(QKeySequence())
         window.addAction(self.undo_action)
         window.addAction(self.redo_action)
-        menu = window.workflow_upgrade.tools.menu()
+        menu = window.workflow_upgrade.tools_menu
         menu.addSeparator()
         menu.addAction(self.undo_action)
         menu.addAction(self.redo_action)

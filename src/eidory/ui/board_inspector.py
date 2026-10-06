@@ -4,9 +4,9 @@ from eidory.ui.edit_history import undoable
 from weakref import ref
 from collections import Counter
 
-from PySide6.QtCore import QObject, QSignalBlocker, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QGridLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
 
 from eidory.core.project_state import PURPOSES, REFERENCE_STATUSES
 from eidory.ui.board_shortcuts import set_board_button_text
@@ -24,31 +24,40 @@ class BoardInspector(QObject):
         self._note_timer.setSingleShot(True)
         self._note_timer.setInterval(300)
         self._note_timer.timeout.connect(self.flush_note)
-        self.page = QWidget()
+        self.page = QScrollArea()
+        self.page.setWidgetResizable(True)
+        self.page.setFrameShape(QScrollArea.Shape.NoFrame)
         self.page.setObjectName('boardSelectionInspector')
-        layout = QVBoxLayout(self.page)
+        body = QWidget()
+        self.page.setWidget(body)
+        layout = QVBoxLayout(body)
         layout.setContentsMargins(8, 10, 8, 8)
         self.heading = self.label('看板 · 图片属性', layout)
         self.heading.setProperty('role', 'flowTitle')
         self.preview = QLabel()
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.preview.setMinimumWidth(0)
         self.preview.setMaximumHeight(150)
         layout.addWidget(self.preview)
         self.info = self.label('在看板中选择图片，直接调整参考等级和用途。', layout)
+        self.info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.scope_label = self.label('用途所属节点', layout)
         self.scope = QComboBox()
+        self.scope.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.scope.setAccessibleName('看板参考的用途所属节点')
-        layout.addWidget(self.scope)
         self.grade_label = self.label('参考等级', layout)
         self.grade = QComboBox()
         self.grade.setAccessibleName('看板所选图片的参考等级')
         self.grade.addItem('等级不同', None)
         for value, title in REFERENCE_STATUSES.items():
             self.grade.addItem(('★ ' if value == 'primary' else '') + title, value)
-        layout.addWidget(self.grade)
+        self.grade.hide()
+        self.grade_label.hide()
         self.purpose_label = self.label('参考用途', layout)
         self.purpose = QComboBox()
+        self.purpose.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.purpose.setAccessibleName('看板所选图片的参考用途')
         self.purpose.addItem('用途不同', None)
         for value in PURPOSES:
@@ -72,11 +81,13 @@ class BoardInspector(QObject):
         self.actions = QWidget()
         self.actions.setObjectName('boardReferenceActions')
         self.actions.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        row = QHBoxLayout(self.actions)
+        row = QGridLayout(self.actions)
         row.setContentsMargins(0, 0, 0, 4)
         row.setSpacing(6)
         self.selection_label = QLabel('先在看板选图')
-        row.addWidget(self.selection_label)
+        self.selection_label.setMinimumWidth(0)
+        self.scope.setMaximumWidth(240)
+        self.scope.setMinimumWidth(0)
         self.quick_grades = {}
         for status, title in REFERENCE_STATUSES.items():
             b = QPushButton(('★ ' if status == 'primary' else '') + title)
@@ -84,13 +95,15 @@ class BoardInspector(QObject):
             b.setCheckable(True)
             # macOS accessibility activates checkable buttons through toggled.
             b.toggled.connect(lambda _checked, value=status: self.save(status=value))
-            row.addWidget(b)
             self.quick_grades[status] = b
         self.remove_button = QPushButton('移出看板')
         self.remove_button.setToolTip('移除所选图片在当前看板分支中的关联；保留图库源文件，可撤销。')
         self.remove_button.clicked.connect(self.remove_selected)
-        row.addWidget(self.remove_button)
-        row.addStretch(1)
+        self._action_widgets = [self.selection_label, self.scope, *self.quick_grades.values(), self.remove_button]
+        self._action_layout = row
+        self._wrapped_actions = None
+        self.actions.installEventFilter(self)
+        self.layout_actions()
         center_layout = window.center_result_stack.parentWidget().layout()
         center_layout.insertWidget(center_layout.indexOf(window.workspace_chrome.board_tools) + 1, self.actions)
         self.actions.hide()
@@ -110,6 +123,33 @@ class BoardInspector(QObject):
         section_button.clicked.disconnect()
         section_button.toggled.connect(lambda _: window.project_board_view.toggle_node_sections())
         self.sections_changed(bool(window.project_board_view._section_items))
+
+    def eventFilter(self, watched, event):
+        if watched is self.actions and event.type() in (QEvent.Type.Resize, QEvent.Type.FontChange):
+            self.layout_actions()
+        return False
+
+    def layout_actions(self):
+        needed = sum(widget.sizeHint().width() for widget in self._action_widgets) + 5 * 6
+        wrapped = self.actions.width() < needed
+        if wrapped == self._wrapped_actions:
+            return
+        self._wrapped_actions = wrapped
+        row = self._action_layout
+        for widget in self._action_widgets:
+            row.removeWidget(widget)
+        for column in range(7):
+            row.setColumnStretch(column, 0)
+        if wrapped:
+            row.addWidget(self.selection_label, 0, 0, 1, 2)
+            row.addWidget(self.scope, 0, 2, 1, 3)
+            for column, widget in enumerate(self._action_widgets[2:]):
+                row.addWidget(widget, 1, column)
+            row.setColumnStretch(4, 1)
+        else:
+            for column, widget in enumerate(self._action_widgets):
+                row.addWidget(widget, 0, column)
+            row.setColumnStretch(6, 1)
 
     @property
     def w(self):
@@ -184,7 +224,7 @@ class BoardInspector(QObject):
                     path = full_path.removeprefix(root_path + ' / ')
                     self.scope.addItem('项目根节点' if nid == root_id else path, nid)
                     self.scope.setItemData(self.scope.count() - 1, full_path, Qt.ItemDataRole.ToolTipRole)
-                if node and node.id in owners and len(ids) == 1:
+                if node and node.id in owners:
                     self.scope.setCurrentIndex(self.scope.findData(node.id))
                 self.preview.clear()
                 image = w._board_image_by_id.get(ids[0]) if len(ids) == 1 else None
@@ -197,6 +237,9 @@ class BoardInspector(QObject):
                     self.info.setText(f'已选 {len(ids)} 张，可批量设置参考等级和用途。' if ids else '在看板中选择图片，直接调整参考等级和用途。')
                 self.preview.setVisible(image is not None)
             active = self.active_links()
+            scope_name = self.scope.currentText() if active else '先选择修改范围'
+            self.scope_label.setText('修改范围：' + scope_name + (f' · {len(active)} 处关联' if active else ''))
+            self.selection_label.setText(f'已选 {len(ids)} 张 · 将修改 {len(active)} 处' if ids else '先在看板选图')
             statuses = {r['reference_status'] or 'candidate' for r in active}
             purposes = {r['reference_purpose'] or '' for r in active}
             status = next(iter(statuses)) if len(statuses) == 1 else None
@@ -211,7 +254,7 @@ class BoardInspector(QObject):
             for value, b in self.quick_grades.items():
                 b.setEnabled(bool(active))
                 b.setChecked(value == status)
-                b.setToolTip('直接设置所选图片的参考等级，保留看板视角。' if active else '先在看板选图；多处使用的图片需在右侧选择用途所属节点。')
+                b.setToolTip('直接设置所选图片的参考等级，保留看板视角。' if active else '先在看板选图；多处使用的图片需在此工具栏选择用途所属节点。')
             self.remove_button.setEnabled(bool(ids))
             self.open_button.setEnabled(len(ids) == 1)
             note_key = (active[0]['node_id'], active[0]['image_id']) if len(active) == 1 else None
@@ -232,6 +275,7 @@ class BoardInspector(QObject):
             self.hint.setText(hint)
         finally:
             self.refreshing = False
+        self.layout_actions()
 
     def scope_changed(self, *_):
         if not self.refreshing:

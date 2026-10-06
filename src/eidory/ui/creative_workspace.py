@@ -217,6 +217,8 @@ class CreativeWorkspace(QObject):
             self.store.save_project(self.project_id, extra=w.inspiration_answers_input.toPlainText().strip())
 
     def before_project_load(self, project_id):
+        if hasattr(self.w, 'creative_flow') and self.w.creative_flow._inline:
+            self.w.creative_flow._inline.finish()
         if project_id != self.project_id:
             self.save_context()
             self.save_search()
@@ -385,6 +387,8 @@ class CreativeWorkspace(QObject):
             return
         previous = FilterPlan.from_payload(scope.get("filter_plan", {}))
         strengths = {f.value: f.score_threshold for f in previous.positive_filters if f.kind == "semantic"}
+        if hasattr(w, 'creative_flow'):
+            strengths.update({r['query']: r['strength'] for r in w.creative_flow.targets() if 'strength' in r})
         plan = FilterPlan((FilterGroup(tuple(SearchFilter("semantic", name, strengths.get(name, 50)) for name in names), match_mode="any"),)) if queries is not None else FilterPlan((FilterGroup((SearchFilter("semantic", query, 50),)),))
         if preserve_filters:
             old_names = set(getattr(self, 'active_search_names', None) or [])
@@ -648,6 +652,9 @@ class CreativeWorkspace(QObject):
 
     @undoable("添加想法")
     def add_entry(self):
+        if hasattr(self.w, 'creative_flow'):
+            self.w.creative_flow.add_inline()
+            return
         node = self.w._current_creative_node()
         if not node or self.store.node(node.id)["locked"]:
             return

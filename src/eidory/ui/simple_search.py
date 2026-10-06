@@ -85,8 +85,12 @@ class SimpleSearch(QObject):
         if not p._busy and not p.error:
             p.status_label.setText('正在准备更新…' if self.pending else '自动更新')
         flow = w.creative_flow
+        flow.refresh_target_controls()
         flow.search_refresh.hide()
-        flow.target_run.setVisible(w.center_result_stack.currentWidget() is flow.search_empty)
+        missing_targets = any(row['enabled'] and w.workflow_upgrade.result_mode.findData(row['query']) < 0
+                              for row in flow.targets())
+        flow.target_run.setVisible(w.center_result_stack.currentWidget() is flow.search_empty
+                                  or (gallery and missing_targets and not p._busy and not self.pending))
         if self.pending == 'targets':
             flow.target_hint.setText('编辑后自动更新结果')
         self.rescue.setVisible(gallery and w.current_result_mode == 'search_chain'

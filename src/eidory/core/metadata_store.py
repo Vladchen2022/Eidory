@@ -3483,6 +3483,7 @@ class MetadataStore:
                 "folders": folder_rows,
                 "images": image_rows,
                 "tags": tag_rows,
+                "tag_groups": rows(conn, "SELECT * FROM tag_groups WHERE id IN (SELECT group_id FROM tags WHERE id IN (" + ",".join("?" for _ in tag_ids) + "))", tag_ids) if tag_ids else [],
                 "image_tags": image_tags,
                 "embeddings": rows(
                     conn,
@@ -3511,7 +3512,7 @@ class MetadataStore:
                 ),
                 **{table: rows(conn, f"SELECT * FROM {table} WHERE image_id IN ({placeholders})", clean_ids)
                    for table in ("creative_node_images", "creative_reference_decisions",
-                                 "creative_reference_notes", "ai_vision_tags")},
+                                 "creative_reference_notes", "ai_vision_tags", "image_hashes")},
             }
 
     def restore_images_snapshot(
@@ -3531,7 +3532,7 @@ class MetadataStore:
             if not isinstance(raw_rows, list):
                 return []
             clean_rows = [dict(row) for row in raw_rows if isinstance(row, Mapping)]
-            if table in {"folders", "tags"}:
+            if table in {"folders", "tags", "tag_groups"}:
                 return clean_rows
             return [row for row in clean_rows if int(row.get(id_key, 0) or 0) in id_set]
 
@@ -3565,6 +3566,7 @@ class MetadataStore:
                        ("file_path", "file_size", "modified_time_ns")) for row in existing):
                     raise ValueError("图片路径或记录已被其他内容占用，未覆盖现有图片")
             insert_rows(conn, "folders", table_rows("folders", id_key="id"))
+            insert_rows(conn, "tag_groups", table_rows("tag_groups"))
             insert_rows(conn, "tags", table_rows("tags"))
             insert_rows(conn, "images", image_rows)
             insert_rows(conn, "embeddings", table_rows("embeddings"))
@@ -3573,7 +3575,7 @@ class MetadataStore:
             insert_rows(conn, "image_collections", table_rows("image_collections"))
             insert_rows(conn, "search_feedback", table_rows("search_feedback"))
             insert_rows(conn, "temporary_project_images", table_rows("temporary_project_images"))
-            for table in ("creative_node_images", "creative_reference_decisions", "creative_reference_notes", "ai_vision_tags"):
+            for table in ("creative_node_images", "creative_reference_decisions", "creative_reference_notes", "ai_vision_tags", "image_hashes"):
                 insert_rows(conn, table, table_rows(table))
             self._delete_unused_tags(conn)
             placeholders = ",".join("?" for _ in clean_ids)

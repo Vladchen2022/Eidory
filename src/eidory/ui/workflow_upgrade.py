@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from eidory.ui.edit_history import undoable
 
 from weakref import ref
@@ -22,6 +23,7 @@ class WorkflowUpgrade(QObject):
         self._window = ref(window)
         self.state = ProjectStateStore(window.store)
         self.refreshing = False
+        self._toolbar_sort_requested = False
         self.jobs = {}
         self.jobFinished.connect(self.finish_job)
         self._build()
@@ -104,7 +106,7 @@ class WorkflowUpgrade(QObject):
         self.result_mode = QComboBox()
         self.result_mode.setAccessibleName('综合推荐或按条目查看')
         self.result_mode.addItem('综合推荐', None)
-        self.result_mode.currentIndexChanged.connect(self.display_results)
+        self.result_mode.currentIndexChanged.connect(self.result_mode_changed)
         results.addWidget(self.result_mode)
         self.result_hint = QLabel('分别检索，合并去重；标记表示命中的搜索目标')
         self.result_hint.setProperty('role', 'muted')
@@ -256,10 +258,38 @@ class WorkflowUpgrade(QObject):
             self.result_mode.addItem(f'{key[:32]} · {len(ids)} 张', key)
             for image_id in ids:
                 self.match_badges.setdefault(image_id, []).append('命中：'+key[:20])
+        # Folder/tag/size filters have no recommendation rank to choose from.
+        if not self.match_ids:
+            current = '__toolbar__'
         self.result_mode.setCurrentIndex(max(0, self.result_mode.findData(current)))
         self.result_mode.blockSignals(False)
         self.display_results()
         self.refresh()
+
+    def request_toolbar_sort(self):
+        self._toolbar_sort_requested = True
+        if hasattr(self.w, 'simple_search'):
+            # A pending preference result must not override a newer sort action.
+            self.w.simple_search.serial += 1
+        if self.result_mode.currentData() is None:
+            previous = self.result_mode.blockSignals(True)
+            self.result_mode.setCurrentIndex(max(0, self.result_mode.findData('__toolbar__')))
+            self.result_mode.blockSignals(previous)
+
+    def request_recommendation_sort(self):
+        self._toolbar_sort_requested = False
+        if self.result_mode.currentData() == '__toolbar__':
+            previous = self.result_mode.blockSignals(True)
+            self.result_mode.setCurrentIndex(0)
+            self.result_mode.blockSignals(previous)
+
+    def result_mode_changed(self, *_args):
+        mode = self.result_mode.currentData()
+        if mode is None:
+            self.request_recommendation_sort()
+        elif mode == '__toolbar__':
+            self.request_toolbar_sort()
+        self.display_results()
 
     def display_results(self, *_args):
         if self.w.current_result_mode != 'search_chain':
@@ -267,16 +297,22 @@ class WorkflowUpgrade(QObject):
         selected = self.w.grid_view.selected_image_ids()
         images = self.w.current_chain_filtered_images
         target = self.result_mode.currentData()
-        if target == '__toolbar__':
-            pass
-        elif target:
+        toolbar_order = (self._toolbar_sort_requested or target == '__toolbar__'
+                         or bool(self.w.manual_result_order_ids))
+        scores = {}
+        if target and target != '__toolbar__':
             images = [im for im in images if im.id in self.match_ids.get(target, set())]
             scores = {im.id: im.score for f, matches in self.w.current_chain_result.filter_matches.items() if str(f.value) == target for im in matches}
+        if toolbar_order:
+            if scores and self.w.current_sort_key == 'score':
+                images = [replace(im, score=scores.get(im.id)) for im in images]
+            images = self.w._sort_images(images)
+        elif target:
             images = sorted(images, key=lambda im: (-(scores.get(im.id) or 0), im.id))
         else:
             ranks = {im.id: i for i, im in enumerate(self.w.current_chain_result.ranked_scope_images or images)}
             images = sorted(images, key=lambda im: ranks.get(im.id, len(ranks)))
-        if hasattr(self.w, "simple_search"):
+        if not toolbar_order and hasattr(self.w, "simple_search"):
             images = self.w.simple_search.sort(images)
         badges = self.w.store.creative_node_image_badges(self.w.current_creative_project_id) if self.w.current_creative_project_id else {}
         node = self.w._current_creative_node()

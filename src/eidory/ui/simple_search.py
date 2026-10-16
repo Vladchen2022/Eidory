@@ -158,6 +158,7 @@ class SimpleSearch(QObject):
             self.w.statusBar().showMessage(payload['error'])
             return
         self.feedback, self.scores = payload['feedback'], payload['scores']
+        self.w.workflow_upgrade.request_recommendation_sort()
         if hasattr(self.w, 'edit_history'):
             after = (dict(self.feedback), dict(self.scores), self.context)
             self.w.edit_history.push('调整图片偏好', lambda: self.restore_feedback(payload['before']),
@@ -171,6 +172,7 @@ class SimpleSearch(QObject):
             return False
         self.serial += 1
         self.feedback, self.scores, self.context = dict(state[0]), dict(state[1]), state[2]
+        self.w.workflow_upgrade.request_recommendation_sort()
         self.w.workflow_upgrade.display_results()
         self.refresh()
         return True

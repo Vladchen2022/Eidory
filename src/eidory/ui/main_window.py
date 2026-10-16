@@ -19385,6 +19385,7 @@ class MainWindow(QMainWindow):
             self._apply_search_chain_filters()
             images = self.current_chain_filtered_images
             if hasattr(self, "workflow_upgrade") and self.current_chain_result:
+                self.workflow_upgrade.request_toolbar_sort()
                 self.workflow_upgrade.search_finished()
             else:
                 self.grid_view.set_images(images)

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QMimeData, QPoint, QSize, QUrl
+from PySide6.QtCore import QMimeData, QPoint, QSize, QUrl, Qt
 from PySide6.QtGui import QColor, QImage, QPixmap, QResizeEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -95,6 +95,53 @@ class JustifiedImageGridSelectionTest(unittest.TestCase):
             mime.setUrls([QUrl.fromLocalFile(str(path))])
 
             self.assertFalse(JustifiedImageGridView._supports_external_import_drop(mime))
+
+    def test_press_keeps_multiple_images_until_an_ordinary_click_finishes(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90)
+        grid.resize(600, 400)
+        grid.set_images([self._image(1), self._image(2), self._image(3)])
+        grid._select_single(0)
+        grid._toggle_index(2)
+        point = grid._rects[0].center()
+        grid._handle_left_press(point, Qt.KeyboardModifier.NoModifier)
+        self.assertEqual(grid.selected_image_ids(), [1, 3])
+        grid._handle_left_release(point)
+        self.assertEqual(grid.selected_image_ids(), [1])
+
+    def test_multifile_drag_keeps_all_urls_and_selection_after_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = [Path(tmp) / f'image-{i}.png' for i in range(3)]
+            for path in paths:
+                image = QImage(8, 8, QImage.Format.Format_RGB32)
+                image.fill(QColor('blue'))
+                image.save(str(path))
+            grid = JustifiedImageGridView(thumbnail_size=90)
+            grid.resize(600, 400)
+            grid.set_images([self._image(i+1, file_path=str(p)) for i, p in enumerate(paths)])
+            grid._select_single(0)
+            grid._toggle_index(2)
+            point = grid._rects[0].center()
+            grid._handle_left_press(point, Qt.KeyboardModifier.NoModifier)
+            with patch('eidory.ui.justified_image_grid.QDrag') as drag_type:
+                drag_type.return_value.exec.return_value = Qt.DropAction.CopyAction
+                grid._handle_mouse_move(point + QPoint(40, 0), Qt.MouseButton.LeftButton)
+                mime = drag_type.return_value.setMimeData.call_args.args[0]
+                self.assertEqual([u.toLocalFile() for u in mime.urls()], [str(paths[0]), str(paths[2])])
+                self.assertTrue(mime.hasFormat(IMAGE_IDS_MIME))
+                drag_type.return_value.exec.assert_called_once_with(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
+            grid._handle_left_release(point)
+            self.assertEqual(grid.selected_image_ids(), [1, 3])
+
+    def test_modifier_click_still_toggles_without_deferred_collapse(self) -> None:
+        grid = JustifiedImageGridView(thumbnail_size=90)
+        grid.resize(600, 400)
+        grid.set_images([self._image(1), self._image(2), self._image(3)])
+        grid._select_single(0)
+        grid._toggle_index(2)
+        point = grid._rects[2].center()
+        grid._handle_left_press(point, Qt.KeyboardModifier.ControlModifier)
+        grid._handle_left_release(point)
+        self.assertEqual(grid.selected_image_ids(), [1])
 
     def test_hit_testing_uses_row_ranges_after_layout(self) -> None:
         grid = JustifiedImageGridView(thumbnail_size=90, spacing=4)

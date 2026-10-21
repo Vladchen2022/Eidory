@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image, ImageEnhance, ImageOps
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -25,6 +25,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QShortcut,
+    QTransform,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -401,7 +402,9 @@ class PreviewImageView(QGraphicsView):
         set_theme_style(self, "background:@canvas@;color:@text@;")
         self.setMinimumHeight(420)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        # Keep Qt's implicit mouse anchor out of redraws and scrollbar updates.
+        # Wheel zoom anchors explicitly; replacing a preview keeps its center.
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontSavePainterState, True)
         self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True)
@@ -497,7 +500,7 @@ class PreviewImageView(QGraphicsView):
         self._pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self._fit_to_window = True
         self._zoom_factor = self.fit_zoom_factor()
-        self._apply_zoom_transform(reset=True)
+        self._apply_zoom_transform()
         self.centerOn(self._pixmap_item)
         self._update_drag_mode()
         if emit:
@@ -510,7 +513,7 @@ class PreviewImageView(QGraphicsView):
         self._pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self._fit_to_window = False
         self._zoom_factor = 1.0
-        self._apply_zoom_transform(reset=True)
+        self._apply_zoom_transform()
         self.centerOn(self._pixmap_item)
         self._update_drag_mode()
         if emit:
@@ -519,9 +522,11 @@ class PreviewImageView(QGraphicsView):
     def set_zoom_factor(self, zoom_factor: float, *, emit: bool = True) -> None:
         if not self._has_pixmap:
             return
+        center_ratio = self._current_center_ratio()
         self._fit_to_window = False
         self._zoom_factor = max(0.1, min(8.0, zoom_factor))
-        self._apply_zoom_transform(reset=True)
+        self._apply_zoom_transform()
+        self._center_on_ratio(center_ratio)
         self._update_drag_mode()
         if emit:
             self.zoomChanged.emit(self._zoom_factor, self._fit_to_window)
@@ -536,16 +541,22 @@ class PreviewImageView(QGraphicsView):
             min(8.0, min(viewport_width / self._original_width, viewport_height / self._original_height)),
         )
 
-    def zoom_by(self, wheel_delta: int) -> None:
+    def zoom_by(self, wheel_delta: int, *, anchor: QPoint | None = None) -> None:
         if not self._has_pixmap or wheel_delta == 0:
             return
+        viewport_rect = self.viewport().rect()
+        if anchor is None or not viewport_rect.contains(anchor):
+            anchor = viewport_rect.center()
+        scene_anchor = self.mapToScene(anchor)
         if self._fit_to_window:
             self._zoom_factor = self.fit_zoom_factor()
             self._fit_to_window = False
         step = 1.15 if wheel_delta > 0 else 1 / 1.15
         self._zoom_factor = max(0.1, min(8.0, self._zoom_factor * step))
         self._pixmap_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
-        self._apply_zoom_transform(reset=False)
+        self._apply_zoom_transform()
+        correction = scene_anchor - self.mapToScene(anchor)
+        self.centerOn(self.mapToScene(self.viewport().rect().center()) + correction)
         self._update_drag_mode()
         self._smooth_timer.start()
         self.zoomChanged.emit(self._zoom_factor, self._fit_to_window)
@@ -569,7 +580,7 @@ class PreviewImageView(QGraphicsView):
             self._schedule_navigator_update()
 
     def wheelEvent(self, event) -> None:
-        self.zoom_by(event.angleDelta().y())
+        self.zoom_by(event.angleDelta().y(), anchor=event.position().toPoint())
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
@@ -579,19 +590,11 @@ class PreviewImageView(QGraphicsView):
             return
         super().mouseDoubleClickEvent(event)
 
-    def _apply_zoom_transform(self, *, reset: bool) -> None:
+    def _apply_zoom_transform(self) -> None:
         target_view_scale = self._view_scale_for_zoom(self._zoom_factor)
-        if reset:
-            self.resetTransform()
-            self.scale(target_view_scale, target_view_scale)
-            return
-        current_view_scale = self.transform().m11()
-        if current_view_scale <= 0:
-            self.resetTransform()
-            self.scale(target_view_scale, target_view_scale)
-            return
-        factor = target_view_scale / current_view_scale
-        self.scale(factor, factor)
+        # An intermediate identity transform collapses the scroll ranges before
+        # restoring the zoom, which can discard a zoomed-in observation point.
+        self.setTransform(QTransform.fromScale(target_view_scale, target_view_scale))
 
     def _view_scale_for_zoom(self, zoom_factor: float) -> float:
         return max(0.001, zoom_factor * self._original_width / self._source_width)
@@ -618,7 +621,8 @@ class PreviewImageView(QGraphicsView):
     def _current_center_ratio(self) -> tuple[float, float] | None:
         if not self._has_pixmap or self._source_width <= 0 or self._source_height <= 0:
             return None
-        center = self.mapToScene(self.viewport().rect().center())
+        inverse, _invertible = self.viewportTransform().inverted()
+        center = inverse.map(QPointF(self.viewport().width() / 2, self.viewport().height() / 2))
         return (
             max(0.0, min(1.0, center.x() / self._source_width)),
             max(0.0, min(1.0, center.y() / self._source_height)),
@@ -1380,6 +1384,7 @@ class ImagePreviewDialog(QDialog):
         self._preview_base_key: tuple[int, str, int, int] | None = None
         self._preview_base_pixmap = QPixmap()
         self._preview_base_is_fallback = False
+        self._preview_source_loaded_bounds: tuple[int, int] | None = None
         self._preview_variant_cache: dict[tuple[bool, bool], QPixmap] = {}
         self._preview_display_cache: dict[tuple[int, int], QPixmap] = {}
         self._preview_source_pending_token: tuple[int, str, int, int, int, int] | None = None
@@ -3299,6 +3304,7 @@ class ImagePreviewDialog(QDialog):
         self._preview_base_key = base_key
         self._preview_base_pixmap = pixmap
         self._preview_base_is_fallback = fallback_used
+        self._preview_source_loaded_bounds = (token[4], token[5])
         self._preview_variant_cache.clear()
         self._preview_display_cache.clear()
         self._render_current_image(use_thumbnail_first=True)
@@ -3344,6 +3350,14 @@ class ImagePreviewDialog(QDialog):
             return True
         if self._preview_base_pixmap.isNull():
             return True
+        if self._preview_source_loaded_bounds is not None:
+            wanted_width, wanted_height = self._source_load_bounds(image, target_width, target_height)
+            loaded_width, loaded_height = self._preview_source_loaded_bounds
+            # A decoded source can be smaller than the viewport (or magnified
+            # beyond its native size). Re-reading it cannot add more pixels.
+            # Remember the fulfilled request, including thumbnail fallbacks, so
+            # a completion never starts the same decode again.
+            return wanted_width > loaded_width or wanted_height > loaded_height
         if self._preview_base_is_fallback:
             return True
         return self._preview_pixmap_is_too_small(
@@ -3371,6 +3385,7 @@ class ImagePreviewDialog(QDialog):
         self._preview_base_key = None
         self._preview_base_pixmap = QPixmap()
         self._preview_base_is_fallback = False
+        self._preview_source_loaded_bounds = None
         self._preview_variant_cache.clear()
         self._preview_display_cache.clear()
 

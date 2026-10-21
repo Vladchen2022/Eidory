@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -11,9 +12,10 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6.QtCore import QEvent, QPointF, QRect, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QPixmap, QResizeEvent
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
+from PySide6.QtTest import QTest
 
 from eidory.core.linetop_processor import LineTopSettings
 from eidory.core.metadata_store import MetadataStore
@@ -548,6 +550,137 @@ class ImagePreviewDialogTest(unittest.TestCase):
             self.assertTrue(dialog.fit_to_window)
             self.assertFalse(dialog.image_view._navigator.isVisible())
             dialog.close()
+
+    def test_zoomed_preview_keeps_panned_location_through_refinement(self) -> None:
+        view = PreviewImageView()
+        view.resize(620, 460)
+        view.show()
+        self.app.processEvents()
+        source = QPixmap(500, 697)
+        source.fill(QColor('blue'))
+        view.set_pixmap(source, original_width=500, original_height=697,
+                        fit_to_window=False, zoom_factor=5.38)
+        view.centerOn(350, 470)
+        self.app.processEvents()
+        before = view._current_center_ratio()
+        try:
+            for width, height in [(250, 349), (500, 697)] * 3:
+                replacement = QPixmap(width, height)
+                replacement.fill(QColor('green'))
+                view.set_pixmap(replacement, original_width=500, original_height=697,
+                                fit_to_window=False, zoom_factor=5.38)
+                QTest.mouseMove(view.viewport(), QPoint(110, 180))
+                QTest.qWait(110)
+                after = view._current_center_ratio()
+                self.assertAlmostEqual(after[0], before[0], delta=.003)
+                self.assertAlmostEqual(after[1], before[1], delta=.003)
+                self.assertGreater(view.horizontalScrollBar().value(), 0)
+                self.assertGreater(view.verticalScrollBar().value(), 0)
+        finally:
+            view.close()
+            self.app.processEvents()
+
+    def test_repeated_redraw_does_not_accumulate_center_rounding_drift(self) -> None:
+        view = PreviewImageView()
+        view.resize(620, 460)
+        view.show()
+        self.app.processEvents()
+        source = QPixmap(500, 697)
+        source.fill(QColor('blue'))
+        view.set_pixmap(source, original_width=500, original_height=697,
+                        fit_to_window=False, zoom_factor=5.38)
+        view.centerOn(350, 470)
+        self.app.processEvents()
+        before = (view.horizontalScrollBar().value(), view.verticalScrollBar().value())
+        try:
+            for _ in range(100):
+                view.set_pixmap(source, original_width=500, original_height=697,
+                                fit_to_window=False, zoom_factor=5.38)
+                self.app.processEvents()
+            self.assertEqual((view.horizontalScrollBar().value(), view.verticalScrollBar().value()), before)
+        finally:
+            view.close()
+            self.app.processEvents()
+
+    def test_small_source_finishes_loading_and_stays_still_when_magnified(self) -> None:
+        def settle(milliseconds):
+            deadline = time.monotonic() + milliseconds / 1000
+            while time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(.005)
+            self.app.processEvents()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / 'small.jpg'
+            Image.new('RGB', (500, 697), color='red').save(image_path)
+            store = MetadataStore(root / 'eidory.sqlite3')
+            store.initialize()
+            folder_id = store.add_folder(str(root))
+            image_id, _state = store.upsert_image(
+                folder_id=folder_id, file_path=str(image_path),
+                file_size=image_path.stat().st_size, width=500, height=697,
+                created_time_ns=None, modified_time_ns=image_path.stat().st_mtime_ns,
+            )
+            dialog = ImagePreviewDialog(
+                images=[store.get_image(image_id)], start_index=0, store=store,
+                semantic_query=None, model_name='fake-model', model_revision='test', embedding_dim=2,
+            )
+            try:
+                with patch.object(dialog._preview_source_thread_pool, 'start',
+                                  wraps=dialog._preview_source_thread_pool.start) as load:
+                    dialog.show()
+                    settle(500)
+                    self.assertEqual(load.call_count, 1)
+                    self.assertIsNone(dialog._preview_source_running_token)
+                    dialog.image_view.set_zoom_factor(5.38)
+                    settle(200)
+                    dialog.image_view.centerOn(350, 470)
+                    self.app.processEvents()
+                    before = dialog.image_view._current_center_ratio()
+                    dialog._set_grayscale_preview(True)
+                    dialog._set_mirrored_preview(True)
+                    settle(500)
+                    after = dialog.image_view._current_center_ratio()
+                    self.assertEqual(load.call_count, 1)
+                    self.assertIsNone(dialog._preview_source_running_token)
+                    self.assertAlmostEqual(after[0], before[0], delta=.001)
+                    self.assertAlmostEqual(after[1], before[1], delta=.001)
+                    image = dialog.current_image()
+                    # Larger requests still load more pixels when the prior
+                    # result only covered a smaller area, even for a fallback.
+                    dialog._preview_source_loaded_bounds = (100, 100)
+                    self.assertTrue(dialog._preview_source_needs_load(image, 500, 697))
+                    dialog._preview_base_is_fallback = True
+                    dialog._preview_source_loaded_bounds = (500, 697)
+                    self.assertFalse(dialog._preview_source_needs_load(image, 2690, 3750))
+                    dialog._clear_preview_pixmap_cache()
+                    self.assertTrue(dialog._preview_source_needs_load(image, 500, 697))
+            finally:
+                dialog.close()
+                self.app.processEvents()
+
+    def test_wheel_zoom_keeps_image_point_under_cursor(self) -> None:
+        view = PreviewImageView()
+        view.resize(620, 460)
+        view.show()
+        self.app.processEvents()
+        source = QPixmap(500, 697)
+        source.fill(QColor('blue'))
+        view.set_pixmap(source, original_width=500, original_height=697,
+                        fit_to_window=False, zoom_factor=3)
+        self.app.processEvents()
+        anchor = QPoint(110, 180)
+        before = view.mapToScene(anchor)
+        try:
+            view.zoom_by(120, anchor=anchor)
+            QTest.qWait(150)
+            after = view.mapToScene(anchor)
+            self.assertAlmostEqual(after.x(), before.x(), delta=1)
+            self.assertAlmostEqual(after.y(), before.y(), delta=1)
+        finally:
+            view.close()
+            self.app.processEvents()
 
     def test_preview_navigator_updates_are_coalesced(self) -> None:
         image_view = PreviewImageView()

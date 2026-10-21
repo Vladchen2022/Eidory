@@ -56,6 +56,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._selection_anchor = -1
         self._drag_start_position: QPoint | None = None
         self._drag_start_index = -1
+        self._pending_single_selection_index: int | None = None
         self._pixmap_cache: OrderedDict[PixmapCacheKey, QPixmap] = OrderedDict()
         self._pixmap_cache_bytes: dict[PixmapCacheKey, int] = {}
         self._pixmap_cache_total_bytes = 0
@@ -108,8 +109,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
                     event.accept()
                     return True
             if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-                self._drag_start_position = None
-                self._drag_start_index = -1
+                self._handle_left_release(event.position().toPoint())
         return super().eventFilter(watched, event)
 
     def rowCount(self) -> int:
@@ -352,8 +352,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_start_position = None
-            self._drag_start_index = -1
+            self._handle_left_release(event.position().toPoint())
         super().mouseReleaseEvent(event)
 
     def dragEnterEvent(self, event) -> None:
@@ -426,7 +425,24 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._drag_start_position = point
         index = self._index_at(point)
         self._drag_start_index = index
-        self._handle_selection_click(index, modifiers)
+        self._pending_single_selection_index = None
+        selection_modifiers = (Qt.KeyboardModifier.ControlModifier
+                               | Qt.KeyboardModifier.MetaModifier
+                               | Qt.KeyboardModifier.ShiftModifier)
+        if index in self._selected_indexes and not (modifiers & selection_modifiers):
+            # A press inside a selection may start a multi-file drag. Collapse
+            # to one image only when this finishes as an ordinary click.
+            self._pending_single_selection_index = index
+        else:
+            self._handle_selection_click(index, modifiers)
+
+    def _handle_left_release(self, point: QPoint) -> None:
+        pending = self._pending_single_selection_index
+        self._pending_single_selection_index = None
+        self._drag_start_position = None
+        self._drag_start_index = -1
+        if pending is not None and self._index_at(point) == pending:
+            self._select_single(pending)
 
     def _handle_mouse_move(self, point: QPoint, buttons: Qt.MouseButton) -> bool:
         if (
@@ -440,8 +456,9 @@ class JustifiedImageGridView(QAbstractScrollArea):
         return False
 
     def _start_image_drag(self) -> None:
-        if self._drag_start_index < 0:
+        if not 0 <= self._drag_start_index < len(self._images):
             return
+        self._pending_single_selection_index = None
         if self._drag_start_index not in self._selected_indexes:
             self._select_single(self._drag_start_index)
         image_ids = self.selected_image_ids()
@@ -454,7 +471,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
             mime.setUrls(urls)
         drag = QDrag(self.viewport())
         drag.setMimeData(mime)
-        current = self.current_image()
+        current = self._images[self._drag_start_index]
         if current is not None:
             pixmap = self._cached_pixmap_for(current)
             if not pixmap.isNull():

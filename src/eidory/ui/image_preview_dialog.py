@@ -1442,6 +1442,7 @@ class ImagePreviewDialog(QDialog):
     favoriteChanged = Signal(object)
     feedbackSaved = Signal(object, str)
     indexRemoved = Signal(object)
+    annotationMembershipChanged = Signal(int)
 
     def refresh_theme(self) -> None:
         for button in self.findChildren(QPushButton):
@@ -1602,6 +1603,7 @@ class ImagePreviewDialog(QDialog):
         self.image_view.doubleClicked.connect(self._fit_image_to_window)
         self.image_view.zoomChanged.connect(self._handle_image_zoom_changed)
         self.annotation_controls = AnnotationControls(self.image_view, store)
+        self.annotation_controls.membershipChanged.connect(self.annotationMembershipChanged.emit)
 
         self.video_widget: QVideoWidget | None = None
         self.video_player: QMediaPlayer | None = None
@@ -1714,6 +1716,7 @@ class ImagePreviewDialog(QDialog):
         video_controls.addWidget(self.video_time_label)
 
         controls = WrappingLayout()
+        self.preview_controls_layout = controls
         controls.addWidget(self.fit_button)
         controls.addWidget(self.actual_size_button)
         controls.addWidget(self.upscale_button)
@@ -1745,6 +1748,7 @@ class ImagePreviewDialog(QDialog):
                 button.setStyleSheet("QPushButton { min-height: 30px; max-height: 30px; padding: 0 8px; }")
 
         layout = QVBoxLayout(self)
+        layout.addLayout(controls)
         preview_row = QHBoxLayout()
         self._preview_row_layout = preview_row
         preview_row.setContentsMargins(0, 0, 0, 0)
@@ -1754,7 +1758,6 @@ class ImagePreviewDialog(QDialog):
         layout.addLayout(preview_row, 1)
         layout.addWidget(self.video_controls_widget)
         layout.addWidget(self.info_label)
-        layout.addLayout(controls)
         layout.addWidget(self.annotation_controls)
 
         self.fit_button.clicked.connect(self._fit_image_to_window)

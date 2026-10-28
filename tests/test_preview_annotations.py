@@ -242,7 +242,9 @@ def test_toolbar_layout_at_window_sizes_has_no_overlap(preview, width):
     assert slider.mapToGlobal(slider.rect().topRight()).x() < value.mapToGlobal(value.rect().topLeft()).x()
     controls = preview.annotation_controls
     assert controls.isVisible() and controls.tool_buttons["pen"].isVisible()
-    for layout in (preview.layout().itemAt(preview.layout().count()-2).layout(), controls.layout()):
+    assert preview.fit_button.mapTo(preview, preview.fit_button.rect().bottomLeft()).y() < preview.image_view.mapTo(preview, preview.image_view.rect().topLeft()).y()
+    assert controls.y() > preview.image_view.mapTo(preview, preview.image_view.rect().bottomLeft()).y()
+    for layout in (preview.preview_controls_layout, controls.layout()):
         rects = [layout.itemAt(i).geometry() for i in range(layout.count()) if not layout.itemAt(i).isEmpty()]
         assert all(not a.intersects(b) for i, a in enumerate(rects) for b in rects[i+1:])
         assert all(r.right() <= width for r in rects)

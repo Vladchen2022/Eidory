@@ -61,7 +61,7 @@ class FilterEditorDialog(QDialog):
             ("画面内容（语义）", "semantic"), ("文字信息（关键词）", "keyword"),
             ("画面颜色", "color"), ("相似图", "similar"), ("文件夹", "collection"),
             ("用户标签", "tag"), ("文件类型", "file_type"), ("方向", "orientation"),
-            ("尺寸", "size"), ("状态", "status"), ("AI 场景标签", "ai_scene"),
+            ("尺寸", "size"), ("状态", "status"), ("标记", "annotation"), ("AI 场景标签", "ai_scene"),
             ("AI 角色标签", "ai_character"),
         ]:
             self.kind_combo.addItem(label, kind)
@@ -147,6 +147,8 @@ class FilterEditorDialog(QDialog):
             options = [(size_filter_label(v), v) for v in ["large", "small"]]
         elif kind == "status":
             options = [("收藏", "favorite"), ("未索引", "unindexed"), ("源文件丢失", "missing"), ("文件可用", "available")]
+        elif kind == "annotation":
+            options = [("含有标记", "present")]
         elif kind in {"ai_scene", "ai_character"}:
             fields = dict(AI_CHARACTER_VISION_FIELD_VALUES if kind == "ai_character" else AI_VISION_FIELD_VALUES)
             if kind == "ai_scene":
@@ -159,6 +161,7 @@ class FilterEditorDialog(QDialog):
             "keyword": "查找文件名、路径、备注和用户标签中的文字。", "semantic": "按画面内容匹配；需要本地语义索引。",
             "color": "匹配整张图片的颜色倾向，不指定某个物体的颜色。", "similar": "先在图片墙中选中一张已索引图片。",
             "ai_scene": "匹配已生成的 AI 场景标签；没有该标签的图片不命中。", "ai_character": "匹配已生成的 AI 角色标签；没有该标签的图片不命中。",
+            "annotation": "查找在预览窗口里保存了画笔标记的图片。隐藏标记仍会命中；清空最后一笔后不再命中。",
         }.get(kind, "确定后自动更新图片墙。"))
         if kind == "color":
             self._update_color()

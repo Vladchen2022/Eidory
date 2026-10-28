@@ -77,6 +77,18 @@ def rethreshold_result(result: SearchChainResult, plan: FilterPlan) -> SearchCha
                    excluded_image_ids=frozenset(excluded_ids), filter_matches=raw_matches, evaluated_plan=plan)
 
 
+def refresh_annotation_matches(result: SearchChainResult, annotated_ids: set[int]) -> SearchChainResult:
+    """Refresh ink membership against the full cached scope without rerunning AI searches."""
+    plan = result.evaluated_plan
+    if plan is None or result.ranked_scope_images is None:
+        raise ValueError("Annotation refresh requires a complete evaluated scope")
+    raw = dict(result.filter_matches)
+    for condition in (*plan.positive_filters, *plan.negative_filters):
+        if condition.kind == "annotation":
+            raw[condition] = tuple(im for im in result.ranked_scope_images if im.id in annotated_ids)
+    return rethreshold_result(replace(result, filter_matches=raw), plan)
+
+
 class FilterEngine:
     """Pure rule orchestration over a stable scope, with no Qt or UI state."""
 
@@ -132,6 +144,9 @@ class FilterEngine:
                 elif condition.kind == "ai_vision":
                     field, _, value = str(condition.value).partition(":")
                     ids = self.store.image_ids_matching_ai_vision(field, value)
+                    found = [im for im in base if im.id in ids]
+                elif condition.kind == "annotation":
+                    ids = self.store.image_ids_with_preview_annotations() if condition.value == "present" else set()
                     found = [im for im in base if im.id in ids]
                 else:
                     found = [im for im in base if self._matches_metadata(im, condition)]

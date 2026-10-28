@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QMenu, QMessageBox, QVBoxLayout
 
 from eidory.core.search_filters import FilterGroup, FilterPlan, SearchFilter, SCORED_FILTER_KINDS
-from eidory.core.filter_engine import rethreshold_result, same_filter_criteria
+from eidory.core.filter_engine import refresh_annotation_matches, rethreshold_result, same_filter_criteria
 from eidory.ui.filter_panel import FilterPanel
 from eidory.ui.theme_colors import set_theme_rich_text
 from eidory.ui.justified_image_grid import JustifiedImageGridView
@@ -57,6 +57,46 @@ class FilterWorkflow(QObject):
         self._strength_idle_timer.setSingleShot(True)
         self._strength_idle_timer.setInterval(350)
         self._strength_idle_timer.timeout.connect(self._finish_idle_strength)
+        self._annotation_dirty = False
+        self._annotation_timer = QTimer(self)
+        self._annotation_timer.setSingleShot(True)
+        self._annotation_timer.setInterval(80)
+        self._annotation_timer.timeout.connect(self._refresh_annotation_results)
+
+    def annotation_membership_changed(self, _image_id):
+        plan = self.plan()
+        if any(f.kind == "annotation" for f in (*plan.positive_filters, *plan.negative_filters)):
+            self._annotation_dirty = True
+            self._annotation_timer.start()
+
+    def refresh_annotations_in_result(self, result):
+        if not self._annotation_dirty:
+            return result
+        plan = result.evaluated_plan
+        if plan is not None and result.ranked_scope_images is not None:
+            if any(f.kind == "annotation" for f in (*plan.positive_filters, *plan.negative_filters)):
+                result = refresh_annotation_matches(result, self.window.store.image_ids_with_preview_annotations())
+            self._annotation_dirty = False
+        return result
+
+    def _refresh_annotation_results(self):
+        w = self.window
+        if w is None or w._closing or not self._annotation_dirty:
+            return
+        plan = self.plan()
+        if not any(f.kind == "annotation" for f in (*plan.positive_filters, *plan.negative_filters)):
+            self._annotation_dirty = False
+            return
+        if not w.search_button.isEnabled() or self.panel.error:
+            # The pending result is refreshed before being displayed, including
+            # annotation changes made while an expensive search was running.
+            return
+        result = w.current_chain_result
+        if (w.current_result_mode == "search_chain" and result.evaluated_plan == plan
+                and result.ranked_scope_images is not None):
+            w._handle_search_chain_done(filters=plan.positive_filters, result=result)
+        else:
+            w._execute_search_chain(operation_mode="recompute")
 
     @property
     def window(self):

@@ -274,6 +274,8 @@ class AnnotationViewMixin:
 
 
 class AnnotationControls(QWidget):
+    membershipChanged = Signal(int)
+
     def __init__(self, view, store, parent=None):
         super().__init__(parent)
         self.view = view
@@ -406,10 +408,13 @@ class AnnotationControls(QWidget):
             if (stat.st_size, stat.st_mtime_ns) != self.signature:
                 raise ValueError("原图已在外部改变，未覆盖标记")
             self.store.save(self.image.id, self.view.annotations, self.signature, expected=self.saved_strokes)
+            membership_changed = bool(self.saved_strokes) != bool(self.view.annotations)
             self.saved_strokes = self.view.annotations
             self.dirty = False
             self.error = ""
             self.status.hide()
+            if membership_changed:
+                self.membershipChanged.emit(self.image.id)
             return True
         except Exception as exc:
             self.error = str(exc)
@@ -438,6 +443,8 @@ class AnnotationControls(QWidget):
                     return
                 try:
                     self.store.save(self.image.id, (), self.signature, expected=self.saved_strokes)
+                    if self.saved_strokes:
+                        self.membershipChanged.emit(self.image.id)
                 except Exception as exc:
                     self.status.setToolTip(str(exc))
                     return

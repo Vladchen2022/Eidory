@@ -3313,6 +3313,11 @@ class MetadataStore:
                     tags_by_image_id.setdefault(int(row["image_id"]), []).append(str(row["tag_name"]))
         return tags_by_image_id
 
+    def image_ids_with_preview_annotations(self) -> set[int]:
+        # Empty documents are deleted by AnnotationStore; no image/JSON decoding is needed.
+        with self.connect(readonly=True) as conn:
+            return {int(row[0]) for row in conn.execute("SELECT image_id FROM image_preview_annotations")}
+
     def tag_counts_for_images(self, image_ids: Sequence[int]) -> dict[str, int]:
         clean_ids = self._clean_ids(image_ids)
         if not clean_ids:

@@ -7135,6 +7135,7 @@ class MainWindow(QMainWindow):
         filters: tuple[SearchFilter, ...],
         result: SearchChainResult,
     ) -> None:
+        result = self.filter_workflow.refresh_annotations_in_result(result)
         self.filter_panel.error = ""
         self.current_chain_result = result
         self.current_chain_images = list(result.images)
@@ -9137,6 +9138,7 @@ class MainWindow(QMainWindow):
         dialog.upscaleRequested.connect(self.image_upscaler.open)
         dialog.collectRequested.connect(lambda image, preview=dialog: self._collect_from_preview(preview, image))
         dialog.favoriteChanged.connect(self._handle_preview_favorite_changed)
+        dialog.annotationMembershipChanged.connect(self.filter_workflow.annotation_membership_changed)
         dialog.feedbackSaved.connect(self._handle_preview_feedback_saved)
         dialog.indexRemoved.connect(self._handle_preview_index_removed)
         dialog.setModal(False)

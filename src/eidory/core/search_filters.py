@@ -102,6 +102,7 @@ VALID_FILTER_KINDS = {
     "ai_vision",
     "collection",
     "status",
+    "annotation",
 }
 SCORED_FILTER_KINDS = {"semantic", "similar", "color"}
 
@@ -136,6 +137,8 @@ def search_filter_from_payload(payload: object) -> SearchFilter | None:
         rgb = _rgb_from_payload(value)
         return SearchFilter("color", rgb, score_threshold) if rgb is not None else None
     if not isinstance(value, str):
+        return None
+    if kind == "annotation" and value != "present":
         return None
     return SearchFilter(str(kind), value, score_threshold if kind in SCORED_FILTER_KINDS else None)
 
@@ -205,6 +208,8 @@ def filter_label(
         return f"类型：{file_type_filter_label(str(search_filter.value))}"
     if search_filter.kind == "status":
         return "状态：" + {"favorite": "收藏", "unindexed": "未索引", "missing": "源文件丢失", "available": "文件可用"}.get(str(search_filter.value), str(search_filter.value))
+    if search_filter.kind == "annotation":
+        return "标记：含有标记"
     if search_filter.kind == "orientation":
         return f"方向：{orientation_filter_label(str(search_filter.value))}"
     if search_filter.kind == "size":

@@ -1870,6 +1870,11 @@ class MainWindow(QMainWindow):
         if self._closing:
             event.ignore()
             return
+        # Resolve unsaved preview ink before stopping workers or closing child windows.
+        for preview in list(getattr(self, "_preview_dialogs", ())):
+            if not preview.annotation_controls.flush(interactive=True):
+                event.ignore()
+                return
         self._closing = True
         if hasattr(self, 'reference_generation'):
             self.reference_generation.close()
@@ -4055,7 +4060,8 @@ class MainWindow(QMainWindow):
                 prepare_database(source_path, restore_temp_path)
                 # Leave old IDs while they still refer to the old database.
                 for preview in list(self._preview_dialogs):
-                    preview.close()
+                    if not preview.close():
+                        raise ValueError("预览标记尚未保存，数据库恢复已取消")
                 for controller in (self.reference_generation, self.image_upscaler):
                     if controller.panel:
                         panel = controller.panel

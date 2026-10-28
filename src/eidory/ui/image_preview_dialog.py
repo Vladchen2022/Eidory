@@ -64,9 +64,11 @@ from eidory.core.media_types import is_supported_video
 from eidory.core.metadata_store import MetadataStore
 from eidory.models import ImageItem
 from eidory.ui.art_analysis_widget import ArtAnalysisWidget
+from eidory.ui.preview_annotations import AnnotationControls, AnnotationViewMixin
+from eidory.ui.wrapping_layout import WrappingLayout
 
 
-PREVIEW_ICON_BUTTON_SIZE = QSize(32, 26)
+PREVIEW_ICON_BUTTON_SIZE = QSize(36, 32)
 PREVIEW_ICON_SIZE = QSize(18, 18)
 INLINE_SOURCE_PREVIEW_MAX_BYTES = 512 * 1024
 SOURCE_PREVIEW_REFINE_DELAY_MS = 320
@@ -354,6 +356,7 @@ def _configure_preview_icon_button(button: QPushButton, icon_name: str, name: st
     button.setIcon(_preview_transform_icon(icon_name))
     button.setIconSize(PREVIEW_ICON_SIZE)
     button.setFixedSize(PREVIEW_ICON_BUTTON_SIZE)
+    button.setStyleSheet("QPushButton { min-height: 30px; max-height: 30px; padding: 0; }")
     button.setToolTip(tooltip)
     button.setAccessibleName(name)
     button.setAccessibleDescription(tooltip)
@@ -456,9 +459,11 @@ class PreviewNavigator(QWidget):
         )
 
 
-class PreviewImageView(QGraphicsView):
+class PreviewImageView(AnnotationViewMixin, QGraphicsView):
     zoomChanged = Signal(float, bool)
     doubleClicked = Signal()
+    annotationsChanged = Signal()
+    annotationHistoryChanged = Signal()
 
     def refresh_theme(self) -> None:
         self.setBackgroundBrush(theme_color("canvas"))
@@ -473,6 +478,7 @@ class PreviewImageView(QGraphicsView):
         self._scene.addItem(self._pixmap_item)
         self._scene.addItem(self._message_item)
         self.setScene(self._scene)
+        self.init_annotations()
 
         self._fit_to_window = True
         self._zoom_factor = 1.0
@@ -487,7 +493,7 @@ class PreviewImageView(QGraphicsView):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setBackgroundBrush(theme_color("canvas"))
         set_theme_style(self, "background:@canvas@;color:@text@;")
-        self.setMinimumHeight(420)
+        self.setMinimumHeight(240)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         # Keep Qt's implicit mouse anchor out of redraws and scrollbar updates.
         # Wheel zoom anchors explicitly; replacing a preview keeps its center.
@@ -567,6 +573,7 @@ class PreviewImageView(QGraphicsView):
         self._source_height = max(1, pixmap.height())
         self._original_width = max(1, int(original_width or pixmap.width()))
         self._original_height = max(1, int(original_height or pixmap.height()))
+        self.sync_annotation_geometry()
         self._clear_navigator_thumb()
         self._scene.setSceneRect(QRectF(0, 0, self._source_width, self._source_height))
         if fit_to_window:
@@ -667,10 +674,14 @@ class PreviewImageView(QGraphicsView):
             self._schedule_navigator_update()
 
     def wheelEvent(self, event) -> None:
+        self.finish_annotation_gesture()
         self.zoom_by(event.angleDelta().y(), anchor=event.position().toPoint())
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if self.annotation_editing() and not self._ink_space:
+            self.mousePressEvent(event)
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self.doubleClicked.emit()
             event.accept()
@@ -692,6 +703,11 @@ class PreviewImageView(QGraphicsView):
         self.viewport().update()
 
     def _update_drag_mode(self) -> None:
+        if self.annotation_editing() and not self._ink_space:
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+            self._schedule_navigator_update()
+            return
         can_pan = self.can_pan()
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag if can_pan else QGraphicsView.DragMode.NoDrag)
         self.viewport().setCursor(Qt.CursorShape.OpenHandCursor if can_pan else Qt.CursorShape.ArrowCursor)
@@ -1432,6 +1448,8 @@ class ImagePreviewDialog(QDialog):
             kind = button.property("eidoryPreviewIcon")
             if kind:
                 button.setIcon(_preview_transform_icon(kind))
+        if hasattr(self, "saturation_value_label"):
+            self.saturation_value_label.setFixedWidth(self.saturation_value_label.fontMetrics().horizontalAdvance("800%")+10)
 
     def __init__(
         self,
@@ -1583,6 +1601,7 @@ class ImagePreviewDialog(QDialog):
         self.image_view.viewport().customContextMenuRequested.connect(self._show_image_context_menu)
         self.image_view.doubleClicked.connect(self._fit_image_to_window)
         self.image_view.zoomChanged.connect(self._handle_image_zoom_changed)
+        self.annotation_controls = AnnotationControls(self.image_view, store)
 
         self.video_widget: QVideoWidget | None = None
         self.video_player: QMediaPlayer | None = None
@@ -1596,8 +1615,6 @@ class ImagePreviewDialog(QDialog):
         self.info_label = QLabel("-")
         self.info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-        self.previous_button = QPushButton("上一张")
-        self.next_button = QPushButton("下一张")
         self.fit_button = QPushButton("适应窗口")
         self.actual_size_button = QPushButton("100%")
         self.collect_button = QPushButton('收集到「' + self.collect_title + '」 (Enter)')
@@ -1627,13 +1644,12 @@ class ImagePreviewDialog(QDialog):
         self.saturation_slider = QSlider(Qt.Orientation.Horizontal)
         self.saturation_slider.setRange(0, 200)
         self.saturation_slider.setValue(PREVIEW_SATURATION_DEFAULT)
-        self.saturation_slider.setFixedWidth(170)
+        self.saturation_slider.setFixedSize(130, 32)
         self.saturation_slider.setToolTip("只调整预览显示饱和度，不保存到图库源图")
         self.saturation_value_label = QLabel(self._saturation_value_text(PREVIEW_SATURATION_DEFAULT))
-        self.saturation_value_label.setFixedWidth(44)
+        self.saturation_value_label.setFixedWidth(self.saturation_value_label.fontMetrics().horizontalAdvance("800%")+10)
         self.saturation_value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.saturation_reset_button = QPushButton("复位")
-        self.saturation_reset_button.setFixedWidth(48)
         self.saturation_reset_button.setToolTip("把饱和度恢复到默认 100%")
         self.video_play_pause_button = QPushButton("播放")
         self.video_position_slider = QSlider(Qt.Orientation.Horizontal)
@@ -1670,8 +1686,6 @@ class ImagePreviewDialog(QDialog):
             self.feedback_group.addButton(button)
 
         nav_buttons = [
-            self.previous_button,
-            self.next_button,
             self.fit_button,
             self.actual_size_button,
             self.grayscale_button,
@@ -1699,28 +1713,36 @@ class ImagePreviewDialog(QDialog):
         video_controls.addWidget(self.video_position_slider, 1)
         video_controls.addWidget(self.video_time_label)
 
-        controls = QHBoxLayout()
-        controls.addWidget(self.previous_button)
-        controls.addWidget(self.next_button)
+        controls = WrappingLayout()
         controls.addWidget(self.fit_button)
         controls.addWidget(self.actual_size_button)
         controls.addWidget(self.upscale_button)
         controls.addWidget(self.collect_button)
         controls.addWidget(self.grayscale_button)
         controls.addWidget(self.mirror_button)
-        controls.addSpacing(8)
-        controls.addWidget(self.saturation_label)
-        controls.addWidget(self.saturation_slider)
-        controls.addWidget(self.saturation_value_label)
-        controls.addWidget(self.saturation_reset_button)
-        controls.addSpacing(12)
+        saturation_widget = QWidget()
+        saturation_row = QHBoxLayout(saturation_widget)
+        saturation_row.setContentsMargins(4, 0, 4, 0)
+        saturation_row.setSpacing(8)
+        for widget in (self.saturation_label, self.saturation_slider, self.saturation_value_label,
+                       self.saturation_reset_button):
+            saturation_row.addWidget(widget, 0, Qt.AlignmentFlag.AlignVCenter)
+        controls.addWidget(saturation_widget)
         controls.addWidget(self.favorite_checkbox)
-        controls.addSpacing(12)
-        controls.addStretch(1)
         controls.addWidget(self.compare_toggle_button)
         controls.addWidget(self.save_render_button)
         controls.addWidget(self.copy_render_button)
         controls.addWidget(self.advanced_toggle_button)
+        controls.addWidget(self.annotation_controls.status)
+
+        # Local metrics override theme padding, keeping icon and text controls aligned.
+        for button in [*nav_buttons, self.upscale_button, self.collect_button, self.saturation_reset_button,
+                       *self.annotation_controls.findChildren(QPushButton)]:
+            button.setAttribute(Qt.WidgetAttribute.WA_LayoutUsesWidgetRect, True)
+            button.setFixedHeight(32)
+            button.setAutoDefault(False)
+            if not button.property("eidoryPreviewIcon"):
+                button.setStyleSheet("QPushButton { min-height: 30px; max-height: 30px; padding: 0 8px; }")
 
         layout = QVBoxLayout(self)
         preview_row = QHBoxLayout()
@@ -1733,9 +1755,8 @@ class ImagePreviewDialog(QDialog):
         layout.addWidget(self.video_controls_widget)
         layout.addWidget(self.info_label)
         layout.addLayout(controls)
+        layout.addWidget(self.annotation_controls)
 
-        self.previous_button.clicked.connect(lambda: self._move(-1))
-        self.next_button.clicked.connect(lambda: self._move(1))
         self.fit_button.clicked.connect(self._fit_image_to_window)
         self.actual_size_button.clicked.connect(self._actual_size_image)
         self.grayscale_button.toggled.connect(self._set_grayscale_preview)
@@ -1766,6 +1787,9 @@ class ImagePreviewDialog(QDialog):
         self._refresh()
 
     def closeEvent(self, event) -> None:
+        if not self.annotation_controls.flush(interactive=True):
+            event.ignore()
+            return
         self._linetop_render_timer.stop()
         self._linetop_overlay_render_timer.stop()
         self._linetop_render_pending_token = None
@@ -1826,10 +1850,20 @@ class ImagePreviewDialog(QDialog):
         self._render_current_image(use_thumbnail_first=True)
 
     def eventFilter(self, watched, event) -> bool:
+        if event.type() in {QEvent.Type.WindowDeactivate, QEvent.Type.ApplicationDeactivate}:
+            self.image_view.set_annotation_space(False)
+        if (event.type() == QEvent.Type.KeyRelease and isinstance(event, QKeyEvent)
+                and event.key() == Qt.Key.Key_Space and self._event_belongs_to_preview(watched)
+                and self.image_view._ink_space):
+            if not event.isAutoRepeat():
+                self.image_view.set_annotation_space(False)
+            event.accept()
+            return True
         if (
             self._is_preview_surface(watched)
             and event.type() == QEvent.Type.MouseButtonDblClick
             and event.button() == Qt.MouseButton.LeftButton
+            and not self.image_view.annotation_editing()
         ):
             image = self.current_image()
             if image is not None and not is_supported_video(image.file_path):
@@ -1847,7 +1881,11 @@ class ImagePreviewDialog(QDialog):
                     return True
                 if event.key() == Qt.Key.Key_Space:
                     if event.type() == QEvent.Type.KeyPress:
-                        self._handle_space_pressed()
+                        if self.image_view.annotation_editing():
+                            if not event.isAutoRepeat():
+                                self.image_view.set_annotation_space(True)
+                        else:
+                            self._handle_space_pressed()
                     event.accept()
                     return True
                 if event.key() == Qt.Key.Key_Tab:
@@ -1886,6 +1924,8 @@ class ImagePreviewDialog(QDialog):
         next_index = self.index + delta
         if next_index < 0 or next_index >= len(self.images):
             return
+        if not self.annotation_controls.flush(interactive=True):
+            return
         self.index = next_index
         self.fit_to_window = True
         self.zoom_factor = 1.0
@@ -1898,6 +1938,8 @@ class ImagePreviewDialog(QDialog):
         self._art_analysis_view_pending_token = None
         self._art_analysis_view_queued_request = None
         image = self.current_image()
+        if not self.annotation_controls.load_image(image, enabled=bool(image and not is_supported_video(image.file_path))):
+            return
         self.upscale_button.setEnabled(bool(image and not image.is_missing and not is_supported_video(image.file_path)))
         if image is None:
             self.info_label.setText("-")
@@ -1921,8 +1963,6 @@ class ImagePreviewDialog(QDialog):
             self._stop_video()
             return
 
-        self.previous_button.setEnabled(self.index > 0)
-        self.next_button.setEnabled(self.index < len(self.images) - 1)
         self.favorite_checkbox.blockSignals(True)
         self.favorite_checkbox.setChecked(image.is_favorite)
         self.favorite_checkbox.blockSignals(False)
@@ -3553,7 +3593,10 @@ class ImagePreviewDialog(QDialog):
                 self._linetop_overlay_render_timer.start()
 
     def _set_mirrored_preview(self, checked: bool) -> None:
+        self.image_view.finish_annotation_gesture()
         self.mirrored_preview = checked
+        self.image_view._ink_mirrored = checked
+        self.image_view.sync_annotation_geometry()
         image = self.current_image()
         if image is not None and not is_supported_video(image.file_path):
             self._render_current_image(use_thumbnail_first=self._preview_base_pixmap.isNull())
@@ -3985,6 +4028,10 @@ class ImagePreviewDialog(QDialog):
         if self.collect_title:
             shortcuts.append((QKeySequence(Qt.Key.Key_Return), lambda: self.collect_button.click() if self.collect_button.isEnabled() else None))
             shortcuts.append((QKeySequence(Qt.Key.Key_Enter), lambda: self.collect_button.click() if self.collect_button.isEnabled() else None))
+        shortcuts.extend([
+            (QKeySequence(QKeySequence.StandardKey.Undo), self.annotation_controls.undo.click),
+            (QKeySequence(QKeySequence.StandardKey.Redo), self.annotation_controls.redo.click),
+        ])
         for sequence, callback in shortcuts:
             shortcut = QShortcut(sequence, self)
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
@@ -4106,6 +4153,8 @@ class ImagePreviewDialog(QDialog):
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self.annotation_controls.flush(interactive=True):
             return
         thumbnail_paths = self.store.remove_images_from_library([image.id])
         self._delete_thumbnail_files(thumbnail_paths)

@@ -266,6 +266,8 @@ class ImageReplacement:
         record = dict(id=key, image_id=image_id, source=str(source), backup=str(backup), stage=str(stage),
                       before_digest=expected_digest, after_digest=digest(candidate), state='prepared',
                       created_at=utc_now_iso(), job_id=job_id, restore_of=restore_of)
+        before_stat = backup.stat()
+        record.update(before_file_size=before_stat.st_size, before_modified_time_ns=before_stat.st_mtime_ns)
         try:
             shutil.copyfile(candidate, stage)
             shutil.copymode(source, stage)
@@ -308,6 +310,11 @@ class ImageReplacement:
                      (stat.st_size, record['width'], record['height'], stat.st_mtime_ns,
                       timestamp_ns_to_iso(stat.st_mtime_ns), record['image_id']))
         conn.execute('DELETE FROM image_hashes WHERE image_id=?', (record['image_id'],))
+        # SeedVR2 preserves framing. Relative ink geometry survives replacement/restore.
+        conn.execute('''UPDATE image_preview_annotations SET file_size=?,modified_time_ns=? WHERE image_id=?
+                        AND file_size=? AND modified_time_ns=?''',
+                     (stat.st_size, stat.st_mtime_ns, record['image_id'],
+                      record.get('before_file_size'), record.get('before_modified_time_ns')))
         # Semantic vectors, AI/user tags, notes, links and board layouts deliberately untouched.
         record['state'] = 'restored' if record['restore_of'] else 'applied'
         self._save(record, conn)

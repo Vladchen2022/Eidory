@@ -3545,7 +3545,7 @@ class MetadataStore:
                 ),
                 **{table: rows(conn, f"SELECT * FROM {table} WHERE image_id IN ({placeholders})", clean_ids)
                    for table in ("creative_node_images", "creative_reference_decisions",
-                                 "creative_reference_notes", "ai_vision_tags", "image_hashes")},
+                                 "creative_reference_notes", "ai_vision_tags", "image_hashes", "image_preview_annotations")},
             }
 
     def restore_images_snapshot(
@@ -3608,7 +3608,7 @@ class MetadataStore:
             insert_rows(conn, "image_collections", table_rows("image_collections"))
             insert_rows(conn, "search_feedback", table_rows("search_feedback"))
             insert_rows(conn, "temporary_project_images", table_rows("temporary_project_images"))
-            for table in ("creative_node_images", "creative_reference_decisions", "creative_reference_notes", "ai_vision_tags", "image_hashes"):
+            for table in ("creative_node_images", "creative_reference_decisions", "creative_reference_notes", "ai_vision_tags", "image_hashes", "image_preview_annotations"):
                 insert_rows(conn, table, table_rows(table))
             self._delete_unused_tags(conn)
             placeholders = ",".join("?" for _ in clean_ids)

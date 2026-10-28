@@ -77,6 +77,28 @@ def test_replace_scan_restore_preserves_every_annotation(upscale):
     assert not replacement.latest(original.id)
 
 
+def test_upscale_and_restore_rebind_preview_ink_without_changing_geometry(upscale):
+    from eidory.core.preview_annotations import AnnotationStore, Stroke
+    repo, replacement, original, job = upscale
+    ink = (Stroke(((.1, .2), (.8, .9)), .01, '#E53935'),)
+    notes = AnnotationStore(repo.store.database_path)
+    notes.save(original.id, ink, (original.file_size, original.modified_time_ns))
+    enlarged = replacement.replace(job)
+    assert notes.load(original.id) == (ink, (enlarged.file_size, enlarged.modified_time_ns))
+    restored = replacement.restore(original.id)
+    assert notes.load(original.id) == (ink, (restored.file_size, restored.modified_time_ns))
+
+
+def test_upscale_does_not_reactivate_ink_bound_to_different_source(upscale):
+    from eidory.core.preview_annotations import AnnotationStore, Stroke
+    repo, replacement, original, job = upscale
+    notes = AnnotationStore(repo.store.database_path)
+    ink = (Stroke(((.1, .2),), .01, '#E53935'),)
+    notes.save(original.id, ink, (123, 456))
+    replacement.replace(job)
+    assert notes.load(original.id) == (ink, (123, 456))
+
+
 def test_scan_observation_taken_before_replace_cannot_erase_metadata(upscale):
     repo, replacement, original, job = upscale
     annotate(repo.store, original)

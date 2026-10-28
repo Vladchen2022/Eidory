@@ -2332,6 +2332,39 @@ class MetadataStore:
             ).fetchall()
             return [self._image_from_row(row) for row in rows]
 
+    def image_position_in_collection(
+        self, image_id: int, collection_id: int | None, *,
+        sort_key: str = "default", sort_desc: bool = True,
+    ) -> int | None:
+        """Find a navigation target without decoding every image record in the folder.
+
+        None denotes the software's uncategorized folder.
+        """
+        clauses = ["images.is_missing = 0"]
+        params: list[object] = []
+        if collection_id is None:
+            clauses.append("NOT EXISTS (SELECT 1 FROM image_collections ic WHERE ic.image_id = images.id)")
+        else:
+            ids = self.collection_descendant_ids(collection_id)
+            if not ids:
+                return None
+            placeholders = ",".join("?" for _ in ids)
+            clauses.append(
+                "EXISTS (SELECT 1 FROM image_collections ic "
+                f"WHERE ic.image_id = images.id AND ic.collection_id IN ({placeholders}))"
+            )
+            params.extend(ids)
+        with self.connect(readonly=True) as conn:
+            row = conn.execute(
+                f"""SELECT position FROM (
+                    SELECT images.id,
+                           ROW_NUMBER() OVER (ORDER BY {self._image_order_by(sort_key, sort_desc)}) - 1 AS position
+                    FROM images WHERE {' AND '.join(clauses)}
+                ) WHERE id = ?""",
+                [*params, image_id],
+            ).fetchone()
+        return int(row["position"]) if row is not None else None
+
     def image_ids_matching_tags(
         self,
         tag_ids: Sequence[int],

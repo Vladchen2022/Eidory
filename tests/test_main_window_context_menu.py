@@ -4394,7 +4394,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             )
             self.assertEqual(
                 self._submenu_texts(menu, "文件与导出"),
-                ["打开源文件", "在 Finder 中显示", "复制路径", "导出选中图片", "删除/移除图片..."],
+                ["打开源文件", "进入此图片所在的文件夹", "在 Finder 中显示", "复制路径", "导出选中图片", "删除/移除图片..."],
             )
             self.assertEqual(
                 self._submenu_texts(menu, "收藏与标签"),

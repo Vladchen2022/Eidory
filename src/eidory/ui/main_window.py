@@ -7961,7 +7961,59 @@ class MainWindow(QMainWindow):
                 entries.append((f"{prefix}：{path}", collection.id))
         return entries
 
-    def _reload_images(self) -> None:
+    def _enter_image_collection(self, image: ImageItem | None) -> None:
+        if image is None:
+            return
+        chains = self.store.collection_chains_for_image(image.id)
+        # Ancestor memberships lead to the same branch; offer its deepest folder.
+        ancestor_ids = {folder.id for chain in chains for folder in chain[:-1]}
+        destinations = {
+            chain[-1].id: " / ".join(folder.name for folder in chain)
+            for chain in chains if chain[-1].id not in ancestor_ids
+        }
+        collection_id = next(iter(destinations), None)
+        if len(destinations) > 1:
+            labels = list(destinations.values())
+            label, accepted = QInputDialog.getItem(
+                self, "进入图片所在的文件夹", "这张图片属于多个文件夹，请选择：",
+                labels, 0, False,
+            )
+            if not accepted:
+                return
+            collection_id = next(key for key, value in destinations.items() if value == label)
+
+        def find_item(parent: QTreeWidgetItem) -> QTreeWidgetItem | None:
+            if (
+                parent.data(0, Qt.ItemDataRole.UserRole) == collection_id
+                and (collection_id is not None or parent.data(0, COLLECTION_VIRTUAL_FILTER_ROLE) == "uncategorized")
+            ):
+                return parent
+            for index in range(parent.childCount()):
+                if (found := find_item(parent.child(index))) is not None:
+                    return found
+            return None
+
+        item = find_item(self.collection_tree.invisibleRootItem())
+        if item is None:
+            self.statusBar().showMessage("该图片所属的文件夹已不存在，请刷新图库后重试")
+            return
+        self._save_pending_note()
+        self.filter_workflow.remember()
+        self.filter_workflow.reset_library_scope()
+        previous = self.collection_tree.blockSignals(True)
+        self.collection_tree.setCurrentItem(item)
+        self.collection_tree.blockSignals(previous)
+        self.current_virtual_filter = "uncategorized" if collection_id is None else None
+        self._expand_folder_tree_parents(item)
+        self.collection_tree.scrollToItem(item)
+        self.search_input.clear()
+        self._reload_images(reveal_image_id=image.id)
+        self.grid_view.select_image_id(image.id)
+        self.grid_view.setFocus()
+        self.workspace_chrome.navigation_tabs.setCurrentIndex(0)
+        self.workspace_chrome.refresh()
+
+    def _reload_images(self, *, reveal_image_id: int | None = None) -> None:
         self.semantic_search_revision += 1
         if hasattr(self, "filter_workflow"):
             self.filter_workflow.follow_sidebar()
@@ -8009,6 +8061,14 @@ class MainWindow(QMainWindow):
         self.current_duplicate_badges = {}
         self._show_gallery_view()
         self.load_more_button.setEnabled(True)
+        initial_limit = self.page_size
+        if reveal_image_id is not None:
+            position = self.store.image_position_in_collection(
+                reveal_image_id, self._selected_collection_id(),
+                sort_key=self._database_sort_key(), sort_desc=self.current_sort_desc,
+            )
+            if position is not None:
+                initial_limit = max(initial_limit, (position // self.page_size + 1) * self.page_size)
         images = self.store.list_images(
             status_filter=self._selected_status_filter(),
             tag_ids=[],
@@ -8016,13 +8076,13 @@ class MainWindow(QMainWindow):
             folder_path_prefix=self._selected_folder_path_prefix(),
             collection_id=self._selected_collection_id(),
             virtual_filter=self._selected_virtual_filter(),
-            limit=self.page_size,
+            limit=initial_limit,
             offset=0,
             sort_key=self._database_sort_key(),
             sort_desc=self.current_sort_desc,
         )
         self.current_offset = len(images)
-        self.load_more_button.setEnabled(len(images) >= self.page_size)
+        self.load_more_button.setEnabled(len(images) >= initial_limit)
         self.grid_view.set_images(images)
         self._set_result_status(f"全部图库：已加载 {len(images)} 张")
         self._update_search_diagnostics([])
@@ -9358,6 +9418,8 @@ class MainWindow(QMainWindow):
             self._open_selected_original()
         elif command == "reveal":
             self._reveal_selected_in_finder()
+        elif command == "enter_collection":
+            self._enter_image_collection(context_image)
         elif command == "copy_path":
             self._copy_selected_path()
         elif command == "favorite":
@@ -9436,6 +9498,7 @@ class MainWindow(QMainWindow):
 
         file_menu = menu.addMenu("文件与导出")
         add_action(file_menu, "open", "打开源文件")
+        add_action(file_menu, "enter_collection", "进入此图片所在的文件夹")
         add_action(file_menu, "reveal", "在 Finder 中显示")
         add_action(file_menu, "copy_path", "复制路径")
         file_menu.addSeparator()
@@ -9527,7 +9590,7 @@ class MainWindow(QMainWindow):
         has_selection = bool(selected_images)
         has_visible_results = bool(self.grid_view.images())
         has_result_context = self._has_result_context()
-        for key in ["open", "reveal", "copy_path"]:
+        for key in ["open", "enter_collection", "reveal", "copy_path"]:
             actions[key].setEnabled(has_single_context)
         for key in [
             "export_selection",

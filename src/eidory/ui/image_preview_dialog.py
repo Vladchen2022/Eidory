@@ -52,11 +52,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from eidory.core.art_analysis import (
+    ART_ANALYSIS_VERSION,
+    ArtAnalysisResult,
+    analyze_image_art,
+    render_art_analysis_view,
+)
 from eidory.core.image_loader import open_local_image
 from eidory.core.linetop_processor import LineTopSettings, render_linetop_image, render_linetop_overlay_image
 from eidory.core.media_types import is_supported_video
 from eidory.core.metadata_store import MetadataStore
 from eidory.models import ImageItem
+from eidory.ui.art_analysis_widget import ArtAnalysisWidget
 
 
 PREVIEW_ICON_BUTTON_SIZE = QSize(32, 26)
@@ -66,6 +73,8 @@ SOURCE_PREVIEW_REFINE_DELAY_MS = 320
 LINETOP_PANEL_WIDTH = 330
 LINETOP_RENDER_CACHE_LIMIT = 12
 LINETOP_OVERLAY_RENDER_CACHE_LIMIT = 4
+ART_ANALYSIS_CACHE_LIMIT = 24
+ART_ANALYSIS_VIEW_CACHE_LIMIT = 6
 LINETOP_OVERLAY_MAX_LONG_SIDE = 2400
 PREVIEW_SATURATION_DEFAULT = 100
 PREVIEW_SATURATION_MAX_FACTOR = 8.0
@@ -150,6 +159,84 @@ class _LineTopRenderTask(QRunnable):
                 render_linetop_overlay_image(source, self.settings)
                 if self.overlay
                 else render_linetop_image(source, self.settings)
+            )
+            qimage = _qimage_from_pillow(rendered)
+            error = ""
+        except Exception as exc:
+            qimage = QImage()
+            error = str(exc)
+        try:
+            self.signals.loaded.emit(self.token, qimage, error)
+        except RuntimeError:
+            return
+
+
+class _ArtAnalysisSignals(QObject):
+    loaded = Signal(object, object, str)
+
+
+class _ArtAnalysisTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        token: object,
+        image_path: str,
+        signals: _ArtAnalysisSignals,
+    ) -> None:
+        super().__init__()
+        self.token = token
+        self.image_path = image_path
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            result = analyze_image_art(self.image_path)
+            error = ""
+        except Exception as exc:
+            result = None
+            error = str(exc)
+        try:
+            self.signals.loaded.emit(self.token, result, error)
+        except RuntimeError:
+            return
+
+
+class _ArtAnalysisViewSignals(QObject):
+    loaded = Signal(object, object, str)
+
+
+class _ArtAnalysisViewTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        token: object,
+        image_path: str,
+        result: ArtAnalysisResult,
+        mode: str,
+        selected_palette_index: int,
+        max_width: int,
+        max_height: int,
+        signals: _ArtAnalysisViewSignals,
+    ) -> None:
+        super().__init__()
+        self.token = token
+        self.image_path = image_path
+        self.result = result
+        self.mode = mode
+        self.selected_palette_index = selected_palette_index
+        self.max_width = max_width
+        self.max_height = max_height
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            rendered = render_art_analysis_view(
+                self.image_path,
+                self.result,
+                mode=self.mode,
+                selected_palette_index=self.selected_palette_index,
+                max_width=self.max_width,
+                max_height=self.max_height,
             )
             qimage = _qimage_from_pillow(rendered)
             error = ""
@@ -1442,6 +1529,32 @@ class ImagePreviewDialog(QDialog):
         self._linetop_overlay_render_timer.setSingleShot(True)
         self._linetop_overlay_render_timer.setInterval(140)
         self._linetop_overlay_render_timer.timeout.connect(self._request_linetop_overlay_render_current)
+        self._art_analysis_cache: dict[tuple[object, ...], ArtAnalysisResult] = {}
+        self._art_analysis_pending_token: tuple[object, ...] | None = None
+        self._art_analysis_running_token: tuple[object, ...] | None = None
+        self._art_analysis_queued_request: tuple[tuple[object, ...], str] | None = None
+        self._art_analysis_signals = _ArtAnalysisSignals()
+        self._art_analysis_signals.loaded.connect(self._handle_art_analysis_loaded)
+        self._art_analysis_thread_pool = QThreadPool(self)
+        self._art_analysis_thread_pool.setMaxThreadCount(1)
+        self._art_analysis_view_mode = "original"
+        self._art_analysis_selected_palette = 0
+        self._art_analysis_view_cache: dict[tuple[object, ...], QPixmap] = {}
+        self._art_analysis_view_pending_token: tuple[object, ...] | None = None
+        self._art_analysis_view_running_token: tuple[object, ...] | None = None
+        self._art_analysis_view_queued_request: tuple[
+            tuple[object, ...],
+            str,
+            ArtAnalysisResult,
+            str,
+            int,
+            int,
+            int,
+        ] | None = None
+        self._art_analysis_view_signals = _ArtAnalysisViewSignals()
+        self._art_analysis_view_signals.loaded.connect(self._handle_art_analysis_view_loaded)
+        self._art_analysis_view_thread_pool = QThreadPool(self)
+        self._art_analysis_view_thread_pool.setMaxThreadCount(1)
         self._zoom_refine_timer = QTimer(self)
         self._zoom_refine_timer.setSingleShot(True)
         self._zoom_refine_timer.setInterval(90)
@@ -1659,6 +1772,10 @@ class ImagePreviewDialog(QDialog):
         self._linetop_queued_render_request = None
         self._linetop_overlay_pending_token = None
         self._linetop_overlay_queued_request = None
+        self._art_analysis_pending_token = None
+        self._art_analysis_queued_request = None
+        self._art_analysis_view_pending_token = None
+        self._art_analysis_view_queued_request = None
         if self._linetop_overlay_window is not None:
             self._detach_linetop_overlay_window()
         self._preview_source_pending_token = None
@@ -1776,6 +1893,10 @@ class ImagePreviewDialog(QDialog):
 
     def _refresh(self) -> None:
         self._preview_refine_timer.stop()
+        self._art_analysis_view_mode = "original"
+        self._art_analysis_selected_palette = 0
+        self._art_analysis_view_pending_token = None
+        self._art_analysis_view_queued_request = None
         image = self.current_image()
         self.upscale_button.setEnabled(bool(image and not image.is_missing and not is_supported_video(image.file_path)))
         if image is None:
@@ -1821,6 +1942,8 @@ class ImagePreviewDialog(QDialog):
             self.copy_render_button.setEnabled(self._linetop_preview_active(image))
             self._refresh_linetop_action_buttons(image)
             self._render_current_image(use_thumbnail_first=True)
+            if self._art_analysis_active(image):
+                self._request_art_analysis(image)
             self._preview_refine_timer.start()
             if self._linetop_overlay_window is not None:
                 self._linetop_overlay_render_timer.start()
@@ -1898,6 +2021,9 @@ class ImagePreviewDialog(QDialog):
         self.copy_render_button.setEnabled(advanced_active)
         self._refresh_linetop_action_buttons(image)
         max_width, max_height = self._render_bounds()
+        if self._art_analysis_active(image) and self._art_analysis_view_mode != "original":
+            self._request_art_analysis_view(image, max_width, max_height)
+            return
         if advanced_active and not self._linetop_show_original_compare:
             self._request_linetop_render(image, max_width, max_height, use_thumbnail_first=use_thumbnail_first)
             return
@@ -2178,22 +2304,40 @@ class ImagePreviewDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        mode_label = QLabel("显示模式")
+        page_layout = layout
+        mode_label = QLabel("功能页面")
         mode_label.setStyleSheet("font-weight:600;")
-        layout.addWidget(mode_label)
+        page_layout.addWidget(mode_label)
         mode_row = QHBoxLayout()
         mode_row.setSpacing(6)
+        self.linetop_art_analysis_button = QPushButton("美术分析")
         self.linetop_line_mode_button = QPushButton("细线稿")
         self.linetop_color_limit_mode_button = QPushButton("色阶限制")
+        self.linetop_art_analysis_button.setCheckable(True)
         self.linetop_line_mode_button.setCheckable(True)
         self.linetop_color_limit_mode_button.setCheckable(True)
         self.linetop_mode_group = QButtonGroup(self)
         self.linetop_mode_group.setExclusive(True)
+        self.linetop_mode_group.addButton(self.linetop_art_analysis_button)
         self.linetop_mode_group.addButton(self.linetop_line_mode_button)
         self.linetop_mode_group.addButton(self.linetop_color_limit_mode_button)
-        mode_row.addWidget(self.linetop_line_mode_button)
-        mode_row.addWidget(self.linetop_color_limit_mode_button)
-        layout.addLayout(mode_row)
+        mode_row.addWidget(self.linetop_art_analysis_button, 1)
+        mode_row.addWidget(self.linetop_line_mode_button, 1)
+        mode_row.addWidget(self.linetop_color_limit_mode_button, 1)
+        page_layout.addLayout(mode_row)
+
+        self.linetop_page_stack = QStackedWidget()
+        self.art_analysis_widget = ArtAnalysisWidget()
+        self.art_analysis_widget.viewRequested.connect(self._set_art_analysis_view)
+        self.linetop_processing_page = QWidget()
+        self.linetop_processing_page.setObjectName("linetopAdvancedContent")
+        processing_layout = QVBoxLayout(self.linetop_processing_page)
+        processing_layout.setContentsMargins(0, 0, 0, 0)
+        processing_layout.setSpacing(12)
+        self.linetop_page_stack.addWidget(self.art_analysis_widget)
+        self.linetop_page_stack.addWidget(self.linetop_processing_page)
+        page_layout.addWidget(self.linetop_page_stack)
+        layout = processing_layout
 
         self.linetop_color_limit_row, self.linetop_color_limit_slider, self.linetop_color_limit_value = (
             self._add_linetop_slider(
@@ -2331,7 +2475,11 @@ class ImagePreviewDialog(QDialog):
             elif isinstance(control, QCheckBox):
                 control.toggled.connect(self._queue_linetop_settings_changed)
             elif isinstance(control, QPushButton):
-                control.toggled.connect(self._queue_linetop_settings_changed)
+                control.toggled.connect(
+                    lambda checked, callback=self._queue_linetop_settings_changed: callback()
+                    if checked
+                    else None
+                )
         self.linetop_opacity_slider.valueChanged.connect(self._queue_linetop_opacity_changed)
         self.linetop_reset_button.clicked.connect(self._reset_linetop_settings)
         self.linetop_open_overlay_button.clicked.connect(self._toggle_linetop_overlay_window)
@@ -2340,6 +2488,13 @@ class ImagePreviewDialog(QDialog):
         self.linetop_overlay_adjustable_frame_checkbox.toggled.connect(self._set_linetop_overlay_adjustable_frame)
         self.linetop_overlay_frame_checkbox.toggled.connect(self._set_linetop_overlay_frame_visible)
         self._sync_linetop_controls_from_settings()
+        self.linetop_page_stack.setCurrentWidget(self.linetop_processing_page)
+        for button in (
+            self.linetop_art_analysis_button,
+            self.linetop_line_mode_button,
+            self.linetop_color_limit_mode_button,
+        ):
+            button.toggled.connect(self._handle_linetop_page_changed)
         return panel
 
     def _add_linetop_slider(
@@ -2373,7 +2528,7 @@ class ImagePreviewDialog(QDialog):
         return widget, slider, value_label
 
     def _current_linetop_settings_from_controls(self) -> LineTopSettings:
-        mode = "line" if self.linetop_line_mode_button.isChecked() else "color_limit"
+        mode = self._active_linetop_mode()
         preset = "photo" if self.linetop_photo_preset_button.isChecked() else "illustration"
         return LineTopSettings(
             mode=mode,
@@ -2389,6 +2544,13 @@ class ImagePreviewDialog(QDialog):
             smart_preset=preset,
             enhanced_line_engine=self.linetop_enhanced_line_checkbox.isChecked(),
         )
+
+    def _active_linetop_mode(self) -> str:
+        if self.linetop_line_mode_button.isChecked():
+            return "line"
+        if self.linetop_color_limit_mode_button.isChecked():
+            return "color_limit"
+        return self._linetop_settings.mode
 
     def _sync_linetop_controls_from_settings(self) -> None:
         for control in self._linetop_controls:
@@ -2417,7 +2579,7 @@ class ImagePreviewDialog(QDialog):
         self._refresh_linetop_control_visibility()
 
     def _refresh_linetop_control_visibility(self) -> None:
-        mode = "line" if self.linetop_line_mode_button.isChecked() else "color_limit"
+        mode = self._active_linetop_mode()
         for widget in self._linetop_line_only_widgets:
             widget.setVisible(mode == "line")
         for widget in self._linetop_color_only_widgets:
@@ -2426,6 +2588,42 @@ class ImagePreviewDialog(QDialog):
         label = self.linetop_brightness_row.findChild(QLabel)
         if label is not None:
             label.setText(brightness_title)
+
+    def _handle_linetop_page_changed(self, _checked: bool = True) -> None:
+        if not (
+            self.linetop_art_analysis_button.isChecked()
+            or self.linetop_line_mode_button.isChecked()
+            or self.linetop_color_limit_mode_button.isChecked()
+        ):
+            return
+        analysis_selected = self.linetop_art_analysis_button.isChecked()
+        self.linetop_page_stack.setCurrentWidget(
+            self.art_analysis_widget if analysis_selected else self.linetop_processing_page
+        )
+        if analysis_selected:
+            self._art_analysis_view_mode = "original"
+            self._art_analysis_selected_palette = 0
+            self._set_linetop_compare_original(False, rerender=False)
+            self._linetop_render_timer.stop()
+            self._linetop_render_pending_token = None
+            self._linetop_queued_render_request = None
+        else:
+            self._art_analysis_view_mode = "original"
+            self._art_analysis_view_pending_token = None
+            self._art_analysis_view_queued_request = None
+            self._linetop_settings = self._current_linetop_settings_from_controls()
+            self._refresh_linetop_control_visibility()
+        image = self.current_image()
+        processing_active = self._linetop_preview_active(image)
+        self.compare_toggle_button.setEnabled(processing_active)
+        self.save_render_button.setEnabled(processing_active)
+        self.copy_render_button.setEnabled(processing_active)
+        self._refresh_linetop_action_buttons(image)
+        if image is None or is_supported_video(image.file_path):
+            return
+        self._render_current_image(use_thumbnail_first=True)
+        if analysis_selected and not self.advanced_panel.isHidden():
+            self._request_art_analysis(image)
 
     def _queue_linetop_settings_changed(self) -> None:
         self._linetop_settings = self._current_linetop_settings_from_controls()
@@ -2461,9 +2659,297 @@ class ImagePreviewDialog(QDialog):
         image = image or self.current_image()
         return bool(
             not self.advanced_panel.isHidden()
+            and not self.linetop_art_analysis_button.isChecked()
             and image is not None
             and not is_supported_video(image.file_path)
         )
+
+    def _art_analysis_active(self, image: ImageItem | None = None) -> bool:
+        image = image or self.current_image()
+        return bool(
+            not self.advanced_panel.isHidden()
+            and self.linetop_art_analysis_button.isChecked()
+            and image is not None
+            and not is_supported_video(image.file_path)
+        )
+
+    @staticmethod
+    def _art_analysis_cache_key(image: ImageItem) -> tuple[object, ...]:
+        return (
+            image.id,
+            image.file_path,
+            image.file_size,
+            image.modified_time_ns,
+            ART_ANALYSIS_VERSION,
+        )
+
+    def _request_art_analysis(self, image: ImageItem) -> None:
+        if not self._art_analysis_active(image):
+            return
+        token = self._art_analysis_cache_key(image)
+        cached = self._art_analysis_cache.get(token)
+        if cached is not None:
+            self.art_analysis_widget.set_result(cached)
+            return
+        self.art_analysis_widget.set_loading(image.file_name)
+        self._art_analysis_pending_token = token
+        if self._art_analysis_running_token is not None:
+            if self._art_analysis_running_token != token:
+                self._art_analysis_queued_request = (token, image.file_path)
+            return
+        self._start_art_analysis_task(token, image.file_path)
+
+    def _start_art_analysis_task(self, token: tuple[object, ...], image_path: str) -> None:
+        self._art_analysis_pending_token = token
+        self._art_analysis_running_token = token
+        self._art_analysis_thread_pool.start(
+            _ArtAnalysisTask(
+                token=token,
+                image_path=image_path,
+                signals=self._art_analysis_signals,
+            )
+        )
+
+    def _start_queued_art_analysis_if_needed(self) -> None:
+        request = self._art_analysis_queued_request
+        self._art_analysis_queued_request = None
+        if request is None:
+            return
+        token, image_path = request
+        image = self.current_image()
+        if (
+            image is None
+            or not self._art_analysis_active(image)
+            or token != self._art_analysis_pending_token
+            or token != self._art_analysis_cache_key(image)
+        ):
+            return
+        cached = self._art_analysis_cache.get(token)
+        if cached is not None:
+            self._art_analysis_pending_token = None
+            self.art_analysis_widget.set_result(cached)
+            return
+        self._start_art_analysis_task(token, image_path)
+
+    def _handle_art_analysis_loaded(
+        self,
+        token: object,
+        result: ArtAnalysisResult | None,
+        error: str,
+    ) -> None:
+        if token == self._art_analysis_running_token:
+            self._art_analysis_running_token = None
+        if isinstance(token, tuple) and result is not None and not error:
+            self._art_analysis_cache[token] = result
+            while len(self._art_analysis_cache) > ART_ANALYSIS_CACHE_LIMIT:
+                oldest_key = next(iter(self._art_analysis_cache))
+                self._art_analysis_cache.pop(oldest_key, None)
+        if token != self._art_analysis_pending_token:
+            self._start_queued_art_analysis_if_needed()
+            return
+        self._art_analysis_pending_token = None
+        image = self.current_image()
+        if (
+            image is None
+            or not self._art_analysis_active(image)
+            or token != self._art_analysis_cache_key(image)
+        ):
+            self._start_queued_art_analysis_if_needed()
+            return
+        if error or result is None:
+            self.art_analysis_widget.set_error(error or "分析结果为空")
+        else:
+            self.art_analysis_widget.set_result(result)
+            if self._art_analysis_view_mode != "original":
+                max_width, max_height = self._render_bounds()
+                self._request_art_analysis_view(image, max_width, max_height)
+        self._start_queued_art_analysis_if_needed()
+
+    def _set_art_analysis_view(self, mode: str, selected_palette_index: int = -1) -> None:
+        if mode not in {
+            "original",
+            "palette",
+            "highlight",
+            "detail",
+            "lightness_highlight",
+            "saturation_highlight",
+            "temperature_highlight",
+        }:
+            return
+        if selected_palette_index >= 0:
+            self._art_analysis_selected_palette = int(selected_palette_index)
+        self._art_analysis_view_mode = mode
+        self._art_analysis_view_pending_token = None
+        self._art_analysis_view_queued_request = None
+        image = self.current_image()
+        if image is not None and self._art_analysis_active(image):
+            self._render_current_image(use_thumbnail_first=True)
+
+    def _art_analysis_view_cache_key(
+        self,
+        image: ImageItem,
+        target_width: int,
+        target_height: int,
+    ) -> tuple[object, ...]:
+        return (
+            *self._art_analysis_cache_key(image),
+            max(1, int(target_width)),
+            max(1, int(target_height)),
+            self._art_analysis_view_mode,
+            int(self._art_analysis_selected_palette),
+            self.grayscale_preview,
+            self.mirrored_preview,
+        )
+
+    def _request_art_analysis_view(
+        self,
+        image: ImageItem,
+        target_width: int,
+        target_height: int,
+    ) -> None:
+        analysis_token = self._art_analysis_cache_key(image)
+        result = self._art_analysis_cache.get(analysis_token)
+        if result is None:
+            if not self.image_view._has_pixmap:
+                self.image_view.set_message("正在准备分析视图...")
+            self._request_art_analysis(image)
+            return
+        cache_key = self._art_analysis_view_cache_key(image, target_width, target_height)
+        cached = self._art_analysis_view_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            self.image_view.set_pixmap(
+                self._display_pixmap_for_view(cached),
+                original_width=image.width,
+                original_height=image.height,
+                fit_to_window=self.fit_to_window,
+                zoom_factor=self.zoom_factor,
+            )
+            self.image_view.set_content_opacity(1.0)
+            self._update_info(image)
+            return
+        # Retain the visible image and observation point while the worker runs.
+        # Clearing the view here would reset the zoom and pan on every resize
+        # or zoom refinement of an analysis visualization.
+        if not self.image_view._has_pixmap:
+            self.image_view.set_message("正在生成分析视图...")
+        self._update_info(image)
+        if self._art_analysis_view_pending_token == cache_key:
+            return
+        request = (
+            cache_key,
+            image.file_path,
+            result,
+            self._art_analysis_view_mode,
+            self._art_analysis_selected_palette,
+            target_width,
+            target_height,
+        )
+        self._art_analysis_view_pending_token = cache_key
+        if self._art_analysis_view_running_token is not None:
+            if self._art_analysis_view_running_token != cache_key:
+                self._art_analysis_view_queued_request = request
+            return
+        self._start_art_analysis_view_task(*request)
+
+    def _start_art_analysis_view_task(
+        self,
+        token: tuple[object, ...],
+        image_path: str,
+        result: ArtAnalysisResult,
+        mode: str,
+        selected_palette_index: int,
+        target_width: int,
+        target_height: int,
+    ) -> None:
+        self._art_analysis_view_pending_token = token
+        self._art_analysis_view_running_token = token
+        self._art_analysis_view_thread_pool.start(
+            _ArtAnalysisViewTask(
+                token=token,
+                image_path=image_path,
+                result=result,
+                mode=mode,
+                selected_palette_index=selected_palette_index,
+                max_width=target_width,
+                max_height=target_height,
+                signals=self._art_analysis_view_signals,
+            )
+        )
+
+    def _start_queued_art_analysis_view_if_needed(self) -> None:
+        request = self._art_analysis_view_queued_request
+        self._art_analysis_view_queued_request = None
+        if request is None or request[0] != self._art_analysis_view_pending_token:
+            return
+        image = self.current_image()
+        if image is None or not self._art_analysis_active(image):
+            return
+        token, image_path, result, mode, selected_index, width, height = request
+        if token != self._art_analysis_view_cache_key(image, width, height):
+            return
+        self._start_art_analysis_view_task(
+            token,
+            image_path,
+            result,
+            mode,
+            selected_index,
+            width,
+            height,
+        )
+
+    def _handle_art_analysis_view_loaded(
+        self,
+        token: object,
+        qimage: QImage,
+        error: str,
+    ) -> None:
+        if token == self._art_analysis_view_running_token:
+            self._art_analysis_view_running_token = None
+        if token != self._art_analysis_view_pending_token:
+            self._start_queued_art_analysis_view_if_needed()
+            return
+        self._art_analysis_view_pending_token = None
+        image = self.current_image()
+        if (
+            image is None
+            or not self._art_analysis_active(image)
+            or self._art_analysis_view_mode == "original"
+        ):
+            self._start_queued_art_analysis_view_if_needed()
+            return
+        width, height = self._render_bounds()
+        if token != self._art_analysis_view_cache_key(image, width, height):
+            self._start_queued_art_analysis_view_if_needed()
+            return
+        if error or qimage.isNull():
+            self.image_view.set_message("无法生成分析视图")
+            self._start_queued_art_analysis_view_if_needed()
+            return
+        pixmap = QPixmap.fromImage(qimage)
+        pixmap = self._apply_preview_transforms(
+            pixmap,
+            grayscale=self.grayscale_preview,
+            mirror_horizontal=self.mirrored_preview,
+        )
+        if pixmap.isNull():
+            self.image_view.set_message("无法生成分析视图")
+            self._start_queued_art_analysis_view_if_needed()
+            return
+        if isinstance(token, tuple):
+            self._art_analysis_view_cache[token] = QPixmap(pixmap)
+            while len(self._art_analysis_view_cache) > ART_ANALYSIS_VIEW_CACHE_LIMIT:
+                oldest_key = next(iter(self._art_analysis_view_cache))
+                self._art_analysis_view_cache.pop(oldest_key, None)
+        self.image_view.set_pixmap(
+            self._display_pixmap_for_view(pixmap),
+            original_width=image.width,
+            original_height=image.height,
+            fit_to_window=self.fit_to_window,
+            zoom_factor=self.zoom_factor,
+        )
+        self.image_view.set_content_opacity(1.0)
+        self._update_info(image)
+        self._start_queued_art_analysis_view_if_needed()
 
     def _refresh_linetop_action_buttons(self, image: ImageItem | None = None) -> None:
         active = self._linetop_preview_active(image)
@@ -2525,12 +3011,17 @@ class ImagePreviewDialog(QDialog):
             self.advanced_toggle_button.blockSignals(False)
         if not visible:
             self._set_linetop_compare_original(False, rerender=False)
+            self._art_analysis_view_mode = "original"
+            self._art_analysis_view_pending_token = None
+            self._art_analysis_view_queued_request = None
         panel_is_visible = not self.advanced_panel.isHidden()
         if panel_is_visible == visible:
             self.compare_toggle_button.setEnabled(self._linetop_preview_active(image))
             self.save_render_button.setEnabled(self._linetop_preview_active(image))
             self.copy_render_button.setEnabled(self._linetop_preview_active(image))
             self._refresh_linetop_action_buttons(image)
+            if visible and image is not None and self._art_analysis_active(image):
+                self._request_art_analysis(image)
             return
         if visible:
             self._resize_for_linetop_panel_visibility(True)
@@ -2547,6 +3038,8 @@ class ImagePreviewDialog(QDialog):
         if image is None or is_supported_video(image.file_path):
             return
         self._render_current_image(use_thumbnail_first=True)
+        if visible and self._art_analysis_active(image):
+            self._request_art_analysis(image)
         self._preview_refine_timer.start()
 
     def _set_linetop_compare_original(self, checked: bool, *, rerender: bool = True) -> None:

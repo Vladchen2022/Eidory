@@ -243,6 +243,9 @@ def test_preview_single_entry_opens_source_and_closes_safely(window, app, librar
     preview.upscale_button.click()
     app.processEvents()
     panel = window.image_upscaler.panel
+    assert panel.window() is preview and not panel.isWindow()
+    assert preview.pages.currentWidget() is panel
+    assert not preview.preview_page.isVisible()
     assert panel.image_id == image.id
     assert panel.info['width'] == 120
     assert panel.start.isEnabled()
@@ -250,7 +253,171 @@ def test_preview_single_entry_opens_source_and_closes_safely(window, app, librar
     panel.close()
     app.processEvents()
     assert window.image_upscaler.panel is None
+    assert preview.pages.currentWidget() is preview.preview_page
+    assert preview.preview_page.isVisible()
     preview.close()
+
+
+def test_embedded_upscale_returns_without_changing_preview_state(window, app, library):
+    from eidory.core.preview_annotations import Stroke
+    window._open_image_preview(library[2][0])
+    preview = next(iter(window._preview_dialogs))
+    app.processEvents()
+    preview._actual_size_image()
+    preview.mirror_button.click()
+    preview.saturation_slider.setValue(125)
+    preview.annotation_controls.tool_buttons['pen'].click()
+    stroke = Stroke(((.1, .2), (.8, .9)), .01, '#E53935')
+    preview.image_view.annotations = (stroke,)
+    preview.image_view._ink_document_changed()
+    image_id = preview.current_image().id
+    preview.upscale_button.click()
+    app.processEvents()
+    panel = window.image_upscaler.panel
+    assert panel.window() is preview
+    assert not any(s.isEnabled() for s in preview._shortcuts)
+    QTest.keyClick(panel.view, Qt.Key.Key_Right)
+    QTest.keyClick(panel.view, Qt.Key.Key_Space)
+    QTest.keyClick(panel.view, Qt.Key.Key_Tab)
+    assert preview.current_image().id == image_id
+    assert not preview.advanced_toggle_button.isChecked()
+    assert preview.isVisible()
+    QTest.keyClick(panel.view, Qt.Key.Key_Escape)
+    app.processEvents()
+    assert preview._upscale_panel is None
+    assert preview.isVisible()
+    assert all(s.isEnabled() for s in preview._shortcuts)
+    assert not preview.fit_to_window and preview.zoom_factor == 1
+    assert preview.mirrored_preview and preview.saturation_slider.value() == 125
+    assert preview.image_view.annotations == (stroke,)
+    assert preview.image_view.annotation_tool == 'pen'
+    preview.close()
+
+
+def test_embedded_ready_result_survives_return_and_reopen(window, app, upscale):
+    repo, replacement, image, job = upscale
+    window._open_image_preview(image)
+    preview = next(iter(window._preview_dialogs))
+    preview.upscale_button.click()
+    app.processEvents()
+    panel = window.image_upscaler.panel
+    assert panel.job['id'] == job['id'] and panel.replace.isEnabled()
+    panel.back.click()
+    app.processEvents()
+    assert window.image_upscaler.panel is None
+    preview.upscale_button.click()
+    app.processEvents()
+    panel = window.image_upscaler.panel
+    assert panel.job['id'] == job['id'] and len(repo.all(image.id)) == 1
+    panel.replace.click()
+    app.processEvents()
+    assert repo.get(job['id'])['state'] == 'applied'
+    assert preview.pages.currentWidget() is panel
+    assert preview.current_image().width == 240
+    panel.back.click()
+    app.processEvents()
+    assert preview.current_image().width == 240
+    preview.close()
+
+
+def test_closing_preview_releases_embedded_page_and_leaves_active_job(window, app, upscale):
+    repo, _, image, job = upscale
+    job['state'] = 'running'
+    repo.save(job)
+    window._open_image_preview(image)
+    preview = next(iter(window._preview_dialogs))
+    preview.upscale_button.click()
+    app.processEvents()
+    assert window.image_upscaler.panel is not None
+    preview.close()
+    app.processEvents()
+    assert window.image_upscaler.panel is None
+    assert repo.get(job['id'])['state'] == 'running'
+
+
+def test_opening_ai_in_another_preview_returns_first_to_image(window, app, library):
+    window._open_image_preview(library[2][0])
+    first = next(iter(window._preview_dialogs))
+    first.upscale_button.click()
+    app.processEvents()
+    window._open_image_preview(library[2][1])
+    second = next(p for p in window._preview_dialogs if p is not first)
+    second.upscale_button.click()
+    app.processEvents()
+    assert window.image_upscaler.panel.preview is second
+    assert first.pages.currentWidget() is first.preview_page
+    assert first._upscale_panel is None
+    second.close()
+    first.close()
+
+
+@pytest.mark.parametrize('width,height', [(720, 520), (800, 600), (1200, 820)])
+def test_embedded_controls_fit_small_window(window, app, upscale, width, height):
+    from PySide6.QtWidgets import QPushButton
+    from eidory.ui.theme import apply_theme
+    repo, replacement, image, job = upscale
+    apply_theme(app, density='comfortable', font_size=15)
+    window._open_image_preview(image)
+    preview = next(iter(window._preview_dialogs))
+    preview.resize(width, height)
+    preview.upscale_button.click()
+    app.processEvents()
+    panel = window.image_upscaler.panel
+    assert preview.width() == width and preview.height() == height
+    assert panel.view.height() >= 260
+    for button in panel.findChildren(QPushButton):
+        if button.isVisible():
+            rect = button.rect()
+            top_left = button.mapTo(panel, rect.topLeft())
+            bottom_right = button.mapTo(panel, rect.bottomRight())
+            assert panel.rect().contains(top_left), button.text()
+            assert panel.rect().contains(bottom_right), button.text()
+    preview.close()
+    apply_theme(app)
+
+
+def test_upscale_does_not_leave_preview_when_ink_save_is_blocked(window, app, library):
+    window._open_image_preview(library[2][0])
+    preview = next(iter(window._preview_dialogs))
+    with patch.object(preview.annotation_controls, 'flush', return_value=False):
+        preview.upscale_button.click()
+    assert window.image_upscaler.panel is None
+    assert preview.pages.currentWidget() is preview.preview_page
+    preview.close()
+
+
+def test_command_w_closes_preview_from_embedded_page(window, app, library):
+    window._open_image_preview(library[2][0])
+    preview = next(iter(window._preview_dialogs))
+    preview.upscale_button.click()
+    app.processEvents()
+    closed = []
+    preview.finished.connect(lambda _result: closed.append(True))
+    QTest.keyClick(window.image_upscaler.panel.view, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+    assert closed
+    assert window.image_upscaler.panel is None
+    assert preview not in window._preview_dialogs
+
+
+def test_embedded_page_stays_open_after_real_background_inspection(window, app, library):
+    from eidory.ui.main_window import MainWindow
+    with patch.object(window, '_start_background_task', side_effect=lambda target, **kw:
+                      MainWindow._start_background_task(window, target, **kw)):
+        window._open_image_preview(library[2][0])
+        preview = next(iter(window._preview_dialogs))
+        QTest.mouseClick(preview.upscale_button, Qt.MouseButton.LeftButton)
+        QTest.qWait(700)
+        panel = window.image_upscaler.panel
+        assert preview.isVisible() and panel is not None
+        assert panel.window() is preview and panel.info and panel.start.isEnabled()
+        assert preview.pages.currentWidget() is panel
+        assert app.activeWindow() is preview
+        panel.back.click()
+        QTest.qWait(100)
+        assert preview.isVisible() and preview.pages.currentWidget() is preview.preview_page
+        assert app.activeWindow() is preview
+        preview.close()
 
 
 def test_compare_uses_same_output_coordinates_and_can_drag_divider(app):

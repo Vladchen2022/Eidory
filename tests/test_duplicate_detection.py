@@ -3,10 +3,12 @@ from __future__ import annotations
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image, ImageDraw
+import numpy as np
 
 from eidory.core.duplicate_detection import (
     ImageHashCacheRecord,
@@ -21,6 +23,70 @@ from eidory.models import ImageItem
 
 
 class DuplicateDetectionTest(unittest.TestCase):
+    def test_near_matches_do_not_merge_transitive_chains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images = []
+            records = {}
+            for index, value in enumerate((0, 255, 65535), start=1):
+                path = root / f"{index}.png"
+                Image.new("RGB", (64, 48), "white").save(path)
+                image = self._image(index, path)
+                images.append(image)
+                records[index] = replace(build_image_hash_cache_record(image, prefer_thumbnail=False),
+                                         dhash=value, file_sha256=f"hash-{index}")
+            with patch("eidory.core.duplicate_detection._comparison_signature",
+                       return_value=np.zeros((32, 32, 3), dtype=np.uint8)):
+                groups = find_duplicate_groups(images, hash_records=records)
+            pairs = {frozenset(m.image.id for m in g.members) for g in groups}
+            self.assertEqual(pairs, {frozenset((1, 2)), frozenset((2, 3))})
+            self.assertTrue(all(len(g.members) == 2 for g in groups))
+
+    def test_hash_collision_between_different_colors_is_not_a_near_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images = []
+            for index, color in enumerate(("red", "green", "blue"), start=1):
+                path = root / f"{index}.png"
+                Image.new("RGB", (64, 48), color).save(path)
+                images.append(self._image(index, path))
+            self.assertEqual(len({image_dhash(Path(i.file_path)) for i in images}), 1)
+            self.assertEqual(find_duplicate_groups(images), [])
+
+    def test_same_hash_but_different_foreground_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images, records = [], {}
+            for index in range(2):
+                path = root / f"{index}.png"
+                image = Image.new("RGB", (128, 96), "white")
+                draw = ImageDraw.Draw(image)
+                if index:
+                    draw.ellipse((0, 0, 120, 90), fill="black")
+                else:
+                    draw.rectangle((30, 0, 60, 96), fill="black")
+                image.save(path)
+                item = self._image(index + 1, path, width=128, height=96)
+                images.append(item)
+                records[item.id] = replace(build_image_hash_cache_record(item, prefer_thumbnail=False), dhash=0)
+            self.assertEqual(find_duplicate_groups(images, hash_records=records), [])
+
+    def test_exact_copies_do_not_multiply_the_same_near_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = Image.new("RGB", (180, 100), "white")
+            ImageDraw.Draw(image).rectangle((20, 20, 150, 80), fill="black")
+            image.save(root / "first.png")
+            shutil.copy2(root / "first.png", root / "copy.png")
+            image.resize((90, 50)).save(root / "small.png")
+            items = [self._image(1, root / "first.png", width=180, height=100),
+                     self._image(2, root / "copy.png", width=180, height=100),
+                     self._image(3, root / "small.png", width=90, height=50)]
+            groups = find_duplicate_groups(items)
+            self.assertEqual(sum(g.kind == "exact" for g in groups), 1)
+            self.assertEqual(sum(g.kind == "near" for g in groups), 1)
+            self.assertEqual(len(next(g for g in groups if g.kind == "near").members), 2)
+
     def test_exact_duplicate_groups_by_file_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
+import numpy as np
 from PIL import Image, ImageOps
 
 from eidory.core.image_loader import open_local_image
@@ -53,23 +54,6 @@ class ImageHashCacheRecord:
     hash_source: str
     hash_source_size: int
     hash_source_modified_time_ns: int
-
-
-class _DisjointSet:
-    def __init__(self) -> None:
-        self.parent: dict[int, int] = {}
-
-    def find(self, value: int) -> int:
-        self.parent.setdefault(value, value)
-        if self.parent[value] != value:
-            self.parent[value] = self.find(self.parent[value])
-        return self.parent[value]
-
-    def union(self, left: int, right: int) -> None:
-        left_root = self.find(left)
-        right_root = self.find(right)
-        if left_root != right_root:
-            self.parent[right_root] = left_root
 
 
 class _BKNode:
@@ -131,8 +115,6 @@ def find_duplicate_groups(
 ) -> list[DuplicateGroup]:
     members: dict[int, DuplicateMember] = {}
     exact_by_hash: dict[str, list[int]] = {}
-    tree = _BKTree()
-    dsu = _DisjointSet()
 
     for image in images:
         if image.is_missing or not is_supported_image(image.file_path):
@@ -167,19 +149,11 @@ def find_duplicate_groups(
             dhash=dhash,
         )
         exact_by_hash.setdefault(sha, []).append(image.id)
-        dsu.find(image.id)
-        if dhash is not None:
-            for match_id in tree.query(dhash, near_distance):
-                if members[match_id].file_sha256 != sha:
-                    dsu.union(image.id, match_id)
-            tree.insert(dhash, image.id)
 
     groups: list[DuplicateGroup] = []
-    exact_group_ids: set[frozenset[int]] = set()
     for sha, image_ids in exact_by_hash.items():
         if len(image_ids) < 2:
             continue
-        exact_group_ids.add(frozenset(image_ids))
         group_members = _sort_members(members[image_id] for image_id in image_ids)
         groups.append(
             DuplicateGroup(
@@ -189,27 +163,91 @@ def find_duplicate_groups(
             )
         )
 
-    near_by_root: dict[int, list[int]] = {}
-    for image_id in members:
-        root = dsu.find(image_id)
-        near_by_root.setdefault(root, []).append(image_id)
-    for image_ids in near_by_root.values():
-        if len(image_ids) < 2:
-            continue
-        image_id_set = frozenset(image_ids)
-        if image_id_set in exact_group_ids:
-            continue
-        group_members = _sort_members(members[image_id] for image_id in image_ids)
-        groups.append(
-            DuplicateGroup(
+    # One representative per byte-identical family avoids multiplying the same
+    # near match by every exact copy. Never take transitive closure of matches:
+    # perceptual similarity is not an equivalence relation.
+    representatives = _sort_members(
+        _sort_members(members[iid] for iid in image_ids)[0]
+        for image_ids in exact_by_hash.values()
+    )
+    tree = _BKTree()
+    signatures: dict[int, np.ndarray | None] = {}
+    for member in representatives:
+        assert member.dhash is not None
+        for match_id in tree.query(member.dhash, near_distance):
+            other = members[match_id]
+            if not _compatible_aspect_ratio(member.image, other.image):
+                continue
+            for candidate in (member, other):
+                if candidate.image.id not in signatures:
+                    signatures[candidate.image.id] = _comparison_signature(candidate.image)
+            left, right = signatures[member.image.id], signatures[match_id]
+            if left is None or right is None:
+                continue
+            structural, color_error = _comparison_scores(left, right)
+            if structural < 0.90 or color_error > 0.12:
+                continue
+            distance = hamming_distance(member.dhash, other.dhash)
+            groups.append(DuplicateGroup(
                 kind="near",
-                reason=f"感知哈希距离 <= {near_distance}，可能是同图不同尺寸或近似变体",
-                members=tuple(group_members),
-            )
-        )
+                reason=(f"两图直接核验：哈希距离 {distance} / 64，"
+                        f"结构一致度 {structural:.0%}；近似候选，请核对内容与文件夹"),
+                members=tuple(_sort_members((member, other))),
+            ))
+        tree.insert(member.dhash, member.image.id)
 
-    groups.sort(key=lambda group: (0 if group.kind == "exact" else 1, -len(group.members), group.reason))
+    groups.sort(key=lambda group: (0 if group.kind == "exact" else 1, -len(group.members), group.reason,
+                                   tuple(m.image.id for m in group.members)))
     return groups
+
+
+def _compatible_aspect_ratio(left: ImageItem, right: ImageItem) -> bool:
+    if not all((left.width, left.height, right.width, right.height)):
+        return True
+    first = left.width / left.height
+    second = right.width / right.height
+    return min(first, second) / max(first, second) >= 0.95
+
+
+def _comparison_signature(image: ImageItem) -> np.ndarray | None:
+    """Small, bounded RGB image used to reject 64-bit hash collisions."""
+    paths = [image.thumbnail_path, image.file_path] if image.thumbnail_status == "ready" else [image.file_path]
+    for path in paths:
+        if not path:
+            continue
+        try:
+            with open_local_image(path) as source:
+                source.draft("RGB", (64, 64))
+                oriented = ImageOps.exif_transpose(source)
+                return np.asarray(
+                    oriented.convert("RGB").resize((32, 32), Image.Resampling.LANCZOS),
+                    dtype=np.uint8,
+                ).copy()
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _comparison_scores(left: np.ndarray, right: np.ndarray) -> tuple[float, float]:
+    """Mean local structural similarity plus normalized RGB absolute error.
+
+    Scores are comparison heuristics, not probabilities of being duplicates.
+    Each 4x4 block contributes equally, preventing a shared sky/background from
+    hiding a different foreground in a global luminance average.
+    """
+    a, b = left.astype(np.float32), right.astype(np.float32)
+    color_error = float(np.abs(a - b).mean() / 255.0)
+    weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    a = (a @ weights).reshape(8, 4, 8, 4).transpose(0, 2, 1, 3).reshape(64, 16)
+    b = (b @ weights).reshape(8, 4, 8, 4).transpose(0, 2, 1, 3).reshape(64, 16)
+    ma, mb = a.mean(axis=1), b.mean(axis=1)
+    da, db = a - ma[:, None], b - mb[:, None]
+    va, vb = (da * da).mean(axis=1), (db * db).mean(axis=1)
+    covariance = (da * db).mean(axis=1)
+    score = ((2 * ma * mb + 6.5025) * (2 * covariance + 58.5225)) / (
+        (ma * ma + mb * mb + 6.5025) * (va + vb + 58.5225)
+    )
+    return float(score.mean()), color_error
 
 
 def find_near_duplicate_candidates(

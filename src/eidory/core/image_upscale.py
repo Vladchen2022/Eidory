@@ -5,21 +5,24 @@ import hashlib
 import io
 import json
 import math
+import logging
+import traceback
 import os
 from pathlib import Path
 import shutil
 import time
 import uuid
 
-from PIL import Image, ImageCms, ImageOps
+from PIL import ExifTags, Image, ImageCms
 from PIL.PngImagePlugin import PngInfo
 
-from eidory.core.comfy_reference import ACTIVE_STATES, ComfyClient, GeneratedReferences, local_url
-from eidory.core.image_loader import open_local_image
+from eidory.core.comfy_reference import ACTIVE_STATES, ComfyClient, GeneratedReferences, local_url, connection_message
+from eidory.core.image_loader import open_local_image, oriented_pixels, srgb_pixels
 from eidory.core.thumbnailer import Thumbnailer
 from eidory.core.time_utils import utc_now_iso, timestamp_ns_to_iso
 
 FORMATS = {'JPEG', 'PNG', 'WEBP'}
+REDUCED_INPUT_MAX_EDGE = 2048
 
 
 def digest(path):
@@ -29,13 +32,21 @@ def digest(path):
 
 def output_size(width, height, factor):
     if not math.isfinite(factor) or factor <= 1 or factor > 8:
-        raise ValueError('目标尺寸必须大于原图，放大倍数最多 8 倍。')
+        raise ValueError('目标尺寸必须大于 AI 输入尺寸，放大倍数最多 8 倍。')
     if max(width, height) * factor > 4096:
         raise ValueError('输出长边最多 4096 像素，请降低倍数或指定长边。')
     size = tuple(round(n * factor) // 2 * 2 for n in (width, height))
     if min(size) < 2 or max(size) <= max(width, height):
-        raise ValueError('按偶数像素对齐后，目标尺寸必须大于原图。')
+        raise ValueError('按偶数像素对齐后，目标尺寸必须大于 AI 输入尺寸。')
     return size
+
+
+def processing_input_size(width, height, *, reduce_input=False):
+    """Reduce only the model input; the source and its backup keep their pixels."""
+    if not reduce_input or max(width, height) <= REDUCED_INPUT_MAX_EDGE:
+        return width, height
+    scale = REDUCED_INPUT_MAX_EDGE / max(width, height)
+    return tuple(max(1, round(n * scale)) for n in (width, height))
 
 
 def source_info(path):
@@ -48,6 +59,87 @@ def source_info(path):
         if image.getexif().get(274, 1) in (5, 6, 7, 8):
             w, h = h, w
         return {'width': w, 'height': h, 'format': image.format}
+
+
+def _color_profile(data):
+    profile = ImageCms.ImageCmsProfile(io.BytesIO(data))
+    space = profile.profile.xcolor_space.strip()
+    mode = {'RGB': 'RGB', 'GRAY': 'L', 'CMYK': 'CMYK'}.get(space)
+    if mode is None:
+        raise ValueError(f'暂不支持图片的 {space} 色彩配置。')
+    return profile, mode
+
+
+def _srgb_input(original):
+    return srgb_pixels(original)
+
+
+def _replacement_colors(result, original, fmt):
+    alpha = result.getchannel('A') if 'A' in result.getbands() else None
+    result = result.convert('RGB')
+    profile_data = original.info.get('icc_profile')
+    if profile_data:
+        profile, mode = _color_profile(profile_data)
+        supported = {'JPEG': {'L', 'RGB', 'CMYK'}, 'PNG': {'L', 'RGB'}, 'WEBP': {'RGB'}}
+        if mode in supported[fmt]:
+            result = ImageCms.profileToProfile(result, ImageCms.createProfile('sRGB'), profile, outputMode=mode)
+        else:
+            # WebP always encodes RGB; attaching a GRAY profile would mislabel it.
+            profile_data = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
+    elif original.mode in {'L', 'LA'} and fmt != 'WEBP':
+        result = result.convert('L')
+    result.info.clear()
+    if alpha is not None and fmt != 'JPEG':
+        result.putalpha(alpha)
+    return result, profile_data
+
+
+def _replacement_exif(original, size):
+    exif = original.getexif()
+    if not exif:
+        return None, []
+    values = dict(exif)
+    for tag in (ExifTags.IFD.Exif, ExifTags.IFD.GPSInfo):
+        if tag in values:
+            values[tag] = dict(exif.get_ifd(tag))
+    details = values.get(ExifTags.IFD.Exif, {})
+    if ExifTags.IFD.Interop in details:
+        details[ExifTags.IFD.Interop] = dict(exif.get_ifd(ExifTags.IFD.Interop))
+
+    omitted = []
+
+    def finite(value):
+        if isinstance(value, (tuple, list)):
+            return all(finite(item) for item in value)
+        if getattr(value, 'denominator', 1) == 0:
+            return False
+        return not isinstance(value, float) or math.isfinite(value)
+
+    def clean(fields, prefix='IFD0'):
+        result = {}
+        for tag, value in fields.items():
+            path = f'{prefix}/{int(tag)}'
+            if isinstance(value, dict):
+                result[tag] = clean(value, path)
+            elif finite(value):
+                result[tag] = value
+            else:
+                # Undefined rationals such as -32768/0 cannot be written by
+                # Pillow. Omit only that field; the byte-for-byte backup retains it.
+                omitted.append(path)
+        return result
+
+    values = clean(values)
+    values[274] = 1
+    for fields in (values, values.get(ExifTags.IFD.Exif, {})):
+        for tag, value in ((256, size[0]), (257, size[1]), (40962, size[0]), (40963, size[1])):
+            if tag in fields:
+                fields[tag] = value
+    prepared = Image.Exif()
+    prepared.endian = exif.endian
+    for tag, value in values.items():
+        prepared[tag] = value
+    return prepared.tobytes(), omitted
 
 
 def seedvr_graph(input_name, factor, seed):
@@ -107,51 +199,92 @@ class UpscaleJobs(GeneratedReferences):
             with self.store.connect() as conn:
                 conn.execute(sql, values)
 
-    def create(self, image_id, factor, url):
+    def create(self, image_id, factor, url, *, reduce_input=False, queue_id=None):
         if self.active() or GeneratedReferences(self.store, self.paths).active():
             raise ValueError('请等待当前生图或放大任务完成。')
+        key = queue_id or str(uuid.uuid4())
+        job = self.get(key) if queue_id else dict(id=key, image_id=image_id, created_at=utc_now_iso())
+        job.update(state='submitting', stage='准备图片', factor=factor, url=url,
+                   reduce_input=reduce_input, error='')
+        self.save(job)
+        try:
+            image = self.store.get_image(image_id)
+            if image:
+                job.update(file_name=image.file_name, source_path=image.file_path)
+                self.save(job)
+            expected = job.get('queued_source')
+            if expected and (not image or [image.file_path, image.file_size, image.modified_time_ns] != expected):
+                raise ValueError('排队后原图发生变化，请核对图片后重新加入队列。')
+            return self._prepare(job)
+        except Exception as exc:
+            job.update(state='failed', error=f"{job['stage']}失败：{connection_message(exc)}",
+                       diagnostic=traceback.format_exc(), failed_at=utc_now_iso())
+            self.save(job)
+            logging.getLogger('eidory.runtime').exception('Upscale %s failed during %s', key, job['stage'])
+            raise ValueError(job['error']) from exc
+
+    def _prepare(self, job):
+        key, image_id, factor, reduce_input = job['id'], job['image_id'], job['factor'], job['reduce_input']
+        url = job['url']
         image = self.store.get_image(image_id)
         if not image or image.is_missing:
             raise ValueError('原图已不在图库中。')
         source = Path(image.file_path)
+        if job.get('queued_source'):
+            queued_path, queued_size, queued_mtime = job['queued_source']
+            stat = source.stat()
+            if str(source) != queued_path or (stat.st_size, stat.st_mtime_ns) != (queued_size, queued_mtime):
+                raise ValueError('排队后源文件发生变化，请核对图片后重新加入队列。')
         info = source_info(source)
-        width, height = output_size(info['width'], info['height'], factor)
-        key = str(uuid.uuid4())
+        input_width, input_height = processing_input_size(info['width'], info['height'], reduce_input=reduce_input)
+        width, height = output_size(input_width, input_height, factor)
+        input_reduced = (input_width, input_height) != (info['width'], info['height'])
         directory = self.root / 'sources' / key
         directory.mkdir(parents=True, exist_ok=True)
         backup = directory / ('original' + source.suffix)
         shutil.copy2(source, backup)
         source_digest = digest(backup)
-        if digest(source) != source_digest:
+        if digest(source) != source_digest or source_info(backup) != info:
             raise ValueError('读取期间原图发生变化，请重试。')
         snapshot = directory / 'input.png'
+        comparison = directory / 'comparison.png' if input_reduced else snapshot
+        job.update(stage='转换色彩与尺寸')
+        self.save(job)
         with open_local_image(backup) as original:
-            decoded = ImageOps.exif_transpose(original)
-            alpha = decoded.convert('RGBA').getchannel('A') if 'A' in decoded.getbands() or 'transparency' in decoded.info else None
-            rgb = decoded.convert('RGB')
-            profile = original.info.get('icc_profile')
-            if profile:
-                rgb = ImageCms.profileToProfile(rgb, ImageCms.ImageCmsProfile(io.BytesIO(profile)), ImageCms.createProfile('sRGB'), outputMode='RGB')
-            if alpha is not None:
-                rgb.putalpha(alpha)
+            rgb = _srgb_input(original)
+            if input_reduced:
+                # Compare against the full-size, correctly oriented/color-managed
+                # source rather than the reduced model input.
+                rgb.save(comparison, 'PNG')
+                rgb = rgb.resize((input_width, input_height), Image.Resampling.LANCZOS)
             rgb.save(snapshot, 'PNG')
-        job = dict(id=key, prompt_id=key, client_id='eidory-upscale-' + key, image_id=image_id,
+        job.update(id=key, prompt_id=key, client_id='eidory-upscale-' + key, image_id=image_id,
                    project_id=0, source_path=str(source), source_digest=source_digest,
                    original_path=str(backup), input_path=str(snapshot), source_info=info,
+                   comparison_path=str(comparison),
+                   input_info=dict(width=input_width, height=input_height, format='PNG'),
+                   input_reduced=input_reduced,
                    target_width=width, target_height=height, factor=factor, seed=2026092701,
-                   created_at=utc_now_iso(), submitted_at=time.time(), state='submitting', error='',
+                   created_at=utc_now_iso(), submitted_at=time.time(), state='submitting', stage='上传输入', error='',
                    output_node='12', url=local_url(url))
         # Input upload is idempotent; the prompt identity is durable before POST /prompt.
+        self.save(job)
         client = ComfyClient(job['url'])
         with snapshot.open('rb') as stream:
             uploaded = client.request('POST', '/upload/image', files={'image': (key + '.png', stream, 'image/png')},
                                       data={'type': 'input', 'subfolder': 'EidoryUpscale', 'overwrite': 'true'})
         name = '/'.join(filter(None, [uploaded.get('subfolder'), uploaded['name']]))
         job['workflow'] = seedvr_graph(name, factor, job['seed'])
+        job['stage'] = '提交任务'
         self.save(job)
         return job
 
     def reconcile(self, job_id):
+        job = self.get(job_id)
+        if job['state'] == 'submitting' and not job.get('workflow'):
+            job.update(state='failed', error='准备或上传被中断，任务尚未提交。可在任务中心重试。')
+            self.save(job)
+            return job
         job = super().reconcile(job_id)
         if job['state'] == 'ready' and (job['width'], job['height']) != (job['target_width'], job['target_height']):
             job.update(state='failed', error='服务返回的尺寸与目标不符，结果未替换原图。')
@@ -160,6 +293,8 @@ class UpscaleJobs(GeneratedReferences):
 
     def discard(self, job_id, *, undo=False):
         job = self.get(job_id)
+        if job.get('purged_at'):
+            raise ValueError('此任务的临时文件已清理，不能撤销丢弃。')
         if job['state'] != ('discarded' if undo else 'ready'):
             raise ValueError('只能丢弃尚未替换的结果。')
         # A recoverable discard, like reference candidates; never delete the source.
@@ -202,27 +337,17 @@ class ImageReplacement:
             result = result.convert('RGBA' if 'A' in result.getbands() else 'RGB')
             # Keep transparency from the actual source, including palette transparency.
             if 'A' in original.getbands() or 'transparency' in original.info:
-                alpha = ImageOps.exif_transpose(original).convert('RGBA').getchannel('A')
+                alpha = oriented_pixels(original).convert('RGBA').getchannel('A')
                 result.putalpha(alpha.resize(result.size, Image.Resampling.LANCZOS))
             fmt = job['source_info']['format']
             options = {}
-            profile = original.info.get('icc_profile')
+            result, profile = _replacement_colors(result, original, fmt)
             if profile:
-                alpha = result.getchannel('A') if 'A' in result.getbands() else None
-                result = ImageCms.profileToProfile(result.convert('RGB'), ImageCms.createProfile('sRGB'),
-                    ImageCms.ImageCmsProfile(io.BytesIO(profile)), outputMode='RGB')
-                if alpha is not None:
-                    result.putalpha(alpha)
                 options['icc_profile'] = profile
-            exif = original.getexif()
-            if exif and fmt in {'JPEG', 'PNG', 'WEBP', 'TIFF'}:
-                exif[274] = 1
-                for field, value in ((256, result.width), (257, result.height), (40962, result.width), (40963, result.height)):
-                    if field in exif:
-                        exif[field] = value
-                options['exif'] = exif.tobytes()
+            exif, omitted = _replacement_exif(original, result.size)
+            if exif:
+                options['exif'] = exif
             if fmt == 'JPEG':
-                result = result.convert('RGB')
                 options.update(quality=98, subsampling=0)
             elif fmt == 'WEBP':
                 options['lossless'] = True
@@ -237,7 +362,7 @@ class ImageReplacement:
             if original.info.get('dpi'):
                 options['dpi'] = original.info['dpi']
             result.save(prepared, fmt, **options)
-        return self._apply(image.id, prepared, job['source_digest'], key=key, job_id=job['id'])
+        return self._apply(image.id, prepared, job['source_digest'], key=key, job_id=job['id'], metadata_omissions=omitted)
 
     def restore(self, image_id):
         previous = self.latest(image_id)
@@ -245,7 +370,7 @@ class ImageReplacement:
             raise ValueError('没有可恢复的原图。')
         return self._apply(image_id, Path(previous['backup']), previous['after_digest'], restore_of=previous['id'])
 
-    def _apply(self, image_id, candidate, expected_digest, *, key=None, job_id=None, restore_of=None):
+    def _apply(self, image_id, candidate, expected_digest, *, key=None, job_id=None, restore_of=None, metadata_omissions=None):
         image = self.store.get_image(image_id)
         if image is None:
             raise ValueError('图片已移出图库。')
@@ -265,7 +390,8 @@ class ImageReplacement:
         stage = source.with_name('.eidory-upscale-' + key + '.part')
         record = dict(id=key, image_id=image_id, source=str(source), backup=str(backup), stage=str(stage),
                       before_digest=expected_digest, after_digest=digest(candidate), state='prepared',
-                      created_at=utc_now_iso(), job_id=job_id, restore_of=restore_of)
+                      created_at=utc_now_iso(), job_id=job_id, restore_of=restore_of,
+                      metadata_omissions=metadata_omissions or [])
         before_stat = backup.stat()
         record.update(before_file_size=before_stat.st_size, before_modified_time_ns=before_stat.st_mtime_ns)
         try:
@@ -273,8 +399,8 @@ class ImageReplacement:
             shutil.copymode(source, stage)
             with stage.open('rb') as f:
                 os.fsync(f.fileno())
-            with open_local_image(stage) as im:
-                record['width'], record['height'] = ImageOps.exif_transpose(im).size
+            info = source_info(stage)
+            record['width'], record['height'] = info['width'], info['height']
             if restore_of:
                 # Restoring original bytes also restores the original file timestamp.
                 shutil.copystat(candidate, stage)

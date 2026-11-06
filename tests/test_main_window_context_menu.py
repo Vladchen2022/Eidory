@@ -88,6 +88,16 @@ class MainWindowContextMenuTest(unittest.TestCase):
         self.addCleanup(tracker.stop)
         self.addCleanup(self._close_test_windows)
 
+    def _wait_for_gallery(self, window):
+        # Library queries now run off the GUI thread; one event dispatch is
+        # not a completion barrier. Assert the same results after delivery.
+        deadline = time.monotonic() + 5
+        self.app.processEvents()
+        while window._loading_more_images and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(.005)
+        self.assertFalse(window._loading_more_images)
+
     def _close_test_windows(self):
         # Close even after a failed assertion. A live watcher must not be
         # garbage-collected while a subsequent test constructs its window.
@@ -3924,9 +3934,9 @@ class MainWindowContextMenuTest(unittest.TestCase):
 
             window = MainWindow(paths=paths, store=store)
             window.show()
-            self.app.processEvents()
+            self._wait_for_gallery(window)
             window._reload_images()
-            self.app.processEvents()
+            self._wait_for_gallery(window)
 
             parent_item = self._collection_item(window.collection_tree, parent_id)
             child_item = self._collection_item(window.collection_tree, child_id)
@@ -3959,7 +3969,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             )
 
             window.collection_tree.setCurrentItem(parent_item)
-            self.app.processEvents()
+            self._wait_for_gallery(window)
             self.assertCountEqual(
                 [image.id for image in window.grid_view.images()],
                 [excluded_parent_id, excluded_child_id],
@@ -4005,7 +4015,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual([image.id for image in merge_result.images], [keep_id])
 
             window._set_collection_search_excluded(parent_id, excluded=False)
-            self.app.processEvents()
+            self._wait_for_gallery(window)
 
             refreshed_parent = self._collection_item(window.collection_tree, parent_id)
             self.assertIsNotNone(refreshed_parent)
@@ -4018,7 +4028,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 [excluded_parent_id, excluded_child_id],
             )
             window._set_collection_search_excluded(parent_id, excluded=True)
-            self.app.processEvents()
+            self._wait_for_gallery(window)
 
             self.assertIn(parent_id, store.list_search_excluded_collection_ids())
             reexcluded_parent = self._collection_item(window.collection_tree, parent_id)
@@ -4065,10 +4075,10 @@ class MainWindowContextMenuTest(unittest.TestCase):
             store.add_search_excluded_folder_prefix(str(child))
             window = MainWindow(paths=paths, store=store)
             window.show()
-            self.app.processEvents()
+            self._wait_for_gallery(window)
 
             window._reload_images()
-            self.app.processEvents()
+            self._wait_for_gallery(window)
 
             child_item = None
             for top_index in range(window.folder_tree.topLevelItemCount()):
@@ -4098,7 +4108,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             )
 
             window.folder_tree.setCurrentItem(child_item)
-            self.app.processEvents()
+            self._wait_for_gallery(window)
             self.assertEqual([image.id for image in window.grid_view.images()], [excluded_id])
 
             search_result = window._compute_search_chain(
@@ -4141,14 +4151,14 @@ class MainWindowContextMenuTest(unittest.TestCase):
             self.assertEqual([image.id for image in merge_result.images], [keep_id])
 
             window._set_folder_search_excluded(str(child), excluded=False)
-            self.app.processEvents()
+            self._wait_for_gallery(window)
 
             self.assertCountEqual(
                 [image.id for image in window.grid_view.images()],
                 [excluded_id],
             )
             window._set_folder_search_excluded(str(child), excluded=True)
-            self.app.processEvents()
+            self._wait_for_gallery(window)
 
             self.assertIn(
                 window._normalize_folder_path(str(child)),
@@ -4382,6 +4392,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 [
                     "快速预览",
                     "对比查看",
+                    "AI 放大…",
                     "查找相似图片",
                     "文件与导出",
                     "收藏与标签",
@@ -6132,6 +6143,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
             window._reload_images()
+            self._wait_for_gallery(window)
             self.assertEqual([image.id for image in window.grid_view.images()], [5, 4])
 
             with patch("eidory.ui.main_window.random.shuffle", side_effect=lambda values: values.reverse()):
@@ -6169,9 +6181,11 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
             window._reload_images()
+            self._wait_for_gallery(window)
             self.assertEqual([image.id for image in window.grid_view.images()], [5, 4])
 
             window._maybe_auto_load_more(window.grid_view.verticalScrollBar().maximum())
+            self._wait_for_gallery(window)
 
             self.assertEqual([image.id for image in window.grid_view.images()], [5, 4, 3, 2])
             self.assertTrue(window.load_more_button.isEnabled())

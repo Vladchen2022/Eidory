@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from eidory.ui.display_image import read_display_image
+
 from eidory.ui.theme_colors import theme_color
 
 from bisect import bisect_right
 from collections import OrderedDict
+from dataclasses import replace
+import logging
+import os
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -57,6 +62,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._drag_start_position: QPoint | None = None
         self._drag_start_index = -1
         self._pending_single_selection_index: int | None = None
+        self._right_context_press = False
+        self._debug_input = os.environ.get('EIDORY_DEBUG_INPUT') == '1'
         self._pixmap_cache: OrderedDict[PixmapCacheKey, QPixmap] = OrderedDict()
         self._pixmap_cache_bytes: dict[PixmapCacheKey, int] = {}
         self._pixmap_cache_total_bytes = 0
@@ -89,6 +96,21 @@ class JustifiedImageGridView(QAbstractScrollArea):
 
     def eventFilter(self, watched, event) -> bool:
         if watched is self.viewport():
+            if self._debug_input and event.type() in {QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+                                                       QEvent.Type.ContextMenu}:
+                point = event.position().toPoint() if hasattr(event, 'position') else event.pos()
+                logging.getLogger('eidory.runtime').info('Grid input type=%s button=%s point=%s index=%s',
+                    event.type(), event.button() if hasattr(event, 'button') else '-', point, self._index_at(point))
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
+                # Route a real viewport right press explicitly. Some native
+                # event sources do not synthesize QContextMenuEvent for this
+                # custom scroll area; others do, so suppress that duplicate.
+                self._right_context_press = True
+                self._pending_single_selection_index = None
+                point, global_point = event.position().toPoint(), event.globalPosition().toPoint()
+                QTimer.singleShot(0, self, lambda: self._request_image_context_menu(point, global_point))
+                event.accept()
+                return True
             if event.type() in {QEvent.Type.DragEnter, QEvent.Type.DragMove}:
                 if self._supports_external_import_drop(event.mimeData()):
                     event.setDropAction(Qt.DropAction.CopyAction)
@@ -101,6 +123,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
                     event.accept()
                     return True
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._right_context_press = False
                 self._handle_left_press(event.position().toPoint(), event.modifiers())
                 event.accept()
                 return True
@@ -139,6 +162,10 @@ class JustifiedImageGridView(QAbstractScrollArea):
         self._update_selection_change(previous_indexes, previous_index)
         self._emit_selection()
 
+    @property
+    def content_revision(self):
+        return getattr(self, "_content_revision", 0)
+
     def set_images(
         self,
         images: list[ImageItem],
@@ -153,6 +180,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
             current = self.current_image()
             current_image_id = current.id if current is not None else None
 
+        self._content_revision = self.content_revision + 1
         new_images = list(images)
         new_layout_signature = self._layout_keys(new_images)
         should_rebuild_layout = self._layout_signature != new_layout_signature
@@ -204,6 +232,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
     def append_images(self, images: list[ImageItem]) -> None:
         if not images:
             return
+        self._content_revision = self.content_revision + 1
         old_count = len(self._images)
         self._images.extend(images)
         self._layout_signature = self._layout_signature + self._layout_keys(images)
@@ -214,6 +243,23 @@ class JustifiedImageGridView(QAbstractScrollArea):
         else:
             self._rebuild_layout()
         self.viewport().update()
+
+    def refresh_image(self, image: ImageItem) -> None:
+        """Refresh one adopted image without rebuilding selection or all cards."""
+        index = self._indexes_by_image_id.get(image.id)
+        if index is None:
+            return
+        previous = self._images[index]
+        self._images[index] = replace(image, score=previous.score)
+        self._content_revision = self.content_revision + 1
+        self._layout_signature = self._layout_keys(self._images)
+        old_key = self._pixmap_cache_key(previous, previous.thumbnail_path or previous.file_path)
+        if old_key in self._pixmap_cache:
+            self._pixmap_cache.pop(old_key)
+            self._pixmap_cache_total_bytes -= self._pixmap_cache_bytes.pop(old_key, 0)
+        if self._aspect_ratio(previous) != self._aspect_ratio(image):
+            self._rebuild_layout_from(index)
+        self._update_selection_indexes({index})
 
     def image_at(self, row: int) -> ImageItem | None:
         if row < 0 or row >= len(self._images):
@@ -326,7 +372,18 @@ class JustifiedImageGridView(QAbstractScrollArea):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event) -> None:
-        index = self._index_at(event.pos())
+        if self._right_context_press and event.reason() == event.Reason.Mouse:
+            self._right_context_press = False
+            event.accept()
+            return
+        self._request_image_context_menu(event.pos(), event.globalPos())
+        event.accept()
+
+    def _request_image_context_menu(self, point: QPoint, global_point: QPoint) -> None:
+        index = self._index_at(point)
+        if self._debug_input:
+            logging.getLogger('eidory.runtime').info('Grid context request index=%s selection_count=%s',
+                                                  index, len(self._selected_indexes))
         if index >= 0:
             if index not in self._selected_indexes:
                 self._select_single(index)
@@ -336,7 +393,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
                 self._selection_anchor = index
                 self._update_selection_indexes({previous_index, index})
                 self._emit_selection()
-            self.imageContextMenuRequested.emit(self._images[index], event.globalPos())
+            self.imageContextMenuRequested.emit(self._images[index], global_point)
 
     def mouseMoveEvent(self, event) -> None:
         if self._handle_mouse_move(event.position().toPoint(), event.buttons()):
@@ -824,7 +881,7 @@ class JustifiedImageGridView(QAbstractScrollArea):
             scaled_size = QSize(size.width(), size.height())
             scaled_size.scale(max_side, max_side, Qt.AspectRatioMode.KeepAspectRatio)
             reader.setScaledSize(scaled_size)
-        return reader.read()
+        return read_display_image(reader, str(path))
 
     def clear_pixmap_cache(self):
         self._reset_image_requests()
@@ -856,7 +913,8 @@ class JustifiedImageGridView(QAbstractScrollArea):
             return
         self._pending_pixmap_loads.add(key)
         source, _mtime, _size, max_side = key
-        self._image_loader.request((self._load_generation, key), [source], max_side, urgent=True)
+        original = next((i.file_path for i in self._images if i.thumbnail_path == source), source)
+        self._image_loader.request((self._load_generation, key), list(dict.fromkeys([source, original])), max_side, urgent=True)
 
     def _reset_image_requests(self):
         self._load_generation += 1

@@ -62,7 +62,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Eidory",
         "CFBundleDisplayName": "Eidory",
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleShortVersionString": "0.1.4",
+        "CFBundleVersion": "20261105.1",
         "NSHighResolutionCapable": "True",
     },
 )

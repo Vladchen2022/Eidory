@@ -23,7 +23,7 @@ import urllib.request
 import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
@@ -190,6 +190,7 @@ from eidory.ui.accessibility import (
     configure_qt_accessibility,
 )
 from eidory.ui.collection_tree import CollectionTreeWidget
+from eidory.ui.duplicate_compare_dialog import DuplicateCompareDialog
 from eidory.ui.image_preview_dialog import ImagePreviewDialog
 from eidory.ui.justified_image_grid import JustifiedImageGridView
 from eidory.ui.near_duplicate_dialog import NearDuplicateDecision, NearDuplicateDialog
@@ -911,16 +912,21 @@ class MissingFilesDialog(QDialog):
 class DuplicateResultsDialog(QDialog):
     groupLoadRequested = Signal(list)
     allGroupsLoadRequested = Signal()
+    removeRequested = Signal(int)
+    deleteRequested = Signal(int)
+    undoRequested = Signal()
 
     def __init__(self, groups: list[DuplicateGroup], *, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("重复 / 近重复图片")
         self.resize(1040, 620)
         self.groups = list(groups)
+        self.original_groups = list(groups)
+        self.compare_dialog: DuplicateCompareDialog | None = None
         self.selected_group_image_ids: list[int] = []
         self.all_group_image_ids: list[int] = []
         layout = QVBoxLayout(self)
-        intro = QLabel("完全重复是文件内容相同；近重复是同图不同尺寸、轻微裁切或同构图变体的候选。不要默认删除，先看所在文件夹。")
+        intro = QLabel("完全重复是文件内容相同；近重复是逐对核验后的画面近似候选。并列对比每次只显示两张图片，请结合画面与所在文件夹决定。")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -935,15 +941,20 @@ class DuplicateResultsDialog(QDialog):
         layout.addWidget(self.tree, 1)
 
         row = QHBoxLayout()
+        self.compare_button = QPushButton("并列对比 / 处理重复图片")
+        self.compare_button.setProperty("variant", "primary")
         self.load_all_groups_button = QPushButton("载入全部组")
         self.load_group_button = QPushButton("载入选中组")
         close_button = QPushButton("关闭")
+        row.addWidget(self.compare_button)
         row.addWidget(self.load_all_groups_button)
         row.addWidget(self.load_group_button)
         row.addStretch(1)
         row.addWidget(close_button)
         layout.addLayout(row)
         self.load_all_groups_button.clicked.connect(self.allGroupsLoadRequested.emit)
+        self.compare_button.clicked.connect(self.open_comparison)
+        self.tree.itemDoubleClicked.connect(lambda _item, _column: self.open_comparison())
         self.load_group_button.clicked.connect(self._accept_selected_group)
         close_button.clicked.connect(self.reject)
         self._populate_tree()
@@ -959,6 +970,43 @@ class DuplicateResultsDialog(QDialog):
                 groups.append(DuplicateGroup(kind=group.kind, reason=group.reason, members=members))
         self.groups = groups
         self._populate_tree()
+        if self.compare_dialog is not None:
+            self.compare_dialog.set_groups(groups)
+
+    def set_groups(self, groups: list[DuplicateGroup]) -> None:
+        self.groups = list(groups)
+        self._populate_tree()
+        if self.compare_dialog is not None:
+            self.compare_dialog.set_groups(groups)
+
+    def open_comparison(self) -> None:
+        if self.compare_dialog is not None:
+            self.compare_dialog.show()
+            self.compare_dialog.raise_()
+            self.compare_dialog.activateWindow()
+            return
+        if not self.groups:
+            return
+        item = self.tree.currentItem()
+        if item is not None and item.parent() is not None:
+            item = item.parent()
+        index = self.tree.indexOfTopLevelItem(item) if item is not None else 0
+        dialog = DuplicateCompareDialog(self.groups, start_index=max(0, index), parent=self)
+        dialog.removeRequested.connect(self.removeRequested.emit)
+        dialog.deleteRequested.connect(self.deleteRequested.emit)
+        dialog.undoRequested.connect(self.undoRequested.emit)
+        dialog.finished.connect(lambda _result: self._clear_comparison(dialog))
+        self.compare_dialog = dialog
+        dialog.show()
+
+    def _clear_comparison(self, dialog: DuplicateCompareDialog) -> None:
+        if self.compare_dialog is dialog:
+            self.compare_dialog = None
+
+    def done(self, result: int) -> None:
+        if self.compare_dialog is not None:
+            self.compare_dialog.close()
+        super().done(result)
 
     def _populate_tree(self) -> None:
         self.tree.clear()
@@ -990,6 +1038,7 @@ class DuplicateResultsDialog(QDialog):
                 parent_item.addChild(child)
             parent_item.setExpanded(index <= 8)
         has_groups = bool(self.groups)
+        self.compare_button.setEnabled(has_groups)
         self.load_all_groups_button.setEnabled(has_groups)
         self.load_group_button.setEnabled(has_groups)
 
@@ -1367,7 +1416,10 @@ class _FileWatchWorker(QObject):
 from eidory.ui.compare_dialog import ImageCompareDialog
 
 
-class MainWindow(QMainWindow):
+from eidory.ui.library_browsing import LibraryBrowsingMixin
+
+
+class MainWindow(LibraryBrowsingMixin, QMainWindow):
     _file_watch_configure_requested = Signal(object)
     _file_watch_clear_requested = Signal()
 
@@ -1404,7 +1456,8 @@ class MainWindow(QMainWindow):
         )
         self.thumbnailer = Thumbnailer(paths.thumbnail_dir)
         self.scanner = ImageScanner(store, self.thumbnailer)
-        self.embedding_provider = JinaClipV2Provider()
+        from eidory.core.portable_model import provider_options
+        self.embedding_provider = JinaClipV2Provider(**provider_options(paths.data_dir))
         self.vector_index = VectorIndex(
             store,
             model_name=self.embedding_provider.model_name,
@@ -3474,6 +3527,9 @@ class MainWindow(QMainWindow):
         self.open_data_dir_button = QPushButton("打开数据目录")
         self.backup_database_button = QPushButton("备份数据库")
         self.restore_database_button = QPushButton("恢复数据库")
+        self.workspace_migration_button = QPushButton("工作区迁移 / 换电脑…")
+        self.workspace_migration_button.setToolTip("携带图片、已有向量、AI 标签、项目及检索模型；恢复后无需重新识图")
+        self.workspace_migration_button.clicked.connect(self._open_workspace_migration)
         self.run_self_check_button = QPushButton("运行启动自检")
         self.show_error_log_button = QPushButton("查看错误日志")
         self.show_operation_history_button = QPushButton("操作历史")
@@ -3573,6 +3629,7 @@ class MainWindow(QMainWindow):
         settings_actions_row.addWidget(self.backup_database_button)
         settings_actions_row.addWidget(self.restore_database_button)
         settings_layout.addLayout(settings_actions_row)
+        settings_layout.addWidget(self.workspace_migration_button)
         settings_health_row = QHBoxLayout()
         settings_health_row.setContentsMargins(0, 0, 0, 0)
         settings_health_row.addWidget(self.run_self_check_button)
@@ -3992,6 +4049,10 @@ class MainWindow(QMainWindow):
                 yield conn
             finally:
                 conn.close()
+
+    def _open_workspace_migration(self) -> None:
+        from eidory.ui.workspace_migration import WorkspaceMigrationDialog
+        WorkspaceMigrationDialog(self).exec()
 
     def _backup_database(self) -> None:
         try:
@@ -8020,133 +8081,6 @@ class MainWindow(QMainWindow):
         self.workspace_chrome.navigation_tabs.setCurrentIndex(0)
         self.workspace_chrome.refresh()
 
-    def _reload_images(self, *, reveal_image_id: int | None = None) -> None:
-        self.semantic_search_revision += 1
-        if hasattr(self, "filter_workflow"):
-            self.filter_workflow.follow_sidebar()
-        self.search_button.setEnabled(True)
-        self._invalidate_result_status_count_cache()
-        self.current_offset = 0
-        self._clear_manual_result_order()
-        self._clear_result_management_state()
-        self._clear_temporary_project_selection()
-        self.search_filters.clear()
-        self.active_filter_index = None
-        self.current_keyword_query = None
-        self.current_semantic_query = None
-        self.current_result_mode = "library"
-        self.current_semantic_images = []
-        self.current_semantic_filtered_images = []
-        self.current_similar_searchable_count = 0
-        self.current_similar_candidate_limit = 0
-        self.current_color_images = []
-        self.current_color_filtered_images = []
-        self.current_search_scope_count = None
-        self.current_inspiration_project_id = None
-        self.current_inspiration_terms = []
-        self.current_inspiration_plan_filters = []
-        self.current_inspiration_raw_term_results = []
-        self.current_inspiration_images = []
-        self.current_inspiration_filtered_images = []
-        self.current_inspiration_matches = {}
-        self.current_temp_project_id = None
-        self.current_search_result_set_project_id = None
-        self.current_temp_project_images = []
-        self.current_temp_project_badges = {}
-        self.current_creative_node_images = []
-        self.current_creative_node_filtered_images = []
-        self.current_creative_node_searchable_count = 0
-        self.current_creative_node_candidate_limit = 0
-        self.current_creative_node_badges = {}
-        self.current_chain_images = []
-        self.current_chain_filtered_images = []
-        self.current_chain_result = SearchChainResult(images=[])
-        self.current_chain_base_image_ids = None
-        self.current_chain_base_label = None
-        self.current_chain_operation_mode = "replace"
-        self.current_duplicate_images = []
-        self.current_duplicate_badges = {}
-        self._show_gallery_view()
-        self.load_more_button.setEnabled(True)
-        initial_limit = self.page_size
-        if reveal_image_id is not None:
-            position = self.store.image_position_in_collection(
-                reveal_image_id, self._selected_collection_id(),
-                sort_key=self._database_sort_key(), sort_desc=self.current_sort_desc,
-            )
-            if position is not None:
-                initial_limit = max(initial_limit, (position // self.page_size + 1) * self.page_size)
-        images = self.store.list_images(
-            status_filter=self._selected_status_filter(),
-            tag_ids=[],
-            tag_match_mode="any",
-            folder_path_prefix=self._selected_folder_path_prefix(),
-            collection_id=self._selected_collection_id(),
-            virtual_filter=self._selected_virtual_filter(),
-            limit=initial_limit,
-            offset=0,
-            sort_key=self._database_sort_key(),
-            sort_desc=self.current_sort_desc,
-        )
-        self.current_offset = len(images)
-        self.load_more_button.setEnabled(len(images) >= initial_limit)
-        self.grid_view.set_images(images)
-        self._set_result_status(f"全部图库：已加载 {len(images)} 张")
-        self._update_search_diagnostics([])
-        self._refresh_feedback_buttons(self.selected_image)
-        self._refresh_filter_chain_ui()
-
-    def _clear_temporary_project_selection(self) -> None:
-        if not hasattr(self, "temp_project_list"):
-            return
-        self.temp_project_list.blockSignals(True)
-        self.temp_project_list.clearSelection()
-        self.temp_project_list.setCurrentItem(None)
-        self.temp_project_list.blockSignals(False)
-
-    def _load_more(self) -> None:
-        if not self._can_load_more_library_page():
-            return
-        self._loading_more_images = True
-        try:
-            offset = self.grid_view.rowCount()
-            images = self.store.list_images(
-                text_query=self.current_keyword_query,
-                status_filter=self._selected_status_filter(),
-                tag_ids=[],
-                tag_match_mode="any",
-                folder_path_prefix=self._selected_folder_path_prefix(),
-                collection_id=self._selected_collection_id(),
-                virtual_filter=self._selected_virtual_filter(),
-                limit=self.page_size,
-                offset=offset,
-                sort_key=self._database_sort_key(),
-                sort_desc=self.current_sort_desc,
-            )
-            if images:
-                self.grid_view.append_images(images)
-            self.current_offset = self.grid_view.rowCount()
-            self.load_more_button.setEnabled(len(images) >= self.page_size)
-            self._set_result_status(f"已加载 {self.grid_view.rowCount()} 张，新增加载 {len(images)} 张")
-        finally:
-            self._loading_more_images = False
-
-    def _can_load_more_library_page(self) -> bool:
-        return (
-            not self._loading_more_images
-            and self.current_result_mode == "library"
-            and not self.search_filters
-            and self.load_more_button.isEnabled()
-        )
-
-    def _maybe_auto_load_more(self, value: int) -> None:
-        if not self._can_load_more_library_page():
-            return
-        bar = self.grid_view.verticalScrollBar()
-        threshold = max(240, self.grid_view.viewport().height())
-        if bar.maximum() - value <= threshold:
-            self._load_more()
-
     def _clear_search(self) -> None:
         should_restore_duplicate_dialog = (
             self.current_result_mode == "duplicate_group"
@@ -9135,7 +9069,7 @@ class MainWindow(QMainWindow):
         dialog._selection_context = self._preview_selection_context()
         dialog.imageChanged.connect(lambda image, context=dialog._selection_context: self._sync_preview_selection(image, context))
         dialog.imageChanged.connect(lambda image, preview=dialog: self._refresh_preview_collection(preview, image))
-        dialog.upscaleRequested.connect(self.image_upscaler.open)
+        dialog.upscaleRequested.connect(lambda image, preview=dialog: self.image_upscaler.open(image, preview=preview))
         dialog.collectRequested.connect(lambda image, preview=dialog: self._collect_from_preview(preview, image))
         dialog.favoriteChanged.connect(self._handle_preview_favorite_changed)
         dialog.annotationMembershipChanged.connect(self.filter_workflow.annotation_membership_changed)
@@ -9420,6 +9354,8 @@ class MainWindow(QMainWindow):
             self.simple_search.prefer(context_image.id, 1 if command == "prefer_more" else -1)
         elif command == "compare_selection":
             self._compare_selected_images()
+        elif command == "batch_upscale":
+            self.image_upscaler.open_selection(selected_images)
         elif command == "find_similar":
             self._find_similar_to_image(context_image)
         elif command == "open":
@@ -9490,6 +9426,11 @@ class MainWindow(QMainWindow):
 
         add_action(menu, "preview", "快速预览")
         add_action(menu, "compare_selection", "对比查看")
+        batch_upscale = add_action(menu, "batch_upscale",
+            f"AI 批量放大所选 {len(selected_images)} 张…" if len(selected_images) > 1 else "AI 放大…")
+        batch_upscale.setToolTip("依次放大所选图片；超限时自动调整尺寸，完成后逐张审核")
+        batch_upscale.setEnabled(bool(selected_images) and not self._database_maintenance_active
+                                 and not self.image_upscaler.working)
         add_action(menu, "find_similar", "查找相似图片")
         if self.current_result_mode == "search_chain" and context_image is not None:
             add_action(menu, "prefer_more", "更像这张（调整排序）")
@@ -12813,6 +12754,7 @@ class MainWindow(QMainWindow):
             if records:
                 self._last_removal_undo = records[0]
                 self.undo_removal_action.setEnabled(True)
+        self._restore_duplicate_results_after_undo(restore_ids if restored else set())
         self._refresh_after_library_removal()
         if failures:
             QMessageBox.warning(
@@ -12822,6 +12764,24 @@ class MainWindow(QMainWindow):
             )
         self._record_operation_history(f"撤销删除/移除：恢复 {restored} 个项目")
         self.statusBar().showMessage(f"已撤销：恢复 {restored} 个项目")
+
+    def _restore_duplicate_results_after_undo(self, restored_ids: set[int]) -> None:
+        dialog = self._duplicate_results_dialog
+        if dialog is None or not restored_ids:
+            return
+        candidate_ids = {m.image.id for g in dialog.original_groups for m in g.members}
+        if not candidate_ids.intersection(restored_ids):
+            return
+        available = {image.id for image in self.store.images_by_ids(sorted(candidate_ids))}
+        groups = []
+        for group in dialog.original_groups:
+            members = tuple(m for m in group.members if m.image.id in available)
+            if len(members) >= 2:
+                groups.append(DuplicateGroup(kind=group.kind, reason=group.reason, members=members))
+        self._duplicate_groups = groups
+        dialog.set_groups(groups)
+        if self.current_result_mode == "duplicate_group":
+            self.current_duplicate_images, self.current_duplicate_badges = self._duplicate_groups_grid_payload(groups)
 
     def _refresh_after_library_removal(self) -> None:
         self._invalidate_near_duplicate_hash_cache()
@@ -13283,15 +13243,26 @@ class MainWindow(QMainWindow):
                     sort_key="name",
                     sort_desc=False,
                 )
-                folder_labels = {image.id: self._folder_label_for_image(image) for image in images}
                 updated_records = []
                 groups = find_duplicate_groups(
                     images,
-                    folder_label_for_image=folder_labels,
                     hash_records=self.store.image_hash_records([image.id for image in images]),
                     on_hash_record=updated_records.append,
                     near_distance=8,
                 )
+                wanted = {m.image.id for g in groups for m in g.members}
+                paths = {collection.id: " / ".join(parts)
+                         for collection, parts in self.store.collection_export_paths()}
+                labels: dict[int, list[str]] = {}
+                with self.store.connect(readonly=True) as conn:
+                    for row in conn.execute("SELECT image_id, collection_id FROM image_collections ORDER BY collection_id"):
+                        if row["image_id"] in wanted and row["collection_id"] in paths:
+                            labels.setdefault(row["image_id"], []).append(paths[row["collection_id"]])
+                groups = [replace(g, members=tuple(
+                    replace(m, folder_label="；".join(labels.get(m.image.id, []))
+                            or Path(m.image.file_path).parent.name)
+                    for m in g.members
+                )) for g in groups]
                 if updated_records:
                     self.store.upsert_image_hash_records(updated_records)
                 self.events.put(("duplicates_done", groups))
@@ -13320,6 +13291,9 @@ class MainWindow(QMainWindow):
         dialog = DuplicateResultsDialog(groups, parent=self)
         dialog.allGroupsLoadRequested.connect(self._load_all_duplicate_group_images)
         dialog.groupLoadRequested.connect(self._load_duplicate_group_images)
+        dialog.removeRequested.connect(self._remove_duplicate_image)
+        dialog.deleteRequested.connect(self._delete_duplicate_image)
+        dialog.undoRequested.connect(self._undo_last_library_removal)
         dialog.finished.connect(lambda _result: self._clear_duplicate_results_dialog(dialog))
         self._duplicate_results_dialog = dialog
         dialog.show()
@@ -13334,6 +13308,28 @@ class MainWindow(QMainWindow):
         message = f"重复检测完成：完全重复 {exact_count} 组，近重复 {near_count} 组"
         self.settings_status_label.setText(message)
         self.statusBar().showMessage(message)
+
+    def _duplicate_action_image(self, image_id: int) -> ImageItem | None:
+        if not any(m.image.id == image_id for g in self._duplicate_groups for m in g.members):
+            return None
+        return self.store.get_image(image_id)
+
+    def _remove_duplicate_image(self, image_id: int) -> None:
+        image = self._duplicate_action_image(image_id)
+        if image is None:
+            return
+        removed = self._remove_images_from_library_with_undo(
+            [image], undo_label=f"移除重复图片：{image.file_name}",
+        )
+        if removed:
+            message = f"已从图库移除 {image.file_name}，源文件保留；可 Cmd+Z 撤销"
+            self.statusBar().showMessage(message)
+            self._record_operation_history(message)
+
+    def _delete_duplicate_image(self, image_id: int) -> None:
+        image = self._duplicate_action_image(image_id)
+        if image is not None:
+            self._delete_source_files_with_undo([image])
 
     def _clear_duplicate_results_dialog(self, dialog: DuplicateResultsDialog) -> None:
         if self._duplicate_results_dialog is dialog:

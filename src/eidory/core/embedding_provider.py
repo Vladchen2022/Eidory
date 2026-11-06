@@ -40,11 +40,15 @@ class JinaClipV2Provider(EmbeddingProvider):
         model_revision: str = "main",
         dim: int = 512,
         prefer_mps: bool = True,
+        cache_folder: str | None = None,
+        local_files_only: bool = False,
     ):
         self._model_name = model_name
         self._model_revision = model_revision
         self._dim = dim
         self._prefer_mps = prefer_mps
+        self._cache_folder = cache_folder
+        self._local_files_only = local_files_only
         self._model: Any | None = None
         self._lock = threading.RLock()
 
@@ -95,6 +99,9 @@ class JinaClipV2Provider(EmbeddingProvider):
             except Exception:
                 first_device = "cpu"
 
+        options = {}
+        if self._cache_folder:
+            options.update(cache_folder=self._cache_folder, local_files_only=self._local_files_only)
         try:
             self._model = SentenceTransformer(
                 self._model_name,
@@ -102,6 +109,7 @@ class JinaClipV2Provider(EmbeddingProvider):
                 trust_remote_code=True,
                 truncate_dim=self._dim,
                 device=first_device,
+                **options,
             )
         except Exception:
             if first_device == "cpu":
@@ -112,6 +120,7 @@ class JinaClipV2Provider(EmbeddingProvider):
                 trust_remote_code=True,
                 truncate_dim=self._dim,
                 device="cpu",
+                **options,
             )
         return self._model
 

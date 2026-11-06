@@ -7,7 +7,7 @@ import sqlite3
 from eidory.core.metadata_store import MetadataStore
 
 
-def prepare_database(source, destination):
+def prepare_database(source, destination, *, existing_foreign_key_issues=()):
     source, destination = Path(source), Path(destination)
     with closing(sqlite3.connect(source.resolve().as_uri() + '?mode=ro', uri=True)) as src:
         if src.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
@@ -32,7 +32,8 @@ def prepare_database(source, destination):
                 actual = {row['name'] for row in conn.execute(f'PRAGMA table_info({table})')}
                 if not required <= actual:
                     raise ValueError(f'数据库缺少必要字段：{table}')
-        if conn.execute('PRAGMA foreign_key_check').fetchone():
+        issues = {tuple(row) for row in conn.execute('PRAGMA foreign_key_check')}
+        if issues != {tuple(row) for row in existing_foreign_key_issues}:
             raise ValueError('数据库存在无效关联')
         if conn.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
             raise ValueError('迁移后的数据库完整性检查未通过')

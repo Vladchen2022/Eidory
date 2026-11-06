@@ -13,6 +13,8 @@ def main() -> int:
     started = time.perf_counter()
     paths = AppPaths.default()
     paths.ensure()
+    from eidory.core.portable_model import configure_portable_model
+    configure_portable_model(paths.data_dir)
     from eidory.core.diagnostics import setup_diagnostics, watch_event_loop
     logger = setup_diagnostics(paths.log_dir)
 
@@ -43,9 +45,29 @@ def main() -> int:
         _setting_int(store, "ui.window_height", 860, 600, 1800),
     )
     window.show()
+    from eidory.core import workspace_selection
+    if workspace_selection.startup_warning:
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.warning(window, '工作区已回退', workspace_selection.startup_warning)
     watch_event_loop(window, logger)
     logger.info('Window shown in %.0f ms', (time.perf_counter()-started)*1000)
-    return app.exec()
+    result = app.exec()
+    next_workspace = getattr(app, '_eidory_next_workspace', None)
+    if next_workspace:
+        # All old readers/writers have finished via MainWindow.closeEvent.
+        # A fresh process also resets the model cache and native file watchers.
+        try:
+            workspace_selection.select_workspace(next_workspace, paths.data_dir)
+        except Exception as exc:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(None, '未切换工作区', f'{exc}\n旧工作区仍然保留，请重新打开软件。')
+            return 1
+        import os
+        if getattr(sys, 'frozen', False):
+            os.environ['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+        arguments = [sys.executable] if getattr(sys, 'frozen', False) else [sys.executable, '-m', 'eidory.main']
+        os.execv(sys.executable, arguments)
+    return result
 
 
 def _setting_int(

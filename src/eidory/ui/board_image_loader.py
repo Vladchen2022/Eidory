@@ -5,6 +5,9 @@ import threading
 
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, Signal
 from PySide6.QtGui import QImage, QImageReader
+from eidory.ui.display_image import read_display_image
+from eidory.core.image_loader import MAX_DECODED_IMAGE_PIXELS
+from eidory.core.thumbnailer import upgrade_display_thumbnail
 
 
 class _Signals(QObject):
@@ -20,16 +23,20 @@ class _Decode(QRunnable):
     def run(self):
         image, used = QImage(), ''
         try:
+            if len(self.paths) >= 2 and not self.cancelled.is_set():
+                upgrade_display_thumbnail(self.paths[0], self.paths[1])
             for path in self.paths:
                 if self.cancelled.is_set():
                     break
                 reader = QImageReader(path)
                 reader.setAutoTransform(True)
                 size = reader.size()
-                if size.isValid() and max(size.width(), size.height()) > self.side:
+                if not self.side and size.width() * size.height() > MAX_DECODED_IMAGE_PIXELS:
+                    continue
+                if self.side and size.isValid() and max(size.width(), size.height()) > self.side:
                     size.scale(self.side, self.side, Qt.AspectRatioMode.KeepAspectRatio)
                     reader.setScaledSize(size)
-                image = reader.read()
+                image = read_display_image(reader, path)
                 if not image.isNull():
                     used = path
                     break

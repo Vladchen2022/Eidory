@@ -14,12 +14,8 @@ class AppPaths:
 
     @classmethod
     def default(cls) -> "AppPaths":
-        override = os.environ.get("EIDORY_DATA_DIR", "").strip()
-        data_dir = (
-            Path(override).expanduser()
-            if override
-            else Path.home() / "Library" / "Application Support" / "Eidory"
-        )
+        from eidory.core.workspace_selection import active_directory
+        data_dir = active_directory()
         return cls(
             data_dir=data_dir,
             thumbnail_dir=data_dir / "thumbnails",

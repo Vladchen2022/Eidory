@@ -4,8 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 icon_source="src/eidory/ui/icons/app_icon.png"
-xcrun swift tools/render_app_icon.swift assets/app_icon_source.png "$icon_source"
+# The 2048px original has generous empty margins. Keep the complete ribbon E,
+# centered at about 68% of the tile width, without repainting its colors/faces.
+xcrun swift tools/render_app_icon.swift assets/app_icon_source.png "$icon_source" 384 372 1280 1280
 icon_workdir="$(mktemp -d "${TMPDIR:-/tmp}/eidory-icon.XXXXXX")"
+trap 'rm -rf "$icon_workdir"' EXIT
 icon_set="$icon_workdir/Eidory.iconset"
 mkdir -p "$icon_set"
 

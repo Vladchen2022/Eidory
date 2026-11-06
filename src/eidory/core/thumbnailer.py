@@ -6,10 +6,35 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageCms
 
-from eidory.core.image_loader import open_local_image
+from eidory.core.image_loader import open_local_image, srgb_pixels
 from eidory.core.media_tools import find_media_tool
+
+
+def upgrade_display_thumbnail(thumbnail_path: str, source_path: str) -> None:
+    """Lazily upgrade old untagged cache files, never modify source images."""
+    thumbnail = Path(thumbnail_path)
+    if not thumbnail.name.startswith('thumb_') or thumbnail.suffix != '.webp' or thumbnail.is_symlink():
+        return
+    try:
+        with Image.open(thumbnail) as cached:
+            if cached.info.get('icc_profile'):
+                return
+            edge = max(cached.size)
+        with open_local_image(source_path) as source:
+            if not source.info.get('icc_profile'):
+                return
+            if source.format == 'JPEG':
+                source.draft('RGB', (edge, edge))
+            corrected = srgb_pixels(source, strict=False)
+            corrected.thumbnail((edge, edge), Image.Resampling.LANCZOS)
+            with Thumbnailer._atomic_output(thumbnail) as temporary:
+                corrected.save(temporary, 'WEBP', quality=82, method=4,
+                               icc_profile=corrected.info['icc_profile'])
+    except (OSError, ValueError, ImageCms.PyCMSError):
+        # Existing caches remain usable if an external drive is disconnected.
+        return
 
 
 class Thumbnailer:
@@ -40,12 +65,12 @@ class Thumbnailer:
         with open_local_image(image_path) as image:
             if image.format == "JPEG":
                 image.draft("RGB", (self.max_edge, self.max_edge))
-            image = ImageOps.exif_transpose(image)
+            image = srgb_pixels(image, strict=False)
             image.thumbnail((self.max_edge, self.max_edge), Image.Resampling.LANCZOS)
             if image.mode not in {"RGB", "RGBA"}:
                 image = image.convert("RGB")
             with self._atomic_output(output_path) as temporary:
-                image.save(temporary, "WEBP", quality=82, method=4)
+                image.save(temporary, "WEBP", quality=82, method=4, icc_profile=image.info.get('icc_profile'))
         return output_path
 
     def generate_video(

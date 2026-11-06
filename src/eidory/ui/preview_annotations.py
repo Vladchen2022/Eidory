@@ -1,9 +1,9 @@
-"""Preview-only ink layer, input and compact, always-visible annotation controls."""
+"""Preview-only ink layer, input and contextual annotation controls."""
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QSignalBlocker, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QTransform
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QGraphicsItem, QGraphicsView, QHBoxLayout,
@@ -287,21 +287,30 @@ class AnnotationControls(QWidget):
         self.blocked = False
         self.error = ""
         self.setObjectName("previewAnnotationControls")
-        row = WrappingLayout(self, spacing=5)
+        tools_row = QHBoxLayout(self)
+        tools_row.setContentsMargins(0, 0, 0, 0)
+        tools_row.setSpacing(5)
+        self.options = QWidget(self)
+        self.options.setObjectName("previewAnnotationOptions")
+        row = WrappingLayout(self.options, spacing=5)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(5)
         self.tools = QButtonGroup(self)
+        self.tools.setExclusive(False)
         self.tool_buttons = {}
         for tool, title in (("pan", "移动"), ("pen", "画笔"), ("eraser", "橡皮")):
             button = QPushButton(title)
             button.setCheckable(True)
             button.setAutoDefault(False)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            button.clicked.connect(lambda checked=False, t=tool: self.set_tool(t))
+            button.toggled.connect(lambda checked, t=tool: self.set_tool(t if checked else "pan"))
             self.tools.addButton(button)
             self.tool_buttons[tool] = button
-            row.addWidget(button)
-        self.tool_buttons["pan"].setChecked(True)
+            (row if tool == "pan" else tools_row).addWidget(button)
+            if tool != "pan":
+                button.setToolTip("再次点击退出标记；按住空格可临时拖动图片")
+        with QSignalBlocker(self.tool_buttons["pan"]):
+            self.tool_buttons["pan"].setChecked(True)
         self.tool_buttons["pan"].setToolTip("拖动平移图片；画笔或橡皮模式下也可按住空格平移")
         self.colors = QComboBox()
         for title, color in (("红色", "#E53935"), ("黄色", "#FFC107"), ("蓝色", "#2196F3"),
@@ -311,7 +320,8 @@ class AnnotationControls(QWidget):
         self.colors.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.colors.currentIndexChanged.connect(lambda i: setattr(view, "annotation_color", self.colors.itemData(i)))
         row.addWidget(self.colors)
-        row.addWidget(QLabel("粗细"))
+        self.width_label = QLabel("粗细")
+        row.addWidget(self.width_label)
         self.width = QSlider(Qt.Orientation.Horizontal)
         self.width.setRange(2, 20)
         self.width.setValue(4)
@@ -326,7 +336,7 @@ class AnnotationControls(QWidget):
         self.visible = QPushButton("显示标记")
         self.visible.setCheckable(True)
         self.visible.setChecked(True)
-        self.visible.toggled.connect(view.set_annotations_visible)
+        self.visible.toggled.connect(self._set_annotations_visible)
         self.undo.clicked.connect(view.undo_annotation)
         self.redo.clicked.connect(view.redo_annotation)
         self.clear.clicked.connect(view.clear_annotations)
@@ -340,11 +350,23 @@ class AnnotationControls(QWidget):
         self.status.hide()
         view.annotationsChanged.connect(self.changed)
         view.annotationHistoryChanged.connect(self.update_actions)
+        self.options.hide()
 
     def set_tool(self, tool):
+        # Toggling the active tool off restores panning. Blocking the other
+        # toggles also makes native accessibility presses follow the same path.
+        for name, button in self.tool_buttons.items():
+            with QSignalBlocker(button):
+                button.setChecked(name == tool)
         if tool != "pan":
             self.visible.setChecked(True)
         self.view.set_annotation_tool(tool)
+        self.update_actions()
+
+    def _set_annotations_visible(self, visible):
+        if not visible:
+            self.set_tool("pan")
+        self.view.set_annotations_visible(visible)
 
     def update_actions(self):
         editable = self.view._ink_editable
@@ -355,6 +377,8 @@ class AnnotationControls(QWidget):
         self.clear.setEnabled(editable and bool(self.view.annotations))
         self.colors.setEnabled(editable)
         self.width.setEnabled(editable)
+        self.options.setVisible(editable and self.view.annotation_tool != "pan")
+        self.colors.setVisible(self.view.annotation_tool == "pen")
 
     def load_image(self, image, *, enabled=True):
         if self.image is not None and image is not None and self.image.id == image.id:

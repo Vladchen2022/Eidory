@@ -66,6 +66,8 @@ from eidory.models import ImageItem
 from eidory.ui.art_analysis_widget import ArtAnalysisWidget
 from eidory.ui.preview_annotations import AnnotationControls, AnnotationViewMixin
 from eidory.ui.wrapping_layout import WrappingLayout
+from eidory.ui.display_image import read_display_image
+from eidory.core.image_loader import srgb_pixels
 
 
 PREVIEW_ICON_BUTTON_SIZE = QSize(36, 32)
@@ -96,7 +98,7 @@ def _load_linetop_source_image(
     with open_local_image(image_path) as source:
         if max_width is not None and max_height is not None and source.format == "JPEG":
             source.draft("RGB", (max_width, max_height))
-        loaded = ImageOps.exif_transpose(source)
+        loaded = srgb_pixels(source)
         if max_width is not None and max_height is not None:
             loaded.thumbnail((max(1, max_width), max(1, max_height)), Image.Resampling.LANCZOS)
         if mirror_horizontal:
@@ -265,14 +267,14 @@ def _load_preview_qimage(image_path: str, max_width: int, max_height: int) -> QI
         scaled_size.scale(max_width, max_height, Qt.AspectRatioMode.KeepAspectRatio)
         if scaled_size.width() < source_size.width() or scaled_size.height() < source_size.height():
             reader.setScaledSize(scaled_size)
-    qimage = reader.read()
+    qimage = read_display_image(reader, image_path)
     if not qimage.isNull():
         return qimage
     try:
         with open_local_image(image_path) as image:
             if image.format == "JPEG":
                 image.draft("RGB", (max_width, max_height))
-            image = ImageOps.exif_transpose(image)
+            image = srgb_pixels(image)
             image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
             image = image.convert("RGBA")
             data = image.tobytes("raw", "RGBA")
@@ -470,8 +472,9 @@ class PreviewImageView(AnnotationViewMixin, QGraphicsView):
         self._message_item.setDefaultTextColor(theme_color("text"))
         self.viewport().update()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, minimum_zoom_factor: float = 0.1):
         super().__init__(parent)
+        self._minimum_zoom_factor = max(0.001, min(0.1, minimum_zoom_factor))
         self._scene = QGraphicsScene(self)
         self._pixmap_item = QGraphicsPixmapItem()
         self._message_item = QGraphicsTextItem()
@@ -618,7 +621,7 @@ class PreviewImageView(AnnotationViewMixin, QGraphicsView):
             return
         center_ratio = self._current_center_ratio()
         self._fit_to_window = False
-        self._zoom_factor = max(0.1, min(8.0, zoom_factor))
+        self._zoom_factor = max(self._minimum_zoom_factor, min(8.0, zoom_factor))
         self._apply_zoom_transform()
         self._center_on_ratio(center_ratio)
         self._update_drag_mode()
@@ -631,7 +634,7 @@ class PreviewImageView(AnnotationViewMixin, QGraphicsView):
         viewport_width = max(1, self.viewport().width() - 2)
         viewport_height = max(1, self.viewport().height() - 2)
         return max(
-            0.1,
+            self._minimum_zoom_factor,
             min(8.0, min(viewport_width / self._original_width, viewport_height / self._original_height)),
         )
 
@@ -646,7 +649,7 @@ class PreviewImageView(AnnotationViewMixin, QGraphicsView):
             self._zoom_factor = self.fit_zoom_factor()
             self._fit_to_window = False
         step = 1.15 if wheel_delta > 0 else 1 / 1.15
-        self._zoom_factor = max(0.1, min(8.0, self._zoom_factor * step))
+        self._zoom_factor = max(self._minimum_zoom_factor, min(8.0, self._zoom_factor * step))
         self._pixmap_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
         self._apply_zoom_transform()
         correction = scene_anchor - self.mapToScene(anchor)
@@ -1590,10 +1593,14 @@ class ImagePreviewDialog(QDialog):
         self._resize_render_timer.setSingleShot(True)
         self._resize_render_timer.setInterval(PREVIEW_RESIZE_RENDER_DELAY_MS)
         self._resize_render_timer.timeout.connect(self._render_after_resize)
+        self._page_focus_timer = QTimer(self)
+        self._page_focus_timer.setSingleShot(True)
+        self._page_focus_timer.timeout.connect(self._focus_active_page)
 
         self.setWindowTitle("Eidory 预览")
         self.resize(1200, 820)
         self.setMinimumSize(720, 520)
+        self._upscale_panel = None
 
         self.image_view = PreviewImageView()
         self.image_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1717,6 +1724,7 @@ class ImagePreviewDialog(QDialog):
 
         controls = WrappingLayout()
         self.preview_controls_layout = controls
+        controls.addWidget(self.annotation_controls)
         controls.addWidget(self.fit_button)
         controls.addWidget(self.actual_size_button)
         controls.addWidget(self.upscale_button)
@@ -1747,8 +1755,13 @@ class ImagePreviewDialog(QDialog):
             if not button.property("eidoryPreviewIcon"):
                 button.setStyleSheet("QPushButton { min-height: 30px; max-height: 30px; padding: 0 8px; }")
 
-        layout = QVBoxLayout(self)
-        layout.addLayout(controls)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        self.pages = QStackedWidget(self)
+        root_layout.addWidget(self.pages)
+        self.preview_page = QWidget()
+        self.pages.addWidget(self.preview_page)
+        layout = QVBoxLayout(self.preview_page)
         preview_row = QHBoxLayout()
         self._preview_row_layout = preview_row
         preview_row.setContentsMargins(0, 0, 0, 0)
@@ -1758,7 +1771,8 @@ class ImagePreviewDialog(QDialog):
         layout.addLayout(preview_row, 1)
         layout.addWidget(self.video_controls_widget)
         layout.addWidget(self.info_label)
-        layout.addWidget(self.annotation_controls)
+        layout.addWidget(self.annotation_controls.options)
+        layout.addLayout(controls)
 
         self.fit_button.clicked.connect(self._fit_image_to_window)
         self.actual_size_button.clicked.connect(self._actual_size_image)
@@ -1789,10 +1803,46 @@ class ImagePreviewDialog(QDialog):
 
         self._refresh()
 
+    def show_upscale_panel(self, panel) -> None:
+        """Switch pages without rebuilding the image view or its editing state."""
+        self._upscale_panel = panel
+        self.image_view.set_annotation_space(False)
+        self.pages.addWidget(panel)
+        self.pages.setCurrentWidget(panel)
+        self.setWindowTitle("Eidory 预览 · " + panel.windowTitle())
+        for shortcut in self._shortcuts:
+            shortcut.setEnabled(False)
+        panel.finished.connect(lambda _result: self._finish_upscale_panel(panel))
+        self._page_focus_timer.start(0)
+
+    def _focus_active_page(self) -> None:
+        if not self.isVisible():
+            return
+        self.raise_()
+        self.activateWindow()
+        if self._upscale_panel is not None:
+            self._upscale_panel.back.setFocus()
+        else:
+            self.image_view.setFocus()
+
+    def _finish_upscale_panel(self, panel) -> None:
+        if self._upscale_panel is not panel:
+            return
+        self._upscale_panel = None
+        self.pages.setCurrentWidget(self.preview_page)
+        self.pages.removeWidget(panel)
+        self.setWindowTitle("Eidory 预览")
+        for shortcut in self._shortcuts:
+            shortcut.setEnabled(True)
+        self._page_focus_timer.start(0)
+
     def closeEvent(self, event) -> None:
         if not self.annotation_controls.flush(interactive=True):
             event.ignore()
             return
+        if self._upscale_panel is not None:
+            self._upscale_panel.close()
+        self._page_focus_timer.stop()
         self._linetop_render_timer.stop()
         self._linetop_overlay_render_timer.stop()
         self._linetop_render_pending_token = None
@@ -1853,6 +1903,20 @@ class ImagePreviewDialog(QDialog):
         self._render_current_image(use_thumbnail_first=True)
 
     def eventFilter(self, watched, event) -> bool:
+        if self._upscale_panel is not None:
+            if (event.type() in {QEvent.Type.KeyPress, QEvent.Type.ShortcutOverride}
+                    and isinstance(event, QKeyEvent) and self._event_belongs_to_preview(watched)
+                    and self._is_close_shortcut(event)):
+                if event.type() == QEvent.Type.KeyPress:
+                    if event.key() == Qt.Key.Key_Escape:
+                        self._upscale_panel.close()
+                    else:
+                        self.close()
+                event.accept()
+                return True
+            # Arrow keys, Space, Tab and Undo belong to the AI page while it is
+            # visible; they must not navigate or edit the hidden original view.
+            return super().eventFilter(watched, event)
         if event.type() in {QEvent.Type.WindowDeactivate, QEvent.Type.ApplicationDeactivate}:
             self.image_view.set_annotation_space(False)
         if (event.type() == QEvent.Type.KeyRelease and isinstance(event, QKeyEvent)
@@ -1899,6 +1963,15 @@ class ImagePreviewDialog(QDialog):
         return super().eventFilter(watched, event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        if self._upscale_panel is not None:
+            if self._is_close_shortcut(event):
+                if event.key() == Qt.Key.Key_Escape:
+                    self._upscale_panel.close()
+                else:
+                    self.close()
+            else:
+                event.ignore()
+            return
         if self._is_close_shortcut(event):
             self.close()
             event.accept()
@@ -1922,7 +1995,7 @@ class ImagePreviewDialog(QDialog):
         super().keyPressEvent(event)
 
     def _move(self, delta: int) -> None:
-        if not self.images:
+        if not self.images or self._upscale_panel is not None:
             return
         next_index = self.index + delta
         if next_index < 0 or next_index >= len(self.images):
@@ -2996,6 +3069,8 @@ class ImagePreviewDialog(QDialog):
 
     def _refresh_linetop_action_buttons(self, image: ImageItem | None = None) -> None:
         active = self._linetop_preview_active(image)
+        for button in (self.compare_toggle_button, self.save_render_button, self.copy_render_button):
+            button.setVisible(active)
         if hasattr(self, "linetop_open_overlay_button"):
             self.linetop_open_overlay_button.setEnabled(active)
         if hasattr(self, "copy_render_button"):

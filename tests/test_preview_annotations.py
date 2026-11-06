@@ -242,13 +242,60 @@ def test_toolbar_layout_at_window_sizes_has_no_overlap(preview, width):
     assert slider.mapToGlobal(slider.rect().topRight()).x() < value.mapToGlobal(value.rect().topLeft()).x()
     controls = preview.annotation_controls
     assert controls.isVisible() and controls.tool_buttons["pen"].isVisible()
-    assert preview.fit_button.mapTo(preview, preview.fit_button.rect().bottomLeft()).y() < preview.image_view.mapTo(preview, preview.image_view.rect().topLeft()).y()
-    assert controls.y() > preview.image_view.mapTo(preview, preview.image_view.rect().bottomLeft()).y()
+    image_bottom = preview.image_view.mapTo(preview, preview.image_view.rect().bottomLeft()).y()
+    assert preview.fit_button.mapTo(preview, preview.fit_button.rect().topLeft()).y() > image_bottom
+    assert controls.mapTo(preview, controls.rect().topLeft()).y() > image_bottom
     for layout in (preview.preview_controls_layout, controls.layout()):
         rects = [layout.itemAt(i).geometry() for i in range(layout.count()) if not layout.itemAt(i).isEmpty()]
         assert all(not a.intersects(b) for i, a in enumerate(rects) for b in rects[i+1:])
         assert all(r.right() <= width for r in rects)
     apply_theme(QApplication.instance())
+
+
+def test_annotation_options_only_open_for_selected_editing_tool(preview):
+    controls = preview.annotation_controls
+    assert controls.options.isHidden()
+    assert controls.tool_buttons['pen'].isVisible()
+    assert controls.tool_buttons['eraser'].isVisible()
+    assert not controls.tool_buttons['pan'].isVisible()
+    controls.tool_buttons['pen'].click()
+    assert controls.options.isVisible() and controls.colors.isVisible()
+    assert preview.image_view.annotation_tool == 'pen'
+    controls.tool_buttons['eraser'].click()
+    assert controls.options.isVisible() and not controls.colors.isVisible()
+    assert not controls.tool_buttons['pen'].isChecked()
+    assert preview.image_view.annotation_tool == 'eraser'
+    controls.tool_buttons['eraser'].click()
+    assert controls.options.isHidden()
+    assert preview.image_view.annotation_tool == 'pan'
+    controls.tool_buttons['pen'].setChecked(True)  # Native AX can toggle directly.
+    assert controls.options.isVisible()
+    controls.tool_buttons['pan'].click()
+    assert controls.options.isHidden()
+    assert not controls.tool_buttons['pen'].isChecked()
+
+
+def test_collapsing_tools_keeps_ink_and_undo(preview):
+    draw(preview)
+    controls = preview.annotation_controls
+    strokes = preview.image_view.annotations
+    controls.tool_buttons['pen'].click()
+    assert controls.options.isHidden()
+    assert preview.image_view.annotations == strokes
+    controls.tool_buttons['pen'].click()
+    controls.undo.click()
+    assert not preview.image_view.annotations
+    controls.redo.click()
+    assert preview.image_view.annotations == strokes
+
+
+def test_advanced_output_actions_follow_processing_context(preview):
+    actions = (preview.compare_toggle_button, preview.save_render_button, preview.copy_render_button)
+    assert all(b.isHidden() for b in actions)
+    preview.advanced_toggle_button.click()
+    assert all(b.isVisible() for b in actions)
+    preview.advanced_toggle_button.click()
+    assert all(b.isHidden() for b in actions)
 
 
 def test_delete_restore_retains_annotation_data(preview):

@@ -472,6 +472,11 @@ CREATE TABLE IF NOT EXISTS image_upscale_jobs (
     payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_upscale_image ON image_upscale_jobs(image_id, created_at);
+CREATE TABLE IF NOT EXISTS duplicate_reviews (
+    fingerprint TEXT PRIMARY KEY,
+    decision TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 -- Kept independently of image deletion so recovery never loses the original file.
 CREATE TABLE IF NOT EXISTS image_preview_annotations (
     image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,

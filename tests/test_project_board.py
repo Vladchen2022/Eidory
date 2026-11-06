@@ -164,6 +164,11 @@ class ProjectBoardViewTest(unittest.TestCase):
             )
             item = board._image_items[1]
             self.assertIsInstance(item, BoardImageItem)
+            # Establish the low zoom this test is about. Auto-fit can legitimately
+            # request a larger image while color-managed decoding is in flight;
+            # do not make the expectation depend on beating its 120 ms timer.
+            board.reset_view()
+            board.centerOn(item)
             self.wait_for_images(board)
             self.assertEqual(max(item.source_pixmap().width(), item.source_pixmap().height()), 384)
 

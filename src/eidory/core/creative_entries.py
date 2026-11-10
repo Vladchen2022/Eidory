@@ -37,6 +37,15 @@ def search_names(payload):
 
 
 def composed_note(payload):
-    parts = [payload.get("base_note", "").strip()]
+    parts = [payload.get("base_note", "")]
     parts.extend(f'{row["name"]}: {row["visual"]}'.rstrip(": ") for row in payload["rows"] if row["name"].strip())
-    return "\n".join(part for part in parts if part)
+    return "\n".join(part for part in parts if part.strip())
+
+
+def prose_addition(original, proposal):
+    """Accept both additions and older proposals that repeat the original."""
+    proposal = proposal.strip()
+    prefix = original.strip()
+    if prefix and (proposal == prefix or proposal.startswith(prefix + "\n")):
+        return proposal[len(prefix):].strip()
+    return proposal

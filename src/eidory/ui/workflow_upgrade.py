@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog
 from eidory.core.project_state import ProjectStateStore, REFERENCE_STATUSES, PURPOSES, capture_project
 from eidory.core.search_targets import resolved_targets, target_signature
 from eidory.core.filter_engine import threshold_matches
+from eidory.ui.wrapping_layout import WrappingLayout
 
 
 class WorkflowUpgrade(QObject):
@@ -45,33 +46,35 @@ class WorkflowUpgrade(QObject):
         tools.setAccessibleName('项目工具')
         menu = QMenu(tools)
         self.project_actions = []
-        for label, callback, needs_project in [
-                ('主题与补充设定…', lambda: w.creative_flow.edit_context(), True),
-                ('方案版本…', self.show_versions, True),
-                ('导出创作参考包…', cw.export_project, True),
-                ('导出可编辑项目包…', self.export_package, True),
-                ('导入可编辑项目包…', self.import_package, False)]:
-            action = menu.addAction(label, callback)
-            if needs_project:
-                self.project_actions.append(action)
-        menu.addSeparator()
-        self.batch_action = menu.addAction('批量补全未确定的内容', w.generate_all_creative_nodes_button.click)
-        self.copy_action = menu.addAction('项目文案', w.open_creative_copy_button.click)
-        menu.addAction('探索灵感方向', cw.show_probe)
-        menu.aboutToShow.connect(lambda: self.batch_action.setEnabled(w.generate_all_creative_nodes_button.isEnabled()))
-        menu.aboutToShow.connect(lambda: self.copy_action.setEnabled(w.open_creative_copy_button.isEnabled()))
+        for label, callback in [
+                ('主题与补充设定…', lambda: w.creative_flow.edit_context()),
+                ('方案版本…', self.show_versions),
+                ('导出创作参考包…', cw.export_project),
+                ('导出可编辑项目包…', self.export_package)]:
+            self.project_actions.append(menu.addAction(label, callback))
         self.tools_menu = menu
         tools.setMenu(menu)
-        cw.navigation.layout().addWidget(tools)
+        commands = QWidget()
+        row = WrappingLayout(commands)
+        row.addWidget(w.generate_all_creative_nodes_button)
+        row.addWidget(w.open_creative_copy_button)
+        w.open_creative_copy_button.clicked.disconnect()
+        w.open_creative_copy_button.clicked.connect(lambda: w.creative_flow.show_project_copy())
+        row.addWidget(tools)
+        cw.navigation.layout().addWidget(commands, 2)
         self.tools = tools
-        settings = w.workspace_chrome._dialogs[4].layout()
+        self.project_commands = commands
+        self.project_commands.setVisible(w.current_creative_project_id is not None)
+        settings = w.settings_sections["backup"]
         utilities = QHBoxLayout()
-        self.button('功能准备检查…', self.show_readiness, utilities)
+        readiness = QPushButton('功能准备检查…')
+        readiness.clicked.connect(self.show_readiness)
+        w.settings_sections["models"].addWidget(readiness)
         self.backup_hint = QLabel('自动备份：正在检查（每天一次，保留最近 7 份）')
         self.backup_hint.setWordWrap(True)
         utilities.addWidget(self.backup_hint, 1)
         self.button('查看自动备份', self.open_backups, utilities)
-        settings.insertLayout(2, utilities)
+        settings.addLayout(utilities)
         row = QHBoxLayout()
         self.target_button = self.button('检查与编辑搜索目标…', self.edit_targets, row)
         self.target_hint = QLabel('核心目标与条目分别找图，细节不自动加入搜索')
@@ -151,8 +154,13 @@ class WorkflowUpgrade(QObject):
         try:
             cw = self.w.creative_workspace
             node = self.w._current_creative_node()
+            in_project = self.w.current_creative_project_id is not None
+            self.project_commands.setVisible(in_project)
+            self.w.generate_all_creative_nodes_button.setVisible(in_project)
+            self.w.open_creative_copy_button.setVisible(in_project)
+            self.w.open_creative_copy_button.setText('项目文案' if self.w.current_language != 'en' else 'Project Copy')
             for action in self.project_actions:
-                action.setEnabled(self.w.current_creative_project_id is not None)
+                action.setEnabled(in_project)
             self.target_button.setEnabled(node is not None)
             key = cw._reference_key
             self.reference_bar.setEnabled(key is not None)
@@ -540,12 +548,14 @@ class WorkflowUpgrade(QObject):
             from eidory.core.project_package import export_project_package
             self.run_job('正在导出项目与素材…',
                 lambda: export_project_package(self.w.store, pid, folder, include_files=mode.startswith('连同')),
-                lambda target: QMessageBox.information(self.w, '项目包已保存', str(target)+'\n用“导入可编辑项目包”继续编辑。'))
+                lambda target: QMessageBox.information(self.w, '项目包已保存', str(target)+'\n从项目选择器的「导入项目包」继续编辑。'))
 
     def import_package(self):
-        path, _ = QFileDialog.getOpenFileName(self.w, '选择可编辑项目包', '', 'Eidory 项目 (project.eidory.json)')
+        picker = self.w.workspace_chrome.project_picker
+        path, _ = QFileDialog.getOpenFileName(picker, '选择可编辑项目包', '', 'Eidory 项目 (project.eidory.json)')
         if not path:
             return
+        picker.hide()
         from eidory.core.project_package import inspect_project_package, import_project_package
         def preview(result):
             _, doc, _, missing = result

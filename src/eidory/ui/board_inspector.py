@@ -256,6 +256,9 @@ class BoardInspector(QObject):
                 b.setChecked(value == status)
                 b.setToolTip('直接设置所选图片的参考等级，保留看板视角。' if active else '先在看板选图；多处使用的图片需在此工具栏选择用途所属节点。')
             self.remove_button.setEnabled(bool(ids))
+            removal_count = len(self._links) if node else len(ids)
+            self.remove_button.setText(f"移出当前看板 · {removal_count} 处" if ids else "移出当前看板")
+            self.remove_button.setToolTip(f"移除 {len(ids)} 张图片在当前看板内的 {removal_count} 处关联；保留图库记录与源文件，可撤销。")
             self.open_button.setEnabled(len(ids) == 1)
             note_key = (active[0]['node_id'], active[0]['image_id']) if len(active) == 1 else None
             text = (active[0]['reference_note'] or '') if note_key else ''

@@ -57,9 +57,21 @@ def threshold_matches(condition: SearchFilter, images: Sequence[ImageItem]) -> l
 def same_filter_criteria(first: FilterPlan | None, second: FilterPlan) -> bool:
     """Strength changes are safe to replay; scope/rule changes require a query."""
     def criteria(plan):
-        return tuple(tuple((g.match_mode, tuple((f.kind, f.value) for f in g.filters))
-                           for g in getattr(plan, section)) for section in ("include", "exclude"))
+        return (tuple(tuple((g.match_mode, tuple((f.kind, f.value) for f in g.filters))
+                            for g in getattr(plan, section)) for section in ("include", "exclude")),
+                tuple((f.kind, f.value) if f else None for f in (plan.quick_include, plan.quick_exclude)))
     return first is not None and criteria(first) == criteria(second)
+
+
+def matching_plan_ids(plan, matches, base_ids):
+    includes = [group for group in plan.include if group.filters]
+    positive = set().union(*(matching_group_ids(g, matches) for g in includes)) if includes else set(base_ids)
+    if plan.quick_include:
+        positive &= matches[plan.quick_include]
+    excluded = set().union(*(matching_group_ids(g, matches) for g in plan.exclude))
+    if plan.quick_exclude:
+        excluded |= matches[plan.quick_exclude]
+    return positive, excluded & positive
 
 
 def rethreshold_result(result: SearchChainResult, plan: FilterPlan) -> SearchChainResult:
@@ -69,10 +81,7 @@ def rethreshold_result(result: SearchChainResult, plan: FilterPlan) -> SearchCha
     raw = {(f.kind, f.value): images for f, images in result.filter_matches.items()}
     raw_matches = {f: raw[(f.kind, f.value)] for f in (*plan.positive_filters, *plan.negative_filters)}
     matches = {f: {im.id for im in threshold_matches(f, images)} for f, images in raw_matches.items()}
-    includes = [group for group in plan.include if group.filters]
-    positive_ids = (set().union(*(matching_group_ids(group, matches) for group in includes))
-                    if includes else {im.id for im in result.ranked_scope_images})
-    excluded_ids = set().union(*(matching_group_ids(group, matches) for group in plan.exclude)) & positive_ids
+    positive_ids, excluded_ids = matching_plan_ids(plan, matches, (im.id for im in result.ranked_scope_images))
     return replace(result, images=[im for im in result.ranked_scope_images if im.id in positive_ids],
                    excluded_image_ids=frozenset(excluded_ids), filter_matches=raw_matches, evaluated_plan=plan)
 
@@ -125,6 +134,9 @@ class FilterEngine:
                     stats[condition.kind + "_candidate_limit"] = result.candidate_limit
                     if condition.kind == "color":
                         stats["color_indexed_count"] = result.indexed_count
+                elif condition.kind == "filename":
+                    text = str(condition.value).strip().casefold()
+                    found = [im for im in base if text in im.file_name.casefold()]
                 elif condition.kind == "keyword":
                     if tags is None:
                         tags = self.store.image_tags_for_image_ids(list(base_ids))
@@ -155,9 +167,7 @@ class FilterEngine:
             raw_matches[condition] = tuple(found)
             matches[condition] = {im.id for im in threshold_matches(condition, found)}
 
-        includes = [group for group in plan.include if group.filters]
-        positive_ids = set().union(*(matching_group_ids(group, matches) for group in includes)) if includes else base_ids
-        excluded_ids = set().union(*(matching_group_ids(group, matches) for group in plan.exclude)) & positive_ids
+        positive_ids, excluded_ids = matching_plan_ids(plan, matches, base_ids)
         ranked = base
         # Exclusion scores never replace positive ranking. Metadata-only filters
         # retain the base order, including an explicitly frozen result set.

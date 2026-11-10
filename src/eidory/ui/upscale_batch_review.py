@@ -43,7 +43,6 @@ class UpscaleBatchReview(QDialog):
         layout.addLayout(tools)
         actions = WrappingLayout()
         self.adopt = QPushButton('采用并替换原图')
-        self.adopt.setProperty('variant', 'primary')
         self.adopt.clicked.connect(lambda: self.decide('adopt'))
         self.copy = QPushButton('采用并另存为副本…')
         self.copy.clicked.connect(self.export_copy)
@@ -51,7 +50,9 @@ class UpscaleBatchReview(QDialog):
         self.discard.clicked.connect(lambda: self.decide('discard'))
         self.undo = QPushButton('撤销本张决定')
         self.undo.clicked.connect(self.undo_decision)
-        for button in (self.adopt, self.copy, self.discard, self.undo):
+        from eidory.ui.review_actions import describe_review_actions
+        describe_review_actions(self.copy, self.adopt, self.discard)
+        for button in (self.copy, self.adopt, self.discard, self.undo):
             actions.addWidget(button)
         layout.addLayout(actions)
         navigation = WrappingLayout()

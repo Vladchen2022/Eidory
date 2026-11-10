@@ -79,7 +79,7 @@ def test_single_paragraph_preserves_original_and_keeps_query_separate(window):
         w._poll_events()
     ws = w.creative_workspace
     assert not ws.store.entries(node.id)
-    assert '平静，不出现恐怖感。' in ws.proposal_input.toPlainText()
+    assert ws.proposal_input.toPlainText() == '漫射天光压低明暗反差，疏朗的色块让空间显得安定。'
     assert ws.proposal_query.text() == '柔和漫射光 低对比色块'
     ws.accept_note()
     assert w.store.get_creative_node(node.id).note.startswith('平静，不出现恐怖感。')
@@ -148,6 +148,72 @@ def test_only_one_batch_entry_and_skips_locked_and_pending(window):
     assert 'AI 正在' not in w.creative_node_status_label.text()
 
 
+def test_organize_keeps_original_visible_and_saves_separate_ideas(window):
+    w = window
+    pid, nodes = create(w, 'story')
+    node = next(n for n in nodes if n.title == '地点')
+    w._load_creative_project(pid, select_node_id=node.id)
+    w.creative_flow.show_planning()
+    original = '河谷边，干涸的河床\n  ' + '岩壁有断续的水痕。' * 200 + '\n'
+    w.creative_node_note_input.setPlainText(original)
+    def organize(**kwargs):
+        assert kwargs['completion_mode'] == 'organize'
+        assert kwargs['current_note'] == original
+        return CreativeNodeNoteSuggestion(note='干涸河床', search_query='干涸河床',
+            additions=({'name': '干涸河床', 'visual': '裸露的砾石和浅色裂纹'},)), 'fixture'
+    ws = w.creative_workspace
+    with patch.object(w, '_make_llm_provider', return_value=SimpleNamespace(generate_creative_reference_entries=organize)):
+        ws.organize_button.click()
+        w._poll_events()
+    assert w.store.get_creative_node(node.id).note == original
+    ws.accept_note()
+    assert ws.store.entries(node.id)['base_note'] == original
+    assert w.creative_flow.base_note_view.isVisible()
+    assert w.creative_flow.base_note_view.toPlainText() == original
+    w.workflow_upgrade.flush()
+    assert w.store.get_creative_node(node.id).note.startswith(original + '\n干涸河床: ')
+
+
+def test_batch_adopts_only_new_prose_after_user_edits(window):
+    w = window
+    pid, nodes = create(w, 'story')
+    text_node = next(n for n in nodes if n.title == '氛围')
+    entry_node = next(n for n in nodes if n.title == '地点')
+    original_entry = '河谷边，干涸的河床'
+    ws = w.creative_workspace
+    for node in nodes:
+        ws.store.save_node(node.id, locked=int(node.id not in (text_node.id, entry_node.id)))
+    w.store.update_creative_node(entry_node.id, note=original_entry)
+    assert ws.store.stage_entries(entry_node.id, [{'name': '裸露的石滩', 'visual': '保留原来的边界线'}])
+    assert ws.store.accept_entries(entry_node.id)
+    old_rows = ws.store.entries(entry_node.id)['rows']
+    w._load_creative_project(pid, select_node_id=text_node.id)
+    w.creative_node_note_input.setPlainText('清晨，冷色天空。')
+    def prose(**kwargs):
+        assert '清晨，冷色天空。' in kwargs['current_note']
+        return CreativeNodeNoteSuggestion(note='晨光把远处林坡分出几层。', search_query='晨光林坡', entry_mode='prose'), 'fixture'
+    def rows(**kwargs):
+        assert original_entry in kwargs['current_note']
+        return CreativeNodeNoteSuggestion(note='龟裂的浅滩', search_query='龟裂浅滩',
+            additions=({'name': '龟裂的浅滩', 'visual': '泥土开裂'},)), 'fixture'
+    with patch.object(w, '_make_llm_provider', return_value=SimpleNamespace(generate_creative_node_prose=prose, generate_creative_reference_entries=rows)):
+        w._generate_all_creative_node_notes()
+        w._poll_events()
+    assert w.store.get_creative_node(text_node.id).note == '清晨，冷色天空。'
+    assert ws.store.entries(entry_node.id)['rows'] == old_rows
+    latest = '清晨，灰蓝色天空。\n  山脊保持平缓。'
+    w.creative_node_note_input.setPlainText(latest)
+    ws.proposal_input.setPlainText('晨光沿山脊照亮远处林坡。')
+    ws.accept_note()
+    assert w.store.get_creative_node(text_node.id).note == latest + '\n晨光沿山脊照亮远处林坡。'
+    w._load_creative_project(pid, select_node_id=entry_node.id)
+    ws.accept_note()
+    entries = ws.store.entries(entry_node.id)
+    assert entries['base_note'] == original_entry
+    assert entries['rows'][:len(old_rows)] == old_rows
+    assert entries['rows'][-1]['name'] == '龟裂的浅滩'
+
+
 def test_prose_schema_retries_rejects_lists_and_never_turns_them_into_rows():
     p = LMStudioProvider(model_name='fixture')
     valid = json.dumps({'note':'地方制度依靠工匠协作维系，低技术条件下的维修能力决定资源分配。', 'search_query':'低技术手工业聚落'})
@@ -187,8 +253,8 @@ def test_template_query_does_not_pollute_prose_and_new_sentences_stay_together(w
     result = CreativeNodeNoteSuggestion(note='村落依靠分工协作修理机械。零件沿商路交换，工艺由师徒传授。', search_query='手工业聚落 木质机械', entry_mode='prose')
     w._apply_creative_node_note_suggestion(node.id, actual.note, result, stage_only=True)
     note = w.creative_workspace.store.node(node.id)['proposal_note']
-    assert note.startswith(actual.note + '\n')
-    assert note.count('\n') == 1
+    assert note.replace(' ', '') == result.note
+    assert '\n' not in note
     assert '时代、技术水平' not in note
 
 

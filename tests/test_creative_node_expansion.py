@@ -178,4 +178,4 @@ def test_staged_named_suggestion_keeps_first_object_name(window):
     window._apply_creative_node_note_suggestion(nid, '破旧的床', SimpleNamespace(note='破旧的床\n拼凑工作台: 回收桌面用于分拣电子元件。\n零件收纳箱: 分类存放拆下的小零件。', search_query='拼凑工作台 零件收纳箱'), stage_only=True)
     proposal = window.creative_workspace.store.node(nid)['proposal_note']
     assert '拼凑工作台: 回收桌面' in proposal
-    assert proposal.startswith('破旧的床\n')
+    assert proposal.startswith('拼凑工作台:')

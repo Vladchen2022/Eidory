@@ -14,11 +14,11 @@ class RemovalRecovery:
         if latest:
             window._last_removal_undo = latest[0]
             window.undo_removal_action.setEnabled(True)
-        layout = window.workspace_chrome._dialogs[4].layout()
+        layout = window.settings_sections["backup"]
         button = QPushButton('回收区…')
         button.setToolTip('恢复本次或之前删除的图片、标签与项目关联；退出应用后仍保留')
         button.clicked.connect(self.open)
-        layout.insertWidget(2, button)
+        layout.addWidget(button)
 
     @property
     def w(self):

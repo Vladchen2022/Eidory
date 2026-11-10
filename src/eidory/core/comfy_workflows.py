@@ -10,6 +10,17 @@ TURBO_NAME = 'Viggle Turbo · 6 步'
 ORIGINAL_NAME = '千问原版 · 40 步'
 
 
+def official_turbo_graph():
+    """Official Qwen 2.1 Turbo schedule used by the local ComfyUI Launcher."""
+    graph = builtin_template()['graph']
+    graph['1']['inputs']['unet_name'] = 'qwen_image_2.1_turbo_bf16.safetensors'
+    del graph['11']
+    graph['12']['inputs']['model'] = ['1', 0]
+    graph['15'] = {'class_type': 'ManualSigmas', 'inputs': {
+        'sigmas': '1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0'}}
+    return graph
+
+
 def builtin_template(turbo=True):
     graph = {
         '1': {'class_type': 'UNETLoader', 'inputs': {'unet_name': 'qwen_image_2.1_bf16.safetensors', 'weight_dtype': 'default'}},

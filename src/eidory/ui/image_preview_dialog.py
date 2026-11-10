@@ -1441,6 +1441,8 @@ def _retain_detached_linetop_overlay(overlay: QObject) -> None:
 class ImagePreviewDialog(QDialog):
     imageChanged = Signal(object)
     upscaleRequested = Signal(object)
+    generateRequested = Signal(object)
+    editRequested = Signal(object)
     collectRequested = Signal(object)
     favoriteChanged = Signal(object)
     feedbackSaved = Signal(object, str)
@@ -1633,6 +1635,12 @@ class ImagePreviewDialog(QDialog):
         self.upscale_button = QPushButton("AI 放大")
         self.upscale_button.setToolTip("使用 SeedVR2 7B 放大原图，对比后决定是否替换")
         self.upscale_button.clicked.connect(lambda: self.upscaleRequested.emit(self.current_image()))
+        self.generate_button = QPushButton("AI 生图")
+        self.generate_button.setToolTip("输入文字，使用本机 ComfyUI 生成图片并保存到图库")
+        self.generate_button.clicked.connect(lambda: self.generateRequested.emit(self.current_image()))
+        self.edit_button = QPushButton("AI 编辑")
+        self.edit_button.setToolTip("涂选遮罩并描述修改，对比后替换原图或另存副本")
+        self.edit_button.clicked.connect(lambda: self.editRequested.emit(self.current_image()))
         self.grayscale_button = QPushButton()
         self.grayscale_button.setCheckable(True)
         _configure_preview_icon_button(
@@ -1727,6 +1735,8 @@ class ImagePreviewDialog(QDialog):
         controls.addWidget(self.annotation_controls)
         controls.addWidget(self.fit_button)
         controls.addWidget(self.actual_size_button)
+        controls.addWidget(self.generate_button)
+        controls.addWidget(self.edit_button)
         controls.addWidget(self.upscale_button)
         controls.addWidget(self.collect_button)
         controls.addWidget(self.grayscale_button)
@@ -1747,7 +1757,7 @@ class ImagePreviewDialog(QDialog):
         controls.addWidget(self.annotation_controls.status)
 
         # Local metrics override theme padding, keeping icon and text controls aligned.
-        for button in [*nav_buttons, self.upscale_button, self.collect_button, self.saturation_reset_button,
+        for button in [*nav_buttons, self.generate_button, self.edit_button, self.upscale_button, self.collect_button, self.saturation_reset_button,
                        *self.annotation_controls.findChildren(QPushButton)]:
             button.setAttribute(Qt.WidgetAttribute.WA_LayoutUsesWidgetRect, True)
             button.setFixedHeight(32)
@@ -2017,6 +2027,7 @@ class ImagePreviewDialog(QDialog):
         if not self.annotation_controls.load_image(image, enabled=bool(image and not is_supported_video(image.file_path))):
             return
         self.upscale_button.setEnabled(bool(image and not image.is_missing and not is_supported_video(image.file_path)))
+        self.edit_button.setEnabled(self.upscale_button.isEnabled())
         if image is None:
             self.info_label.setText("-")
             self._set_linetop_compare_original(False, rerender=False)

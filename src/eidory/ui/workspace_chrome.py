@@ -3,15 +3,30 @@ from __future__ import annotations
 
 from weakref import ref
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer
-from PySide6.QtGui import QIcon, QKeySequence
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer
+from PySide6.QtGui import QIcon, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QMenu, QPushButton,
     QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from eidory.ui.theme import apply_theme
-from eidory.ui.theme_colors import THEMES, get_theme
+from eidory.ui.theme_colors import THEMES, get_theme, theme_color
+
+
+def _sidebar_arrow_icon(point_left):
+    pixmap = QPixmap(36, 36)
+    pixmap.setDevicePixelRatio(2)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(theme_color("text"), 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    tip, shoulder = (4, 8) if point_left else (14, 10)
+    painter.drawLine(4, 9, 14, 9)
+    painter.drawLine(tip, 9, shoulder, 5)
+    painter.drawLine(tip, 9, shoulder, 13)
+    painter.end()
+    return QIcon(pixmap)
 
 
 class WorkspaceChrome(QObject):
@@ -149,8 +164,10 @@ class WorkspaceChrome(QObject):
         brand = QLabel("Eidory")
         brand.setObjectName("workspaceBrand")
         row.addWidget(brand)
-        self.left_button = self._button("导航", lambda: self.toggle_sidebar(0), row)
+        self._sidebar_icon_theme = None
+        self.left_button = self._button("", lambda: self.toggle_sidebar(0), row)
         self.left_button.setCheckable(True)
+        self.left_button.setIconSize(QSize(18, 18))
         self.exit_focus_button = self._button("退出专注", lambda: w._set_board_focus_mode(False), row, primary=True)
         self.exit_focus_button.hide()
         # Keep the combo as the existing project-state adapter, not a second
@@ -160,13 +177,16 @@ class WorkspaceChrome(QObject):
         self.project_button = self._button("独立图库 ▾", lambda: self.open_project_picker(), row)
         self.project_button.setAccessibleName("选择项目或独立图库")
         self.project_button.setMaximumWidth(330)
+        self.project_board_button = self._button("项目看板", self.toggle_context_board, row)
+        self.project_board_button.hide()
         self.project_picker = QDialog(w)
         self.project_picker.setWindowTitle("选择项目或参考集")
         self.project_picker.setWindowModality(Qt.WindowModality.WindowModal)
         picker_layout = QVBoxLayout(self.project_picker)
         picker_actions = QHBoxLayout()
         self.library_button = self._button("独立图库", self.open_library, picker_actions)
-        self.new_project_button = self._button("＋ 新建创作项目", self.new_project, picker_actions)
+        self.new_project_button = self._button("＋ 新建项目", self.choose_project_type, picker_actions)
+        self.import_project_button = self._button("导入项目包…", lambda: w.workflow_upgrade.import_package(), picker_actions)
         picker_layout.addLayout(picker_actions)
         picker_layout.addWidget(w.temp_project_list, 1)
         w.temp_project_list.setMinimumHeight(180)
@@ -182,11 +202,28 @@ class WorkspaceChrome(QObject):
         w.temp_project_list.installEventFilter(self)
         self.library_button.setAutoDefault(False)
         self.new_project_button.setAutoDefault(False)
+        self.import_project_button.setAutoDefault(False)
+        self.project_type_picker = QDialog(self.project_picker)
+        self.project_type_picker.setWindowTitle("选择项目类型")
+        type_layout = QVBoxLayout(self.project_type_picker)
+        type_layout.setSpacing(10)
+        self.create_node_project_button = self._button("创作节点项目", self.new_project, type_layout)
+        self.node_project_hint = QLabel("按节点构思、找参考，最后整理成看板。")
+        self.node_project_hint.setWordWrap(True)
+        type_layout.addWidget(self.node_project_hint)
+        self.create_inspiration_project_button = self._button("语义探针项目", self.new_inspiration_project, type_layout)
+        self.inspiration_project_hint = QLabel("用一句话快速探索多个灵感方向，再从图库找图。")
+        self.inspiration_project_hint.setWordWrap(True)
+        type_layout.addWidget(self.inspiration_project_hint)
+        self.cancel_project_type_button = self._button("取消", self.project_type_picker.reject, type_layout)
+        for button in (self.create_node_project_button, self.create_inspiration_project_button, self.cancel_project_type_button):
+            button.setAutoDefault(False)
         row.addStretch(1)
         self.tasks_button = self._button("后台任务", lambda: self.open_global_panel(3), row)
         self.settings_button = self._button("设置", lambda: self.open_global_panel(4), row)
-        self.right_button = self._button("信息", lambda: self.toggle_sidebar(2), row)
+        self.right_button = self._button("", lambda: self.toggle_sidebar(2), row)
         self.right_button.setCheckable(True)
+        self.right_button.setIconSize(QSize(18, 18))
         w.central_layout.insertWidget(0, self.header)
         w.central_layout.setStretch(w.central_layout.indexOf(w.root_splitter), 1)
         w.root_splitter.widget(2).setObjectName("referenceSidebar")
@@ -221,25 +258,37 @@ class WorkspaceChrome(QObject):
         if not self.project_picker.isVisible():
             self.w._load_selected_temporary_project()
 
-    def _project_picked(self, *_):
-        # Selection may rebuild the list; use its new current item, not the
-        # signal's potentially deleted QListWidgetItem wrapper.
-        item = self.w.temp_project_list.currentItem()
-        if item and item.data(Qt.ItemDataRole.UserRole) is not None:
-            self.project_picker.hide()
-
     def _activate_project(self, item):
+        # Switching workspaces can clear or rebuild the picker selection.
+        is_project = item.data(Qt.ItemDataRole.UserRole) is not None
         self.w._handle_project_sidebar_item_clicked(item)
-        self._project_picked()
+        if is_project:
+            self.project_picker.hide()
 
     def open_library(self):
         self.project_picker.hide()
         self.w._load_creative_project(None)
         self.navigation_tabs.setCurrentIndex(0)
 
+    def toggle_context_board(self):
+        if self.w.current_creative_project_id:
+            self.w.creative_flow.toggle_project_board()
+        else:
+            self.w._toggle_semantic_workspace_board()
+
+    def choose_project_type(self):
+        self.project_type_picker.resize(min(420, self.project_button.screen().availableGeometry().width() - 16), 0)
+        self.project_type_picker.open()
+
     def new_project(self):
+        self.project_type_picker.accept()
         self.project_picker.hide()
         self.w.creative_workspace.new_project()
+
+    def new_inspiration_project(self):
+        self.project_type_picker.accept()
+        self.project_picker.hide()
+        self.w._start_new_inspiration()
 
     def _build_selection_bar(self):
         w = self.w
@@ -321,7 +370,7 @@ class WorkspaceChrome(QObject):
                 hint.setProperty("role", "muted")
                 appearance.addWidget(hint)
                 appearance.addStretch(1)
-                layout.addLayout(appearance)
+                w.settings_sections["appearance"].insertLayout(0, appearance)
                 display = QHBoxLayout()
                 display.addWidget(QLabel("界面密度"))
                 self.density_combo = QComboBox()
@@ -341,13 +390,17 @@ class WorkspaceChrome(QObject):
                 display.addStretch(1)
                 self.restore_layout_button = self._button("恢复默认布局", w._restore_workspace_layout, display)
                 self.restore_layout_button.setToolTip("展开左右侧栏；保留当前项目、筛选、选中图片与看板内容")
-                layout.addLayout(display)
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-            page.setMinimumWidth(0)
-            scroll.setWidget(page)
-            layout.addWidget(scroll)
+                w.settings_sections["appearance"].insertLayout(1, display)
+            if index == 4:
+                layout.addWidget(page, 1)
+                page.show()  # Removing the former inspector tab hides its page.
+            else:
+                scroll = QScrollArea()
+                scroll.setWidgetResizable(True)
+                scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+                page.setMinimumWidth(0)
+                scroll.setWidget(page)
+                layout.addWidget(scroll)
             self._button("返回工作台", dialog.hide, layout)
             self._dialogs[index] = dialog
         tabs.tabBar().setMinimumWidth(tabs.tabBar().minimum_width_for_tab_count(3))
@@ -364,6 +417,15 @@ class WorkspaceChrome(QObject):
 
     def retranslate(self):
         english = self.w.current_language == "en"
+        self.new_project_button.setText("＋ New Project" if english else "＋ 新建项目")
+        self.import_project_button.setText("Import Project…" if english else "导入项目包…")
+        self.project_type_picker.setWindowTitle("Choose Project Type" if english else "选择项目类型")
+        self.create_node_project_button.setText("Creative Node Project" if english else "创作节点项目")
+        self.create_inspiration_project_button.setText("Semantic Probe Project" if english else "语义探针项目")
+        self.cancel_project_type_button.setText("Cancel" if english else "取消")
+        self.node_project_hint.setText("Develop ideas by node, collect references, and organize a board." if english else "按节点构思、找参考，最后整理成看板。")
+        self.inspiration_project_hint.setText("Explore several directions from a short description and find images in the library." if english else "用一句话快速探索多个灵感方向，再从图库找图。")
+        self.w.creative_workspace.back_to_inspiration.setText("← Back to Explore Ideas" if english else "← 返回探索灵感")
         self.w.right_tab_widget.setTabText(1, "Usage" if english else "用途")
         self.w.add_collection_button.setText("＋ Folder" if english else "＋ 文件夹")
         self.w.search_creative_node_button.setText("Find References" if english else "用此语句找参考")
@@ -392,6 +454,7 @@ class WorkspaceChrome(QObject):
         if hasattr(self.w, 'board_shortcuts'):
             self.w.board_shortcuts.refresh_labels()
         self.board_tools.timer.start(0)
+        self.sync_sidebars()
 
     def _inspector_changed(self, index):
         if index in (3, 4):
@@ -401,6 +464,9 @@ class WorkspaceChrome(QObject):
             self._last_inspector_tab = index
 
     def open_global_panel(self, index):
+        if index == 3 and hasattr(self.w, "task_center"):
+            self.w.task_center.open()
+            return
         dialog = self._dialogs.get(index)
         if dialog:
             dialog.show()
@@ -438,7 +504,7 @@ class WorkspaceChrome(QObject):
         w.inspiration_answers_input.setFixedHeight(80)
         # These actions were stacked for a narrow inspector. In the workspace,
         # keep their natural width and the project template on one compact row.
-        project_layout = w.ai_workflow_stack.widget(0).layout()
+        project_layout = w.creative_editor.layout()
         project_actions = QWidget()
         actions = QHBoxLayout(project_actions)
         actions.setContentsMargins(0, 0, 0, 0)
@@ -471,6 +537,10 @@ class WorkspaceChrome(QObject):
     def sync_sidebars(self, *_args):
         w = self.w
         english = w.current_language == "en"
+        theme_id = get_theme().id
+        if theme_id != self._sidebar_icon_theme:
+            self._sidebar_icon_theme = theme_id
+            self._sidebar_arrows = {direction: _sidebar_arrow_icon(direction) for direction in (False, True)}
         self.exit_focus_button.setVisible(w._board_focus_mode)
         self.exit_focus_button.setText("Exit Focus" if english else "退出专注")
         for index, button, label in ((0, self.left_button, "左"), (2, self.right_button, "右")):
@@ -479,7 +549,9 @@ class WorkspaceChrome(QObject):
             action = ("收起" if visible else "显示") + label + "侧栏"
             if english:
                 action = ("Hide " if visible else "Show ") + ("Navigation" if index == 0 else "Inspector")
-            button.setText(action)
+            icon = self._sidebar_arrows[(index == 0) == visible]
+            if button.icon().cacheKey() != icon.cacheKey():
+                button.setIcon(icon)
             button.setAccessibleName(action)
             button.setToolTip(action + ("; sidebars reopen on launch" if english else "；仅影响本次使用，重启后自动展开"))
 
@@ -535,6 +607,11 @@ class WorkspaceChrome(QObject):
         w = self.w
         cw = w.creative_workspace
         project_id = w.current_creative_project_id
+        exploring = cw.is_exploring_inspiration()
+        if hasattr(w, 'image_upscaler'):
+            w.image_upscaler.result_button.hide()
+        if hasattr(w, 'preview_ai'):
+            w.preview_ai.entry.hide()
         if project_id != self._last_project:
             self._last_project = project_id
             if project_id:
@@ -547,11 +624,21 @@ class WorkspaceChrome(QObject):
         title = w.creative_project_combo.currentText()
         if project_id:
             title = title.rsplit(" (", 1)[0].removeprefix("⬆ ")
+        elif exploring:
+            title = "Semantic Probe Project" if w.current_language == "en" else "语义探针项目"
         self.project_button.setText(self.project_button.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, 280) + " ▾")
         self.project_button.setToolTip(title)
         w.creative_node_status_label.hide()
         is_gallery = w.center_result_stack.currentWidget() is w.grid_view
         is_board = w.center_result_stack.currentWidget() is w.project_board_view
+        semantic_id = w.semantic_workspace_id
+        linked_board = bool(is_board and semantic_id and w._current_board_temp_project_id == semantic_id and
+                            (w._temporary_project_state_payload(semantic_id) or {}).get("inspiration_id"))
+        semantic = w.store.get_temporary_project(semantic_id) if semantic_id and (exploring or linked_board) else None
+        if semantic:
+            title = semantic.name
+            self.project_button.setText(self.project_button.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, 280) + " ▾")
+            self.project_button.setToolTip(title)
         phase = 3 if is_board else 0 if not is_gallery else 2 if w.current_result_mode == "creative_node" else 1
         for index, button in enumerate(self.stage_buttons):
             previous = button.blockSignals(True)
@@ -568,7 +655,18 @@ class WorkspaceChrome(QObject):
         )
         self.stage_buttons[3].setEnabled(can_show_board)
         self.stage_buttons[3].setToolTip("" if can_show_board else "先选择创作项目或参考集，再使用看板")
-        self.selection_bar.setVisible(is_gallery)
+        for index, button in enumerate(self.stage_buttons):
+            button.setVisible(not project_id and not linked_board and index in (1, 3))
+        self.project_board_button.setVisible(bool(project_id or semantic))
+        if semantic:
+            self.project_board_button.setText("← 返回探索灵感" if linked_board else f"已收集 · {semantic.image_count} 张")
+        if project_id:
+            previous = w.creative_flow._board_return if hasattr(w, 'creative_flow') else None
+            from_search = bool(previous and previous[0] == project_id and previous[2])
+            self.project_board_button.setText(('← 返回搜图' if from_search else '← 返回构思') if is_board else '项目看板')
+            cw.context_label.setText("看板" if is_board else "找参考" if is_gallery else "构思")
+        cw.navigation.setVisible(not exploring and not linked_board)
+        self.selection_bar.setVisible(is_gallery and not exploring)
         self.board_tools.setVisible(is_board and not w._board_focus_mode)
         w.show_gallery_button.hide()
         w.show_project_board_button.hide()

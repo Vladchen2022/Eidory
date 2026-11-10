@@ -94,6 +94,35 @@ def visible_names(result):
     return {im.file_name for im in result.images if im.id not in result.excluded_image_ids}
 
 
+def test_two_quick_fields_apply_without_changing_group_logic(window):
+    w = window
+    advanced = FilterPlan(include=(FilterGroup((SearchFilter("keyword", "plane"),
+                                               SearchFilter("keyword", "car")), "any"),))
+    w.filter_workflow.apply(advanced)
+    w._poll_events()
+    fields = w.filter_panel.quick_fields
+    include, _ = fields["include"]
+    exclude, mode = fields["exclude"]
+    include.setText("red")
+    exclude.setText("plane")
+    exclude.returnPressed.emit()
+    w._poll_events()
+    plan = w.filter_workflow.plan()
+    assert plan.include == advanced.include
+    assert plan.quick_include == SearchFilter("filename", "red")
+    assert plan.quick_exclude == SearchFilter("filename", "plane")
+    assert {im.file_name for im in w.grid_view.images()} == {"red-car.png"}
+    mode.setCurrentIndex(mode.findData("semantic"))
+    exclude.returnPressed.emit()
+    w._poll_events()
+    assert w.filter_workflow.plan().quick_exclude == SearchFilter("semantic", "plane", 50)
+    assert w.grid_view.images() == []
+    w.filter_workflow.undo()
+    w._poll_events()
+    assert w.filter_workflow.plan() == plan
+    assert mode.currentData() == "filename"
+
+
 RED = SearchFilter("color", (255, 0, 0), 50)
 PLANE = SearchFilter("keyword", "plane")
 
@@ -512,7 +541,8 @@ def test_two_filter_boxes_keep_each_condition_on_its_own_row(window):
         for slider in panel.strength_sliders.values():
             assert slider.isVisible() and slider.width() >= 80
             assert slider.geometry().right() < slider.parentWidget().width()
-        assert panel.height() <= 200
+        assert all(field.isVisible() for field, _ in panel.quick_fields.values())
+        assert panel.height() <= 230  # Includes the new row for both quick searches.
 
 
 def test_five_condition_rows_grow_and_shrink_without_padding_empty_exclusion_box(window):

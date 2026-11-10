@@ -21,6 +21,7 @@ model are still changing.
 - Repairs missing files by relinking a single file or remapping a moved folder prefix.
 - Detects exact and near-duplicate image candidates without deleting anything automatically.
 - Supports multi-image comparison for final reference judgment.
+- Offers local ComfyUI text-to-image generation, masked editing, and AI upscaling in the image preview, with result review before saving or replacing originals.
 - Uses local embeddings for image semantic search.
 - Uses an LLM provider for AI semantic probes and reference grouping.
 - Exports selected files or the whole logical library folder tree.

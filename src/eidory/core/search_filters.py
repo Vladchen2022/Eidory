@@ -32,14 +32,16 @@ class FilterPlan:
     # Groups are OR-ed; conditions within a group use its explicit mode.
     include: tuple[FilterGroup, ...] = ()
     exclude: tuple[FilterGroup, ...] = ()
+    quick_include: SearchFilter | None = None
+    quick_exclude: SearchFilter | None = None
 
     @property
     def positive_filters(self) -> tuple[SearchFilter, ...]:
-        return tuple(f for group in self.include for f in group.filters)
+        return tuple(f for group in self.include for f in group.filters) + ((self.quick_include,) if self.quick_include else ())
 
     @property
     def negative_filters(self) -> tuple[SearchFilter, ...]:
-        return tuple(f for group in self.exclude for f in group.filters)
+        return tuple(f for group in self.exclude for f in group.filters) + ((self.quick_exclude,) if self.quick_exclude else ())
 
     @property
     def has_conditions(self) -> bool:
@@ -48,7 +50,11 @@ class FilterPlan:
     def to_payload(self) -> dict[str, object]:
         def groups(values):
             return [{"match_mode": g.match_mode, "filters": [search_filter_to_payload(f) for f in g.filters]} for g in values]
-        return {"include": groups(self.include), "exclude": groups(self.exclude)}
+        result = {"include": groups(self.include), "exclude": groups(self.exclude)}
+        for key in ("quick_include", "quick_exclude"):
+            if condition := getattr(self, key):
+                result[key] = search_filter_to_payload(condition)
+        return result
 
     @classmethod
     def from_payload(cls, payload: object) -> "FilterPlan":
@@ -67,7 +73,14 @@ class FilterPlan:
                     raise ValueError("invalid filter condition")
                 result.append(FilterGroup(filters, str(raw.get("match_mode", "all"))))
             return tuple(result)
-        return cls(groups("include"), groups("exclude"))
+        def quick(key):
+            if key not in payload:
+                return None
+            result = search_filter_from_payload(payload[key])
+            if result is None or result.kind not in {"filename", "semantic"} or not str(result.value).strip():
+                raise ValueError("invalid quick search")
+            return result
+        return cls(groups("include"), groups("exclude"), quick("quick_include"), quick("quick_exclude"))
 
 
 @dataclass(frozen=True)
@@ -94,6 +107,7 @@ VALID_FILTER_KINDS = {
     "semantic",
     "similar",
     "keyword",
+    "filename",
     "color",
     "tag",
     "file_type",
@@ -198,6 +212,8 @@ def filter_label(
         return f"相似：{image_label}"
     if search_filter.kind == "keyword":
         return f"关键词：{search_filter.value}"
+    if search_filter.kind == "filename":
+        return f"文件名：{search_filter.value}"
     if search_filter.kind == "color":
         return f"颜色：{format_color_hex(search_filter.value)}"  # type: ignore[arg-type]
     if search_filter.kind == "tag":

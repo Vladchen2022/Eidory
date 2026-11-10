@@ -110,7 +110,6 @@ def test_cancel_sections_preserves_locked_frames_geometry_notes_and_roundtrip(wi
     board_project(w, library[2])
     board = w.project_board_view
     button = w.creative_workspace.board_buttons[1]
-    button.click()
     assert board._section_items and button.isChecked()
     board._section_items[0].locked=True
     board._add_text('自定义便签',987,654)

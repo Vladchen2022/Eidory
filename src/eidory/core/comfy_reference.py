@@ -99,14 +99,14 @@ def prepare_template(graph: dict) -> dict:
             sampler_select = graph[sampler]['inputs']['sampler'][0]
             assert graph[guider]['class_type'] == 'BasicGuider'
             assert graph[noise]['class_type'] == 'RandomNoise'
-            assert graph[sigmas]['class_type'] == 'ViggleTurboSigmas'
+            assert graph[sigmas]['class_type'] in {'ViggleTurboSigmas', 'ManualSigmas'}
             assert graph[sampler_select]['class_type'] == 'KSamplerSelect'
             positive = graph[guider]['inputs']['conditioning'][0]
             seed_node, seed_field = noise, 'noise_seed'
         else:
             positive = graph[sampler]['inputs']['positive'][0]
         latent = graph[sampler]['inputs']['latent_image'][0]
-        if advanced:
+        if advanced and graph[sigmas]['class_type'] == 'ViggleTurboSigmas':
             assert graph[sigmas]['inputs']['latent'] == graph[sampler]['inputs']['latent_image']
         encoder_type = graph[positive]['class_type']
         field = {'TextEncodeQwenImage21': 'prompt', 'CLIPTextEncode': 'text'}[encoder_type]
@@ -129,8 +129,9 @@ def sampling_description(template):
     sampler = graph[template['sampler_node']]
     values = sampler['inputs']
     if sampler['class_type'] == 'SamplerCustomAdvanced':
-        sigmas = graph[values['sigmas'][0]]['inputs']['nodes']
-        steps = len([v for v in sigmas.split(',') if v.strip()])
+        schedule = graph[values['sigmas'][0]]
+        sigmas = schedule['inputs'].get('nodes', schedule['inputs'].get('sigmas', ''))
+        steps = len([v for v in sigmas.split(',') if v.strip()]) - (schedule['class_type'] == 'ManualSigmas')
         method = graph[values['sampler'][0]]['inputs']['sampler_name']
         return f'{steps} 步 · {method} · Turbo 专用调度 · 无额外 CFG · 每次新种子'
     return f"{values['steps']} 步 · {values['sampler_name']} / {values['scheduler']} · CFG {values['cfg']} · 每次新种子"
@@ -194,7 +195,7 @@ class ComfyClient:
             if not schema:
                 raise ValueError('ComfyUI 缺少节点：' + kind)
             for field, rule in schema.get('input', {}).get('required', {}).items():
-                if kind == 'LoadImage' and field == 'image':
+                if kind in {'LoadImage', 'LoadImageMask'} and field == 'image':
                     # The upload route supports subfolders which aren't enumerated
                     # by the UI combo. /prompt validates the actual uploaded path.
                     continue
@@ -238,6 +239,23 @@ class GeneratedReferences:
             args = (project_id,)
         with self.store.connect(readonly=True) as conn:
             return [json.loads(row[0]) for row in conn.execute(query + ' ORDER BY created_at DESC, id DESC', args)]
+
+    def references_for_review(self):
+        """Keep detached results recoverable, with their live destination status."""
+        with self.store.connect(readonly=True) as conn:
+            rows = conn.execute("""
+                SELECT json_remove(j.payload, '$.workflow') AS payload,
+                       CASE WHEN p.id IS NULL THEN '原项目已删除'
+                            WHEN n.id IS NULL THEN '原节点已删除'
+                            ELSE '' END AS detached_reason
+                FROM generated_reference_jobs j
+                LEFT JOIN creative_projects p ON p.id = j.project_id
+                LEFT JOIN creative_nodes n ON n.project_id = j.project_id
+                    AND n.id = json_extract(j.payload, '$.node_id')
+                WHERE COALESCE(json_extract(j.payload, '$.origin'), '') <> 'preview'
+                ORDER BY j.created_at DESC, j.id DESC
+            """).fetchall()
+        return [dict(json.loads(row['payload']), detached_reason=row['detached_reason']) for row in rows]
 
     def active(self):
         with self.store.connect(readonly=True) as conn:

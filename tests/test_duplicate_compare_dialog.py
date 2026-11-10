@@ -372,6 +372,24 @@ def test_results_entry_starts_from_selected_child(app, library):
     app.processEvents()
 
 
+def test_detection_opens_pair_without_replacing_picture_wall(window, library):
+    images = library[2]
+    before = window.grid_view.images()
+    window._handle_duplicates_done([group(images[:2]), group(images[2:], "near")])
+    results = window._duplicate_results_dialog
+    compare = results.compare_dialog
+    assert compare.isVisible() and not results.isVisible()
+    assert window.grid_view.images() == before
+    results.show_group_list()
+    results.kind_filter.setCurrentIndex(2)
+    assert results.tree.topLevelItem(0).isHidden()
+    results.compare_button.click()
+    assert set(compare.cards) == {im.id for im in images[2:]}
+    compare.loader.stop()
+    assert compare.loader.pool.waitForDone(3000)
+    results.close()
+
+
 def test_remove_preserves_source_and_undo_restores_comparison(window, library, app):
     images = library[2]
     window._handle_duplicates_done([group(images[:2])])

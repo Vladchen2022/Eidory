@@ -3515,7 +3515,7 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window._load_inspiration_project(project_id)
             self.app.processEvents()
 
-            self.assertEqual(window.current_inspiration_project_id, project_id)
+            self.assertEqual(window.inspiration_draft_project_id, project_id)
             self.assertEqual(
                 window.inspiration_brief_input.toPlainText(),
                 "落魄机械工程师研究摩托车",
@@ -6808,8 +6808,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
                     window.current_creative_project_id = None
                     window.current_creative_node_id = None
                     brief = f"{template.label} 测试主题"
-                    window.inspiration_brief_input.setPlainText(brief)
-                    window.inspiration_answers_input.setPlainText("医生，赛博朋克，地下诊所")
+                    window.creative_brief_input.setPlainText(brief)
+                    window.creative_extra_input.setPlainText("医生，赛博朋克，地下诊所")
                     window._generate_all_creative_node_notes()
                     window._poll_events()
                     self._adopt_suggestions(window)
@@ -6866,8 +6866,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             character_index = window.creative_template_combo.findData("character")
             self.assertGreaterEqual(character_index, 0)
             window.creative_template_combo.setCurrentIndex(character_index)
-            window.inspiration_brief_input.setPlainText("赛博朋克世界观里的一个半人半机器人的医生")
-            window.inspiration_answers_input.setPlainText("赛博朋克，人机结合")
+            window.creative_brief_input.setPlainText("赛博朋克世界观里的一个半人半机器人的医生")
+            window.creative_extra_input.setPlainText("赛博朋克，人机结合")
             window.creative_node_imagination_slider.setValue(85)
 
             def run_immediately(target, **_kwargs):
@@ -7608,8 +7608,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
                 extra="",
                 model_name="fake",
             )
-            window.inspiration_brief_input.clear()
-            window.inspiration_answers_input.clear()
+            window.creative_brief_input.clear()
+            window.creative_extra_input.clear()
             window._load_creative_project(project_id, show_board=False)
             self.app.processEvents()
 
@@ -8215,8 +8215,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             character_index = window.creative_template_combo.findData("character")
             self.assertGreaterEqual(character_index, 0)
             window.creative_template_combo.setCurrentIndex(character_index)
-            window.inspiration_brief_input.setPlainText("赛博朋克世界观里的一个半人半机器人的医生")
-            window.inspiration_answers_input.setPlainText("赛博朋克，人机结合")
+            window.creative_brief_input.setPlainText("赛博朋克世界观里的一个半人半机器人的医生")
+            window.creative_extra_input.setPlainText("赛博朋克，人机结合")
 
             def run_immediately(target, **_kwargs):
                 target()
@@ -8341,8 +8341,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
             self.assertIsNone(window.current_creative_project_id)
-            self.assertEqual(window.inspiration_brief_input.toPlainText(), "")
-            self.assertEqual(window.inspiration_answers_input.toPlainText(), "")
+            self.assertEqual(window.creative_brief_input.toPlainText(), "")
+            self.assertEqual(window.creative_extra_input.toPlainText(), "")
 
             def run_immediately(target, **_kwargs):
                 target()
@@ -8359,8 +8359,8 @@ class MainWindowContextMenuTest(unittest.TestCase):
             projects = store.list_creative_projects()
             self.assertEqual(len(projects), 1)
             self.assertEqual(projects[0].title, "雨夜补给站")
-            self.assertIn("飞行器驾驶员", window.inspiration_brief_input.toPlainText())
-            self.assertIn("蓝紫色反光", window.inspiration_answers_input.toPlainText())
+            self.assertIn("飞行器驾驶员", window.creative_brief_input.toPlainText())
+            self.assertIn("蓝紫色反光", window.creative_extra_input.toPlainText())
             nodes = store.list_creative_nodes(projects[0].id)
             self.assertGreater(len(nodes), 3)
             self.assertGreaterEqual(provider.seed_calls, 1)

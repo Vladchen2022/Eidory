@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (
 )
 
 from eidory.ui.reference_entries import ReferenceEntriesTable
-from eidory.core.creative_entries import decode_entries, encode_entries, new_entry, search_names, composed_note
+from eidory.core.creative_entries import decode_entries, encode_entries, new_entry, search_names, composed_note, prose_addition
+from eidory.core.creative_templates import TEMPLATE_NOTES
 from eidory.core.creative_workspace import CreativeWorkspaceStore, decode_state
 from eidory.core.search_filters import FilterGroup, FilterPlan, SearchFilter
 
@@ -28,7 +29,6 @@ class CreativeWorkspace(QObject):
         self.search_node_id = None
         self.search_states = {}
         self.restore_position = None
-        self.probe_draft = None
         self._reference_key = None
         self._build()
 
@@ -53,6 +53,10 @@ class CreativeWorkspace(QObject):
         self.planning_scroll.setWidget(self.planning)
         self.planning.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         w.center_result_stack.addWidget(self.planning_scroll)
+        self.inspiration_scroll = QScrollArea()
+        self.inspiration_scroll.setWidgetResizable(True)
+        self.inspiration_scroll.setWidget(w.inspiration_workspace)
+        w.center_result_stack.addWidget(self.inspiration_scroll)
         w.center_result_stack.parentWidget().setMinimumWidth(480)
         self.sidebar = QWidget()
         side = QVBoxLayout(self.sidebar)
@@ -62,7 +66,6 @@ class CreativeWorkspace(QObject):
         w.creative_project_combo.show()
         self._button("新建创作项目", self.new_project, side)
         self._button("编辑构思与 AI 建议", self.show_project_planning, side)
-        self._button("探索灵感方向", self.show_probe, side)
         w.creative_node_tree.setMinimumHeight(150)
         w.creative_node_tree.setMaximumHeight(16777215)
         side.addWidget(w.creative_node_tree, 1)
@@ -112,10 +115,12 @@ class CreativeWorkspace(QObject):
         self.probe_tuning = QWidget()
         tuning = QHBoxLayout(self.probe_tuning)
         tuning.setContentsMargins(0, 0, 0, 0)
-        tuning.addWidget(QLabel("灵感结果 · 更多"))
+        self.back_to_inspiration = self._button("← 返回探索灵感", self.show_inspiration, tuning)
+        tuning.addWidget(QLabel("灵感结果 · 相似度"))
         tuning.addWidget(w.score_threshold_slider, 1)
         tuning.addWidget(QLabel("更相近"))
         tuning.addWidget(w.score_threshold_label)
+        tuning.addWidget(w.save_temp_project_button)
         w.center_result_stack.parentWidget().layout().insertWidget(2, self.probe_tuning)
         self.probe_tuning.hide()
         w.project_board_view.setAccessibleName("创作参考看板")
@@ -194,10 +199,8 @@ class CreativeWorkspace(QObject):
         node_layout.addWidget(self.proposal_panel)
         self.proposal_input.textChanged.connect(self.save_proposal_edits)
         self.proposal_query.textChanged.connect(self.save_proposal_edits)
-        probe_layout = w.inspiration_term_list.parentWidget().layout()
-        self._button("把选中的灵感方向加入当前创作项目", self.convert_probes, probe_layout)
-        w.inspiration_brief_input.textChanged.connect(self.save_context)
-        w.inspiration_answers_input.textChanged.connect(self.save_context)
+        w.creative_brief_input.textChanged.connect(self.save_context)
+        w.creative_extra_input.textChanged.connect(self.save_context)
         w.center_result_stack.currentChanged.connect(self.view_changed)
         w.grid_view.selectionChanged.connect(self.refresh_reference)
         w.project_board_view.selectionChanged.connect(self.refresh_reference)
@@ -205,7 +208,7 @@ class CreativeWorkspace(QObject):
 
     def save_context(self):
         w = self.w
-        if self.loading or not self.project_id or w.ai_workflow_stack.currentIndex() != 0:
+        if self.loading or not self.project_id:
             return
         if w.store.get_creative_project(self.project_id):
             if hasattr(w, 'workflow_upgrade'):
@@ -213,24 +216,84 @@ class CreativeWorkspace(QObject):
                 for node in w.store.list_creative_nodes(self.project_id):
                     if not w.workflow_upgrade.state.options(node.id)['reviewed_context']:
                         w.workflow_upgrade.state.set_options(node.id, reviewed_context=old_key)
-            w.store.update_creative_project_details(self.project_id, brief=w.inspiration_brief_input.toPlainText().strip())
-            self.store.save_project(self.project_id, extra=w.inspiration_answers_input.toPlainText().strip())
+            w.store.update_creative_project_details(self.project_id, brief=w.creative_brief_input.toPlainText().strip())
+            self.store.save_project(self.project_id, extra=w.creative_extra_input.toPlainText().strip())
 
     def before_project_load(self, project_id):
         if hasattr(self.w, 'creative_flow') and self.w.creative_flow._inline:
             self.w.creative_flow._inline.finish()
         if project_id != self.project_id:
+            self.save_resume_position()
             self.save_context()
             self.save_search()
             if project_id and not self.store.project(project_id)["scope_json"]:
                 self.store.save_project(project_id, scope=self.w._current_view_payload())
+
+    def save_resume_position(self):
+        w = self.w
+        pid = w.current_creative_project_id
+        if not pid or not hasattr(w, "creative_flow"):
+            return
+        node = w._current_creative_node()
+        if node is None or node.project_id != pid:
+            return
+        view = w.center_result_stack.currentWidget()
+        stage = "planning"
+        data = {"node": node.id}
+        if view is w.project_board_view and w._current_board_node_id is not None:
+            stage = "board"
+            board = w.project_board_view
+            data.update(board_node=w._current_board_node_id, selected=board.selected_image_ids(),
+                        viewport=board.viewport_state(), board_return=w.creative_flow._board_return)
+        elif view is w.grid_view:
+            if w.current_result_mode == "search_chain" and self.search_node_id == node.id:
+                stage = "search"
+            elif w.current_result_mode == "creative_node":
+                stage = "collected"
+                data.update(selected=w.grid_view.selected_image_ids(), scroll=w.grid_view.verticalScrollBar().value())
+        elif view is self.planning_scroll and w.creative_content_tabs.currentIndex() == 1:
+            stage = "copy"
+        if stage == "planning":
+            scroll = self.planning_scroll if view is self.planning_scroll else w.creative_flow.home
+            data["scroll"] = scroll.verticalScrollBar().value()
+        data["stage"] = stage
+        w.store.set_setting(f"ui.project_resume.{pid}", json.dumps(data))
+
+    def open_project(self, project_id):
+        w = self.w
+        state = decode_state(w.store.get_setting(f"ui.project_resume.{project_id}")) or {}
+        node_ids = {n.id for n in w.store.list_creative_nodes(project_id)}
+        node_id = state.get("node")
+        w._load_creative_project(project_id, select_node_id=node_id if node_id in node_ids else None)
+        stage = state.get("stage")
+        if stage == "board" and state.get("board_node") in node_ids:
+            w._show_creative_board_for_node(state["board_node"])
+            previous = state.get("board_return")
+            w.creative_flow._board_return = (tuple(previous) if isinstance(previous, list) and len(previous) == 3
+                                             and previous[0] == project_id and previous[1] in node_ids else None)
+            board = w.project_board_view
+            board.select_image_ids(state.get("selected", []))
+            board.restore_viewport_state(state.get("viewport"))
+            w.workspace_chrome.refresh()
+        elif stage == "search" and node_id in node_ids:
+            self.show_candidates()
+        elif stage == "collected" and node_id in node_ids:
+            self.show_collected()
+            w.grid_view.select_image_ids(state.get("selected", []))
+            w.grid_view.verticalScrollBar().setValue(state.get("scroll", 0))
+        elif stage == "copy":
+            w.creative_flow.show_project_copy()
+        else:
+            self.show_planning()
+            current = w.center_result_stack.currentWidget()
+            if isinstance(current, QScrollArea):
+                current.verticalScrollBar().setValue(state.get("scroll", 0))
 
     def load_project(self, project_id):
         if project_id == self.project_id:
             return
         self.project_id = project_id
         self.search_node_id = None
-        self.probe_draft = None
         self.load_context()
 
     def load_context(self):
@@ -238,27 +301,10 @@ class CreativeWorkspace(QObject):
         project = w.store.get_creative_project(self.project_id) if self.project_id else None
         self.loading = True
         try:
-            w.inspiration_brief_input.setPlainText(project.brief if project else "")
-            w.inspiration_answers_input.setPlainText(self.store.project(project.id)["extra"] if project else "")
+            w.creative_brief_input.setPlainText(project.brief if project else "")
+            w.creative_extra_input.setPlainText(self.store.project(project.id)["extra"] if project else "")
         finally:
             self.loading = False
-
-    def switch_ai_mode(self, mode):
-        w = self.w
-        previous = w.ai_workflow_stack.currentIndex()
-        if (mode == "probe") == (previous == 1):
-            return
-        if mode == "probe":
-            self.save_context()
-            if self.probe_draft:
-                self.loading = True
-                w.inspiration_brief_input.setPlainText(self.probe_draft[0])
-                w.inspiration_answers_input.setPlainText(self.probe_draft[1])
-                self.loading = False
-        else:
-            self.probe_draft = (w.inspiration_brief_input.toPlainText(), w.inspiration_answers_input.toPlainText())
-            if self.project_id:
-                self.load_context()
 
     def ai_context(self, project):
         self.save_context()
@@ -337,17 +383,16 @@ class CreativeWorkspace(QObject):
         if hasattr(self.w, 'creative_flow'):
             self.w.creative_flow.start_brief.clear()
             self.w.creative_flow.start_extra.clear()
-        self.w._set_ai_workflow_mode("project")
         self.load_context()
         self.show_planning()
         if hasattr(self.w, 'creative_flow'):
             self.w.creative_flow.start_brief.setFocus()
         else:
-            self.w.inspiration_brief_input.setFocus()
+            self.w.creative_brief_input.setFocus()
 
     def show_planning(self):
         w = self.w
-        if hasattr(w, 'creative_flow') and w.ai_workflow_stack.currentIndex() == 0:
+        if hasattr(w, 'creative_flow'):
             w.creative_flow.show_planning()
             return
         w._save_current_board_layout_if_needed()
@@ -360,12 +405,29 @@ class CreativeWorkspace(QObject):
         w.statusBar().showMessage("构思 · " + self.context_label.text())
 
     def show_project_planning(self):
-        self.w._set_ai_workflow_mode("project")
         self.show_planning()
 
-    def show_probe(self):
-        self.w._set_ai_workflow_mode("probe")
-        self.show_planning()
+    def leave_project_for_inspiration(self):
+        w = self.w
+        if (w.current_creative_project_id is not None or w.current_temp_project_id is not None
+                or w.center_result_stack.currentWidget() is w.project_board_view):
+            w._load_creative_project(None)
+        w.workspace_chrome.navigation_tabs.setCurrentIndex(0)
+
+    def is_exploring_inspiration(self):
+        w = self.w
+        view = w.center_result_stack.currentWidget()
+        return w.current_creative_project_id is None and (
+            view is self.inspiration_scroll or (view is w.grid_view and w.current_result_mode == "inspiration")
+        )
+
+    def show_inspiration(self):
+        w = self.w
+        self.leave_project_for_inspiration()
+        w.center_result_stack.setCurrentWidget(self.inspiration_scroll)
+        w.right_tab_widget.setCurrentIndex(0)
+        w.statusBar().showMessage("语义探针项目 · 探索灵感")
+        w.inspiration_brief_input.setFocus()
 
     def find(self):
         self.w._search_selected_creative_node()
@@ -717,28 +779,31 @@ class CreativeWorkspace(QObject):
             else:
                 w.statusBar().showMessage("无法采纳：目标条目已更改、节点已锁定或存在空名称，请检查建议")
             return
-        if partial:
-            text = self.proposal_input.textCursor().selectedText().replace("\u2029", "\n").strip()
-            if not text:
-                w.statusBar().showMessage("先在 AI 建议中选中要追加的段落")
-                return
-            note = w.creative_node_note_input.toPlainText().rstrip() + "\n" + text
-            query = w.creative_node_query_input.text()
-        else:
-            note, query = self.proposal_input.toPlainText(), self.proposal_query.text()
+        proposed = self.proposal_input.toPlainText()
+        selected = self.proposal_input.textCursor().selectedText().replace("\u2029", "\n").strip() if partial else proposed
+        query = w.creative_node_query_input.text() if partial else self.proposal_query.text()
         w._save_current_creative_node_editor_snapshot()
+        node = w.store.get_creative_node(node.id)
         entries = self.store.entries(node.id)
+        original = entries["base_note"] if entries is not None else node.note
+        addition = prose_addition(original, selected)
+        if not addition:
+            w.statusBar().showMessage("先选中要追加的段落" if partial else "建议中没有可追加的文字")
+            return
+        if original.strip() in TEMPLATE_NOTES:
+            original = ""
+        note = original + "\n" + addition if original.strip() else addition
         if entries is not None:
-            # Older copy-writing providers may still return prose; preserve row identity and choices.
-            entries["base_note"] = note.strip()
+            entries["base_note"] = note
             note, query = composed_note(entries), " ".join(search_names(entries))[:240]
-        if self.store.accept(node.id, note=note.strip(), query=query.strip(), keep_proposal=partial,
+        if self.store.accept(node.id, note=note, query=query.strip(), keep_proposal=partial,
                              entries_json=encode_entries(entries) if entries is not None else None):
             if partial:
-                remaining = self.proposal_input.toPlainText().replace(text, "", 1).strip()
+                remaining = proposed.replace(selected, "", 1).strip()
                 self.store.save_node(node.id, proposal_note=remaining)
+            self.invalidate_entry_search(node.id)
             self.reload_node(node.id)
-            w.statusBar().showMessage("已采纳建议，可恢复采纳前的内容")
+            w.statusBar().showMessage("已追加建议，原文已保留")
 
     def reload_node(self, node_id):
         w = self.w
@@ -784,28 +849,6 @@ class CreativeWorkspace(QObject):
     def save_reference(self):
         if self._reference_key:
             self.store.save_reference_note(*self._reference_key, self.reference_input.toPlainText())
-
-    def convert_probes(self):
-        w = self.w
-        terms = w._selected_inspiration_terms()
-        node = w._current_creative_node()
-        if not terms or node is None:
-            w.statusBar().showMessage("先选择创作项目和要加入的灵感方向")
-            return
-        self.store.save_project(node.project_id, probe={"history_id": w.current_inspiration_project_id, "titles": [term.title for term in terms]})
-        first = None
-        for term in terms:
-            new_id = w.store.create_creative_node(project_id=node.project_id, parent_id=node.id, title=term.title,
-                                                 note=term.reason or term.title, search_query=term.query)
-            first = first or new_id
-            images = [im.id for im in w._selected_grid_images() if any(match.query == term.query for match in w.current_inspiration_matches.get(im.id, []))]
-            if images:
-                w.store.add_images_to_creative_node(new_id, images, intent_label=term.title, intent_query=term.query)
-        w._set_ai_workflow_mode("project")
-        w._refresh_creative_projects(select_project_id=node.project_id)
-        w._load_creative_project(node.project_id, select_node_id=first)
-        self.show_planning()
-        w.statusBar().showMessage(f"已加入 {len(terms)} 个灵感节点，并带入选中的匹配图片")
 
     def export_project(self):
         w = self.w

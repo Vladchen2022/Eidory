@@ -133,6 +133,15 @@ def template_search_query(title: str, note: str, project_brief: str = "") -> str
     return " ".join(part for part in parts if part)[:400]
 
 
+def _template_notes(node):
+    yield node.note.strip()
+    for child in node.children:
+        yield from _template_notes(child)
+
+
+TEMPLATE_NOTES = frozenset(note for template in CREATIVE_TEMPLATES for note in _template_notes(template.root))
+
+
 def creative_node_template(node_title: str, node_path: str = "") -> CreativeTemplateNode | None:
     """Use explicit template responsibilities before consulting the nearest ancestor.
 

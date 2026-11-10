@@ -1,6 +1,6 @@
 [project]
 name = "eidory"
-version = "0.1.4"
+version = "0.1.13"
 description = "Local-first semantic image library for personal use."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -34,16 +34,26 @@ def test_sidebars_can_be_restored_from_header_in_focus_mode(window, app):
     w = window
     chrome = w.workspace_chrome
     original = w.root_splitter.sizes()
-    for index, button in ((0, chrome.left_button), (2, chrome.right_button)):
+    left_arrow = chrome.left_button.icon().cacheKey()
+    right_arrow = chrome.right_button.icon().cacheKey()
+    assert left_arrow != right_arrow
+    for index, button, expanded_icon, collapsed_icon in (
+        (0, chrome.left_button, left_arrow, right_arrow),
+        (2, chrome.right_button, right_arrow, left_arrow),
+    ):
+        assert not button.text() and not button.icon().isNull()
         button.click()
         app.processEvents()
         assert w.root_splitter.sizes()[index] == 0
         assert button.isVisible()
         assert not button.isChecked()
-        assert button.text() == ("显示左侧栏" if index == 0 else "显示右侧栏")
+        assert not button.text()
+        assert button.icon().cacheKey() == collapsed_icon
+        assert button.accessibleName() == ("显示左侧栏" if index == 0 else "显示右侧栏")
         button.click()
         app.processEvents()
         assert w.root_splitter.sizes()[index] == original[index]
+        assert button.icon().cacheKey() == expanded_icon
     w._set_board_focus_mode(True)
     assert w.root_splitter.sizes()[0] == 0
     assert chrome.left_button.isVisible()
@@ -219,16 +229,14 @@ def test_stage_navigation_reflects_current_work_and_recovers_from_board(window, 
     image = w.store.list_images(limit=None)[0]
     w.store.add_images_to_creative_node(node.id, [image.id])
     chrome = w.workspace_chrome
-    for index in (0, 1, 2, 3):
-        chrome.stage_buttons[index].click()
-        w._poll_events()
-        app.processEvents()
-        assert chrome.stage_buttons[1 if index == 2 else index].isChecked()
-        assert sum(button.isChecked() for button in chrome.stage_buttons) == 1
+    w.creative_flow.show_planning()
+    w.creative_flow.document_search.click()
+    w._poll_events()
+    chrome.project_board_button.click()
     assert chrome.board_tools.isVisible()
     w._set_board_focus_mode(True)
-    assert chrome.stage_buttons[1].isVisible()
-    chrome.stage_buttons[1].click()
+    assert chrome.project_board_button.isVisible()
+    chrome.project_board_button.click()
     app.processEvents()
     assert not w._board_focus_mode
     assert w.center_result_stack.currentWidget() is w.grid_view

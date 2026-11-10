@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import io
 import json
 import math
@@ -74,19 +75,21 @@ def _srgb_input(original):
     return srgb_pixels(original)
 
 
-def _replacement_colors(result, original, fmt):
+def _replacement_colors(result, original, fmt, *, preserve_gray=True):
     alpha = result.getchannel('A') if 'A' in result.getbands() else None
     result = result.convert('RGB')
     profile_data = original.info.get('icc_profile')
     if profile_data:
         profile, mode = _color_profile(profile_data)
         supported = {'JPEG': {'L', 'RGB', 'CMYK'}, 'PNG': {'L', 'RGB'}, 'WEBP': {'RGB'}}
+        if not preserve_gray:
+            supported = {key: modes - {'L'} for key, modes in supported.items()}
         if mode in supported[fmt]:
             result = ImageCms.profileToProfile(result, ImageCms.createProfile('sRGB'), profile, outputMode=mode)
         else:
             # WebP always encodes RGB; attaching a GRAY profile would mislabel it.
             profile_data = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
-    elif original.mode in {'L', 'LA'} and fmt != 'WEBP':
+    elif preserve_gray and original.mode in {'L', 'LA'} and fmt != 'WEBP':
         result = result.convert('L')
     result.info.clear()
     if alpha is not None and fmt != 'JPEG':
@@ -341,7 +344,7 @@ class ImageReplacement:
                 result.putalpha(alpha.resize(result.size, Image.Resampling.LANCZOS))
             fmt = job['source_info']['format']
             options = {}
-            result, profile = _replacement_colors(result, original, fmt)
+            result, profile = _replacement_colors(result, original, fmt, preserve_gray=job.get('origin') != 'preview')
             if profile:
                 options['icc_profile'] = profile
             exif, omitted = _replacement_exif(original, result.size)
@@ -392,6 +395,12 @@ class ImageReplacement:
                       before_digest=expected_digest, after_digest=digest(candidate), state='prepared',
                       created_at=utc_now_iso(), job_id=job_id, restore_of=restore_of,
                       metadata_omissions=metadata_omissions or [])
+        if job_id:
+            with self.store.connect(readonly=True) as conn:
+                row = conn.execute('SELECT payload FROM generated_reference_jobs WHERE id=?', (job_id,)).fetchone()
+            if row and json.loads(row[0]).get('origin') == 'preview':
+                record['job_table'] = 'generated_reference_jobs'
+                record['semantic_edit'] = True
         before_stat = backup.stat()
         record.update(before_file_size=before_stat.st_size, before_modified_time_ns=before_stat.st_mtime_ns)
         try:
@@ -406,6 +415,8 @@ class ImageReplacement:
                 shutil.copystat(candidate, stage)
             with self.store.connect() as conn:
                 conn.execute('PRAGMA synchronous=FULL')
+                if record.get('semantic_edit'):
+                    record['semantic_snapshot'] = self._semantic_snapshot(conn, image_id)
                 self._save(record, conn)  # Durable recovery intent, before touching the source.
             with self.store.connect() as conn:
                 conn.execute('PRAGMA synchronous=FULL')
@@ -441,26 +452,61 @@ class ImageReplacement:
                         AND file_size=? AND modified_time_ns=?''',
                      (stat.st_size, stat.st_mtime_ns, record['image_id'],
                       record.get('before_file_size'), record.get('before_modified_time_ns')))
-        # Semantic vectors, AI/user tags, notes, links and board layouts deliberately untouched.
+        # Upscaling keeps semantic identity. Generative edits can change content;
+        # invalidate machine-derived data while preserving manual tags and links.
+        if record.get('semantic_edit'):
+            self.store._mark_image_media_stale(conn, record['image_id'], utc_now_iso())
+            if self.store._table_exists(conn, 'ai_vision_profile_results'):
+                conn.execute("UPDATE ai_vision_profile_results SET status='stale' WHERE image_id=?", (record['image_id'],))
         record['state'] = 'restored' if record['restore_of'] else 'applied'
         self._save(record, conn)
         if record['restore_of']:
             row = conn.execute('SELECT payload FROM image_replacements WHERE id=?', (record['restore_of'],)).fetchone()
             previous = json.loads(row[0])
+            if previous.get('semantic_snapshot'):
+                self._restore_semantics(conn, record['image_id'], previous['semantic_snapshot'])
             previous['state'] = 'restored'
             self._save(previous, conn)
             if previous.get('job_id'):
-                row = conn.execute('SELECT payload FROM image_upscale_jobs WHERE id=?', (previous['job_id'],)).fetchone()
+                table = previous.get('job_table', 'image_upscale_jobs')
+                row = conn.execute(f'SELECT payload FROM {table} WHERE id=?', (previous['job_id'],)).fetchone()
                 if row:
                     job = json.loads(row[0])
                     job.update(state='restored', error='')
-                    UpscaleJobs(self.store, self.paths).save(job, conn)
+                    conn.execute(f'UPDATE {table} SET payload=? WHERE id=?', (json.dumps(job, ensure_ascii=False), job['id']))
         if record['job_id']:
-            row = conn.execute('SELECT payload FROM image_upscale_jobs WHERE id=?', (record['job_id'],)).fetchone()
+            table = record.get('job_table', 'image_upscale_jobs')
+            row = conn.execute(f'SELECT payload FROM {table} WHERE id=?', (record['job_id'],)).fetchone()
             if row:
                 job = json.loads(row[0])
                 job.update(state='applied', error='')
-                UpscaleJobs(self.store, self.paths).save(job, conn)
+                conn.execute(f'UPDATE {table} SET payload=? WHERE id=?', (json.dumps(job, ensure_ascii=False), job['id']))
+
+    @staticmethod
+    def _semantic_snapshot(conn, image_id):
+        snapshot = {'embedding_status': conn.execute('SELECT embedding_status FROM images WHERE id=?', (image_id,)).fetchone()[0]}
+        for table in ('embeddings', 'color_features', 'ai_vision_tags', 'ai_vision_profile_results'):
+            if not ImageReplacement._table_present(conn, table):
+                continue
+            snapshot[table] = [{key: {'bytes': base64.b64encode(value).decode('ascii')} if isinstance(value, bytes) else value
+                                for key, value in dict(row).items()}
+                               for row in conn.execute(f'SELECT * FROM {table} WHERE image_id=?', (image_id,))]
+        return snapshot
+
+    @staticmethod
+    def _restore_semantics(conn, image_id, snapshot):
+        conn.execute('UPDATE images SET embedding_status=? WHERE id=?', (snapshot['embedding_status'], image_id))
+        for table in ('embeddings', 'color_features', 'ai_vision_tags', 'ai_vision_profile_results'):
+            if table not in snapshot:
+                continue
+            conn.execute(f'DELETE FROM {table} WHERE image_id=?', (image_id,))
+            for raw in snapshot[table]:
+                row = {k: base64.b64decode(v['bytes']) if isinstance(v, dict) and 'bytes' in v else v for k, v in raw.items()}
+                conn.execute(f'INSERT INTO {table} ('+','.join(row)+') VALUES ('+','.join('?' for _ in row)+')', tuple(row.values()))
+
+    @staticmethod
+    def _table_present(conn, table):
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
 
     def _thumbnail(self, image_id):
         image = self.store.get_image(image_id)

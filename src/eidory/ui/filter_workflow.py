@@ -31,6 +31,7 @@ class FilterWorkflow(QObject):
         self._window = ref(window)
         self.include_groups = ()
         self.exclude_groups = ()
+        self.quick_include = self.quick_exclude = None
         self.scope = {"kind": "sidebar"}
         self.history = []
         self.restoring = False
@@ -104,17 +105,21 @@ class FilterWorkflow(QObject):
 
     def plan(self) -> FilterPlan:
         w = self.window
-        if tuple(f for g in self.include_groups for f in g.filters) != tuple(w.search_filters):
+        plan = FilterPlan(self.include_groups, self.exclude_groups, self.quick_include, self.quick_exclude)
+        if plan.positive_filters != tuple(w.search_filters):
             self.include_groups = (FilterGroup(tuple(w.search_filters)),) if w.search_filters else ()
-        if tuple(f for g in self.exclude_groups for f in g.filters) != tuple(w.result_exclusion_filters):
+            self.quick_include = None
+        if plan.negative_filters != tuple(w.result_exclusion_filters):
             # Old independent exclusions are migrated as OR, never silently AND.
             self.exclude_groups = (FilterGroup(tuple(w.result_exclusion_filters), "any"),) if w.result_exclusion_filters else ()
-        return FilterPlan(self.include_groups, self.exclude_groups)
+            self.quick_exclude = None
+        return FilterPlan(self.include_groups, self.exclude_groups, self.quick_include, self.quick_exclude)
 
     def set_plan(self, plan):
         self.cancel_strength()
         w = self.window
         self.include_groups, self.exclude_groups = plan.include, plan.exclude
+        self.quick_include, self.quick_exclude = plan.quick_include, plan.quick_exclude
         w.search_filters = list(plan.positive_filters)
         w.result_exclusion_filters = list(plan.negative_filters)
         w.result_exclusion_filter_matches.clear()
@@ -154,6 +159,7 @@ class FilterWorkflow(QObject):
             return
         result = rethreshold_result(w.current_chain_result, plan)
         self.include_groups, self.exclude_groups = plan.include, plan.exclude
+        self.quick_include, self.quick_exclude = plan.quick_include, plan.quick_exclude
         w.search_filters = list(plan.positive_filters)
         w.result_exclusion_filters = list(plan.negative_filters)
         w.active_filter_index = w._last_score_filter_index()
@@ -304,6 +310,8 @@ class FilterWorkflow(QObject):
         omitted = len(w._search_excluded_collection_ids()) + len(w._search_excluded_folder_prefixes())
         if omitted:
             actions.append((f"有 {omitted} 个文件夹停用搜索", self.show_disabled_folders))
+        self.panel.scope_limits.setText(f"{omitted} 个文件夹停用搜索" if omitted else "")
+        self.panel.scope_limits.setVisible(bool(omitted))
         self.panel.set_context_actions(actions)
         count = len(w.grid_view.images())
         excluded = w._result_exclusion_filter_image_ids() | w.result_excluded_image_ids | w.result_excluded_collection_image_ids
@@ -313,7 +321,8 @@ class FilterWorkflow(QObject):
         result = w.current_chain_result
         if w.current_result_mode == "search_chain" and result.filters_applied:
             details = f"范围 {result.scope_count} 张  ·  保留命中 {len(result.images)} 张  ·  排除 {len(available_excluded)} 张  ·  显示 {count} 张"
-            self.panel.result_label.setText(f"显示 {count} 张 · 排除 {len(available_excluded)} · 范围 {result.scope_count}")
+            total = len(w.current_chain_filtered_images)
+            self.panel.result_label.setText(f"纳入 {result.scope_count:,} 张 · 命中 {total:,} 张 · 已加载 {count:,} 张")
             if self.panel._busy or self.panel.error or result.evaluated_plan != plan:
                 self.panel.result_label.setText("上次结果 · " + self.panel.result_label.text())
             coverage = []
@@ -327,7 +336,12 @@ class FilterWorkflow(QObject):
                 set_theme_rich_text(self.panel.result_label, self.panel.result_label.text() + ' · <a href="index" style="color:@link@">有图片尚未索引，查看处理</a>')
             self.panel.result_label.setToolTip(details)
         else:
-            self.panel.result_label.setText(f"图片墙 · 已加载 {count} 张")
+            if w.current_result_mode == "library":
+                library_total, missing = w._result_status_counts()
+                scope_count = w._current_scope_count_for_status(total=library_total, missing=missing)
+                self.panel.result_label.setText(f"范围 {scope_count:,} 张 · 已加载 {count:,} 张")
+            else:
+                self.panel.result_label.setText(f"图片墙 · 已加载 {count:,} 张")
             self.panel.result_label.setToolTip(self.panel.result_label.text())
 
         if hasattr(w, "simple_search"):

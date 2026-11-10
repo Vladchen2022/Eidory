@@ -164,6 +164,7 @@ def test_search_query_is_saved_without_requiring_focus_change(window):
     f.open_search(); w._poll_events()
     field = f.target_content.findChild(QLineEdit)
     field.setText('机器人关节')
+    field.textEdited.emit(field.text())
     assert f.targets()[0]['query'] == '机器人关节'
     assert f._search_dirty_node == w.current_creative_node_id
     f.refresh()
@@ -188,7 +189,8 @@ def test_project_picker_resumes_existing_content(window, app):
     assert not chrome.project_picker.isVisible()
     assert w.current_creative_project_id == pid
     assert w.creative_project_combo.currentData() == pid
-    assert w.center_result_stack.currentWidget() is w.project_board_view
+    assert w.current_creative_node_id == node.id
+    assert w.center_result_stack.currentWidget() is w.creative_workspace.planning_scroll
     assert w.store.get_creative_node(node.id).note == node.note
 
 

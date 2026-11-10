@@ -2503,6 +2503,37 @@ class ProjectBoardView(QGraphicsView):
     def select_image_id(self, image_id: int) -> None:
         self._select_image_id(image_id)
 
+    def select_image_ids(self, image_ids) -> None:
+        with QSignalBlocker(self._scene):
+            self._scene.clearSelection()
+            for image_id in image_ids:
+                if item := self._image_items.get(image_id):
+                    item.setSelected(True)
+        self._emit_selection_changed()
+
+    def viewport_state(self):
+        center = self.mapToScene(self.viewport().rect().center())
+        return {"zoom": self._zoom, "center": [center.x(), center.y()], "mode": self._view_mode}
+
+    def restore_viewport_state(self, state):
+        if not isinstance(state, dict):
+            return
+        if state.get("mode") == "fit_all":
+            self.fit_all_images()
+            return
+        try:
+            x, y = map(float, state["center"])
+            zoom = float(state["zoom"])
+        except (TypeError, ValueError, KeyError):
+            return
+        if not all(map(math.isfinite, (x, y, zoom))) or not MIN_ZOOM <= zoom <= MAX_ZOOM:
+            return
+        self._view_mode = "manual"
+        self._zoom = zoom
+        self.setTransform(QTransform.fromScale(zoom, zoom))
+        self.centerOn(x, y)
+        self.viewport().update()
+
     def _zoom_by(self, factor: float, *, anchor_pos=None, defer_quality=False) -> None:
         next_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
         if abs(next_zoom - self._zoom) < 1e-9:

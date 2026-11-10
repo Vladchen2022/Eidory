@@ -208,6 +208,7 @@ class FilterEditorDialog(QDialog):
 
 
 class FilterPanel(QWidget):
+    quickChanged = Signal()
     draftChanged = Signal()
     applyRequested = Signal(object)
     scopeRequested = Signal()
@@ -256,12 +257,39 @@ class FilterPanel(QWidget):
         self.scope_button.setMaximumWidth(280)
         self.scope_button.clicked.connect(self.scopeRequested)
         self.scope_row.addWidget(self.scope_button)
+        self.scope_limits = QLabel()
+        self.scope_limits.setProperty("role", "muted")
+        self.scope_limits.hide()
+        self.scope_row.addWidget(self.scope_limits)
         self._show_empty_conditions = False
-        self.expand_button = QPushButton('＋ 筛选条件')
+        self.expand_button = QPushButton('更多条件')
         self.expand_button.clicked.connect(self._toggle_empty_conditions)
         self.scope_row.addWidget(self.expand_button)
         self.scope_row.addStretch(1)
         outer.addLayout(self.scope_row)
+
+        quick_row = QHBoxLayout()
+        self.quick_fields = {}
+        for section, title in (("include", "保留"), ("exclude", "排除")):
+            line = QHBoxLayout()
+            line.addWidget(QLabel(title))
+            mode = QComboBox()
+            mode.setAccessibleName(title + "搜索方式")
+            mode.addItem("文件名", "filename")
+            mode.addItem("语义", "semantic")
+            mode.setToolTip("文件名仅匹配名称；语义按已索引的画面内容匹配。")
+            field = QLineEdit()
+            field.setAccessibleName(title + "搜索")
+            field.setPlaceholderText("输入" + title + "条件，按回车搜索")
+            field.setClearButtonEnabled(True)
+            field.textChanged.connect(lambda _text, side=section: self._quick_edited(side))
+            mode.currentIndexChanged.connect(lambda _index, side=section: self._quick_edited(side))
+            field.returnPressed.connect(self._apply_draft)
+            line.addWidget(field, 1)
+            line.addWidget(mode)
+            quick_row.addLayout(line, 1)
+            self.quick_fields[section] = (field, mode)
+        outer.addLayout(quick_row)
 
         columns = QHBoxLayout()
         columns.setSpacing(10)
@@ -340,8 +368,21 @@ class FilterPanel(QWidget):
         self._render()
 
     def _apply_draft(self):
+        if self._busy:
+            return
         self.strengthFinished.emit()
         self.applyRequested.emit(self.draft)
+
+    def _quick_edited(self, section):
+        field, mode = self.quick_fields[section]
+        text = field.text().strip()
+        kind = mode.currentData()
+        old = getattr(self.draft, "quick_" + section)
+        condition = (old if old and old.kind == kind and old.value == text
+                     else SearchFilter(kind, text, 50 if kind == "semantic" else None) if text else None)
+        self.draft = replace(self.draft, **{"quick_" + section: condition})
+        self._update_status()
+        self.quickChanged.emit()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -422,6 +463,17 @@ class FilterPanel(QWidget):
         menu.exec(self.context_button.mapToGlobal(self.context_button.rect().bottomLeft()))
 
     def _render(self):
+        for section, (field, mode) in self.quick_fields.items():
+            condition = getattr(self.draft, "quick_" + section)
+            value = str(condition.value) if condition else ""
+            if field.text().strip() != value:
+                blocked = field.blockSignals(True)
+                field.setText(value)
+                field.blockSignals(blocked)
+            if condition and mode.currentData() != condition.kind:
+                blocked = mode.blockSignals(True)
+                mode.setCurrentIndex(mode.findData(condition.kind))
+                mode.blockSignals(blocked)
         self.strength_sliders.clear()
         self.condition_rows.clear()
         for section in ("include", "exclude"):
@@ -443,7 +495,7 @@ class FilterPanel(QWidget):
         for box in self.section_boxes.values():
             box.setVisible(active or self._show_empty_conditions)
         self.expand_button.setVisible(not active)
-        self.expand_button.setText('收起空筛选' if self._show_empty_conditions else '＋ 筛选条件')
+        self.expand_button.setText('收起更多条件' if self._show_empty_conditions else '更多条件')
 
     def _render_group(self, section, index, group):
         rows = self.section_layouts[section]

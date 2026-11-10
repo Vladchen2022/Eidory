@@ -3870,12 +3870,13 @@ class MetadataStore:
         summary: str = "",
         color_hex: str = "",
         kind: str = "semantic",
+        inspiration_id: int | None = None,
     ) -> int:
         clean_name = name.strip()
         if not clean_name:
             raise ValueError("temporary project name must not be empty")
         clean_ids = self._clean_ids(image_ids)
-        if not clean_ids:
+        if not clean_ids and not (kind == "semantic" and inspiration_id):
             raise ValueError("temporary project must contain at least one image")
         clean_summary = _clean_optional_text(summary, max_length=600) or ""
         clean_kind = _clean_temporary_project_kind(kind)
@@ -3918,6 +3919,11 @@ class MetadataStore:
                 ),
             )
             project_id = int(cur.lastrowid)
+            if inspiration_id and clean_kind == "semantic":
+                conn.execute(
+                    "INSERT INTO temporary_project_states(project_id,payload_json,updated_at) VALUES(?,?,?)",
+                    (project_id, json.dumps({"inspiration_id": inspiration_id}), now),
+                )
             for index, image_id in enumerate(clean_ids):
                 conn.execute(
                     """
@@ -3929,6 +3935,23 @@ class MetadataStore:
                     (project_id, image_id, index, now),
                 )
             return project_id
+
+    def semantic_workspace_links(self) -> dict[int, int]:
+        """Map saved probe sessions to their collections; legacy collections are unchanged."""
+        with self.connect(readonly=True) as conn:
+            rows = conn.execute(
+                """SELECT s.project_id, s.payload_json FROM temporary_project_states s
+                   JOIN temporary_projects p ON p.id=s.project_id WHERE p.kind='semantic'"""
+            ).fetchall()
+        links = {}
+        for row in rows:
+            try:
+                link = json.loads(row["payload_json"]).get("inspiration_id")
+            except (ValueError, AttributeError, TypeError):
+                continue
+            if type(link) is int and link > 0:
+                links[link] = int(row["project_id"])
+        return links
 
     def list_temporary_projects(self, *, kind: str | None = None) -> list[TemporaryProjectItem]:
         clean_kind = _clean_temporary_project_kind(kind) if kind is not None else None
@@ -4983,7 +5006,7 @@ class MetadataStore:
             params.append(clean_title)
         if note is not None:
             assignments.append("note = ?")
-            params.append(note.strip()[:1600])
+            params.append(note)
         if search_query is not None:
             assignments.append("search_query = ?")
             params.append(" ".join(search_query.strip().split())[:400])

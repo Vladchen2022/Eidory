@@ -325,7 +325,8 @@ class ReferenceGeneration(QObject):
             return None
 
     def active(self):
-        return self.repo.active()
+        job = self.repo.active()
+        return job if job and job.get('origin') != 'preview' else None
 
     def refresh(self, *_):
         w = self.w
@@ -336,6 +337,8 @@ class ReferenceGeneration(QObject):
         if self.panel:
             upscaler = getattr(w, 'image_upscaler', None)
             upscale_busy = bool(upscaler and (upscaler.working or upscaler.repo.active()))
+            preview = getattr(w, 'preview_ai', None)
+            upscale_busy = bool(upscale_busy or (preview and (preview.working or preview.repo.active())))
             self.panel.generate.setEnabled(not self.working and not job and not upscale_busy and bool(self.template()))
             self.panel.cancel.setEnabled(bool(job) and not self.working)
             self.panel.cancel.setText('停止等待' if job and job['state'] == 'offline' else '取消任务')
@@ -355,6 +358,9 @@ class ReferenceGeneration(QObject):
             return
         self.w.creative_workspace.save_context()
         self.w._save_pending_note()
+        self.open_node(node)
+
+    def open_node(self, node, *, job_id=None):
         if self.panel and (self.panel.node_id != node.id):
             self.panel.close()
             self.panel.deleteLater()
@@ -364,6 +370,12 @@ class ReferenceGeneration(QObject):
         self.panel.show()
         self.panel.raise_()
         self.refresh()
+        if job_id:
+            for index in range(self.panel.candidates.count()):
+                item = self.panel.candidates.item(index)
+                if item.data(Qt.ItemDataRole.UserRole) == job_id:
+                    self.panel.candidates.setCurrentItem(item)
+                    break
 
     def run(self, operation, callback):
         if self.working or self.w._closing:
@@ -446,6 +458,8 @@ class ReferenceGeneration(QObject):
         self.run(lambda: self.repo.submit(job['id']), lambda j: self.job_updated(j))
 
     def job_updated(self, job):
+        if hasattr(self.w, 'task_center'):
+            self.w.task_center.refresh_references()
         if self.panel:
             self.panel.status.setText(job.get('error') or STATE_LABELS[job['state']])
             self.panel.refresh_candidates()
@@ -595,6 +609,9 @@ class ReferenceGeneration(QObject):
             self.run(lambda: self.repo.discard(job['id'], undo=job['state'] == 'discarded'), self.job_updated)
 
     def hold_indexing(self, hold):
+        preview = getattr(self.w, 'preview_ai', None)
+        preview_job = preview.repo.active() if preview else None
+        hold = bool(hold or (preview and (preview.working or (preview_job and preview_job['state'] != 'offline'))))
         upscaler = getattr(self.w, 'image_upscaler', None)
         upscale_job = upscaler.repo.active() if upscaler else None
         upscale_offline = bool(upscale_job and upscale_job['state'] == 'offline')

@@ -31,19 +31,33 @@ class WipeComparison(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.before, self.after = QImage(), QImage()
+        self.after_preview = QImage()
+        self.before_preview = QImage()
         self.scale = 1.0
         self.pan = QPointF()
         self.divider = .5
         self.fit_mode = True
         self.drag = None
+        self.before_label = '原图'
+        self.after_label = 'SeedVR2 7B'
+        self.empty_text = '正在读取原图…'
         self.setMinimumSize(350, 260)
         self.setAccessibleName('原图与放大结果对比；滚轮缩放，拖动画面移动，拖动中线对比')
         self.setMouseTracking(True)
 
     def set_image(self, side, image):
         setattr(self, side, image)
+        if side == 'after':
+            self.after_preview = QImage()
+        elif side == 'before':
+            self.before_preview = QImage()
         if self.fit_mode:
             self.fit()
+        self.update()
+
+    def set_tone_preview(self, image):
+        # The display layer does not change native dimensions, zoom or pan.
+        self.after_preview = image
         self.update()
 
     def dimensions(self):
@@ -71,18 +85,19 @@ class WipeComparison(QWidget):
         p.fillRect(self.rect(), QColor('#232323'))
         if self.before.isNull():
             p.setPen(QColor('white'))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, '正在读取原图…')
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.empty_text)
             return
         size = self.dimensions()
         w, h = size.width()*self.scale, size.height()*self.scale
         rect = QRectF((self.width()-w)/2 + self.pan.x(), (self.height()-h)/2 + self.pan.y(), w, h)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        p.drawImage(rect, self.before)
+        before = self.before_preview if not self.after_preview.isNull() and not self.before_preview.isNull() else self.before
+        p.drawImage(rect, before)
         x = int(self.width()*self.divider)
         if not self.after.isNull():
             p.save()
             p.setClipRect(x, 0, self.width()-x, self.height())
-            p.drawImage(rect, self.after)
+            p.drawImage(rect, self.after_preview if not self.after_preview.isNull() else self.after)
             p.restore()
             p.setPen(QPen(QColor('white'), 2))
             p.drawLine(x, 0, x, self.height())
@@ -90,10 +105,10 @@ class WipeComparison(QWidget):
             p.drawEllipse(QPointF(x, self.height()/2), 8, 8)
         p.setPen(QColor('white'))
         p.fillRect(8, 8, 58, 26, QColor(0, 0, 0, 150))
-        p.drawText(18, 26, '原图')
+        p.drawText(18, 26, self.before_label)
         if not self.after.isNull():
             p.fillRect(self.width()-135, 8, 127, 26, QColor(0, 0, 0, 150))
-            p.drawText(self.width()-125, 26, 'SeedVR2 7B')
+            p.drawText(self.width()-125, 26, self.after_label)
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y() or event.pixelDelta().y()
@@ -207,22 +222,21 @@ class UpscalePanel(QWidget):
         row.addWidget(hint)
         self.restore = QPushButton('恢复原图')
         self.restore.clicked.connect(controller.restore)
-        row.addWidget(self.restore)
         self.discard = QPushButton('丢弃结果')
         self.discard.clicked.connect(controller.discard)
-        row.addWidget(self.discard)
         self.replace = QPushButton('替换原图')
-        self.replace.setProperty('variant', 'primary')
         self.replace.clicked.connect(controller.replace)
-        row.addWidget(self.replace)
         self.export = QPushButton('保存为新图片…')
         self.export.clicked.connect(controller.export_copy)
-        row.addWidget(self.export)
+        from eidory.ui.review_actions import describe_review_actions
+        describe_review_actions(self.export, self.replace, self.discard)
+        for action in (self.export, self.replace, self.discard, self.restore):
+            row.addWidget(action)
         tasks = QPushButton('任务与结果')
         tasks.clicked.connect(controller.open_tasks)
         row.addWidget(tasks)
         outer.addLayout(row)
-        self.status = QLabel('结果临时保存；对比后再决定是否替换。')
+        self.status = QLabel('结果暂存。另存可选择文件位置并加入图库；替换会更新原图所在位置。')
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         outer.addWidget(self.status)
@@ -367,7 +381,8 @@ class UpscalePanel(QWidget):
                 pass
         ready = bool(job and job['state'] == 'ready')
         same_active = bool(active and active['image_id'] == self.image_id)
-        other_generation = bool(self.c.w.reference_generation.active() or self.c.w.reference_generation.working)
+        preview = getattr(self.c.w, 'preview_ai', None)
+        other_generation = bool(self.c.w.reference_generation.repo.active() or self.c.w.reference_generation.working or (preview and preview.working))
         pending = any(j['state'] in ACTIVE_STATES | {'waiting'} or
                       (j['state'] == 'paused' and (not job or j['id'] != job['id'])) for j in jobs)
         self.start.setEnabled(self.valid and not busy and not active and not other_generation and not ready and not pending)
@@ -386,7 +401,7 @@ class UpscalePanel(QWidget):
         self.replace.setEnabled(ready and not busy)
         self.export.setEnabled(bool(job and job['state'] in {'ready', 'applied', 'exported'} and not job.get('purged_at')) and not busy)
         self.discard.setEnabled(bool(job and job['state'] in {'ready', 'discarded'} and not job.get('purged_at')) and not busy and not active)
-        self.discard.setText('撤销丢弃' if job and job['state'] == 'discarded' else '丢弃结果')
+        self.discard.setText('撤销放弃' if job and job['state'] == 'discarded' else '放弃结果')
         self.restore.setVisible(bool(self.c.replacements.latest(self.image_id)))
         self.restore.setEnabled(not busy and not active and not ready)
         if job and job.get('original_path') and Path(job['original_path']).is_file():
@@ -470,6 +485,10 @@ class ImageUpscaler(QObject):
         self.inspect()
 
     def open_tasks(self):
+        if hasattr(self.w, "task_center"):
+            self.w.task_center.open(1)
+            self.tasks.refresh()
+            return
         if self.tasks is None:
             from eidory.ui.upscale_tasks import UpscaleTasks
             self.tasks = UpscaleTasks(self)
@@ -498,7 +517,10 @@ class ImageUpscaler(QObject):
         self.batch_review.activateWindow()
 
     def notify_batches(self):
-        ready = sum(j['state'] == 'ready' for j in self.repo.all())
+        jobs = self.repo.all()
+        ready = sum(j['state'] == 'ready' for j in jobs)
+        if hasattr(self.w, 'task_center'):
+            self.w.task_center.update_counts('upscale', jobs)
         self.result_button.setText(f'AI 任务与结果 · 待审 {ready} 张' if ready else 'AI 任务与结果')
         if self.batch_notice or self.w._closing:
             return
@@ -692,7 +714,7 @@ class ImageUpscaler(QObject):
             self.panel.status.setText(job.get('error') or LABELS.get(job['state'], job['state']))
         if job['state'] == 'ready':
             self.notified_job_id = job['id']
-            self.w.statusBar().showMessage('AI 放大完成，点击「AI 任务与结果」即可对比。')
+            self.w.statusBar().showMessage('AI 放大完成，在「后台任务 → AI 放大」审核结果。')
             if hasattr(self, 'result_button'):
                 self.result_button.setText('AI 结果待确认')
 
@@ -709,7 +731,7 @@ class ImageUpscaler(QObject):
             if job.get('next_check_at', 0) > time.time():
                 return
             self.run(lambda: self.repo.reconcile(job['id']), self.updated)
-        elif self.repo.waiting() and self.w.store.get_setting('upscale.queue_paused', '0') != '1' and not self.w.reference_generation.active():
+        elif self.repo.waiting() and self.w.store.get_setting('upscale.queue_paused', '0') != '1' and not self.w.reference_generation.repo.active() and not (getattr(self.w, 'preview_ai', None) and self.w.preview_ai.working):
             self.run(self.repo.start_next, self.updated)
         elif self.panel:
             self.inspect()

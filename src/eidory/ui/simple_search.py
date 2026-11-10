@@ -5,7 +5,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QPushButton, QMenu
 from eidory.core.search_filters import FilterPlan
-from eidory.core.filter_engine import threshold_matches, matching_group_ids
+from eidory.core.filter_engine import threshold_matches, matching_plan_ids
 
 
 class SimpleSearch(QObject):
@@ -26,6 +26,7 @@ class SimpleSearch(QObject):
         self.ranked.connect(self.accept_ranking)
         panel = window.filter_panel
         panel.draftChanged.connect(lambda: self.schedule('filters'))
+        panel.quickChanged.connect(self.refresh)
         panel.strengthChanged.connect(lambda _: self.schedule('strength'))
         panel.clear_button.setToolTip('清除后自动更新图片墙')
         panel.apply_button.setText('更新结果')
@@ -79,16 +80,17 @@ class SimpleSearch(QObject):
     def refresh(self):
         w, p = self.w, self.w.filter_panel
         gallery = w.center_result_stack.currentWidget() is w.grid_view
-        # The same rule applies to text, checkboxes and sliders: edits update
-        # automatically. Keep a manual retry only when useful.
-        p.apply_button.setVisible(bool(p.error))
+        quick_dirty = any(getattr(p.draft, key) != getattr(p.applied, key)
+                          for key in ('quick_include', 'quick_exclude'))
+        p.apply_button.setText('搜索' if quick_dirty else '重试筛选')
+        p.apply_button.setVisible(bool(p.error) or quick_dirty)
         if not p._busy and not p.error:
-            p.status_label.setText('正在准备更新…' if self.pending else '自动更新')
+            p.status_label.setText('正在准备更新…' if self.pending else '按回车搜索' if quick_dirty else '自动更新')
         flow = w.creative_flow
         flow.refresh_target_controls()
         flow.search_refresh.hide()
-        missing_targets = any(row['enabled'] and w.workflow_upgrade.result_mode.findData(row['query']) < 0
-                              for row in flow.targets())
+        missing_targets = (not flow.is_document_search() or flow.search_options.isChecked()) and any(
+            row['enabled'] and w.workflow_upgrade.result_mode.findData(row['query']) < 0 for row in flow.targets())
         flow.target_run.setVisible(w.center_result_stack.currentWidget() is flow.search_empty
                                   or (gallery and missing_targets and not p._busy and not self.pending))
         if self.pending == 'targets':
@@ -183,12 +185,15 @@ class SimpleSearch(QObject):
         matches = {f: {im.id for im in threshold_matches(f, raw)} for f, raw in result.filter_matches.items()}
         base = {im.id for im in result.ranked_scope_images or ()}
         def count(candidate):
-            groups = [g for g in candidate.include if g.filters]
-            keep = set.union(*(matching_group_ids(g, matches) for g in groups)) if groups else base
-            exclude = set().union(*(matching_group_ids(g, matches) for g in candidate.exclude))
+            keep, exclude = matching_plan_ids(candidate, matches, base)
             return len(keep - exclude - w.result_excluded_image_ids - w.result_excluded_collection_image_ids)
         options = []
         for section in ('include', 'exclude'):
+            key = 'quick_' + section
+            if condition := getattr(plan, key):
+                candidate = replace(plan, **{key: None})
+                n = count(candidate)
+                options.append((n, f'清除「{w._filter_label(condition)}」 · 可保留 {n} 张', candidate))
             for gi, group in enumerate(getattr(plan, section)):
                 for fi, condition in enumerate(group.filters):
                     groups = list(getattr(plan, section))

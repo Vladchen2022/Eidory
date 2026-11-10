@@ -21,6 +21,7 @@ GroupKey = tuple[str, tuple[int, ...]]
 
 
 class DuplicateCompareDialog(QDialog):
+    groupsRequested = Signal()
     removeRequested = Signal(int)
     deleteRequested = Signal(int)
     undoRequested = Signal()
@@ -110,6 +111,9 @@ class DuplicateCompareDialog(QDialog):
         self.resume_button.setEnabled(bool(self.resume_cursor))
         self.resume_button.clicked.connect(self.resume_review)
         review_row.addWidget(self.resume_button)
+        groups_button = QPushButton("组列表…")
+        groups_button.clicked.connect(self.groupsRequested.emit)
+        review_row.addWidget(groups_button)
         root.addLayout(review_row)
         self.review_label = QLabel()
         root.addWidget(self.review_label)
@@ -123,7 +127,7 @@ class DuplicateCompareDialog(QDialog):
         root.addWidget(self.selection_label)
         modifier = "⌘" if sys.platform == "darwin" else "Ctrl+"
         help_label = QLabel(
-            f"点击图片选中后：Delete 删除源文件 · {modifier}Delete 只从图库移除 · "
+            f"点击图片选中后：Delete 移到废纸篓 · {modifier}Delete 从图库移除 · "
             f"← / → 切换组 · ↑ / ↓ 切换本组副本 · {modifier}Z 撤销\n"
             "删除会先保存回收备份，再移到废纸篓；移除保留硬盘上的源文件。"
         )
@@ -131,8 +135,9 @@ class DuplicateCompareDialog(QDialog):
         help_label.setProperty("role", "muted")
         root.addWidget(help_label)
         footer = QHBoxLayout()
-        self.previous_button = QPushButton("← 上一组")
-        self.next_button = QPushButton("下一组 →")
+        self.previous_button = QPushButton("← 上一组（按编号）")
+        self.next_button = QPushButton("下一组（按编号）→")
+        self.next_pending.setToolTip("跳过已审核的组，可从列表末尾回到前面的待审组。")
         self.undo_button = QPushButton("撤销上次删除 / 移除")
         close_button = QPushButton("关闭")
         self.previous_button.clicked.connect(lambda: self.change_group(-1))
@@ -199,6 +204,23 @@ class DuplicateCompareDialog(QDialog):
                 self._render_group()
                 return
         self.review_label.setText('没有其他待审核组。左右方向键仍按原顺序查看全部组。')
+
+    def show_first_pending(self):
+        for index, group in enumerate(self.groups):
+            if self.decisions.get(fingerprint(group)) not in {"keep", "different"}:
+                if index != self.group_index:
+                    self.group_index, self.candidate_index = index, 0
+                    self._render_group()
+                return
+
+    def jump_to_group(self, group):
+        for index, item in enumerate(self.groups):
+            if self._group_key(item) == self._group_key(group):
+                if index != self.group_index:
+                    self.group_index, self.candidate_index = index, 0
+                    self._navigation_notice = "从组列表跳转"
+                    self._render_group()
+                return
 
     def actual_images(self):
         self._actual_requested = True
@@ -444,12 +466,13 @@ class DuplicateCompareDialog(QDialog):
             form.addRow(title, label)
         col.addLayout(form)
         actions = QHBoxLayout()
-        remove = QPushButton("从图库移除")
+        from eidory.ui.review_actions import REMOVE_FROM_LIBRARY, TRASH_SOURCE
+        remove = QPushButton(REMOVE_FROM_LIBRARY)
         remove.setObjectName("removeDuplicate")
-        remove.setToolTip("只移除图库索引，保留硬盘源文件")
-        delete = QPushButton("删除源文件")
+        remove.setToolTip("仅移除这一张的图库记录，保留硬盘源文件。")
+        delete = QPushButton(TRASH_SOURCE)
         delete.setObjectName("deleteDuplicate")
-        delete.setToolTip("保存回收备份后，将源文件移到废纸篓")
+        delete.setToolTip("先保存回收备份，再把这一张的源文件移到废纸篓。")
         for button, mode in ((remove, "remove"), (delete, "delete")):
             button.setAutoDefault(False)
             button.clicked.connect(lambda _checked=False, m=mode, iid=image.id: self.request_action(m, iid))

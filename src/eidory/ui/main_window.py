@@ -929,6 +929,11 @@ class DuplicateResultsDialog(QDialog):
         intro = QLabel("完全重复是文件内容相同；近重复是逐对核验后的画面近似候选。并列对比每次只显示两张图片，请结合画面与所在文件夹决定。")
         intro.setWordWrap(True)
         layout.addWidget(intro)
+        self.kind_filter = QComboBox()
+        self.kind_filter.setAccessibleName("重复组筛选")
+        self.kind_filter.addItems(["全部重复组", "完全重复", "近似重复", "待审核"])
+        self.kind_filter.currentIndexChanged.connect(self._filter_groups)
+        layout.addWidget(self.kind_filter)
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(5)
@@ -941,21 +946,15 @@ class DuplicateResultsDialog(QDialog):
         layout.addWidget(self.tree, 1)
 
         row = QHBoxLayout()
-        self.compare_button = QPushButton("并列对比 / 处理重复图片")
+        self.compare_button = QPushButton("对比选中组")
         self.compare_button.setProperty("variant", "primary")
-        self.load_all_groups_button = QPushButton("载入全部组")
-        self.load_group_button = QPushButton("载入选中组")
         close_button = QPushButton("关闭")
         row.addWidget(self.compare_button)
-        row.addWidget(self.load_all_groups_button)
-        row.addWidget(self.load_group_button)
         row.addStretch(1)
         row.addWidget(close_button)
         layout.addLayout(row)
-        self.load_all_groups_button.clicked.connect(self.allGroupsLoadRequested.emit)
         self.compare_button.clicked.connect(self.open_comparison)
         self.tree.itemDoubleClicked.connect(lambda _item, _column: self.open_comparison())
-        self.load_group_button.clicked.connect(self._accept_selected_group)
         close_button.clicked.connect(self.reject)
         self._populate_tree()
 
@@ -979,34 +978,86 @@ class DuplicateResultsDialog(QDialog):
         if self.compare_dialog is not None:
             self.compare_dialog.set_groups(groups)
 
-    def open_comparison(self) -> None:
+    def open_comparison(self, _checked=False, *, start_pending=False) -> None:
+        item = self.tree.currentItem()
+        if item is not None and item.parent() is not None:
+            item = item.parent()
+        index = self.tree.indexOfTopLevelItem(item) if item is not None else -1
         if self.compare_dialog is not None:
+            if 0 <= index < len(self.groups) and not start_pending:
+                self.compare_dialog.jump_to_group(self.groups[index])
+            self.hide()
             self.compare_dialog.show()
             self.compare_dialog.raise_()
             self.compare_dialog.activateWindow()
             return
         if not self.groups:
             return
-        item = self.tree.currentItem()
-        if item is not None and item.parent() is not None:
-            item = item.parent()
-        index = self.tree.indexOfTopLevelItem(item) if item is not None else 0
-        dialog = DuplicateCompareDialog(self.groups, start_index=max(0, index), parent=self)
+        dialog = DuplicateCompareDialog(self.groups, start_index=max(0, index), parent=self.parentWidget() or self)
         dialog.removeRequested.connect(self.removeRequested.emit)
         dialog.deleteRequested.connect(self.deleteRequested.emit)
         dialog.undoRequested.connect(self.undoRequested.emit)
+        dialog.groupsRequested.connect(self.show_group_list)
         dialog.finished.connect(lambda _result: self._clear_comparison(dialog))
         self.compare_dialog = dialog
+        if start_pending:
+            dialog.show_first_pending()
+        self.hide()
         dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def show_group_list(self):
+        if self.compare_dialog:
+            compare = self.compare_dialog
+            compare.hide()
+            if compare.groups:
+                current = compare.groups[compare.group_index]
+                for index, group in enumerate(self.groups):
+                    if compare._group_key(group) == compare._group_key(current):
+                        self.tree.setCurrentItem(self.tree.topLevelItem(index))
+                        break
+        self._filter_groups()
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     def _clear_comparison(self, dialog: DuplicateCompareDialog) -> None:
         if self.compare_dialog is dialog:
             self.compare_dialog = None
+            if not self.isVisible():
+                self.reject()
 
     def done(self, result: int) -> None:
         if self.compare_dialog is not None:
-            self.compare_dialog.close()
+            dialog, self.compare_dialog = self.compare_dialog, None
+            dialog.close()
         super().done(result)
+
+    def close(self) -> bool:
+        if self.compare_dialog is not None:
+            self.reject()
+            return True
+        return super().close()
+
+    def _filter_groups(self, *_args):
+        from eidory.core.duplicate_review import fingerprint
+        mode = self.kind_filter.currentIndex()
+        decisions = self.compare_dialog.decisions if self.compare_dialog else {}
+        first = None
+        for i, group in enumerate(self.groups):
+            row = self.tree.topLevelItem(i)
+            if row is None:
+                continue
+            pending = decisions.get(fingerprint(group)) not in {"keep", "different"}
+            visible = not mode or (mode == 1 and group.kind == "exact") or (mode == 2 and group.kind != "exact") or (mode == 3 and pending)
+            row.setHidden(not visible)
+            if visible and first is None:
+                first = row
+        current = self.tree.currentItem()
+        if current is None or (current.parent() or current).isHidden():
+            self.tree.setCurrentItem(first)
+        self.compare_button.setEnabled(first is not None)
 
     def _populate_tree(self) -> None:
         self.tree.clear()
@@ -1014,8 +1065,10 @@ class DuplicateResultsDialog(QDialog):
         self.all_group_image_ids = []
         for index, group in enumerate(self.groups, start=1):
             title = "完全重复" if group.kind == "exact" else "近重复"
+            compare = self.compare_dialog
+            number = compare._group_order.get(compare._group_key(group), index) if compare else index
             parent_item = QTreeWidgetItem([
-                f"{title} #{index}：{len(group.members)} 张",
+                f"{title} #{number}：{len(group.members)} 张",
                 group.reason,
                 "",
                 "",
@@ -1037,10 +1090,7 @@ class DuplicateResultsDialog(QDialog):
                 child.setData(0, Qt.ItemDataRole.UserRole, [image.id])
                 parent_item.addChild(child)
             parent_item.setExpanded(index <= 8)
-        has_groups = bool(self.groups)
-        self.compare_button.setEnabled(has_groups)
-        self.load_all_groups_button.setEnabled(has_groups)
-        self.load_group_button.setEnabled(has_groups)
+        self._filter_groups()
 
     def _accept_selected_group(self) -> None:
         item = self.tree.currentItem()
@@ -1510,6 +1560,9 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.current_color_candidate_limit = 0
         self.current_search_scope_count: int | None = None
         self.current_inspiration_project_id: int | None = None
+        self.inspiration_draft_project_id: int | None = None
+        self.semantic_workspace_id: int | None = None
+        self.inspiration_generation_revision = 0
         self.current_inspiration_terms: list[InspirationTerm] = []
         self.current_inspiration_raw_term_results: list[tuple[InspirationTerm, list[ImageItem]]] = []
         self.current_inspiration_images: list[ImageItem] = []
@@ -1755,6 +1808,10 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.reference_generation = ReferenceGeneration(self)
         from eidory.ui.image_upscale import ImageUpscaler
         self.image_upscaler = ImageUpscaler(self)
+        from eidory.ui.preview_ai import PreviewAI
+        self.preview_ai = PreviewAI(self)
+        from eidory.ui.task_center import TaskCenter
+        self.task_center = TaskCenter(self)
         from eidory.ui.removal_recovery import RemovalRecovery
         self.removal_recovery = RemovalRecovery(self)
         startup_removed_roots, startup_removed_images = self._cleanup_missing_active_scan_roots()
@@ -1933,6 +1990,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self.reference_generation.close()
         if hasattr(self, 'image_upscaler'):
             self.image_upscaler.close()
+        if hasattr(self, 'preview_ai'):
+            self.preview_ai.close()
         if hasattr(self, "task_control"):
             self.task_control.cancel()
         if hasattr(self, "simple_search"):
@@ -1970,6 +2029,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self.creative_flow._inline.finish()
         self.creative_workspace.save_context()
         self.creative_workspace.save_search()
+        self.creative_workspace.save_resume_position()
         self._save_pending_note()
         self._detail_preview_pending_token = None
         self._save_current_board_layout_if_needed()
@@ -2452,6 +2512,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
     def refresh_theme(self) -> None:
         # Update presentation in place, preserving selection, drafts and undo.
         self._apply_macos_titlebar()
+        if hasattr(self, "workspace_chrome"):
+            self.workspace_chrome.sync_sidebars()
         for button in self.findChildren(QPushButton):
             kind = button.property("eidoryBoardIcon")
             if kind:
@@ -3024,7 +3086,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self._loaded_creative_node_detail_id: int | None = None
         self._loaded_creative_node_note_text: str = ""
         self._loaded_creative_node_query_text: str = ""
-        self.delete_source_button = QPushButton("删除/移除图片")
+        self.delete_source_button = QPushButton("移除图片…")
         self.delete_source_button.setToolTip("选择删除源文件，或只从 Eidory 移除索引")
         self.play_pause_button = QPushButton("播放", panel)
         self.open_original_button = QPushButton("打开源文件", panel)
@@ -3129,15 +3191,11 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.search_inspiration_button.setEnabled(False)
         self.save_temp_project_button = QPushButton("存为语义探针项目")
         self.save_temp_project_button.setEnabled(False)
-        self.ai_project_mode_button = QPushButton("创作节点")
-        self.ai_probe_mode_button = QPushButton("语义探针")
-        self.ai_project_mode_button.setCheckable(True)
-        self.ai_probe_mode_button.setCheckable(True)
-        self.ai_workflow_mode_group = QButtonGroup(self)
-        self.ai_workflow_mode_group.setExclusive(True)
-        self.ai_workflow_mode_group.addButton(self.ai_project_mode_button, 0)
-        self.ai_workflow_mode_group.addButton(self.ai_probe_mode_button, 1)
-        self.ai_project_mode_button.setChecked(True)
+        self.creative_brief_input = QTextEdit(self)
+        self.creative_extra_input = QTextEdit(self)
+        for field in (self.creative_brief_input, self.creative_extra_input):
+            field.setAcceptRichText(False)
+            field.hide()
 
         self.ai_vision_progress_bar = QProgressBar()
         self.ai_vision_progress_bar.setRange(0, 100)
@@ -3271,10 +3329,6 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         inspiration_layout = QVBoxLayout(inspiration_tab)
         inspiration_layout.setContentsMargins(8, 8, 8, 8)
         inspiration_layout.setSpacing(8)
-        inspiration_layout.addWidget(QLabel("创作主题"))
-        inspiration_layout.addWidget(self.inspiration_brief_input)
-        inspiration_layout.addWidget(QLabel("补充信息"))
-        inspiration_layout.addWidget(self.inspiration_answers_input)
         imagination_header = QHBoxLayout()
         imagination_header.setContentsMargins(0, 0, 0, 0)
         imagination_header.addWidget(self.creative_node_imagination_title_label)
@@ -3286,15 +3340,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         imagination_row.addWidget(self.creative_node_imagination_strict_label)
         imagination_row.addWidget(self.creative_node_imagination_slider, 1)
         imagination_row.addWidget(self.creative_node_imagination_divergent_label)
-        ai_mode_row = QHBoxLayout()
-        ai_mode_row.setContentsMargins(0, 0, 0, 0)
-        ai_mode_row.setSpacing(0)
-        ai_mode_row.addWidget(self.ai_project_mode_button)
-        ai_mode_row.addWidget(self.ai_probe_mode_button)
-        inspiration_layout.addLayout(ai_mode_row)
-
-        self.ai_workflow_stack = QStackedWidget()
-        project_mode_widget = QWidget()
+        self.creative_editor = project_mode_widget = QWidget()
         project_mode_layout = QVBoxLayout(project_mode_widget)
         project_mode_layout.setContentsMargins(0, 0, 0, 0)
         project_mode_layout.setSpacing(7)
@@ -3354,10 +3400,23 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         project_mode_layout.addWidget(self.creative_content_tabs, 1)
         project_mode_layout.addStretch(1)
 
-        probe_mode_widget = QWidget()
+        self.inspiration_workspace = probe_mode_widget = QWidget()
+        probe_mode_widget.setObjectName("inspirationWorkspace")
         probe_mode_layout = QVBoxLayout(probe_mode_widget)
-        probe_mode_layout.setContentsMargins(0, 0, 0, 0)
-        probe_mode_layout.setSpacing(7)
+        probe_mode_layout.setContentsMargins(20, 14, 20, 18)
+        probe_mode_layout.setSpacing(8)
+        self.inspiration_heading = QLabel("探索灵感")
+        self.inspiration_heading.setProperty("role", "sectionTitle")
+        probe_mode_layout.addWidget(self.inspiration_heading)
+        self.inspiration_intro = QLabel("用一句话生成几个方向，再从图库中找参考。")
+        self.inspiration_intro.setWordWrap(True)
+        probe_mode_layout.addWidget(self.inspiration_intro)
+        self.inspiration_brief_label = QLabel("灵感主题")
+        self.inspiration_extra_label = QLabel("补充信息")
+        probe_mode_layout.addWidget(self.inspiration_brief_label)
+        probe_mode_layout.addWidget(self.inspiration_brief_input)
+        probe_mode_layout.addWidget(self.inspiration_extra_label)
+        probe_mode_layout.addWidget(self.inspiration_answers_input)
         probe_mode_layout.addWidget(self.inspiration_questions_label)
         probe_mode_layout.addWidget(QLabel("历史探针"))
         probe_mode_layout.addWidget(self.inspiration_history_list)
@@ -3372,11 +3431,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         inspiration_button_row.addWidget(self.generate_inspiration_button)
         inspiration_button_row.addWidget(self.search_inspiration_button)
         probe_mode_layout.addLayout(inspiration_button_row)
-        probe_mode_layout.addWidget(self.save_temp_project_button)
-
-        self.ai_workflow_stack.addWidget(project_mode_widget)
-        self.ai_workflow_stack.addWidget(probe_mode_widget)
-        inspiration_layout.addWidget(self.ai_workflow_stack, 1)
+        inspiration_layout.addWidget(project_mode_widget, 1)
 
         filter_tab = QWidget()
         filter_layout = QVBoxLayout(filter_tab)
@@ -3490,9 +3545,22 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         index_layout.addStretch(1)
 
         settings_tab = QWidget()
-        settings_layout = QVBoxLayout(settings_tab)
-        settings_layout.setContentsMargins(8, 8, 8, 8)
-        settings_layout.setSpacing(8)
+        settings_root = QVBoxLayout(settings_tab)
+        self.settings_categories = QTabWidget()
+        settings_root.addWidget(self.settings_categories, 1)
+        self.settings_sections = {}
+        for key, title in (("appearance", "外观"), ("models", "模型"),
+                           ("library", "图库维护"), ("backup", "备份与迁移")):
+            page = QWidget()
+            section = QVBoxLayout(page)
+            section.setAlignment(Qt.AlignmentFlag.AlignTop)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+            scroll.setWidget(page)
+            self.settings_categories.addTab(scroll, title)
+            self.settings_sections[key] = section
+        settings_layout = self.settings_sections["models"]
         settings_layout.addWidget(QLabel("文本模型设置"))
         settings_form = QFormLayout()
         self._configure_sidebar_form(settings_form)
@@ -3519,9 +3587,10 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         settings_form.addRow("Model", self.llm_model_input)
         settings_form.addRow("API Key", self.llm_api_key_input)
         settings_form.addRow("温度", self.llm_temperature_spin)
-        settings_form.addRow("界面语言", self.language_combo)
-        settings_form.addRow("数据目录", self.data_dir_label)
-        settings_form.addRow("数据库", self.database_path_label)
+        language_form = QFormLayout()
+        language_form.addRow("界面语言", self.language_combo)
+        self.settings_sections["appearance"].addLayout(language_form)
+        self.language_combo.activated.connect(self._save_interface_language)
         settings_layout.addLayout(settings_form)
         self.save_settings_button = QPushButton("保存设置")
         self.open_data_dir_button = QPushButton("打开数据目录")
@@ -3557,11 +3626,13 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.refresh_path_candidates_button = QPushButton("刷新旧位置")
         self.choose_remap_new_path_button = QPushButton("选择新位置")
         self.apply_path_remap_button = QPushButton("应用路径重映射")
-        self.settings_status_label = QLabel(
-            "LM Studio 默认使用 http://localhost:1234/v1；Ollama 默认使用 http://localhost:11434/v1；API Key 不会写入日志。"
-        )
+        self.settings_status_label = QLabel()
         self.settings_status_label.setWordWrap(True)
         settings_layout.addWidget(self.save_settings_button)
+        model_hint = QLabel("LM Studio 和 Ollama 可以使用本机服务。API Key 不会写入日志。")
+        model_hint.setWordWrap(True)
+        settings_layout.addWidget(model_hint)
+        settings_layout = self.settings_sections["library"]
         settings_layout.addSpacing(4)
         settings_layout.addWidget(QLabel("路径修复"))
         path_remap_form = QFormLayout()
@@ -3621,8 +3692,15 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         export_row.addWidget(self.export_library_button)
         export_row.addWidget(self.export_selection_button)
         settings_layout.addLayout(export_row)
+        settings_layout = self.settings_sections["backup"]
         settings_layout.addSpacing(4)
-        settings_layout.addWidget(QLabel("数据库维护"))
+        backup_hint = QLabel("数据库备份用于恢复记录。换电脑请选择工作区迁移，可同时带上图片、已有向量和标签。")
+        backup_hint.setWordWrap(True)
+        settings_layout.addWidget(backup_hint)
+        paths_form = QFormLayout()
+        paths_form.addRow("数据目录", self.data_dir_label)
+        paths_form.addRow("数据库", self.database_path_label)
+        settings_layout.addLayout(paths_form)
         settings_actions_row = QHBoxLayout()
         settings_actions_row.setContentsMargins(0, 0, 0, 0)
         settings_actions_row.addWidget(self.open_data_dir_button)
@@ -3630,14 +3708,14 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         settings_actions_row.addWidget(self.restore_database_button)
         settings_layout.addLayout(settings_actions_row)
         settings_layout.addWidget(self.workspace_migration_button)
+        settings_layout = self.settings_sections["library"]
         settings_health_row = QHBoxLayout()
         settings_health_row.setContentsMargins(0, 0, 0, 0)
         settings_health_row.addWidget(self.run_self_check_button)
         settings_health_row.addWidget(self.show_error_log_button)
         settings_layout.addLayout(settings_health_row)
         settings_layout.addWidget(self.show_operation_history_button)
-        settings_layout.addWidget(self.settings_status_label)
-        settings_layout.addStretch(1)
+        settings_root.addWidget(self.settings_status_label)
         self._load_settings_controls()
         self._refresh_inspiration_history()
 
@@ -3773,7 +3851,6 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.tag_panel_pick_button.clicked.connect(self._tag_panel_pick_tags)
         self.tag_panel_remove_button.clicked.connect(self._tag_panel_remove_selected_tag)
         self.tag_panel_clear_button.clicked.connect(self._tag_panel_clear_tags)
-        self.ai_workflow_mode_group.idClicked.connect(self._on_ai_workflow_mode_clicked)
         self.creative_node_imagination_slider.valueChanged.connect(
             self._update_creative_node_imagination
         )
@@ -4030,6 +4107,13 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.settings_status_label.setText("设置已保存。API Key 不会写入日志。")
         self.statusBar().showMessage("设置已保存")
 
+    def _save_interface_language(self, _index=None):
+        language = str(self.language_combo.currentData() or "zh")
+        self.store.set_setting("ui.language", language)
+        self.current_language = language
+        self._apply_runtime_language_settings()
+        self._refresh_ai_vision_stats()
+
     def _open_data_directory(self) -> None:
         self.paths.ensure()
         ok = QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.paths.data_dir)))
@@ -4123,7 +4207,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                 for preview in list(self._preview_dialogs):
                     if not preview.close():
                         raise ValueError("预览标记尚未保存，数据库恢复已取消")
-                for controller in (self.reference_generation, self.image_upscaler):
+                for controller in (self.reference_generation, self.image_upscaler, self.preview_ai):
                     if controller.panel:
                         panel = controller.panel
                         controller.panel = None
@@ -4257,6 +4341,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
 
         if hasattr(self, 'reference_generation'):
             self.reference_generation.refresh()
+        if hasattr(self, 'preview_ai'):
+            self.preview_ai.refresh()
 
     def _set_maintenance_controls_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -4491,8 +4577,12 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self.inspiration_questions_label.setText("AI questions: -")
             self.inspiration_status_label.setText("Select up to 7 semantic probes.")
             self.use_ai_scene_tags_checkbox.setText("Generate AI scene tags with probes")
-            self.ai_project_mode_button.setText("Project Nodes")
-            self.ai_probe_mode_button.setText("Semantic Probes")
+            self.inspiration_heading.setText("Explore Ideas")
+            self.inspiration_intro.setText("Describe an idea to generate directions and find references in the library.")
+            self.inspiration_brief_label.setText("Idea")
+            self.inspiration_extra_label.setText("Extra Context")
+            self.inspiration_brief_input.setAccessibleName("Idea")
+            self.inspiration_answers_input.setAccessibleName("Extra Context")
             self.creative_template_label.setText("New Project Template")
             self.creative_new_project_button.setText("Create Project from This Topic")
             self.creative_ai_project_button.setText("Give Me a New Creative Topic")
@@ -4625,7 +4715,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self.save_result_set_button.setToolTip("把当前图片墙结果保存为搜索结果集")
             self.rename_file_button.setText("重命名")
             self.rename_file_button.setToolTip("重命名硬盘上的源文件")
-            self.delete_source_button.setText("删除/移除图片")
+            self.delete_source_button.setText("移除图片…")
             self.delete_source_button.setToolTip("选择删除源文件，或只从 Eidory 移除索引")
             self.tag_panel_pick_button.setText("给选中图片添加标签")
             self.tag_panel_remove_button.setText("移除标签")
@@ -4656,8 +4746,12 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self.inspiration_questions_label.setText("AI 追问：-")
             self.inspiration_status_label.setText("生成后最多选择 7 个语义探针。")
             self.use_ai_scene_tags_checkbox.setText("生成探针时同时生成 AI 场景标签")
-            self.ai_project_mode_button.setText("创作节点")
-            self.ai_probe_mode_button.setText("语义探针")
+            self.inspiration_heading.setText("探索灵感")
+            self.inspiration_intro.setText("用一句话生成几个方向，再从图库中找参考。")
+            self.inspiration_brief_label.setText("灵感主题")
+            self.inspiration_extra_label.setText("补充信息")
+            self.inspiration_brief_input.setAccessibleName("灵感主题")
+            self.inspiration_answers_input.setAccessibleName("补充信息")
             self.creative_template_label.setText("新建项目模板")
             self.creative_new_project_button.setText("按此主题新建项目")
             self.creative_ai_project_button.setText("给我一个新创作题目")
@@ -5079,23 +5173,6 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
     def _restore_search_task_controls(self) -> None:
         self.search_button.setEnabled(True)
         self._restore_inspiration_generation_controls()
-
-    def _on_ai_workflow_mode_clicked(self, mode_id: int) -> None:
-        self._set_ai_workflow_mode("probe" if mode_id == 1 else "project")
-
-    def _set_ai_workflow_mode(self, mode: str) -> None:
-        if not hasattr(self, "ai_workflow_stack"):
-            return
-        if hasattr(self, "creative_workspace"):
-            self.creative_workspace.switch_ai_mode(mode)
-        is_probe = mode == "probe"
-        self.ai_project_mode_button.blockSignals(True)
-        self.ai_probe_mode_button.blockSignals(True)
-        self.ai_project_mode_button.setChecked(not is_probe)
-        self.ai_probe_mode_button.setChecked(is_probe)
-        self.ai_project_mode_button.blockSignals(False)
-        self.ai_probe_mode_button.blockSignals(False)
-        self.ai_workflow_stack.setCurrentIndex(1 if is_probe else 0)
 
     def _toggle_more_maintenance(self, checked: bool) -> None:
         self.more_maintenance_widget.setVisible(checked)
@@ -5812,8 +5889,28 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             return
         self._start_search_with_filter(search_filter)
 
+    def _start_new_inspiration(self) -> None:
+        # Invalidate the previous probe's search before showing the blank form.
+        if self.current_result_mode == "inspiration":
+            self._clear_search()
+        self.inspiration_generation_revision += 1
+        self.semantic_workspace_id = None
+        self.inspiration_draft_project_id = None
+        self.inspiration_proposal_terms = []
+        self.inspiration_plan_filters = []
+        self.inspiration_questions = []
+        self.inspiration_model_name = ""
+        self.inspiration_brief_input.clear()
+        self.inspiration_answers_input.clear()
+        self._populate_inspiration_term_list([])
+        self._populate_inspiration_filter_list([])
+        self._sync_inspiration_questions_label()
+        self._refresh_inspiration_history()
+        self._refresh_inspiration_status()
+        self._restore_inspiration_generation_controls()
+        self.creative_workspace.show_inspiration()
+
     def _generate_inspiration_terms_from_panel(self) -> None:
-        self._set_ai_workflow_mode("probe")
         brief = self.inspiration_brief_input.toPlainText().strip()
         if not brief:
             self.inspiration_status_label.setText("先输入创作主题。")
@@ -5832,6 +5929,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         )
         provider = self._make_llm_provider()
         answers = self.inspiration_answers_input.toPlainText()
+        self.inspiration_generation_revision += 1
+        revision = self.inspiration_generation_revision
 
         def run() -> None:
             try:
@@ -5841,16 +5940,16 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                         answers=answers,
                         language=self.current_language,
                     )
-                    self.events.put(("search_plan_proposal", proposal))
+                    self.events.put(("search_plan_proposal", (revision, proposal)))
                 else:
                     proposal = provider.generate_inspiration_terms(
                         brief=brief,
                         answers=answers,
                         language=self.current_language,
                     )
-                    self.events.put(("inspiration_proposal", proposal))
+                    self.events.put(("inspiration_proposal", (revision, proposal)))
             except Exception as exc:
-                self.events.put(("inspiration_error", exc))
+                self.events.put(("inspiration_error", (revision, exc)))
 
         self._start_background_task(
             run,
@@ -5858,8 +5957,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         )
 
     def _show_inspiration_proposal(self, proposal) -> None:
-        self._set_ai_workflow_mode("probe")
-        self.current_inspiration_project_id = None
+        self.inspiration_draft_project_id = None
         self.inspiration_proposal_terms = list(proposal.terms)
         self.inspiration_plan_filters = []
         self.current_inspiration_plan_filters = []
@@ -5876,8 +5974,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
 
     def _show_search_plan_proposal(self, proposal) -> None:
-        self._set_ai_workflow_mode("probe")
-        self.current_inspiration_project_id = None
+        self.inspiration_draft_project_id = None
         self.inspiration_proposal_terms = list(proposal.terms)
         self.inspiration_plan_filters = list(proposal.filters)
         self.current_inspiration_plan_filters = []
@@ -5914,7 +6011,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self.inspiration_term_list.addItem(item)
         self.inspiration_term_list.blockSignals(False)
 
-    def _populate_inspiration_filter_list(self, filters: list[SearchPlanFilter]) -> None:
+    def _populate_inspiration_filter_list(self, filters: list[SearchPlanFilter], *, select_all=False) -> None:
         if not hasattr(self, "inspiration_filter_list"):
             return
         self.inspiration_filter_list.blockSignals(True)
@@ -5932,7 +6029,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             item = QListWidgetItem(text)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
-                Qt.CheckState.Unchecked if plan_filter.optional else Qt.CheckState.Checked
+                Qt.CheckState.Unchecked if plan_filter.optional and not select_all else Qt.CheckState.Checked
             )
             item.setData(Qt.ItemDataRole.UserRole, plan_filter)
             item.setSizeHint(QSize(0, 42 if plan_filter.reason else 28))
@@ -5959,7 +6056,10 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.inspiration_history_list.blockSignals(True)
         self.inspiration_history_list.clear()
         selected_item: QListWidgetItem | None = None
+        linked = self.store.semantic_workspace_links()
         for project in self.store.list_inspiration_projects():
+            if project.id in linked:
+                continue
             item = QListWidgetItem(
                 f"{project.title}    {project.selected_count}/{project.term_count}"
             )
@@ -5987,17 +6087,19 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             return
         self._load_inspiration_project(int(project_id))
 
-    def _load_inspiration_project(self, project_id: int) -> None:
+    def _load_inspiration_project(self, project_id: int, *, saved_filters=()) -> None:
         project = self.store.get_inspiration_project(project_id)
         if project is None:
             self._refresh_inspiration_history()
             self.statusBar().showMessage("该 AI 探针历史已不存在")
             return
-        self._set_ai_workflow_mode("probe")
         terms = self.store.inspiration_terms_for_project(project_id)
-        self.current_inspiration_project_id = project.id
+        self.semantic_workspace_id = self.store.semantic_workspace_links().get(project_id)
+        self.inspiration_generation_revision += 1
+        self.generate_inspiration_button.setEnabled(True)
+        self.inspiration_draft_project_id = project.id
         self.inspiration_proposal_terms = list(terms)
-        self.inspiration_plan_filters = []
+        self.inspiration_plan_filters = list(saved_filters)
         self.current_inspiration_plan_filters = []
         self.current_inspiration_raw_term_results = []
         self.inspiration_questions = list(project.questions)
@@ -6005,12 +6107,40 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.inspiration_brief_input.setPlainText(project.brief)
         self.inspiration_answers_input.setPlainText(project.answers)
         self._populate_inspiration_term_list(self.inspiration_proposal_terms)
-        self._populate_inspiration_filter_list([])
+        self._populate_inspiration_filter_list(self.inspiration_plan_filters, select_all=True)
         self._sync_inspiration_questions_label()
         self._refresh_inspiration_status()
         self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
         self._refresh_inspiration_history(select_project_id=project_id)
         self.statusBar().showMessage(f"已恢复 AI 探针历史：{project.title}")
+
+    def _open_semantic_workspace(self, workspace_id: int) -> bool:
+        state = self._temporary_project_state_payload(workspace_id) or {}
+        inspiration_id = state.get("inspiration_id")
+        if type(inspiration_id) is not int or not self.store.get_inspiration_project(inspiration_id):
+            return False
+        if self.current_result_mode == "inspiration":
+            self._clear_search()
+        filters = []
+        for value in (state.get("filters") or []):
+            if isinstance(value, dict) and isinstance(value.get("field"), str) and isinstance(value.get("value"), str):
+                filters.append(SearchPlanFilter(value["field"], value["value"], bool(value.get("optional")), str(value.get("reason", ""))))
+        self.semantic_workspace_id = workspace_id
+        self.creative_workspace.show_inspiration()
+        self._load_inspiration_project(inspiration_id, saved_filters=filters)
+        self.workspace_chrome.refresh()
+        return True
+
+    def _toggle_semantic_workspace_board(self):
+        workspace_id = self.semantic_workspace_id
+        if workspace_id is None:
+            return
+        if self.center_result_stack.currentWidget() is self.project_board_view:
+            if not self._open_semantic_workspace(workspace_id):
+                self.workspace_chrome.open_library()
+        else:
+            self._show_temporary_project_board(workspace_id)
+            self.workspace_chrome.refresh()
 
     def _show_inspiration_history_context_menu(self, position) -> None:
         item = self.inspiration_history_list.itemAt(position)
@@ -6045,6 +6175,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         deleted = self.store.delete_inspiration_project(project_id)
+        if self.inspiration_draft_project_id == project_id:
+            self.inspiration_draft_project_id = None
         if self.current_inspiration_project_id == project_id:
             self.current_inspiration_project_id = None
         self._refresh_inspiration_history()
@@ -6131,7 +6263,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
     def _run_single_inspiration_term_search(self, term: InspirationTerm) -> None:
         self.inspiration_status_label.setText(f"正在单条搜索：{term.title}")
         self._run_inspiration_search(
-            self.current_inspiration_project_id or 0,
+            self.inspiration_draft_project_id or 0,
             [
                 InspirationTerm(
                     id=term.id,
@@ -6159,7 +6291,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             return
         selected_titles = {term.title for term in selected_terms}
         plan_filters = self._selected_inspiration_plan_filters()
-        project_id = self.current_inspiration_project_id
+        project_id = self.inspiration_draft_project_id
         if project_id is not None and self.store.get_inspiration_project(project_id) is not None:
             self.store.update_inspiration_project_selection(
                 project_id,
@@ -6177,6 +6309,17 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                 terms=self.inspiration_proposal_terms,
                 selected_titles=selected_titles,
             )
+        self.inspiration_draft_project_id = project_id
+        if self.creative_workspace.is_exploring_inspiration():
+            workspace_id = self.semantic_workspace_id or self.store.semantic_workspace_links().get(project_id)
+            if workspace_id is None or self.store.get_temporary_project(workspace_id) is None:
+                workspace_id = self.store.create_temporary_project(brief[:28], [], inspiration_id=project_id)
+            self.semantic_workspace_id = workspace_id
+            state = {"inspiration_id": project_id,
+                     "filters": [{"field": f.field, "value": f.value, "optional": f.optional, "reason": f.reason} for f in plan_filters]}
+            self.store.save_temporary_project_state(workspace_id, json.dumps(state, ensure_ascii=False))
+            self._expand_project_sidebar_section("temporary")
+            self._refresh_project_sidebar(select_kind="temporary", select_id=workspace_id)
         self._refresh_inspiration_history(select_project_id=project_id)
         self._run_inspiration_search(project_id, selected_terms, plan_filters=plan_filters)
 
@@ -6190,6 +6333,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         if not selected_terms:
             self.statusBar().showMessage("没有可搜索的语义探针")
             return
+        self.creative_workspace.leave_project_for_inspiration()
         self.creative_workspace.save_search()
         self._show_gallery_view()
         self.semantic_search_revision += 1
@@ -6220,6 +6364,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.load_more_button.setEnabled(False)
         self.generate_inspiration_button.setEnabled(False)
         self.search_inspiration_button.setEnabled(False)
+        self.creative_workspace.view_changed()
+        self.workspace_chrome.refresh()
         filter_text = (
             f"，{len(self.current_inspiration_plan_filters)} 个 AI 场景标签"
             if self.current_inspiration_plan_filters else ""
@@ -6250,7 +6396,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                     (revision, project_id, selected_terms, term_results, list(plan_filters or [])),
                 ))
             except Exception as exc:
-                self.events.put(("error", f"灵感项目搜索失败：{exc}"))
+                self.events.put(("inspiration_search_error", (revision, str(exc))))
 
         self._start_background_task(
             run,
@@ -8485,7 +8631,9 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                 self.export_selection_button.setText("Export Images")
         else:
             self.save_temp_project_button.setText(
-                f"存为语义探针 {count} 张" if count else "存为语义探针项目"
+                (f"收集 {count} 张到当前项目" if count else "收集到当前项目")
+                if self.current_result_mode == "inspiration" and self.semantic_workspace_id else
+                (f"存为语义探针 {count} 张" if count else "存为语义探针项目")
             )
             if hasattr(self, "export_selection_button"):
                 self.export_selection_button.setText("导出图片")
@@ -8522,6 +8670,16 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self.statusBar().showMessage("没有选中图片")
             return
         clean_kind = "quick" if kind == "quick" else "semantic"
+        if clean_kind == "semantic" and self.current_result_mode == "inspiration" and self.semantic_workspace_id:
+            workspace = self.store.get_temporary_project(self.semantic_workspace_id)
+            if workspace is not None:
+                labels, queries = self._temporary_project_intents_for_images(images)
+                added = self.store.add_images_to_temporary_project(
+                    workspace.id, [image.id for image in images], intent_labels=labels, intent_queries=queries)
+                self._refresh_project_sidebar(select_kind="temporary", select_id=workspace.id)
+                self.workspace_chrome.refresh()
+                self.statusBar().showMessage(f"已加入「{workspace.name}」{added} 张")
+                return
         label = "暂时收藏" if clean_kind == "quick" else "语义探针项目"
         if len(images) > 1 and not self._confirm_batch_operation(
             f"保存为{label}",
@@ -9070,6 +9228,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         dialog.imageChanged.connect(lambda image, context=dialog._selection_context: self._sync_preview_selection(image, context))
         dialog.imageChanged.connect(lambda image, preview=dialog: self._refresh_preview_collection(preview, image))
         dialog.upscaleRequested.connect(lambda image, preview=dialog: self.image_upscaler.open(image, preview=preview))
+        dialog.generateRequested.connect(lambda image, preview=dialog: self.preview_ai.open(image, 'generate', preview=preview))
+        dialog.editRequested.connect(lambda image, preview=dialog: self.preview_ai.open(image, 'edit', preview=preview))
         dialog.collectRequested.connect(lambda image, preview=dialog: self._collect_from_preview(preview, image))
         dialog.favoriteChanged.connect(self._handle_preview_favorite_changed)
         dialog.annotationMembershipChanged.connect(self.filter_workflow.annotation_membership_changed)
@@ -9453,7 +9613,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         file_menu.addSeparator()
         add_action(file_menu, "export_selection", "导出选中图片")
         file_menu.addSeparator()
-        add_action(file_menu, "delete_source", "删除/移除图片...")
+        add_action(file_menu, "delete_source", "移除图片…")
 
         marker_menu = menu.addMenu("收藏与标签")
         add_action(marker_menu, "favorite", f"收藏选中 {len(selected_images)} 张")
@@ -9463,10 +9623,13 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         add_action(marker_menu, "clear_tags", "清除选中图片标签")
 
         semantic_menu = menu.addMenu("语义探针项目")
-        add_action(semantic_menu, "save_temp", "保存选中为语义探针项目")
+        active_semantic = self.semantic_workspace_id if self.current_result_mode == "inspiration" else None
+        add_action(semantic_menu, "save_temp", "收集到当前语义探针项目" if active_semantic else "保存选中为语义探针项目")
         temp_project_menu = semantic_menu.addMenu("加入已有语义探针项目")
         temp_project_actions: dict[object, int] = {}
         for project in self.store.list_temporary_projects(kind="semantic"):
+            if project.id == active_semantic:
+                continue
             project_action = temp_project_menu.addAction(f"{project.name} ({project.image_count})")
             project_action.setData(f"temporary_project:{project.id}")
             temp_project_actions[project_action] = project.id
@@ -10949,6 +11112,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self.batch_remove_tag_combo.clear()
 
     def _set_creative_selection_controls_visible(self, visible: bool) -> None:
+        if self.current_creative_project_id is not None and hasattr(self, "creative_flow"):
+            visible = False
         self.creative_selection_widget.setVisible(visible)
         label = self.detail_form.labelForField(self.creative_selection_widget)
         if label is not None:
@@ -12472,16 +12637,17 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self._delete_source_files_with_undo(images)
 
     def _ask_delete_or_remove_mode(self, count: int) -> str | None:
+        from eidory.ui.review_actions import REMOVE_FROM_LIBRARY, TRASH_SOURCE
         message = QMessageBox(self)
         message.setIcon(QMessageBox.Icon.Warning)
-        message.setWindowTitle("删除/移除图片")
-        message.setText(f"已选择 {count} 个项目。请选择要执行的操作。")
+        message.setWindowTitle("移除图片")
+        message.setText(f"将处理 {count} 张图片。请选择影响范围。")
         message.setInformativeText(
-            "“只从软件移除”不会删除硬盘源文件。\n"
-            "“删除源文件”会先备份到回收区（跨重启保留），再把硬盘源文件移到废纸篓。"
+            "「从图库移除」保留硬盘源文件。\n"
+            "「移到废纸篓」会先保存回收备份，再移动硬盘源文件。"
         )
-        remove_button = message.addButton("只从软件移除", QMessageBox.ButtonRole.ActionRole)
-        delete_button = message.addButton("删除源文件", QMessageBox.ButtonRole.DestructiveRole)
+        remove_button = message.addButton(REMOVE_FROM_LIBRARY, QMessageBox.ButtonRole.ActionRole)
+        delete_button = message.addButton(TRASH_SOURCE, QMessageBox.ButtonRole.DestructiveRole)
         cancel_button = message.addButton(QMessageBox.StandardButton.Cancel)
         message.setDefaultButton(cancel_button)
         message.exec()
@@ -13296,15 +13462,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         dialog.undoRequested.connect(self._undo_last_library_removal)
         dialog.finished.connect(lambda _result: self._clear_duplicate_results_dialog(dialog))
         self._duplicate_results_dialog = dialog
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-        all_images, badges = self._duplicate_groups_grid_payload(groups)
-        self._show_duplicate_images(
-            all_images,
-            badges_by_image_id=badges,
-            status_prefix=f"全部重复候选（{len(groups)} 组）",
-        )
+        self.workspace_chrome._dialogs[4].hide()
+        dialog.open_comparison(start_pending=True)
         message = f"重复检测完成：完全重复 {exact_count} 组，近重复 {near_count} 组"
         self.settings_status_label.setText(message)
         self.statusBar().showMessage(message)
@@ -13339,12 +13498,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         dialog = self._duplicate_results_dialog
         if dialog is None:
             return False
-        if dialog.isMinimized():
-            dialog.showNormal()
-        else:
-            dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
+        dialog.open_comparison(start_pending=True)
         return True
 
     def _duplicate_groups_grid_payload(
@@ -13478,7 +13632,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         return removed_roots, removed_images
 
     def _start_embedding(self) -> None:
-        if hasattr(self, 'reference_generation') and self.reference_generation.active():
+        if hasattr(self, 'reference_generation') and self.reference_generation.repo.active():
             self.statusBar().showMessage('正在生成参考，完成后可继续语义索引')
             return
         if self._database_maintenance_active:
@@ -13512,7 +13666,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self._start_embedding()
 
     def _start_ai_vision(self) -> None:
-        if hasattr(self, 'reference_generation') and self.reference_generation.active():
+        if hasattr(self, 'reference_generation') and self.reference_generation.repo.active():
             self.statusBar().showMessage('正在生成参考，完成后可继续 AI 识别')
             return
         if self._database_maintenance_active:
@@ -13573,7 +13727,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.statusBar().showMessage("已移除 AI 识别文件夹" if removed else "AI 识别文件夹不存在")
 
     def _start_ai_character_vision(self) -> None:
-        if hasattr(self, 'reference_generation') and self.reference_generation.active():
+        if hasattr(self, 'reference_generation') and self.reference_generation.repo.active():
             self.statusBar().showMessage('正在生成参考，完成后可继续 AI 识别')
             return
         if self._database_maintenance_active:
@@ -13785,23 +13939,23 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                 if revision != self.semantic_search_revision:
                     continue
                 self._add_result_exclusion_filter_from_matches(search_filter, matches)
-            elif kind == "inspiration_proposal":
+            elif kind in {"inspiration_proposal", "inspiration_error", "search_plan_proposal"}:
+                revision, result = payload
+                if revision != self.inspiration_generation_revision:
+                    continue
                 self.generate_inspiration_button.setEnabled(True)
-                self._show_inspiration_proposal(payload)
-            elif kind == "inspiration_error":
-                self.generate_inspiration_button.setEnabled(True)
-                self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
-                self._show_inspiration_error(payload)
-            elif kind == "search_plan_proposal":
-                self.generate_inspiration_button.setEnabled(True)
-                self._show_search_plan_proposal(payload)
+                if kind == "inspiration_proposal":
+                    self._show_inspiration_proposal(result)
+                elif kind == "search_plan_proposal":
+                    self._show_search_plan_proposal(result)
+                else:
+                    self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
+                    self._show_inspiration_error(result)
             elif kind == "search_plan_error":
                 self.generate_inspiration_button.setEnabled(True)
                 self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
                 self._show_inspiration_error(payload)
             elif kind == "inspiration_done":
-                self.generate_inspiration_button.setEnabled(True)
-                self.search_inspiration_button.setEnabled(bool(self._selected_inspiration_terms()))
                 plan_filters = None
                 raw_term_results = None
                 result = None
@@ -13811,6 +13965,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                     revision, project_id, selected_terms, result = payload
                 if revision != self.semantic_search_revision:
                     continue
+                self._restore_inspiration_generation_controls()
                 self._handle_inspiration_done(
                     project_id=project_id,
                     selected_terms=selected_terms,
@@ -13818,6 +13973,12 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                     raw_term_results=raw_term_results,
                     plan_filters=plan_filters,
                 )
+            elif kind == "inspiration_search_error":
+                revision, message = payload
+                if revision == self.semantic_search_revision:
+                    self._restore_search_task_controls()
+                    self.inspiration_status_label.setText(f"灵感项目搜索失败：{message}")
+                    self.statusBar().showMessage(f"灵感项目搜索失败：{message}")
             elif kind == "creative_node_note_done":
                 if isinstance(payload, tuple) and len(payload) == 4:
                     node_id, original_note, suggestion, model_name = payload
@@ -14618,6 +14779,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                 self.current_creative_project_id = None
                 self.current_creative_node_id = None
             self._refresh_creative_projects()
+            self.task_center.refresh_references()
             self.statusBar().showMessage(f"已删除创作项目：{project.title}")
 
     def _on_creative_project_combo_changed(self, _index: int) -> None:
@@ -14647,6 +14809,9 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         show_board: bool = False,
         save_current_editor: bool = True,
     ) -> None:
+        exploring = hasattr(self, "creative_workspace") and self.creative_workspace.is_exploring_inspiration()
+        if exploring and project_id is not None:
+            self._clear_search()
         # Save while the old board still owns its node and pending edits.
         self._save_current_board_layout_if_needed()
         if hasattr(self, "creative_flow"):
@@ -14655,7 +14820,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self.creative_workspace.before_project_load(project_id)
         previous_project_id = self.current_creative_project_id
         leaving_context = bool(
-            previous_project_id is not None
+            exploring
+            or previous_project_id is not None
             or self.current_temp_project_id is not None
             or getattr(getattr(self, "creative_workspace", None), "project_id", None) is not None
             or self.center_result_stack.currentWidget() is self.project_board_view
@@ -15066,8 +15232,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self.creative_workspace.refresh()
 
     def _create_creative_project_from_current_brief(self) -> None:
-        self._set_ai_workflow_mode("project")
-        brief = self.inspiration_brief_input.toPlainText().strip()
+        brief = self.creative_brief_input.toPlainText().strip()
         if not brief:
             self.statusBar().showMessage("先填写创作主题，或使用 AI 生成完整项目")
             return
@@ -15089,7 +15254,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             provider_name=self._llm_service_label(service),
             model_name=self._llm_model(service),
         )
-        self.creative_workspace.store.save_project(project_id, extra=self.inspiration_answers_input.toPlainText().strip())
+        self.creative_workspace.store.save_project(project_id, extra=self.creative_extra_input.toPlainText().strip())
         root_id = self.store.creative_root_node_id(project_id)
         if root_id is not None:
             self._seed_creative_template(
@@ -15106,7 +15271,6 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         self.statusBar().showMessage(f"已新建创作项目：{title} / {template.label}")
 
     def _generate_ai_creative_project(self) -> None:
-        self._set_ai_workflow_mode("project")
         if self._creative_all_nodes_in_progress:
             return
         self._generate_creative_project_seed_then_all_nodes()
@@ -15218,6 +15382,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         if self.store.delete_creative_node(node.id):
             self._push_creative_node_undo({"kind": "deleted", "snapshot": snapshot})
             self._load_creative_project(node.project_id, select_node_id=parent_id)
+            self.task_center.refresh_references()
 
     def _show_creative_node_context_menu(self, pos) -> None:
         item = self.creative_node_tree.itemAt(pos)
@@ -15298,6 +15463,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             parent_id = node.parent_id
             if self.store.delete_creative_node(node_id):
                 self._load_creative_project(project_id, select_node_id=parent_id)
+                self.task_center.refresh_references()
                 self.statusBar().showMessage("已撤销新建节点")
             return
         if kind != "deleted":
@@ -15362,10 +15528,10 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
     def _creative_node_ai_context(self, project) -> tuple[str, str]:
         if hasattr(self, "creative_workspace"):
             return self.creative_workspace.ai_context(project)
-        topic = self.inspiration_brief_input.toPlainText().strip()
+        topic = self.creative_brief_input.toPlainText().strip()
         if not topic:
             topic = (project.brief or project.title).strip()
-        extra = self.inspiration_answers_input.toPlainText().strip()
+        extra = self.creative_extra_input.toPlainText().strip()
         return topic, extra
 
     @staticmethod
@@ -15846,7 +16012,6 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
     def _generate_creative_children_for_selected_node(self, *, completion_mode: str = "auto") -> None:
         if self._creative_all_nodes_in_progress or self._creative_node_note_in_progress:
             return
-        self._set_ai_workflow_mode("project")
         node = self._current_creative_node()
         project = (
             self.store.get_creative_project(self.current_creative_project_id)
@@ -15876,7 +16041,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                 self.statusBar().showMessage("先点选要补充细节的条目行；左侧复选框仅用于选择搜索目标")
                 return
         if self._creative_node_editor_node_id == node.id:
-            raw_note = self.creative_node_note_input.toPlainText().strip()
+            raw_note = self.creative_node_note_input.toPlainText()
             raw_query = self.creative_node_query_input.text().strip()
             self._set_creative_node_editor_draft(
                 node.id,
@@ -15887,7 +16052,6 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             )
         else:
             raw_note, raw_query = self._creative_node_editor_text_pair(node)
-            raw_note = raw_note.strip()
             raw_query = raw_query.strip()
         node_template_hint = raw_note if _is_creative_template_placeholder_text(raw_note) else ""
         initial_constraint = self._creative_node_ai_constraint_text(
@@ -15954,7 +16118,6 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                 self._generate_creative_children_for_selected_node(completion_mode=mode)
 
     def _generate_all_creative_node_notes(self) -> None:
-        self._set_ai_workflow_mode("project")
         if self._creative_all_nodes_in_progress:
             return
         if self.current_creative_project_id is not None and self.current_creative_node_id is not None:
@@ -15968,8 +16131,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             else None
         )
         if project is None:
-            brief = self.inspiration_brief_input.toPlainText().strip()
-            extra = self.inspiration_answers_input.toPlainText().strip()
+            brief = self.creative_brief_input.toPlainText().strip()
+            extra = self.creative_extra_input.toPlainText().strip()
             if not brief and not extra:
                 self._generate_creative_project_seed_then_all_nodes()
                 return
@@ -15980,8 +16143,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                 extra=extra,
             )
         else:
-            brief = self.inspiration_brief_input.toPlainText().strip()
-            extra = self.inspiration_answers_input.toPlainText().strip()
+            brief = self.creative_brief_input.toPlainText().strip()
+            extra = self.creative_extra_input.toPlainText().strip()
             project_brief = (project.brief or "").strip()
             if not brief and not extra and not project_brief:
                 self._generate_creative_project_seed_then_all_nodes(project.id)
@@ -16031,15 +16194,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             return
         if target_project_id is not None and self.store.get_creative_project(target_project_id) is not None:
             project_id = target_project_id
-            old_project = self.store.get_creative_project(project_id)
-            old_project_markers = {
-                (old_project.title or "").strip() if old_project is not None else "",
-                (old_project.brief or "").strip() if old_project is not None else "",
-                "未命名创作项目",
-                "AI创作测试题",
-                "新创作项目",
-            }
-            updated_project = self.store.update_creative_project_details(
+            self.store.update_creative_project_details(
                 project_id,
                 title=title or None,
                 brief=brief,
@@ -16050,8 +16205,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                 root_note = (root.note or "").strip() if root is not None else ""
                 should_update_root = root is not None and not self.creative_workspace.store.node(root_id)["locked"] and (
                     not root_note
-                    or _is_creative_template_placeholder_text(root_note)
-                    or root_note in old_project_markers
+                    or " ".join(root_note.split()) in CREATIVE_TEMPLATE_NOTE_TEXTS
                 )
                 if should_update_root:
                     updated_root = self.store.update_creative_node(
@@ -16094,10 +16248,7 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             self._set_creative_all_nodes_busy(False)
             return
         if self.current_creative_project_id == project_id and self.current_creative_node_id is not None:
-            if self._pending_creative_node_detail_id is not None:
-                self._save_pending_creative_node_details()
-            else:
-                self._save_current_creative_node_editor_snapshot()
+            self.workflow_upgrade.flush()
         nodes = self.store.list_creative_nodes(project_id)
         if not nodes:
             self.statusBar().showMessage("当前项目没有可补全节点")
@@ -16302,6 +16453,10 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         node = self.store.get_creative_node(node_id)
         if node is None:
             return None
+        if stage_only:
+            state = self.creative_workspace.store.node(node_id)
+            if state["locked"] or state["proposal_note"] or state["proposal_entries_json"]:
+                return None
         additions = getattr(suggestion, "additions", ())
         if additions:
             staged = self.creative_workspace.store.stage_entries(
@@ -16350,10 +16505,14 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             if not _creative_note_has_meaningful_expansion(original_note, note):
                 return None
         if stage_only:
-            if self.creative_workspace.store.node(node.id)["locked"]:
+            # Keep only the addition in the editable suggestion. The accepted
+            # text is read again when the user adopts it.
+            if original_note and note.startswith(original_note):
+                note = note[len(original_note):].strip()
+            if not note:
                 return None
             self.creative_workspace.store.save_node(
-                node.id, proposal_note=note or node.note, proposal_query=query or node.search_query or node.title,
+                node.id, proposal_note=note, proposal_query=query or node.search_query or node.title,
             )
             return node
         updated = self.store.update_creative_node(
@@ -16512,7 +16671,6 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         return payload
 
     def _generate_creative_project_copy(self) -> None:
-        self._set_ai_workflow_mode("project")
         project = (
             self.store.get_creative_project(self.current_creative_project_id)
             if self.current_creative_project_id is not None
@@ -16752,6 +16910,8 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
             return
         note_text, query_text = self._creative_node_editor_text_pair(node)
         query = query_text.strip() or node.search_query or node.title
+        if hasattr(self, 'creative_flow') and self.creative_flow.is_document_search():
+            query = self.creative_workspace.active_search_names[0]
         previous_ids = set(self.store.creative_node_image_ids(node.id, include_descendants=False))
         changed = self.store.add_images_to_creative_node(
             node.id,
@@ -17954,29 +18114,28 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
         if self._project_sidebar_item_is_current_view(str(kind), project_id_int):
             return
         if kind == "creative":
-            self._set_ai_workflow_mode("project")
             self.creative_project_combo.blockSignals(True)
             self._set_combo_to_data(self.creative_project_combo, project_id_int)
             self.creative_project_combo.blockSignals(False)
-            self._load_creative_project(project_id_int, show_board=True)
-            self.right_tab_widget.setCurrentIndex(self.creative_flow.reference_index)
+            self.creative_workspace.open_project(project_id_int)
             return
         if kind == "search":
             self._load_temporary_project(project_id_int)
+            return
+        if kind == "temporary" and self._open_semantic_workspace(project_id_int):
             return
         self._show_temporary_project_board(project_id_int)
 
     def _project_sidebar_item_is_current_view(self, kind: str, project_id: int) -> bool:
         if kind == "creative":
-            return (
-                self.current_creative_project_id == project_id
-                and self.center_result_stack.currentWidget() is self.project_board_view
-            )
+            return self.current_creative_project_id == project_id
         if kind == "search":
             return (
                 self.current_search_result_set_project_id == project_id
                 and self.center_result_stack.currentWidget() is self.grid_view
             )
+        if kind == "temporary" and self.semantic_workspace_id == project_id and self.creative_workspace.is_exploring_inspiration():
+            return True
         return (
             self._current_board_temp_project_id == project_id
             and self.center_result_stack.currentWidget() is self.project_board_view
@@ -20088,6 +20247,10 @@ class MainWindow(LibraryBrowsingMixin, QMainWindow):
                 ]
             )
         )
+        if hasattr(self, "task_center"):
+            failed = sum(int(stats.get("failed", 0)) for stats in
+                         (embedding_stats, thumbnail_stats, color_stats, scene_stats, character_stats))
+            self.task_center.update_index_count(failed)
 
     @staticmethod
     def _format_index_health_line(label: str, stats: Mapping[str, int]) -> str:

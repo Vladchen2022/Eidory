@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtWidgets import QMenu
+from PySide6.QtWidgets import QFileDialog, QMenu
 
 from test_filter_workflow import app, library, window, apply
 from test_creative_workspace import project
@@ -138,14 +138,25 @@ def test_reference_set_has_explicit_context_and_can_exit_to_library(window, libr
     assert not w.workspace_chrome.stage_buttons[3].isEnabled()
 
 
-def test_project_tools_disable_only_actions_requiring_a_project(window):
+def test_project_tools_show_only_inside_a_project_and_import_stays_available(window):
     w = window
+    chrome, tools = w.workspace_chrome, w.workflow_upgrade.tools
+    assert not tools.isVisible()
     assert all(not action.isEnabled() for action in w.workflow_upgrade.project_actions)
-    others = [a for a in w.workflow_upgrade.tools.menu().actions() if a not in w.workflow_upgrade.project_actions]
-    assert all(action.isEnabled() for action in others)
+    chrome.open_project_picker()
+    assert chrome.import_project_button.isVisible()
+    with patch.object(QFileDialog, 'getOpenFileName', return_value=('', '')) as choose_file:
+        chrome.import_project_button.click()
+    assert choose_file.call_args.args[0] is chrome.project_picker
+    assert chrome.project_picker.isVisible()
+    chrome.project_picker.hide()
     project(w)
+    assert tools.isVisible()
+    assert '导出创作参考包…' in [a.text() for a in tools.menu().actions()]
+    assert not any('导入' in a.text() for a in tools.menu().actions())
     assert all(action.isEnabled() for action in w.workflow_upgrade.project_actions)
-    w.creative_project_combo.setCurrentIndex(0)
+    chrome.open_library()
+    assert not tools.isVisible()
     assert all(not action.isEnabled() for action in w.workflow_upgrade.project_actions)
 
 

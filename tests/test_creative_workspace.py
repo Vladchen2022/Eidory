@@ -64,14 +64,15 @@ def test_project_context_is_isolated_and_persistent(window):
     a, node = project(w)
     project(w, '极地空间站', '只能使用冷色')
     w._load_creative_project(a, select_node_id=node.id)
-    assert w.inspiration_brief_input.toPlainText() == '沙漠古城'
+    assert w.creative_brief_input.toPlainText() == '沙漠古城'
     assert w._creative_node_ai_context(w.store.get_creative_project(a)) == ('沙漠古城', '只能使用暖色')
-    w.inspiration_answers_input.setPlainText('夜晚，暖色')
-    w._set_ai_workflow_mode('probe')
+    w.creative_extra_input.setPlainText('夜晚，暖色')
+    w.creative_workspace.show_inspiration()
     w.inspiration_brief_input.setPlainText('自由探索海底')
     assert w._creative_node_ai_context(w.store.get_creative_project(a)) == ('沙漠古城', '夜晚，暖色')
-    w._set_ai_workflow_mode('project')
-    assert w.inspiration_brief_input.toPlainText() == '沙漠古城'
+    w._load_creative_project(a, select_node_id=node.id)
+    assert w.creative_brief_input.toPlainText() == '沙漠古城'
+    assert w.inspiration_brief_input.toPlainText() == '自由探索海底'
     assert CreativeWorkspaceStore(w.store).project(a)['extra'] == '夜晚，暖色'
 
 
@@ -213,22 +214,6 @@ def test_project_reference_membership_updates_on_reuse_remove_rename_and_switch(
     w.grid_view.select_image_ids([image.id])
     w._remove_selection_from_current_creative_node()
     assert w.grid_view._project_references == {}
-
-
-def test_converted_probes_refresh_project_counts_and_branch_status(window):
-    w = window
-    pid, _ = project(w)
-    root = w.store.creative_root_node_id(pid)
-    w._load_creative_project(pid, select_node_id=root)
-    image = w.store.list_images(limit=None)[0]
-    term = SimpleNamespace(title='油灯', reason='暖色光线', query='油灯')
-    w.current_inspiration_matches = {image.id: [SimpleNamespace(query='油灯')]}
-    before = len(w.store.list_creative_nodes(pid))
-    with patch.object(w, '_selected_inspiration_terms', return_value=[term]), patch.object(w, '_selected_grid_images', return_value=[image]):
-        w.creative_workspace.convert_probes()
-    assert f'({before + 1}/1)' in w.creative_project_combo.currentText()
-    w._load_creative_project(pid, select_node_id=root)
-    assert '本节点 0 张 · 含子节点 1 张' in w.creative_node_status_label.text()
 
 
 def test_board_edit_undo_redo_and_text_survive_save(window, tmp_path):
